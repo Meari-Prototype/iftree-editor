@@ -1,0 +1,39 @@
+﻿{
+  "llm": {
+    "agent": {
+      "toolSettings": {
+        "searchResultLimit": 20,
+        "searchBlockMaxChars": 20000,
+        "fetchContentMaxChars": 20000,
+        "webSearchResultLimit": 5,
+        "webOpenCharLimit": 12000
+      }
+    },
+    "summary": {
+      "independent": false,
+      "summaryStrategies": [
+        {
+          "id": "article-default",
+          "name": "完整全文默认",
+          "skipBelowChars": 100,
+          "minWords": 300,
+          "maxWords": 4000,
+          "ratioPercent": 10
+        },
+        {
+          "id": "node-default",
+          "name": "节点/子树默认",
+          "skipBelowChars": 100,
+          "minWords": 0,
+          "maxWords": 3000,
+          "ratioPercent": 20
+        }
+      ],
+      "activeArticleSummaryStrategyId": "article-default",
+      "activeNodeSummaryStrategyId": "node-default"
+    }
+  },
+  "renderMode": "hardware",
+  "forceHardwareAcceleration": true,
+  "debugLogging": false
+}

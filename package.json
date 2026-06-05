@@ -1,0 +1,47 @@
+{
+  "name": "iftree-editor",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "author": "Meari",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "preapp": "npm run rebuild:native:electron",
+    "app": "electron .",
+    "mcp": "electron scripts/mcp-server.mjs",
+    "build": "vite build",
+    "lint": "eslint src",
+    "monitor:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/monitor-hardware.ps1",
+    "verify:samples": "electron scripts/verify-samples.mjs",
+    "verify:chm": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-chm-e2e.ps1",
+    "vectors:ensure": "electron scripts/ensure-doc-vectors.mjs",
+    "rebuild:native": "npm run rebuild:native:electron",
+    "rebuild:native:electron": "node scripts/rebuild-native-electron.mjs",
+    "precheck:native": "npm run rebuild:native:electron",
+    "check:native": "electron scripts/check-electron-native.cjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@lancedb/lancedb": "^0.27.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@radix-ui/react-tabs": "^1.1.13",
+    "@vitejs/plugin-react": "^5.1.0",
+    "better-sqlite3": "^12.9.0",
+    "electron": "^39.2.7",
+    "fflate": "^0.8.2",
+    "lucide-react": "^0.468.0",
+    "pdfjs-dist": "^5.7.284",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "uuid": "^14.0.0",
+    "vite": "^7.2.7"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-unused-imports": "^4.4.1"
+  }
+}

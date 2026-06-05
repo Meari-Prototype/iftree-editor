@@ -1,0 +1,19 @@
+* text=auto eol=lf
+
+*.bak binary
+*.db binary
+*.docx binary
+*.gif binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.lance/** binary
+*.pdf binary
+*.png binary
+*.sqlite binary
+*.sqlite3 binary
+*.webp binary
+*.xlsx binary
+
+output/** -diff
+package-lock.json -diff
