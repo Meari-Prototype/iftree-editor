@@ -1,5 +1,7 @@
 # IF-Tree Editor · 条件树编辑器
 
+**简体中文** · [English](README.en.md)
+
 > 本地优先的文档数据管理工具：把多文档语料整理成带稳定地址的 if-tree 条件树，便于在大规模原文（设计目标为百亿字级）中精确定位所需片段。检索结果可回溯到具体出处，也可通过 MCP 交由外部 agent 框架协作处理。
 
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
@@ -249,3 +251,4 @@ npm test                            # 使用 Electron runtime 运行单元测试
 - 界面内置 [Noto Sans CJK](src/frontend/assets/fonts/NOTICE.md) 字体（SIL Open Font License）。
 - 语义向量基于 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) 模型。
 - 以及 Electron、React、Vite、LanceDB、Transformers.js 等开源项目。
+- 开发过程中借助 ChatGPT 5.5 xhigh、Claude Opus 4.8 max 与 DeepSeek V4 辅助。
