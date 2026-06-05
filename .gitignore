@@ -3,22 +3,22 @@ dist/
 dist-electron/
 .vite/
 
-docs/
+/docs/
 # Local app/runtime state
 .env
 .env.*
 !.env.example
-database/
+/database/
 # 默认忽略整个 library/，但只放行 db 契约测试用的真实夹具（其余 library 内容仍全部忽略）
 /library/*
 !/library/generated/
 /library/generated/*
 !/library/generated/IFTreeEditor数据库读写测试样例.md
-benchmark/
-testcode/
-testtext/
-output/
-tmp/
+/benchmark/
+/testcode/
+/testtext/
+/output/
+/tmp/
 .iftree-dev/
 .iftree-cache/
 .iftree-debug/
