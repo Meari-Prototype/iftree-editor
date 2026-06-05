@@ -1,6 +1,7 @@
 {
   "name": "iftree-editor",
   "version": "0.1.0",
+  "description": "本地优先的文档数据管理工具：把多文档语料整理成带稳定地址的 if-tree 条件树，支持精确检索、证据可溯与 MCP agent 协作。",
   "private": true,
   "license": "Apache-2.0",
   "author": "Meari",
@@ -13,6 +14,8 @@
     "mcp": "electron scripts/mcp-server.mjs",
     "build": "vite build",
     "lint": "eslint src",
+    "pretest": "npm run rebuild:native:electron",
+    "test": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$env:ELECTRON_RUN_AS_NODE='1'; & .\\node_modules\\.bin\\electron.cmd --test tests/*.test.mjs\"",
     "monitor:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/monitor-hardware.ps1",
     "verify:samples": "electron scripts/verify-samples.mjs",
     "verify:chm": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-chm-e2e.ps1",

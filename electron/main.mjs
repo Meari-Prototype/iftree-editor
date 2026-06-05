@@ -300,7 +300,7 @@ function readProjectConfig() {
   const configPath = projectConfigPath();
   if (!existsSync(configPath)) return {};
   try {
-    return JSON.parse(readFileSync(configPath, 'utf8')) || {};
+    return JSON.parse(readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '')) || {};
   } catch {
     return {};
   }

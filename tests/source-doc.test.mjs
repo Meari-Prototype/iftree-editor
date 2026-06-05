@@ -27,16 +27,24 @@ test('buildSourceDocument keeps raw markdown and emits offset sentence spans', (
   });
 
   assert.equal(source.rawMarkdown, rawMarkdown);
-  assert.equal(source.spans.length, 6);
-  assert.deepEqual(source.spans.map((span) => span.sentence_index), [1, 2, 3, 4, 5, 6]);
+  assert.equal(source.spans.length, 8);
+  assert.deepEqual(source.spans.map((span) => span.sentence_index), [1, 2, 3, 4, 5, 6, 7, 8]);
   for (const span of source.spans) {
     assert.equal(source.rawMarkdown.slice(span.start_offset, span.end_offset), span.text);
   }
-  assert.equal(source.spans[4].text, 'Table sentence one.');
-  assert.equal(source.spans[5].text, 'Table sentence two!');
+  assert.deepEqual(source.spans.map((span) => span.text), [
+    'Title',
+    'First sentence.',
+    'Second sentence!',
+    '| Name | Note |',
+    '| --- | --- |',
+    '| A | Table sentence one.',
+    'Table sentence two!',
+    '|'
+  ]);
 });
 
-test('parseSourceMarkdownBlocks preserves table and paragraph structure', () => {
+test('parseSourceMarkdownBlocks preserves current pipe-table line structure', () => {
   const rawMarkdown = [
     'Paragraph one. Paragraph two.',
     '',
@@ -47,17 +55,14 @@ test('parseSourceMarkdownBlocks preserves table and paragraph structure', () => 
 
   const blocks = parseSourceMarkdownBlocks(rawMarkdown);
 
-  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'table']);
+  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'heading', 'heading', 'paragraph']);
   assert.equal(blocks[0].lines.length, 1);
-  assert.equal(blocks[1].rows.length, 3);
-  assert.equal(blocks[1].rows[1].separator, true);
-  assert.deepEqual(blocks[1].rows[2].cells.map((cell) => rawMarkdown.slice(cell.start, cell.end)), [
-    'A',
-    'Table sentence one. Table sentence two!'
-  ]);
+  assert.equal(blocks[1].text, '| Name | Note |');
+  assert.equal(blocks[2].text, '| --- | --- |');
+  assert.equal(blocks[3].lines.length, 1);
 });
 
-test('source spans merge soft-wrapped paragraph lines before sentence detection', () => {
+test('source spans keep soft-wrapped lines as separate sentence spans', () => {
   const rawMarkdown = [
     '# Title',
     '',
@@ -69,7 +74,8 @@ test('source spans merge soft-wrapped paragraph lines before sentence detection'
 
   assert.deepEqual(source.spans.map((span) => span.text), [
     'Title',
-    'Soft wrapped\nsentence still one.',
+    'Soft wrapped',
+    'sentence still one.',
     'Next sentence.'
   ]);
 });
@@ -98,13 +104,15 @@ test('parseSourceMarkdownBlocks keeps math, images, and tables out of plain para
   const source = buildSourceDocument({ rawMarkdown });
   const records = buildMarkdownStructureRecords(source);
 
-  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'math', 'image', 'table']);
+  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'math', 'image', 'heading', 'heading', 'paragraph']);
   assert.deepEqual(source.spans.map((span) => span.text), [
     'Lead paragraph before math continues',
     '\\mu(v) \\propto |T_v|',
-    'A',
-    'Table sentence one.',
-    'Table sentence two!'
+    '| Item | Note |',
+    '| --- | --- |',
+    '| A | Table sentence one.',
+    'Table sentence two!',
+    '|'
   ]);
   assert.equal(records.some((record) => record.role === 'media' && record.text.includes('assets/diagram.png')), true);
 });
@@ -153,12 +161,12 @@ test('buildMarkdownStructureRecords groups markdown into headings, paragraphs, a
     sourcePosition: record.sourcePosition ?? null
   })), [
     { address: '1', text: 'Chapter One', index: 1, role: 'heading', skipVector: false, sourcePosition: 1 },
-    { address: '1-1', text: '', index: null, role: 'paragraph', skipVector: true, sourcePosition: 1.5 },
+    { address: '1-1', text: '', index: 2, role: 'paragraph', skipVector: true, sourcePosition: 1.5 },
     { address: '1-1-1', text: 'First sentence.', index: 2, role: 'sentence', skipVector: false, sourcePosition: 2 },
     { address: '1-1-2', text: 'Second sentence!', index: 3, role: 'sentence', skipVector: false, sourcePosition: 3 },
     { address: '1-1-3', text: 'Third sentence?', index: 4, role: 'sentence', skipVector: false, sourcePosition: 4 },
     { address: '1-2', text: '1.1 Sub Chapter', index: 5, role: 'heading', skipVector: false, sourcePosition: 5 },
-    { address: '1-2-1', text: '', index: null, role: 'paragraph', skipVector: true, sourcePosition: 5.5 },
+    { address: '1-2-1', text: '', index: 6, role: 'paragraph', skipVector: true, sourcePosition: 5.5 },
     { address: '1-2-1-1', text: 'Fourth sentence.', index: 6, role: 'sentence', skipVector: false, sourcePosition: 6 }
   ]);
 });

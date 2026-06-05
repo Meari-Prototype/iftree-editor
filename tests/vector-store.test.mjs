@@ -49,7 +49,7 @@ test('VectorStore returns nearest vectors from LanceDB search', async () => {
     const results = await store.search({ docId: 10, vector: query, limit: 1 });
 
     assert.equal(results.length, 1);
-    assert.equal(results[0].node_id, 1);
+    assert.equal(results[0].node_id, '1');
     assert.equal(results[0].score > 0.5, true);
   });
 });

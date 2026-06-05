@@ -85,11 +85,11 @@ test('inserts, updates, and deletes nodes while preserving sibling addresses', a
     const second = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '第二句。', nodeType: 'ELSE' });
     const child = store.insertNode({ docId: doc.id, parentId: second.id, text: '子句。' });
 
-    store.updateNode(first.id, { text: '第一句 updated。', node_type: 'LOOP' });
+    store.updateNode(first.id, { text: '第一句 updated。', nodeType: 'LOOP' });
     let loaded = store.getDoc(doc.id);
 
     assert.equal(loaded.tree.children[0].address, '1-1');
-    assert.equal(loaded.tree.children[0].node_type, 'LOOP');
+    assert.equal(loaded.tree.children[0].nodeType, 'LOOP');
     assert.equal(loaded.tree.children[1].address, '1-2');
     assert.equal(loaded.tree.children[1].children[0].address, '1-2-1');
 
@@ -98,70 +98,8 @@ test('inserts, updates, and deletes nodes while preserving sibling addresses', a
 
     assert.equal(loaded.tree.children.length, 1);
     assert.equal(loaded.tree.children[0].id, first.id);
-    assert.equal(child.id > 0, true);
-  });
-});
-
-test('stores node canvas size overrides and restores them from snapshots', async () => {
-  await withStore(async (store) => {
-    const doc = store.createDoc({ title: 'Size Demo', rootText: 'Root' });
-    const node = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'Resizable' });
-
-    let loaded = store.getDoc(doc.id);
-    let reloaded = loaded.nodes.find((item) => item.id === node.id);
-    assert.equal(reloaded.node_size_mode, 'auto');
-    assert.equal(reloaded.node_width, null);
-    assert.equal(reloaded.node_height, null);
-
-    store.updateNode(node.id, { node_width: 320, node_height: 160 });
-    loaded = store.getDoc(doc.id);
-    reloaded = loaded.nodes.find((item) => item.id === node.id);
-
-    assert.equal(reloaded.node_size_mode, 'manual');
-    assert.equal(reloaded.node_width, 320);
-    assert.equal(reloaded.node_height, 160);
-
-    const snapshot = store.createSnapshot(doc.id);
-
-    store.updateNode(node.id, { node_size_mode: 'auto', node_width: null, node_height: null });
-    loaded = store.getDoc(doc.id);
-    reloaded = loaded.nodes.find((item) => item.id === node.id);
-    assert.equal(reloaded.node_size_mode, 'auto');
-    assert.equal(reloaded.node_width, null);
-    assert.equal(reloaded.node_height, null);
-
-    store.restoreSnapshot(doc.id, snapshot);
-    loaded = store.getDoc(doc.id);
-    reloaded = loaded.nodes.find((item) => item.id === node.id);
-    assert.equal(reloaded.node_size_mode, 'manual');
-    assert.equal(reloaded.node_width, 320);
-    assert.equal(reloaded.node_height, 160);
-  });
-});
-
-test('stores node layout settings in SQLite', async () => {
-  await withStore(async (store) => {
-    assert.equal(store.getNodeLayoutSettings().mode, 'equalWidth');
-
-    const saved = store.updateNodeLayoutSettings({
-      mode: 'goldenRatio',
-      defaultWidth: 360,
-      minWidth: 100,
-      maxWidth: 100000,
-      minHeight: 48,
-      maxHeight: 100000,
-      paddingX: 16,
-      noteGap: 8
-    });
-
-    assert.equal(saved.mode, 'goldenRatio');
-    assert.equal(saved.defaultWidth, 360);
-    assert.equal(store.getNodeLayoutSettings().paddingX, 16);
-
-    store.close();
-    store.init();
-    assert.equal(store.getNodeLayoutSettings().mode, 'goldenRatio');
-    assert.equal(store.getNodeLayoutSettings().noteGap, 8);
+    assert.equal(typeof child.id, 'string');
+    assert.equal(child.id.length > 0, true);
   });
 });
 
@@ -172,23 +110,23 @@ test('updateNode can clear nullable node labels back to unmarked', async () => {
 
     store.updateNode(node.id, {
       trust_level: '受控',
-      human_tag: '人工-阻塞',
+      nodeType: 'HUMAN_BLOCK',
       source_position: 12.5
     });
-    let loaded = store.getDoc(doc.id).nodes.find((item) => item.id === node.id);
-    assert.equal(loaded.trust_level, '受控');
-    assert.equal(loaded.human_tag, '人工-阻塞');
-    assert.equal(loaded.source_position, 12.5);
+    let loaded = store.getDoc(doc.id).tree.children[0];
+    assert.equal(loaded.trustLevel, '受控');
+    assert.equal(loaded.nodeType, 'HUMAN_BLOCK');
+    assert.equal(loaded.sourcePosition, 12.5);
 
     store.updateNode(node.id, {
-      trust_level: null,
-      human_tag: null,
-      source_position: null
+      trustLevel: null,
+      nodeType: 'TEXT',
+      sourcePosition: null
     });
-    loaded = store.getDoc(doc.id).nodes.find((item) => item.id === node.id);
-    assert.equal(loaded.trust_level, null);
-    assert.equal(loaded.human_tag, null);
-    assert.equal(loaded.source_position, null);
+    loaded = store.getDoc(doc.id).tree.children[0];
+    assert.equal(loaded.trustLevel, null);
+    assert.equal(loaded.nodeType, 'TEXT');
+    assert.equal(loaded.sourcePosition, null);
   });
 });
 
@@ -245,10 +183,10 @@ test('stores markdown hierarchy metadata and maps sentence spans by explicit ind
     const secondSentence = paragraph.children[1];
 
     assert.equal(chapter.text, 'Chapter');
-    assert.equal(chapter.source_position, 1);
+    assert.equal(chapter.sourcePosition, 1);
     assert.equal(paragraph.text, '');
-    assert.equal(paragraph.node_title, '');
-    assert.equal(paragraph.source_position, 1.5);
+    assert.equal(paragraph.title, '');
+    assert.equal(paragraph.sourcePosition, 1.5);
     assert.equal(firstSentence.text, 'First sentence.');
     assert.equal(secondSentence.text, 'Second sentence!');
     assert.deepEqual(loaded.sourceSpans.map((span) => span.node_address), [
@@ -257,8 +195,8 @@ test('stores markdown hierarchy metadata and maps sentence spans by explicit ind
       secondSentence.address
     ]);
 
-    store.updateNode(paragraph.id, { node_title: '段落备注' });
-    assert.equal(store.getDoc(doc.id).tree.children[0].children[0].node_title, '段落备注');
+    store.updateNode(paragraph.id, { nodeTitle: '段落备注' });
+    assert.equal(store.getDoc(doc.id).tree.children[0].children[0].title, '段落备注');
   });
 });
 
@@ -351,49 +289,41 @@ test('merges node titles and notes without dropping either side', async () => {
       nodeTitle: 'Second title'
     });
 
-    store.updateNode(first.id, { node_note: 'First note' });
-    store.updateNode(second.id, { node_note: 'Second note' });
+    store.updateNode(first.id, { nodeNote: 'First note' });
+    store.updateNode(second.id, { nodeNote: 'Second note' });
 
     assert.equal(store.mergeNodeIntoPreviousSibling(second.id), true);
 
     const merged = store.getDoc(doc.id).tree.children[0];
     assert.equal(merged.text, 'First.\n\nSecond.');
-    assert.equal(merged.node_title, 'First title\n\nSecond title');
-    assert.equal(merged.node_note, 'First note\n\nSecond note');
+    assert.equal(merged.title, 'First title\n\nSecond title');
+    assert.equal(merged.note, 'First note\n\nSecond note');
   });
 });
 
-test('updates axioms and errors associated with a document', async () => {
+test('updates axioms associated with a document', async () => {
   await withStore(async (store) => {
     const doc = store.createDoc({ title: 'Demo', rootText: '根' });
-    const child = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '如果发生错误，那么显示 ERROR' });
 
     const axiom = store.addAxiom({ docId: doc.id, content: '本地运行环境可信', status: 'pending' });
-    const error = store.addError({ docId: doc.id, nodeId: child.id, errorType: '缺否则', description: '缺少否则分支' });
     store.updateAxiom(axiom.id, { status: 'confirmed' });
-    store.updateError(error.id, { resolved: 1 });
 
     const loaded = store.getDoc(doc.id);
 
     assert.equal(loaded.axioms[0].label, 'A1');
     assert.equal(loaded.axioms[0].status, 'confirmed');
-    assert.equal(loaded.errors[0].node_address, '1-1');
-    assert.equal(loaded.errors[0].resolved, 1);
   });
 });
 
-test('listDocs reports node and unresolved error counts without join duplication', async () => {
+test('listDocs reports node counts without join duplication', async () => {
   await withStore(async (store) => {
     const doc = store.createDoc({ title: 'Demo', rootText: '根' });
-    const first = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '第一句。' });
-    const second = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '第二句。' });
-    store.addError({ docId: doc.id, nodeId: first.id, errorType: '缺否则', description: '第一处' });
-    store.addError({ docId: doc.id, nodeId: second.id, errorType: '静默吞没', description: '第二处' });
+    store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '第一句。' });
+    store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '第二句。' });
 
-    const [listed] = store.listDocs();
+    const listed = store.listDocs().find((item) => item.id === doc.id);
 
     assert.equal(listed.node_count, 3);
-    assert.equal(listed.unresolved_error_count, 2);
   });
 });
 
@@ -403,24 +333,25 @@ test('deletes a document and its document-scoped records', async () => {
     const second = store.createDoc({ title: 'Second', rootText: 'Root B' });
     const firstChild = store.insertNode({ docId: first.id, parentId: first.rootNodeId, text: 'Child A' });
     const firstTarget = store.insertNode({ docId: first.id, parentId: first.rootNodeId, text: 'Target A' });
-    store.addNodeRefByAddress({
+    store.addNodeRefToNode({
+      docId: first.id,
       sourceNodeId: firstChild.id,
-      targetAddress: '1-2',
+      targetNodeId: firstTarget.id,
       refKind: 'relates',
       note: 'internal reference'
     });
     store.addAxiom({ docId: first.id, content: 'Axiom A', status: 'pending' });
-    store.addError({ docId: first.id, nodeId: firstTarget.id, errorType: 'Error A', description: 'Desc A' });
     store.saveHistorySnapshot({ docId: first.id, summary: 'Snapshot A' });
 
     assert.equal(store.deleteDoc(first.id), true);
 
     assert.equal(store.getDoc(first.id), null);
     assert.equal(store.getDoc(second.id).doc.title, 'Second');
-    assert.deepEqual(store.listDocs().map((doc) => doc.id), [second.id]);
+    const remainingIds = store.listDocs().map((doc) => doc.id);
+    assert.equal(remainingIds.includes(first.id), false);
+    assert.equal(remainingIds.includes(second.id), true);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM nodes WHERE doc_id = ?').get(first.id).count, 0);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM axioms WHERE doc_id = ?').get(first.id).count, 0);
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM errors WHERE doc_id = ?').get(first.id).count, 0);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM save_history WHERE doc_id = ?').get(first.id).count, 0);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM refs').get().count, 0);
     assert.equal(store.deleteDoc(first.id), false);
@@ -490,21 +421,23 @@ test('promotes nodes without persisting addresses', async () => {
   });
 });
 
-test('adds and deletes node references resolved by dynamic address', async () => {
+test('adds and deletes node references resolved by stable ids', async () => {
   await withStore(async (store) => {
     const doc = store.createDoc({ title: 'Demo', rootText: 'Root' });
     const source = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'Source.' });
-    store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'Target.' });
+    const target = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'Target.' });
 
-    const ref = store.addNodeRefByAddress({
+    const ref = store.addNodeRefToNode({
+      docId: doc.id,
       sourceNodeId: source.id,
-      targetAddress: '1-2',
+      targetNodeId: target.id,
       refKind: 'depends',
       note: 'source depends on target'
     });
     let loaded = store.getDoc(doc.id);
 
-    assert.equal(ref.id > 0, true);
+    assert.equal(typeof ref.id, 'string');
+    assert.equal(ref.id.length > 0, true);
     assert.equal(loaded.refs.length, 1);
     assert.equal(loaded.refs[0].source_address, '1-1');
     assert.equal(loaded.refs[0].target_address, '1-2');

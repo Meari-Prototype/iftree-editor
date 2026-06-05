@@ -9,11 +9,11 @@ import { buildTree } from '../src/core/tree.mjs';
 
 function sampleTree() {
   return buildTree([
-    { id: 1, doc_id: 1, parent_id: null, sort_order: 1, node_type: 'TEXT', text: 'Root' },
-    { id: 2, doc_id: 1, parent_id: 1, sort_order: 1, node_type: 'TEXT', text: 'First sibling' },
-    { id: 3, doc_id: 1, parent_id: 1, sort_order: 2, node_type: 'TEXT', text: 'Second sibling' },
-    { id: 4, doc_id: 1, parent_id: 3, sort_order: 1, node_type: 'TEXT', text: 'Second child' },
-    { id: 5, doc_id: 1, parent_id: 4, sort_order: 1, node_type: 'TEXT', text: 'Grandchild' }
+    { id: 'node-root', docId: 'doc-1', parentId: null, sortOrder: 1, nodeType: 'TEXT', text: 'Root' },
+    { id: 'node-first', docId: 'doc-1', parentId: 'node-root', sortOrder: 1, nodeType: 'TEXT', text: 'First sibling' },
+    { id: 'node-second', docId: 'doc-1', parentId: 'node-root', sortOrder: 2, nodeType: 'TEXT', text: 'Second sibling' },
+    { id: 'node-child', docId: 'doc-1', parentId: 'node-second', sortOrder: 1, nodeType: 'TEXT', text: 'Second child' },
+    { id: 'node-grandchild', docId: 'doc-1', parentId: 'node-child', sortOrder: 1, nodeType: 'TEXT', text: 'Grandchild' }
   ]);
 }
 
@@ -22,7 +22,7 @@ test('summaryTargetsForMode uses selected node own text for current node summari
 
   const targets = summaryTargetsForMode({
     tree,
-    selectedNodeId: 3,
+    selectedNodeId: 'node-second',
     mode: 'selected'
   });
 
@@ -36,8 +36,8 @@ test('summaryTargetsForMode uses ctrl-selected nodes for current node summaries'
 
   const targets = summaryTargetsForMode({
     tree,
-    selectedNodeId: 3,
-    selectedNodeIds: [2, 4],
+    selectedNodeId: 'node-second',
+    selectedNodeIds: ['node-first', 'node-child'],
     mode: 'selected'
   });
 
@@ -50,7 +50,7 @@ test('summaryTargetsForMode uses selected subtree text for subtree summaries', (
 
   const subtreeTargets = summaryTargetsForMode({
     tree,
-    selectedNodeId: 3,
+    selectedNodeId: 'node-second',
     mode: 'subtree'
   });
   assert.equal(subtreeTargets.length, 1);
@@ -62,7 +62,7 @@ test('summaryTargetsForMode uses every node with children for article summaries'
 
   const articleTargets = summaryTargetsForMode({
     tree,
-    selectedNodeId: 3,
+    selectedNodeId: 'node-second',
     mode: 'article'
   });
   assert.deepEqual(articleTargets.map((target) => target.node.address), ['1', '1-2', '1-2-1']);
@@ -79,7 +79,7 @@ test('summaryTargetsForMode uses selected node address depth for current level s
 
   const targets = summaryTargetsForMode({
     tree,
-    selectedNodeId: 3,
+    selectedNodeId: 'node-second',
     mode: 'depth'
   });
 
@@ -89,7 +89,7 @@ test('summaryTargetsForMode uses selected node address depth for current level s
 
 test('collapsedForDepthLimit removes collapsed nodes that block the requested depth', () => {
   const tree = sampleTree();
-  const collapsed = new Set([3, 4, 5]);
+  const collapsed = new Set(['node-second', 'node-child', 'node-grandchild']);
 
   const next = collapsedForDepthLimit({
     tree,
@@ -97,5 +97,5 @@ test('collapsedForDepthLimit removes collapsed nodes that block the requested de
     depthLimit: 3
   });
 
-  assert.deepEqual([...next].sort((a, b) => a - b), [4, 5]);
+  assert.deepEqual([...next].sort(), ['node-child', 'node-grandchild']);
 });
