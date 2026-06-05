@@ -96,6 +96,24 @@ export function readSourceDocument(filePath) {
   });
 }
 
+export function readDocxSourceDocument(filePath) {
+  const zip = unzipSync(readFileSync(filePath));
+  const documentEntry = zip['word/document.xml'];
+  if (!documentEntry) throw new Error('DOCX 导入失败：未找到 word/document.xml');
+
+  const decoder = new TextDecoder('utf-8');
+  const styleNames = parseDocxStyleNames(zip, decoder);
+  const documentXml = decoder.decode(documentEntry);
+  const rawMarkdown = docxParagraphsToMarkdown(documentXml, styleNames);
+  if (!rawMarkdown.trim()) throw new Error('DOCX 导入失败：未读取到正文');
+
+  return buildSourceDocument({
+    sourcePath: filePath,
+    sourceType: 'docx',
+    rawMarkdown
+  });
+}
+
 export function sentencesFromTxt(filePath) {
   return splitSentences(readTextFile(filePath));
 }
@@ -449,10 +467,6 @@ function decodeHtmlEntities(value) {
     .replace(/&#39;/g, "'");
 }
 
-export function recordsFromPy(filePath) {
-  return recordsFromPythonSource(readTextFile(filePath));
-}
-
 export function recordsFromPythonSource(source) {
   const logicalLines = collectPythonLogicalLines(source);
   const outline = buildPythonOutline(logicalLines);
@@ -550,7 +564,8 @@ export function recordsFromPythonSource(source) {
 }
 
 export async function sentencesFromXlsx(filePath) {
-  return (await recordsFromXlsx(filePath)).map((record) => record.text);
+  const extension = extname(filePath).toLowerCase() || '.xlsx';
+  throw new Error(`${extension} 是数据库导出中继格式，不支持句子/文档导入。`);
 }
 
 export async function recordsFromXlsx(filePath) {
@@ -610,48 +625,24 @@ export async function readSentenceRecords(filePath) {
     text: span.text,
     vector: null
   }));
+  if (extension === '.docx') return readDocxSourceDocument(filePath).spans.map((span) => ({
+    index: span.sentence_index,
+    text: span.text,
+    vector: null
+  }));
   if (extension === '.chm') return (await readChmSourceDocument(filePath, { granularity: 'sentence' })).records;
-  if (extension === '.xlsx') return await recordsFromXlsx(filePath);
-  if (extension === '.csv') return recordsFromCsv(filePath);
+  if (extension === '.xlsx' || extension === '.csv') {
+    throw new Error(`${extension} 是数据库导出中继格式，不支持句子/文档导入。`);
+  }
   throw new Error(`Unsupported import file: ${extension}`);
-}
-
-export async function readPythonStructureRecords(filePath) {
-  const extension = extname(filePath).toLowerCase();
-  if (extension !== '.py') throw new Error(`Python import only supports .py, got ${extension}`);
-  return recordsFromPy(filePath);
 }
 
 export async function readStructuredRecords(filePath) {
   const extension = extname(filePath).toLowerCase();
-  if (extension !== '.xlsx') throw new Error(`Structured import only supports .xlsx, got ${extension}`);
-
-  const sentences = await recordsFromXlsx(filePath);
-  const structure = await readStructureSheet(filePath);
-
-  if (!structure || structure.length === 0) {
-    // No structure sheet → fall back to flat import
-    return { sentences, structure: null };
+  if (extension === '.xlsx' || extension === '.csv') {
+    throw new Error(`${extension} 是数据库导出中继格式，不支持结构化文档导入。`);
   }
-
-  // Merge structure with sentences (by index)
-  const validTypes = new Set(['TEXT', 'IF', 'ELSE', 'LOOP', 'FOREACH', 'BREAK', 'CONTINUE']);
-  const validTrust = new Set(['受控', '不受控', '']);
-
-  const merged = structure.map((item) => {
-    const idx = Number(item.index) - 1;
-    const sentence = sentences[idx];
-    return {
-      index: item.index,
-      text: sentence ? sentence.text : '',
-      vector: sentence ? sentence.vector : null,
-      nodeType: validTypes.has(item.type) ? item.type : 'TEXT',
-      address: String(item.address || ''),
-      trustLevel: validTrust.has(item.trust) ? (item.trust || null) : null
-    };
-  });
-
-  return { sentences, structure: merged };
+  throw new Error(`Structured import is not supported for ${extension}`);
 }
 
 function collectPythonLogicalLines(source) {
@@ -894,67 +885,69 @@ function inferPythonNodeType(code) {
   return 'TEXT';
 }
 
-async function readStructureSheet(filePath) {
-  const files = unzipSync(new Uint8Array(readFileSync(filePath)));
-  const decoder = new TextDecoder('utf-8');
+function parseDocxStyleNames(files, decoder) {
+  const entry = files['word/styles.xml'];
+  if (!entry) return new Map();
 
-  // Find workbook.xml to get sheet names
-  const wbXml = decoder.decode(files['xl/workbook.xml']);
-  const sheetPattern = /<sheet\b[^>]*\bname="([^"]*)"[^>]*>/gi;
-  let structureSheetId = null;
-  for (const match of wbXml.matchAll(sheetPattern)) {
-    if (match[1] === '结构') {
-      // Extract sheetId from the r:id attribute
-      const ridMatch = match[0].match(/r:id="([^"]+)"/i);
-      if (ridMatch) {
-        // Find the corresponding sheet in workbook.xml.rels
-        const relsXml = decoder.decode(files['xl/_rels/workbook.xml.rels'] || new Uint8Array());
-        // Match the whole <Relationship> element regardless of attribute order
-        const relElem = relsXml.match(new RegExp(`<Relationship\\b[^>]*\\bId="${ridMatch[1]}"[^>]*/?>`, 'i'));
-        if (relElem) {
-          const targetMatch = relElem[0].match(/\bTarget="([^"]*)"/i);
-          if (targetMatch) {
-            structureSheetId = targetMatch[1]; // e.g., "worksheets/sheet2.xml" or "/xl/worksheets/sheet2.xml"
-          }
-        }
-      }
-      break;
-    }
+  const stylesXml = decoder.decode(entry);
+  const styleNames = new Map();
+  for (const match of stylesXml.matchAll(/<w:style\b([^>]*)>([\s\S]*?)<\/w:style>/g)) {
+    const styleId = attr(match[1], 'w:styleId') || attr(match[1], 'styleId');
+    if (!styleId) continue;
+    const nameMatch = match[2].match(/<w:name\b([^>]*)\/?>/i);
+    const styleName = nameMatch ? (attr(nameMatch[1], 'w:val') || attr(nameMatch[1], 'val')) : '';
+    if (styleName) styleNames.set(styleId, styleName);
   }
-
-  if (!structureSheetId) return null;
-  const sheetPath = structureSheetId.startsWith('/') ? structureSheetId.slice(1) : `xl/${structureSheetId}`;
-  if (!files[sheetPath]) return null;
-
-  const sheetXml = decoder.decode(files[sheetPath]);
-  return parseStructureSheet(sheetXml, decoder, files);
+  return styleNames;
 }
 
-function parseStructureSheet(sheetXml, decoder, files) {
-  const sharedStrings = parseSharedStrings(files, decoder);
-  const rows = [];
-  const cellPattern = /<c\b([^>]*)>([\s\S]*?)<\/c>/g;
+function docxParagraphsToMarkdown(documentXml, styleNames) {
+  const blocks = [];
+  for (const match of documentXml.matchAll(/<w:p\b[\s\S]*?<\/w:p>/g)) {
+    const paragraphXml = match[0];
+    const text = docxParagraphText(paragraphXml);
+    const style = docxParagraphStyle(paragraphXml);
+    if (!text) continue;
+    if (isDocxTocParagraph(style, text)) continue;
 
-  for (const match of sheetXml.matchAll(cellPattern)) {
-    const attrs = match[1];
-    const body = match[2];
-    const ref = attr(attrs, 'r');
-    const parsedRef = parseCellRef(ref);
-    if (!parsedRef) continue;
-    const { column, rowNumber } = parsedRef;
-    if (rowNumber < 2) continue; // skip header
-
-    if (!rows[rowNumber]) rows[rowNumber] = {};
-    const type = attr(attrs, 't');
-    const value = cellValue(body, type, sharedStrings);
-
-    if (column === 1) rows[rowNumber].index = value;
-    else if (column === 2) rows[rowNumber].type = value;
-    else if (column === 3) rows[rowNumber].address = value;
-    else if (column === 4) rows[rowNumber].trust = value;
+    const level = docxHeadingLevel(style, styleNames);
+    blocks.push(level > 0 ? `${'#'.repeat(level)} ${text}` : text);
   }
+  return blocks.join('\n\n').trim();
+}
 
-  return rows.filter(Boolean).filter((r) => r.index != null);
+function docxParagraphText(paragraphXml) {
+  const parts = [];
+  const tokenPattern = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>|<w:tab\b[^>]*\/>|<w:br\b[^>]*\/>/g;
+  for (const match of paragraphXml.matchAll(tokenPattern)) {
+    if (match[0].startsWith('<w:tab')) parts.push('\t');
+    else if (match[0].startsWith('<w:br')) parts.push('\n');
+    else parts.push(xmlUnescape(match[1]));
+  }
+  return parts.join('').replace(/\u00a0/g, ' ').trim();
+}
+
+function docxParagraphStyle(paragraphXml) {
+  const match = paragraphXml.match(/<w:pStyle\b([^>]*)\/?>/i);
+  if (!match) return '';
+  return attr(match[1], 'w:val') || attr(match[1], 'val') || '';
+}
+
+function docxHeadingLevel(style, styleNames) {
+  const candidates = [style, styleNames.get(style)].filter(Boolean);
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').replace(/\s+/g, '').toLowerCase();
+    const numbered = normalized.match(/(?:heading|标题)([1-6])$/i);
+    if (numbered) return Number(numbered[1]);
+    if (/^[1-6]$/.test(normalized)) return Number(normalized);
+    if (normalized === 'title' || normalized === '标题') return 1;
+  }
+  return 0;
+}
+
+function isDocxTocParagraph(style, text) {
+  const normalizedStyle = String(style || '').toLowerCase();
+  return normalizedStyle.startsWith('toc') || String(text || '').trim() === '目录';
 }
 
 function parseSharedStrings(files, decoder) {

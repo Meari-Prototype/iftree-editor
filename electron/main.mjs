@@ -2910,11 +2910,11 @@ function registerIpc() {
   ipcMain.handle('import:chooseFile', async (_event, payload) => {
     const mode = normalizeImportMode(payload?.mode);
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: '导入 md、txt、py、pdf 或 chm',
+      title: '导入 chm、txt、md、pdf 或 docx',
       defaultPath: ensureLibraryRoot(),
       properties: ['openFile', 'multiSelections'],
       filters: [
-        { name: '条件树导入文件', extensions: ['md', 'txt', 'py', 'pdf', 'chm'] },
+        { name: '条件树导入文件', extensions: ['chm', 'txt', 'md', 'pdf', 'docx'] },
         { name: '所有文件', extensions: ['*'] }
       ]
     });
