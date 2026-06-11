@@ -9,19 +9,22 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.1.0%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.2.0%20alpha-orange)
 
-> **Project status: 0.1.0, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.2.0, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
 > - **Ready to use**: the core **MCP read-only query service** and **db command contract** are stable and usable; read-only retrieval is the most dependable part right now.
+>
+> See the [CHANGELOG](CHANGELOG.md) for version history.
 
 ---
 
 ## Table of Contents
 
 - [Introduction](#introduction)
+- [Documentation](#documentation)
 - [Features](#features)
 - [Screenshots](#screenshots)
 - [Tech Stack](#tech-stack)
@@ -31,6 +34,7 @@
 - [Data Storage](#data-storage)
 - [Semantic Vectors](#semantic-vectors)
 - [Import & Export](#import--export)
+- [MCP & External Agents](#mcp--external-agents)
 - [Project Structure](#project-structure)
 - [Development & Testing](#development--testing)
 - [License](#license)
@@ -49,25 +53,40 @@ IF-Tree Editor is a local-first document data management tool aimed at large mul
 
 The same content can switch between two reading densities: collapsed, it reads like a Markdown document; expanded, it becomes an operable condition tree. On import, the sentence-to-source offset mapping is preserved so both views correspond to the same original text.
 
+## Documentation
+
+In-depth documentation lives in `docs/` (currently in Chinese):
+
+- [Getting started](docs/getting-started.md) — install to first search in 15 minutes.
+- [How-to guides](docs/how-to.md) — LLM setup, vectors, imports, smart import, connecting external agents, memory volumes, streaming writes, backup.
+- [Reference](docs/reference.md) — MCP tools, db commands, the import-json contract, config and environment variables.
+- [Concepts & design](docs/concepts.md) — addresses, trust levels, three-way merge, the three memory layers, the shared backend.
+- [Changelog](CHANGELOG.md)
+
 ## Features
 
 - **Precise retrieval**: keyword search + local semantic search based on `bge-m3`, with sentence-level offset mapping, locating a hit to specific sentences; WebGPU/fp16 inference by default, switchable to CPU.
 - **Evidence-based answers**: when answering factual questions, the built-in agent reads textual evidence and gives the evidence node address, rather than answering from the model's general knowledge or the wording of the question; results are verifiable.
 - **Local-first storage**: documents, nodes, axioms, ERRORs, references, and history live in SQLite; node-level semantic vectors live in LanceDB — usable with no cloud service.
-- **Agent collaboration & MCP**: a built-in agent with tiered permissions (Q&A / collaborate / full), exposing the library to external agent frameworks via MCP; the LLM layer supports both OpenAI-compatible and Anthropic-compatible APIs.
+- **Agent collaboration & MCP**: the built-in agent and the MCP server share one permission tiering (Q&A / collaborate / full); external agent frameworks can search and read evidence, and any write from the collaborate tier up goes into an edit branch awaiting human review. The LLM layer supports both OpenAI-compatible and Anthropic-compatible APIs.
 - **Address-stable condition tree**: node addresses look like `1-3-2`, recomputed dynamically from `parent_id + sort_order` and kept consistent across inserts and re-parenting, so every sentence can be cited precisely.
 - **Dual-density reading**: collapsed it renders as a Markdown document, expanded as an operable condition tree; the tree view expands to the document's true maximum depth by default, with expand/collapse by level and expand-all / collapse-all.
 - **Multiple views**: tree view, relationship graph, IDE view, rich text, keyword search, semantic search; the relationship graph generates directed edges in if-tree reading order and overlays explicit reference edges.
 - **Structural editing**: read-only / edit lock; add empty nodes, drag a single node or `Ctrl`-multi-select to re-parent, drop onto a node to merge / juxtapose / attach; built-in undo / redo (`Ctrl+Z`, `Ctrl+Y`, `Ctrl+Shift+Z`).
-- **Multi-format import & export**: import CHM, TXT, Markdown, PDF, DOCX; Excel / CSV are explicitly relay formats for database export, not ordinary document import; export to Markdown and JSON.
+- **Edit branches & three-way merge**: structural changes from agents go into a shadow branch awaiting review; merging into the mainline reconciles three ways by stable node id using merkle hashing — fast-forwards write through, structural mismatches block as a whole, and field-level conflicts are decided by a human one by one.
+- **Streaming writes**: append-only data streams (chat logs, event logs) go straight into an "incremental edit" document without a branch, with keyword and semantic indexes maintained incrementally; bulk import has a dedicated acceleration session.
+- **Event memory volumes**: an external agent can deliver a structured self-report log as a memory volume at the end of a session; volumes seal automatically on a 24-hour rhythm and become distillable. The distill-and-approve pipeline lands in a later release.
+- **Shared backend**: one backend process per database — the app, MCP, and CLI share it over a named pipe and can stay online at the same time without conflict.
+- **Multi-format import & export**: import CHM, TXT, Markdown, PDF, DOCX; irregular sources go through smart import (an LLM produces JSON that is validated byte-for-byte before ingestion); Excel / CSV are explicitly relay formats for database export, not ordinary document import; export to Markdown and JSON.
 - **AI summary notes**: call an OpenAI- or Anthropic-compatible API to generate summary notes for a single node, a subtree, the current level, or the whole document.
 - **Rich node metadata**: node type, trust level, manual tags, axioms, ERRORs, references, and save history.
 
 ## Screenshots
 
-<!-- Add 1–2 application screenshots here, e.g. docs/screenshot-tree.png and docs/screenshot-richtext.png -->
-
-> Screenshots to be added.
+| | |
+| --- | --- |
+| **Tree view & dual-density reading**<br>![Tree view](docs/images/editor-tree.png) | **Keyword search**<br>![Keyword search](docs/images/keyword-search.png) |
+| **IDE view & agent collaboration**<br>![IDE view with agent chat](docs/images/ide-agent.png) | **Launcher**<br>![Launcher](docs/images/launcher.png) |
 
 ## Tech Stack
 
@@ -136,7 +155,7 @@ The multi-provider configuration maintained on the settings page is written back
 
 ### Application config (`iftree.config.json`)
 
-Controls summary strategies, agent tool parameters, and render mode — e.g. summary word-count bounds, compression ratio, number of search results, and whether to force hardware acceleration.
+Controls summary strategies, agent tool parameters, and render mode — e.g. summary word-count bounds, compression ratio, number of search results, and whether to force hardware acceleration. Render mode, hardware acceleration, and debug logging map to toggles in the launcher; early releases ship with debug logging on by default (logs go to `.iftree-debug/`), which makes problem reports easier. Field details: [reference](docs/reference.md#配置与环境变量).
 
 ### Data directory (`IFTREE_HOME`)
 
@@ -144,7 +163,7 @@ Set the `IFTREE_HOME` environment variable to override the default data director
 
 ## Data Storage
 
-The app involves two kinds of local data: the **document library** you manage, and the database and vectors derived from it.
+The app involves three kinds of local data: the **document library** you manage, the **main database** parsed from it, and rebuildable **derived data** (vectors and attachments).
 
 ### Document library (`library/`)
 
@@ -152,13 +171,16 @@ The app involves two kinds of local data: the **document library** you manage, a
 
 `library/` is in `.gitignore` — it is your data and is not distributed with the repository. It is entirely separate from `docs/`: the former is the managed document corpus, the latter is just project documentation; do not merge `library/` into `docs/`.
 
-### Derived storage (`%USERPROFILE%\.iftree\`)
+### Main database (`database/store.sqlite`)
 
-The structure, vectors, and attachments parsed after import are written to the user data directory (overridable with `IFTREE_HOME`):
+The structured data parsed on import — documents, nodes, axioms, ERRORs, references, history, memory volumes — lives in `database/store.sqlite` at the project root (gitignored). Use the `IFTREE_DB` environment variable to point at a different path.
+
+### Derived data (`%USERPROFILE%\.iftree\`)
+
+Vectors and attachments are written to the user data directory (overridable with `IFTREE_HOME`):
 
 ```text
 %USERPROFILE%\.iftree\
-  store.sqlite          # documents, nodes, axioms, ERRORs, references, history
   vectors\nodes.lance\  # node-level semantic vectors
   assets\doc-<id>\      # document attachments (images, etc.)
 ```
@@ -187,7 +209,29 @@ The original Markdown reading source is stored in SQLite's `source_documents` / 
 
 Excel `.xlsx` and CSV `.csv` are relay formats for database export, not ordinary document import.
 
+Sources too irregular for rule-based parsing go through **smart import**: an LLM inspects the source, writes a one-off splitting script that produces JSON, and `db import-json` validates it byte-for-byte before ingestion — body text may only be sliced from the source, never rewritten (see the [how-to guide](docs/how-to.md#用智能导入处理无规则结构的源文)).
+
 **Export**: Markdown document and JSON structure.
+
+## MCP & External Agents
+
+The MCP server exposes the library to external agent frameworks such as Claude Code and Codex over stdio. The permission tier is locked at launch by the `IFTREE_MCP_TIER` environment variable: `read` (search and read, default), `edit` (+ edit-branch writes, streaming writes, memory delivery), `full` (+ merge, rollback, and other administrative actions).
+
+Client configuration example (with the project root as working directory):
+
+```json
+{
+  "mcpServers": {
+    "iftree-library": {
+      "command": "npm",
+      "args": ["run", "--silent", "mcp"],
+      "env": { "ELECTRON_RUN_AS_NODE": "1", "IFTREE_MCP_TIER": "read" }
+    }
+  }
+}
+```
+
+The app, MCP, and CLI share one backend process per database and can stay online together. The tool list and the `db` command contract are in the [reference](docs/reference.md); the smart-import and memory-delivery contracts for external agents ship with the repository under [`.iftree-llm-workspace/skills/`](.iftree-llm-workspace/skills/).
 
 ## Project Structure
 
@@ -213,18 +257,23 @@ Excel `.xlsx` and CSV `.csv` are relay formats for database export, not ordinary
 │   │   ├── db/           # schema, ids, normalizers, snapshot history
 │   │   ├── entities/     # Entity read/write and projection
 │   │   ├── handlers/     # Read / write command handlers
-│   │   └── llm/          # Agent runtime, chat client, headless agent
+│   │   └── llm/          # Agent runtime, shared backend (named pipe), headless agent, LLM settings
 │   ├── core/             # Pure logic (no Electron dependency)
 │   │   ├── tree.mjs      # Tree building, dynamic addresses, Markdown/JSON export
 │   │   ├── mindmap.mjs   # Tree-view projection, depth control, layout
-│   │   ├── importers.mjs # Works with import-formats/ to parse chm/txt/md/pdf/docx
-│   │   ├── source-doc.mjs# Source parsing and sentence offset mapping
+│   │   ├── merkle.mjs / merkle-diff.mjs / merkle-merge.mjs # Tree hashing, diff, three-way merge
+│   │   ├── source-text.mjs / source-docx.mjs / source-chm.mjs # Works with import-formats/ to parse txt/md/csv/xlsx/docx/chm
+│   │   ├── source-markdown.mjs # Source parsing and sentence offset mapping
 │   │   └── ...           # viewport, hitbox, drag-drop, markdown, etc.
 │   ├── vector/           # Semantic vectors: embeddings, vector-store, worker, model download
 │   └── agent/            # Agent config and session storage
 ├── scripts/              # CLI tools: MCP server, db commands, native rebuild, verification scripts
 ├── tests/                # node:test unit tests
+├── docs/                 # Project documentation: tutorial / how-to / reference / concepts
+├── .iftree-llm-workspace/
+│   └── skills/           # Import and memory-delivery contracts for LLMs (shipped with the repo)
 ├── library/              # Document library workspace: your source documents (created at runtime, gitignored)
+├── database/             # Main database store.sqlite (created at runtime, gitignored)
 ├── iftree.config.json    # Summary strategy / agent tool / render mode config
 └── .env.example          # Environment variable template (LLM API)
 ```
@@ -232,7 +281,8 @@ Excel `.xlsx` and CSV `.csv` are relay formats for database export, not ordinary
 ## Development & Testing
 
 ```powershell
-npm run lint          # ESLint static checks
+npm run lint          # ESLint static checks (src / electron / scripts / tests)
+npm run check:types   # TypeScript type check (TS files under migration)
 npm run build         # production build
 npm run check:native  # verify native modules match the Electron ABI
 npm test              # run unit tests on the Electron runtime
