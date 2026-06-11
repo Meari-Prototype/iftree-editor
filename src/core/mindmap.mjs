@@ -17,7 +17,7 @@ export const DEFAULT_NODE_LAYOUT = Object.freeze({
 });
 
 export function normalizeNodeLayout(value = {}) {
-  const source = value && typeof value === 'object' ? value : {};
+  const source = /** @type {Record<string, any>} */ (value && typeof value === 'object' ? value : {});
   const minWidth = normalizeNumber(source.minWidth, DEFAULT_NODE_LAYOUT.minWidth, 40, 100000);
   const maxWidth = Math.max(minWidth, normalizeNumber(source.maxWidth, DEFAULT_NODE_LAYOUT.maxWidth, minWidth, 100000));
   const minHeight = normalizeNumber(source.minHeight, DEFAULT_NODE_LAYOUT.minHeight, 24, 1000000);

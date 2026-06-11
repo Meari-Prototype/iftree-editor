@@ -1,19 +1,26 @@
-// c2d-events.mjs
+// c2d-events.ts
 // Event handling logic for C2DMapView.
 // Each function takes explicit context — no closures over React state.
 
 import { clamp, clampCenterScrollTop } from './c2d-measure.mjs';
 import { parentAddress } from '../../core/node-model.mjs';
+import type { C2DBlock, C2DColumn } from './c2d-types';
+
+type ColEls = Map<number, HTMLElement>;
+type Cards = Map<string, HTMLElement>;
 
 // ── Scroll sync ──────────────────────────────────────────
 
-function groupForBlock(column, block) {
+function groupForBlock(column: C2DColumn | undefined, block: C2DBlock) {
   return (column?.groups || []).find(group =>
     (group.blocks || []).some(item => item.address === block.address)
   ) || null;
 }
 
-function syncLeftChildColumn(parentIdx, parentAddr, targetY, colElsMap, cardsMap, columns) {
+function syncLeftChildColumn(
+  parentIdx: number, parentAddr: string, targetY: number,
+  colElsMap: ColEls, cardsMap: Cards, columns: C2DColumn[]
+) {
   const childIdx = parentIdx - 1;
   const childEl = colElsMap.get(childIdx);
   if (!childEl) return;
@@ -34,13 +41,15 @@ function syncLeftChildColumn(parentIdx, parentAddr, targetY, colElsMap, cardsMap
   }
 }
 
-export function syncParentColumn(childIdx, colElsMap, cardsMap, columns) {
+export function syncParentColumn(
+  childIdx: number, colElsMap: ColEls, cardsMap: Cards, columns: C2DColumn[]
+) {
   const childEl = colElsMap.get(childIdx);
   if (!childEl) return;
   const childR = childEl.getBoundingClientRect();
   const targetY = childR.top + childR.height / 2;
   const blocks = columns[childIdx]?.groups.flatMap(g => g.blocks) || [];
-  let center = null;
+  let center: C2DBlock | null = null;
   let bestD = Infinity;
   for (const b of blocks) {
     const el = cardsMap.get(b.address);
@@ -76,17 +85,23 @@ export function syncParentColumn(childIdx, colElsMap, cardsMap, columns) {
 
 // ── Scroll boundary clamping ─────────────────────────────
 
-function columnScrollItems(blocks, cardsMap) {
+interface ScrollItem {
+  block: C2DBlock;
+  top: number;
+  bottom: number;
+}
+
+function columnScrollItems(blocks: C2DBlock[], cardsMap: Cards): ScrollItem[] {
   return blocks.map(b => {
     const el = cardsMap.get(b.address);
     if (!el) return null;
     return { block: b, top: el.offsetTop, bottom: el.offsetTop + el.offsetHeight };
-  }).filter(Boolean).sort((a, b) => a.top - b.top);
+  }).filter((item): item is ScrollItem => Boolean(item)).sort((a, b) => a.top - b.top);
 }
 
-function activeScrollItem(items, scrollTop, viewH) {
+function activeScrollItem(items: ScrollItem[], scrollTop: number, viewH: number) {
   const center = scrollTop + viewH / 2;
-  let best = null;
+  let best: { item: ScrollItem; index: number; distance: number } | null = null;
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
     const d = Math.abs((it.top + it.bottom) / 2 - center);
@@ -95,14 +110,16 @@ function activeScrollItem(items, scrollTop, viewH) {
   return best;
 }
 
-function activeExpandedScrollItem(items, expandedSet, scrollTop, viewH) {
+function activeExpandedScrollItem(items: ScrollItem[], expandedSet: Set<string>, scrollTop: number, viewH: number) {
   return activeScrollItem(
     items.filter(it => expandedSet.has(it.block.address)),
     scrollTop, viewH
   );
 }
 
-function clampExpandedNodeScroll({ item, direction, viewH, scrollMax, nextScrollTop }) {
+function clampExpandedNodeScroll({ item, direction, viewH, scrollMax, nextScrollTop }: {
+  item: ScrollItem; direction: 'down' | 'up'; viewH: number; scrollMax: number; nextScrollTop: number;
+}) {
   // 展开节点统一规则：scrollTop 卡在 [顶部对齐, 底部对齐] 区间内——上下卡住、
   // 中间可滚。节点能放进视野时该区间很窄（顶/底两个贴边位几乎重合），超长节点
   // 时该区间很宽（中间能滚很多，才看得到底部的备注）。向下滚钳到底边界，
@@ -118,7 +135,10 @@ function clampExpandedNodeScroll({ item, direction, viewH, scrollMax, nextScroll
   };
 }
 
-function clampCollapsedRunScroll({ items, activeIndex, direction, viewH, scrollMax, nextScrollTop, expandedSet }) {
+function clampCollapsedRunScroll({ items, activeIndex, direction, viewH, scrollMax, nextScrollTop, expandedSet }: {
+  items: ScrollItem[]; activeIndex: number; direction: 'down' | 'up';
+  viewH: number; scrollMax: number; nextScrollTop: number; expandedSet: Set<string>;
+}) {
   let start = activeIndex;
   let end = activeIndex;
   while (start > 0 && !expandedSet.has(items[start - 1].block.address)) start--;
@@ -141,7 +161,10 @@ function clampCollapsedRunScroll({ items, activeIndex, direction, viewH, scrollM
   };
 }
 
-export function clampColumnScrollBoundary(colEl, blocks, nextScrollTop, delta, expandedSet, cardsMap) {
+export function clampColumnScrollBoundary(
+  colEl: HTMLElement | null, blocks: C2DBlock[], nextScrollTop: number,
+  delta: number, expandedSet: Set<string>, cardsMap: Cards
+) {
   if (!colEl) return null;
   const viewH = colEl.clientHeight;
   const scrollMax = Math.max(0, colEl.scrollHeight - viewH);
@@ -149,7 +172,7 @@ export function clampColumnScrollBoundary(colEl, blocks, nextScrollTop, delta, e
   const items = columnScrollItems(blocks, cardsMap);
   if (!items.length) return null;
 
-  const direction = delta > 0 ? 'down' : 'up';
+  const direction: 'down' | 'up' = delta > 0 ? 'down' : 'up';
   const ae = activeExpandedScrollItem(items, expandedSet, nextScrollTop, viewH);
   if (ae) {
     const c = clampExpandedNodeScroll({ item: ae.item, direction, viewH, scrollMax, nextScrollTop });
@@ -166,12 +189,21 @@ export function clampColumnScrollBoundary(colEl, blocks, nextScrollTop, delta, e
 
 // ── Wheel event ──────────────────────────────────────────
 
-export function handleColumnWheel(event, { colElsMap, cardsMap, columns, expandedSet, scrollTargets, onMeasure }) {
-  const el = event.currentTarget;
+export interface ColumnWheelContext {
+  colElsMap: ColEls;
+  cardsMap: Cards;
+  columns: C2DColumn[];
+  expandedSet: Set<string>;
+  scrollTargets: Map<number | string, number | ReturnType<typeof setTimeout>>;
+  onMeasure: () => void;
+}
+
+export function handleColumnWheel(event: WheelEvent, { colElsMap, cardsMap, columns, expandedSet, scrollTargets, onMeasure }: ColumnWheelContext) {
+  const el = event.currentTarget as HTMLElement;
   const delta = event.deltaMode === 1 ? event.deltaY * 40 : event.deltaY;
   if (!delta) return;
   let colIndex = -1;
-  let blocks = [];
+  let blocks: C2DBlock[] = [];
   for (const [i, colEl] of colElsMap.entries()) {
     if (colEl === el) {
       colIndex = i;
@@ -181,7 +213,7 @@ export function handleColumnWheel(event, { colElsMap, cardsMap, columns, expande
   }
   const scrollMax = Math.max(0, el.scrollHeight - el.clientHeight);
   const tKey = colIndex;
-  const base = scrollTargets.has(tKey) ? scrollTargets.get(tKey) : el.scrollTop;
+  const base = scrollTargets.has(tKey) ? Number(scrollTargets.get(tKey)) : el.scrollTop;
   const next = clamp(base + delta, 0, scrollMax);
   const clamped = clampColumnScrollBoundary(el, blocks, next, delta, expandedSet, cardsMap);
   if (!clamped) {
@@ -193,23 +225,29 @@ export function handleColumnWheel(event, { colElsMap, cardsMap, columns, expande
   event.preventDefault();
   event.stopPropagation();
   scrollTargets.set(tKey, clamped.scrollTop);
-  clearTimeout(scrollTargets.get(`t${tKey}`));
+  clearTimeout(scrollTargets.get(`t${tKey}`) as ReturnType<typeof setTimeout>);
   scrollTargets.set(`t${tKey}`, setTimeout(() => {
     scrollTargets.delete(tKey);
     scrollTargets.delete(`t${tKey}`);
   }, 150));
   el.scrollTo({ top: clamped.scrollTop, behavior: 'smooth' });
-  requestAnimationFrame(onMeasure);
+  onMeasure();
   syncParentColumn(colIndex, colElsMap, cardsMap, columns);
 }
 
 // ── Column resize gesture ────────────────────────────────
 
-export function startColumnResize(colIndex, event, { currentWidths, onWidthChange, onEnd }) {
+export interface ColumnResizeContext {
+  currentWidths: number[];
+  onWidthChange: (colIndex: number, width: number) => void;
+  onEnd?: () => void;
+}
+
+export function startColumnResize(colIndex: number, event: { preventDefault(): void; clientX: number }, { currentWidths, onWidthChange, onEnd }: ColumnResizeContext) {
   event.preventDefault();
   const startX = event.clientX;
   const startW = currentWidths[colIndex] || 240;
-  function onMove(ev) {
+  function onMove(ev: PointerEvent) {
     const w = Math.max(120, startW + ev.clientX - startX);
     onWidthChange(colIndex, w);
   }

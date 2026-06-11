@@ -3,7 +3,7 @@ import { parse } from 'node:path';
 import {
   inspectSourceDocumentStructure,
   recordsFromSourceDocument
-} from '../importers.mjs';
+} from '../source-text.mjs';
 
 const SIMPLE_AUTO_DIRECT_CHAR_LIMIT = 1000;
 

@@ -3,6 +3,7 @@ import {
   normalizeStableId
 } from './db/ids.mjs';
 import { normalizeNodeType } from '../core/node-model.mjs';
+import { mergeNodeNotes } from '../core/node-notes.mjs';
 
 // Lazy diff projection: take a base doc snapshot (nodes/axioms/refs) plus a list
 // of edit branch entries, and return the projected document state the user
@@ -61,6 +62,108 @@ export function activeEditBranchEntries(entries = []) {
 
 export function undoneEditBranchEntries(entries = []) {
   return (Array.isArray(entries) ? entries : []).filter((entry) => !isActiveEditBranchEntry(entry));
+}
+
+// 内容字段冲突可经 node.update patch 微调解决；parent_id 走结构 entry（node.reparent 等），patch 碰不到。
+const RESOLVABLE_CONTENT_FIELDS = new Set(['text', 'node_title', 'node_note', 'node_type', 'trust_level']);
+
+function stripNodeEntries(entries, nodeId, kinds = null) {
+  const id = String(nodeId);
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+    let match = false;
+    if (entry.kind === 'node.delete') match = String(entry.target_ref) === id;
+    else if (entry.kind === 'node.update') match = String(entry.node_id) === id;
+    if (!match) continue;
+    if (kinds && !kinds.includes(entry.kind)) continue;
+    entries.splice(i, 1);
+  }
+}
+
+function stripPatchField(entries, nodeId, field) {
+  const id = String(nodeId);
+  for (const entry of entries) {
+    if (entry.kind !== 'node.update' || String(entry.node_id) !== id) continue;
+    if (entry.patch && Object.prototype.hasOwnProperty.call(entry.patch, field)) {
+      delete entry.patch[field];
+      if (Array.isArray(entry.fields)) entry.fields = entry.fields.filter((f) => f.field !== field);
+    }
+  }
+}
+
+// 把人裁结果（每个冲突选 ours/theirs/填值）折进分支 entries，复用既有重放机制写回。
+// 无冲突字段不动（重放本就自动合）；冲突字段：取 theirs=保留分支 patch、取 ours=从 patch 剥掉该字段、
+// 填值=追加一条 {field:value} 的 node.update。delete-modify 按选择增删 node.delete。
+// conflicts 来自保存闸门的逐条前置验证（结构性失配在进面板前已被 blocked 拦下，
+// 故这里收到的字段冲突必然源自 node.update patch，「划账」是精确的），形状与
+// classifyThreeWayMerge 预览的扁平列表一致：{id, field, ours, theirs, base}。
+// 返回 { entries, errors }；errors 非空时调用方应拒绝写回。
+// v1 不支持：parent_id 结构冲突、复活己删节点、__parent__（主干删父+分支在其下新增/移入）。
+export function resolveConflictEntries({ entries = [], conflicts = [], resolutions = [] } = {}) {
+  const active = activeEditBranchEntries(entries).map((entry) => JSON.parse(JSON.stringify(entry)));
+  const appended = [];
+  const errors = [];
+  const byKey = new Map();
+  for (const res of resolutions || []) {
+    if (res && res.id != null && res.field != null && res.pick != null) {
+      byKey.set(`${String(res.id)}::${res.field}`, res);
+    }
+  }
+
+  for (const conflict of conflicts || []) {
+    const id = String(conflict.id);
+    const field = conflict.field;
+    const res = byKey.get(`${id}::${field}`);
+    if (!res) { errors.push({ id, field, reason: 'unresolved' }); continue; }
+    const pick = res.pick;
+
+    if (field === 'parent_id') {
+      errors.push({ id, field, reason: 'parent-reparent-conflict-unsupported' });
+      continue;
+    }
+
+    if (field === '__parent__') {
+      // 主干已删父、分支在其下新增/移入：取 theirs 需复活父节点（v1 不支持），取 ours 需剥结构 entry（patch 碰不到）。
+      errors.push({ id, field, reason: 'parent-deleted-in-trunk-unsupported' });
+      continue;
+    }
+
+    if (field === '__node__') {
+      if (pick !== 'ours' && pick !== 'theirs') { errors.push({ id, field, reason: 'delete-modify-needs-ours-or-theirs' }); continue; }
+      const oursDeleted = conflict.ours === 'deleted';
+      const theirsDeleted = conflict.theirs === 'deleted';
+      const pickedDeleted = pick === 'ours' ? oursDeleted : theirsDeleted;
+      if (pickedDeleted) {
+        // 结果=删除：主干已删的清掉分支无效更新；分支删的保留 node.delete 让重放删主干节点。
+        if (oursDeleted) stripNodeEntries(active, id, ['node.update']);
+      } else if (pick === 'ours') {
+        // ours 改、theirs 删，保留 ours 版本 → 去掉分支对该节点的全部 entry。
+        stripNodeEntries(active, id);
+      } else {
+        // theirs 改、ours 删，要复活 theirs → 分支 entry 是 update，缺节点无法重放，v1 不支持。
+        errors.push({ id, field, reason: 'resurrect-deleted-node-unsupported' });
+      }
+      continue;
+    }
+
+    if (!RESOLVABLE_CONTENT_FIELDS.has(field)) {
+      errors.push({ id, field, reason: 'field-not-resolvable' });
+      continue;
+    }
+    if (pick === 'theirs') {
+      continue; // 保留分支 patch，重放即取 theirs
+    }
+    if (pick === 'ours') {
+      stripPatchField(active, id, field); // 重放不触该字段 → 保留 ours
+    } else if (pick === 'fill') {
+      if (res.value === undefined) { errors.push({ id, field, reason: 'fill-requires-value' }); continue; }
+      appended.push({ kind: 'node.update', action: 'patch', node_id: id, patch: { [field]: res.value }, status: 'active' });
+    } else {
+      errors.push({ id, field, reason: `unknown-pick:${String(pick)}` });
+    }
+  }
+
+  return { entries: [...active, ...appended], errors };
 }
 
 function cloneRow(row) {
@@ -333,6 +436,8 @@ function applyNodeSplit(state, entry) {
   applyNodeSplitSentenceMode(state, entry);
 }
 
+// 与 store.mergeNodeIntoTarget 重放语义对齐：'\n\n' 连接正文、mergeNodeNotes 合并
+// 标题与备注、孩子按 sort_order 序追加到 target 尾部、target 在 source 子树内则拒绝。
 function applyNodeMergeInto(state, entry) {
   const sourceIndex = findNodeIndex(state, entry.source_ref ?? entry.node_id);
   const targetIndex = findNodeIndex(state, entry.target_ref ?? entry.target_node_id);
@@ -341,23 +446,29 @@ function applyNodeMergeInto(state, entry) {
   const target = state.nodes[targetIndex];
   if (source.parent_id === null || target.parent_id === null) return;
   if (sameRef(source.id, target.id)) return;
-  const targetText = (target.text || '').trim();
-  const sourceText = (source.text || '').trim();
-  target.text = targetText && sourceText ? `${targetText}\n${sourceText}` : (targetText || sourceText);
+  const descendants = descendantNodeIds(state, source.id);
+  if (descendants.has(target.id)) return;
+  target.text = [target.text, source.text]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .join('\n\n');
+  target.node_title = mergeNodeNotes(target.node_title, source.node_title);
+  target.node_note = mergeNodeNotes(target.node_note, source.node_note);
   target.updated_at = new Date().toISOString();
-  const targetChildSiblings = state.nodes.filter((other) => sameRef(other.parent_id, target.id));
-  let nextOrder = targetChildSiblings.length;
-  for (const child of state.nodes) {
-    if (sameRef(child.parent_id, source.id)) {
-      child.parent_id = target.id;
-      nextOrder += 1;
-      child.sort_order = nextOrder;
-    }
-  }
-  for (const ref of state.refs) {
-    if (ref.source_type === 'node' && sameRef(ref.source_id, source.id)) ref.source_id = target.id;
-    if (ref.target_type === 'node' && sameRef(ref.target_id, source.id)) ref.target_id = target.id;
-  }
+  const targetChildCount = state.nodes.filter((other) => sameRef(other.parent_id, target.id)).length;
+  const movingChildren = state.nodes.filter((child) => sameRef(child.parent_id, source.id));
+  movingChildren.sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0)
+    || compareIdForOrder(a.id, b.id));
+  movingChildren.forEach((child, index) => {
+    child.parent_id = target.id;
+    child.sort_order = targetChildCount + index + 1;
+  });
+  // 被合并节点被摧毁 → 指向它的引用连带蒸发（与重放一致；孩子已搬走、其引用不动）。
+  state.refs = state.refs.filter((ref) => {
+    if (ref.source_type === 'node' && sameRef(ref.source_id, source.id)) return false;
+    if (ref.target_type === 'node' && sameRef(ref.target_id, source.id)) return false;
+    return true;
+  });
   const sourceParent = source.parent_id;
   state.nodes = state.nodes.filter((node) => !sameRef(node.id, source.id));
   resortSiblings(state, sourceParent);
@@ -385,7 +496,10 @@ function applyNodeReparent(state, entry) {
   resortSiblings(state, newParentRef);
 }
 
-function applyNodeMoveAfter(state, entry) {
+// 与 store.moveNode{After,Before}Sibling 重放语义对齐：在 target 父级的兄弟序列
+// （剔除 node 自身，按 sort_order, id 排序）里 splice 定位后统一重编号。不能把
+// 「剔除 node 的下标」当 sort_order 推后阈值用——同父向后移会错一位。
+function applyNodeMoveRelative(state, entry, placeBefore) {
   const nodeIndex = findNodeIndex(state, entry.node_ref ?? entry.node_id);
   const targetIndex = findNodeIndex(state, entry.target_ref ?? entry.target_node_id);
   if (nodeIndex < 0 || targetIndex < 0) return;
@@ -397,21 +511,25 @@ function applyNodeMoveAfter(state, entry) {
   if (descendants.has(target.id)) return;
   const oldParent = node.parent_id;
   const newParent = target.parent_id;
-  const newSiblings = state.nodes.filter((other) => sameRef(other.parent_id, newParent) && !sameRef(other.id, node.id));
-  newSiblings.sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0));
-  const targetOrder = newSiblings.findIndex((other) => sameRef(other.id, target.id));
-  const insertOrder = targetOrder >= 0 ? targetOrder + 2 : newSiblings.length + 1;
+  const siblings = state.nodes.filter((other) => sameRef(other.parent_id, newParent) && !sameRef(other.id, node.id));
+  siblings.sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0)
+    || compareIdForOrder(a.id, b.id));
+  const targetPos = siblings.findIndex((other) => sameRef(other.id, target.id));
+  if (targetPos < 0) return;
+  siblings.splice(placeBefore ? targetPos : targetPos + 1, 0, node);
   node.parent_id = newParent;
-  node.sort_order = insertOrder;
-  // Push siblings after insertOrder down by 1
-  for (const other of state.nodes) {
-    if (other === node) continue;
-    if (sameRef(other.parent_id, newParent) && (Number(other.sort_order) || 0) >= insertOrder) {
-      other.sort_order = (Number(other.sort_order) || 0) + 1;
-    }
+  for (let index = 0; index < siblings.length; index += 1) {
+    siblings[index].sort_order = index + 1;
   }
   resortSiblings(state, oldParent);
-  resortSiblings(state, newParent);
+}
+
+function applyNodeMoveAfter(state, entry) {
+  applyNodeMoveRelative(state, entry, false);
+}
+
+function applyNodeMoveBefore(state, entry) {
+  applyNodeMoveRelative(state, entry, true);
 }
 
 function applyAxiomAdd(state, entry) {
@@ -536,7 +654,7 @@ const APPLIERS = {
   'node.mergeInto': applyNodeMergeInto,
   'node.mergePrevious': applyNodeMergeInto,
   'node.reparent': applyNodeReparent,
-  'node.moveBefore': applyNodeMoveAfter,
+  'node.moveBefore': applyNodeMoveBefore,
   'node.moveAfter': applyNodeMoveAfter,
   'axiom.add': applyAxiomAdd,
   'axiom.update': applyAxiomUpdate,

@@ -14,5 +14,5 @@ export function compareNodeAddress(a, b) {
     const diff = (aParts[i] || 0) - (bParts[i] || 0);
     if (diff !== 0) return diff;
   }
-  return (Number(a?.id) || 0) - (Number(b?.id) || 0);
+  return String(a?.id || '').localeCompare(String(b?.id || ''));
 }

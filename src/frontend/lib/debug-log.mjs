@@ -1,50 +1,6 @@
-const SAFE_STRING_KEYS = new Set([
-  'action',
-  'ariaLabel',
-  'backend',
-  'button',
-  'channel',
-  'code',
-  'direction',
-  'editMode',
-  'error',
-  'event',
-  'from',
-  'id',
-  'key',
-  'kind',
-  'label',
-  'level',
-  'method',
-  'message',
-  'mode',
-  'name',
-  'phase',
-  'renderBackend',
-  'renderMode',
-  'role',
-  'screen',
-  'stage',
-  'status',
-  'tag',
-  'to',
-  'type',
-  'view'
-]);
+import { debugValueSummary, safeDebugLabel } from '../../core/debug-summary.mjs';
 
-const REDACTED_KEY_PARTS = [
-  'api',
-  'content',
-  'markdown',
-  'password',
-  'path',
-  'prompt',
-  'raw',
-  'secret',
-  'summary',
-  'text',
-  'token'
-];
+export { debugValueSummary, safeDebugLabel };
 
 let debugLoggingActive = false;
 
@@ -64,39 +20,6 @@ export function debugStartedAt() {
 
 export function debugElapsedMs(startedAt) {
   return Math.round((nowMs() - startedAt) * 10) / 10;
-}
-
-export function safeDebugLabel(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-}
-
-function shouldRedactKey(key) {
-  const normalized = String(key || '').toLowerCase();
-  return REDACTED_KEY_PARTS.some((part) => normalized.includes(part));
-}
-
-export function debugValueSummary(value, key = '', depth = 0) {
-  if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
-  if (typeof value === 'string') {
-    const normalizedKey = String(key || '').toLowerCase();
-    if (SAFE_STRING_KEYS.has(key) || normalizedKey.endsWith('id') || normalizedKey === 'address') return safeDebugLabel(value);
-    return { type: 'string', length: value.length };
-  }
-  if (Array.isArray(value)) return { type: 'array', length: value.length };
-  if (typeof value !== 'object') return String(value);
-  if (depth >= 2) return { type: 'object', keys: Object.keys(value).slice(0, 20) };
-
-  const result = {};
-  for (const [childKey, childValue] of Object.entries(value)) {
-    if (shouldRedactKey(childKey)) {
-      result[childKey] = typeof childValue === 'string'
-        ? { type: 'string', length: childValue.length }
-        : debugValueSummary(childValue, childKey, depth + 1);
-      continue;
-    }
-    result[childKey] = debugValueSummary(childValue, childKey, depth + 1);
-  }
-  return result;
 }
 
 export function summarizeArgs(args) {

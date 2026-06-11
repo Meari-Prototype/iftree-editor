@@ -32,14 +32,12 @@ export function inspectMarkdownStructure(sourceDocumentOrMarkdown) {
     ? buildSourceDocument({ rawMarkdown: sourceDocumentOrMarkdown })
     : sourceDocumentOrMarkdown;
   const rawMarkdown = normalizeSourceMarkdown(sourceDocument?.rawMarkdown || sourceDocument?.raw_markdown || '');
-  const rawBlocks = sourceDocument?.blocks || parseSourceMarkdownBlocks(rawMarkdown);
-  const blocks = omitTocBlocks(rawBlocks, rawMarkdown);
+  const blocks = sourceDocument?.blocks || parseSourceMarkdownBlocks(rawMarkdown);
   const headings = blocks.filter((block) => block.type === 'heading');
   const hasContentStructure = blocks.some((block) => block.type !== 'heading');
   return {
     blockCount: blocks.length,
     headingCount: headings.length,
-    hasExplicitToc: hasExplicitTocBlock(rawBlocks, rawMarkdown),
     hasStructure: headings.length > 1 || (headings.length === 1 && hasContentStructure)
   };
 }
@@ -49,7 +47,7 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown, options 
     ? buildSourceDocument({ rawMarkdown: sourceDocumentOrMarkdown })
     : sourceDocumentOrMarkdown;
   const rawMarkdown = normalizeSourceMarkdown(sourceDocument?.rawMarkdown || sourceDocument?.raw_markdown || '');
-  const blocks = omitTocBlocks(sourceDocument?.blocks || parseSourceMarkdownBlocks(rawMarkdown), rawMarkdown);
+  const blocks = sourceDocument?.blocks || parseSourceMarkdownBlocks(rawMarkdown);
   const spans = sourceDocument?.spans || sourceSpansFromMarkdown(rawMarkdown, { blocks });
   const spanReader = createSpanRangeReader(spans);
   const granularity = options.granularity === 'paragraph' ? 'paragraph' : 'sentence';
@@ -190,7 +188,7 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown, options 
 
 export function sourceSpansFromMarkdown(markdown, options = {}) {
   const rawMarkdown = normalizeSourceMarkdown(markdown);
-  const blocks = omitTocBlocks(options.blocks || parseSourceMarkdownBlocks(rawMarkdown), rawMarkdown);
+  const blocks = options.blocks || parseSourceMarkdownBlocks(rawMarkdown);
   const spans = [];
 
   function addRange(start, end) {
@@ -247,7 +245,7 @@ export function sourceSpansFromMarkdown(markdown, options = {}) {
 export function parseSourceMarkdownBlocks(markdown) {
   const rawMarkdown = normalizeSourceMarkdown(markdown);
   const lines = collectLines(rawMarkdown);
-  const blocks = [];
+  const blocks = /** @type {Array<Record<string, any>>} */ ([]);
   let index = 0;
 
   while (index < lines.length) {
@@ -650,97 +648,6 @@ function paragraphLineGroups(lines) {
   return groups;
 }
 
-function hasExplicitTocBlock(blocks, rawMarkdown) {
-  for (let index = 0; index < blocks.length; index += 1) {
-    const block = blocks[index];
-    if (block.type !== 'heading') continue;
-    if (!isTocHeadingText(headingText(block, rawMarkdown))) continue;
-    const nextBlocks = blocks.slice(index + 1, index + 8);
-    const tocLineCount = nextBlocks.reduce((count, item) => count + tocLikeLineCount(item, rawMarkdown), 0);
-    if (tocLineCount >= 3) return true;
-  }
-  return false;
-}
-
-function omitTocBlocks(blocks, rawMarkdown) {
-  const sourceBlocks = Array.isArray(blocks) ? blocks : [];
-  const result = [];
-  for (let index = 0; index < sourceBlocks.length; index += 1) {
-    const block = sourceBlocks[index];
-    if (block?.type !== 'heading' || !isTocHeadingText(headingText(block, rawMarkdown))) {
-      result.push(block);
-      continue;
-    }
-
-    const skippedHeadingKeys = new Set();
-    let cursor = index + 1;
-    let previous = block;
-    while (cursor < sourceBlocks.length) {
-      const current = sourceBlocks[cursor];
-      const key = current?.type === 'heading' ? normalizedHeadingKey(headingText(current, rawMarkdown)) : '';
-      if (key && skippedHeadingKeys.has(key) && blockGapHasBlankLine(rawMarkdown, previous, current)) {
-        break;
-      }
-      if (!isTocLikeBlock(current, rawMarkdown)) break;
-      if (key) skippedHeadingKeys.add(key);
-      previous = current;
-      cursor += 1;
-    }
-    index = cursor - 1;
-  }
-  return result;
-}
-
-function isTocHeadingText(text) {
-  return /^(目录|目次|contents|table\s+of\s+contents)$/iu.test(String(text || '').replace(/\s+/gu, ' ').trim());
-}
-
-function isTocLikeBlock(block, rawMarkdown) {
-  if (!block) return false;
-  if (block.type === 'heading') return tocLikeLineCount(block, rawMarkdown) > 0;
-  return tocLikeLineCount(block, rawMarkdown) >= 1;
-}
-
-function normalizedHeadingKey(text) {
-  return String(text || '')
-    .replace(/\s+/gu, '')
-    .replace(/[。．.：:；;]+$/gu, '')
-    .toLowerCase();
-}
-
-function blockGapHasBlankLine(rawMarkdown, previous, current) {
-  const gap = String(rawMarkdown || '').slice(previous?.end ?? 0, current?.start ?? 0);
-  return /\n\s*\n/u.test(gap);
-}
-
-function tocLikeLineCount(block, rawMarkdown) {
-  const text = blockText(block, rawMarkdown);
-  return text
-    .split('\n')
-    .filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return false;
-      return /\d+\s*$/u.test(trimmed) ||
-        /\.{2,}/u.test(trimmed) ||
-        /^(Chapter|Part)\s+[A-Za-z0-9IVXLCDM]+/iu.test(trimmed) ||
-        /^[第]?[一二三四五六七八九十百千0-9]+[章节篇部卷編编]/u.test(trimmed) ||
-        /^场景\s*(?:\d+(?:\.\d+)?|[零一二三四五六七八九十百千万]+)[：:]/u.test(trimmed) ||
-        /^[a-z]\.\s*\S/iu.test(trimmed) ||
-        /^\d+(?:\.\d+)*\.?\s+\S/u.test(trimmed);
-    }).length;
-}
-
-function blockText(block, rawMarkdown) {
-  if (!block) return '';
-  if (block.text) return block.text;
-  if (block.lines) return block.lines.map((line) => rawMarkdown.slice(line.start, line.end)).join('\n');
-  if (block.items) return block.items.map((item) => rawMarkdown.slice(item.start, item.end)).join('\n');
-  if (block.rows) return block.rows.map((row) => (
-    (row.cells || []).map((cell) => rawMarkdown.slice(cell.start, cell.end)).join(' ')
-  )).join('\n');
-  return rawMarkdown.slice(block.start ?? 0, block.end ?? 0);
-}
-
 function headingText(block, rawMarkdown) {
   if (block.text) return block.text;
   if (block.contentStart != null && block.contentEnd != null) {
@@ -934,11 +841,7 @@ function decoratedHeadingBlock(line) {
     level = 2;
   } else if (/^[零一二三四五六七八九十百千万]+[、.．]\s*\S+/.test(trimmed)) {
     level = 2;
-  } else if (/^场景\s*(?:\d+(?:\.\d+)?|[零一二三四五六七八九十百千万]+)[：:]\s*\S+/.test(trimmed)) {
-    level = 3;
   } else if (/^【[^】]+】[：:]?$/.test(trimmed)) {
-    level = 4;
-  } else if (/^(互动线索|物品线索|守密人信息|守秘人信息)[：:]$/.test(trimmed)) {
     level = 4;
   } else if (/^[①②③④⑤⑥⑦⑧⑨⑩]\s*[^：:，。！？；,.!?]+$/.test(trimmed)) {
     level = 4;
@@ -998,6 +901,5 @@ function isStandaloneTitleText(text) {
   if (!text || text.length > 15) return false;
   if (isSeparatorLine(text)) return false;
   if (/^(?:[-*+•]|\d+[.)])\s+/u.test(text)) return false;
-  if (/^(作者|修订|编辑|版面设计|版面布局|封面绘制|出品|版权相关.*|.*工作室)$/u.test(text)) return false;
   return !/[。？！；：，、,.!?;:"""''()\[\]【】《》]/.test(text);
 }

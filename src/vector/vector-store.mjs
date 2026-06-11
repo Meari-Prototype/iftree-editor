@@ -154,6 +154,45 @@ export class VectorStore {
     return ids.length;
   }
 
+  // 批量查这批 id 里哪些已有向量（供增量补建找缺失，避免全量拉行 OOM）。
+  async existingIds(nodeIds = []) {
+    if (!this.table) return new Set();
+    const ids = [...new Set((nodeIds || [])
+      .map((id) => String(id ?? '').trim())
+      .filter(Boolean))];
+    const found = new Set();
+    for (let offset = 0; offset < ids.length; offset += DELETE_PREDICATE_CHUNK_SIZE) {
+      const chunk = ids.slice(offset, offset + DELETE_PREDICATE_CHUNK_SIZE);
+      const rows = await this.table.query()
+        .where(`id IN (${chunk.map(quoteValue).join(',')})`)
+        .select(['id'])
+        .limit(chunk.length)
+        .toArray();
+      for (const row of rows) found.add(String(row.id));
+    }
+    return found;
+  }
+
+  // 批量取这批 id 的 (id → text)：完整性比对用（正文一致性），按 id 分块查询，
+  // 不按 doc 全量拉行进内存。
+  async textByNodeIds(nodeIds = []) {
+    if (!this.table) return new Map();
+    const ids = [...new Set((nodeIds || [])
+      .map((id) => String(id ?? '').trim())
+      .filter(Boolean))];
+    const found = new Map();
+    for (let offset = 0; offset < ids.length; offset += DELETE_PREDICATE_CHUNK_SIZE) {
+      const chunk = ids.slice(offset, offset + DELETE_PREDICATE_CHUNK_SIZE);
+      const rows = await this.table.query()
+        .where(`id IN (${chunk.map(quoteValue).join(',')})`)
+        .select(['id', 'text'])
+        .limit(chunk.length)
+        .toArray();
+      for (const row of rows) found.set(String(row.id), String(row.text || ''));
+    }
+    return found;
+  }
+
   async hasNodeVector(nodeId) {
     if (!this.table) return false;
     const count = await this.table.countRows(stringPredicate('id', nodeId));
@@ -166,8 +205,17 @@ export class VectorStore {
   }
 
   async listDocVectorIds(docId, options = {}) {
-    const rows = await this.listDocVectorRows(docId, options);
-    return rows.map((row) => row.id);
+    if (!this.table) return [];
+    const explicitLimit = Math.floor(Number(options.limit));
+    const limit = explicitLimit > 0
+      ? explicitLimit
+      : Math.max(1, await this.countDocVectors(docId));
+    const rows = await this.table.query()
+      .where(stringPredicate('doc_id', docId))
+      .select(['id'])
+      .limit(limit)
+      .toArray();
+    return rows.map((row) => String(row.id)).filter(Boolean);
   }
 
   async listDocVectorRows(docId, options = {}) {

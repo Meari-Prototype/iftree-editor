@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   AGENT_REASONING_OPTIONS, agentContextUsageView, agentDiffTraceTarget, agentModeLabel, agentReasoningLabel, agentReasoningShortLabel,
-  agentSessionTime, agentSessionTitle, agentToolNameText, agentToolStatusText, buildAgentModelOptions, clipText, compactAgentModelLabel,
+  agentSessionTime, agentSessionTitle, agentToolArgsSummary, agentToolNameText, agentToolStatusText, buildAgentModelOptions, clipText, compactAgentModelLabel,
   defaultAgentModelKey, diffFields, diffTitle, formatAgentElapsed
 } from '../lib/agent-utils.mjs';
 import { LocateNodeButton } from './common.jsx';
@@ -263,18 +263,21 @@ export function AgentPanel({
                     <div className={`agent-answer${message.error ? ' error' : ''}`}>
                       <span className="agent-message-meta">{meta}</span>
                       {Array.isArray(message.toolEvents) && message.toolEvents.length > 0 && (
-                        <details className="agent-tool-log">
-                          <summary>过程记录 {message.toolEvents.length} 个</summary>
-                          <div className="agent-tool-list">
-                            {message.toolEvents.map((tool) => {
-                              const hasDisplayPreview = Object.prototype.hasOwnProperty.call(tool, 'displayPreview');
-                              const resultText = hasDisplayPreview ? tool.displayPreview : tool.resultPreview;
-                              return (
-                                <div key={tool.id} className={`agent-tool-item ${tool.status || 'running'}`}>
-                                  <div className="agent-tool-title">
-                                    <span>{agentToolNameText(tool.name)}</span>
-                                    <em>{agentToolStatusText(tool.status)}</em>
-                                  </div>
+                        <div className="agent-tool-list">
+                          {message.toolEvents.map((tool) => {
+                            const hasDisplayPreview = Object.prototype.hasOwnProperty.call(tool, 'displayPreview');
+                            const resultText = hasDisplayPreview ? tool.displayPreview : tool.resultPreview;
+                            const status = tool.status === 'done' || tool.status === 'error' ? tool.status : 'running';
+                            const argsSummary = agentToolArgsSummary(tool);
+                            return (
+                              <details key={tool.id} className={`agent-tool-row ${status}`}>
+                                <summary>
+                                  <span className="agent-tool-status-dot" aria-hidden="true" />
+                                  <span className="agent-tool-name">{agentToolNameText(tool.name)}</span>
+                                  {argsSummary && <span className="agent-tool-args">({argsSummary})</span>}
+                                  <em className="agent-tool-state">{agentToolStatusText(status)}</em>
+                                </summary>
+                                <div className="agent-tool-body">
                                   {tool.argsPreview && (
                                     <>
                                       <span className="agent-tool-label">参数</span>
@@ -294,10 +297,10 @@ export function AgentPanel({
                                     </>
                                   )}
                                 </div>
-                              );
-                            })}
-                          </div>
-                        </details>
+                              </details>
+                            );
+                          })}
+                        </div>
                       )}
                       <p className="agent-message-content">
                         {text || message.status || '正在处理...'}

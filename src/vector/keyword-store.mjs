@@ -203,6 +203,30 @@ export class KeywordStore {
     await this.table.delete(stringPredicate('doc_id', docId));
   }
 
+  // 增量入库（projectneed 4-16）：批量 add 一批行，分批写入；LanceDB FTS 对 add 的行即时可搜，
+  // 不 delete 整 doc、不全量重建索引。来源保证不重复 id（SQL 地址校验先拦重复推送）。
+  async addRows(rows = []) {
+    const keywordRows = rows.map(toKeywordRow);
+    if (keywordRows.length === 0) return;
+    const BATCH = 2000;
+    const hadTable = Boolean(this.table);
+    const table = await this.ensureTable(keywordRows.slice(0, BATCH));
+    if (!table) return;
+    const start = hadTable ? 0 : Math.min(BATCH, keywordRows.length);
+    for (let i = start; i < keywordRows.length; i += BATCH) {
+      await table.add(keywordRows.slice(i, i + BATCH));
+    }
+    await this.ensureFtsIndex();
+  }
+
+  // 轻量计数（查询时判断该 doc 是否已建索引，避免全量拉行比对）。
+  async countDocRows(docId) {
+    if (!this.table) return 0;
+    const normalized = String(docId ?? '').trim();
+    if (!normalized) return 0;
+    return this.table.countRows(stringPredicate('doc_id', normalized));
+  }
+
   async search({ terms = [], docId = null } = {}) {
     if (!this.table) return [];
     const query = (Array.isArray(terms) ? terms : [terms])

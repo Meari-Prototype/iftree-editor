@@ -23,7 +23,7 @@ function progressLine(event = {}) {
     return `[vector] cleanup staleDeleted=${event.staleDeleted} changedDeleted=${event.changedDeleted}`;
   }
   if (event.stage === 'missing') return `[vector] missing=${event.missingCount} batchSize=${event.batchSize}`;
-  if (event.stage === 'batch_done') return `[vector] embedded ${event.completed}/${event.total}`;
+  if (event.stage === 'batch_done') return `[vector] embedded ${event.missingInserted} (scanned ${event.scanned})`;
   if (event.stage === 'done') return `[vector] done vectorsAfter=${event.vectorCountAfter} inserted=${event.missingInserted}`;
   return '';
 }

@@ -1,14 +1,24 @@
 import { parseJsonObject } from '../../shared.mjs';
 
+// 与 db/schema.mjs 的 TABLES_SQL 保持一致；errors 表只存在于 PRD 设计稿，
+// 代码从未建过——列进来会让 COUNT(*) 直接抛 no such table。
 const TABLES = Object.freeze([
   'docs',
   'doc_folders',
   'nodes',
   'axioms',
-  'errors',
   'refs',
   'source_documents',
-  'source_spans'
+  'source_spans',
+  'source_pdf_pages',
+  'source_pdf_chars',
+  'save_history',
+  'commits',
+  'doc_heads',
+  'edit_branches',
+  'entities',
+  'entity_links',
+  'entity_node_bindings'
 ]);
 
 function normalizeLimit(value, fallback = 100, max = 1000) {
@@ -67,6 +77,9 @@ function normalizeDocRow(row) {
 function tableStats(store) {
   const stats = {};
   for (const table of TABLES) {
+    // query-db 以 readonly+migrate:false 打开任意路径的库，可能是缺新表的旧库：
+    // 只统计实际存在的表，缺的跳过而不是让 COUNT(*) 抛 no such table。
+    if (typeof store.hasTable === 'function' && !store.hasTable(table)) continue;
     stats[table] = Number(store.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()?.count || 0);
   }
   return stats;

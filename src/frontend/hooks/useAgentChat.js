@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { agentMessagesFromSession, upsertAgentToolEvent } from '../lib/agent-utils.mjs';
 import { agentRepository } from '../data/repositories.js';
 
+/** @param {{ setNotice?: any }} [options] */
 export function useAgentChat({ setNotice } = {}) {
   const [agentSettings, setAgentSettings] = useState(null);
   const [agentMessages, setAgentMessages] = useState([]);
@@ -15,18 +16,53 @@ export function useAgentChat({ setNotice } = {}) {
 
   useEffect(() => {
     if (!agentRepository.canStream()) return undefined;
-    return agentRepository.onStream((event) => {
+    // delta 节流：流式 token 每秒几十个，逐个 setState 会让 App 整树以同频重渲染。
+    // 这里把 delta 文本按 requestId 累积，最长 80ms 合并提交一次；
+    // 非 delta 事件（status/tool/done）先冲掉积压再处理，保证顺序不乱。
+    const pendingDeltas = new Map();
+    let flushTimer = 0;
+    const applyPendingDeltas = () => {
+      if (pendingDeltas.size === 0) return;
+      const batch = new Map(pendingDeltas);
+      pendingDeltas.clear();
+      let usage = null;
+      for (const entry of batch.values()) {
+        if (entry.usage) usage = entry.usage;
+      }
+      if (usage) setAgentContextUsage(usage);
+      setAgentMessages((previous) => previous.map((message) => {
+        const entry = batch.get(message.requestId);
+        if (!entry || message.role !== 'assistant') return message;
+        return {
+          ...message,
+          answer: `${message.answer || ''}${entry.text}`,
+          status: '正在回复...',
+          streaming: true
+        };
+      }));
+    };
+    const unsubscribe = agentRepository.onStream((event) => {
+      if (event?.type === 'delta') {
+        const entry = pendingDeltas.get(event.requestId) || { text: '', usage: null };
+        entry.text += event.text || '';
+        if (event.usage) entry.usage = event.usage;
+        pendingDeltas.set(event.requestId, entry);
+        if (!flushTimer) {
+          flushTimer = window.setTimeout(() => {
+            flushTimer = 0;
+            applyPendingDeltas();
+          }, 80);
+        }
+        return;
+      }
+      if (flushTimer) {
+        window.clearTimeout(flushTimer);
+        flushTimer = 0;
+      }
+      applyPendingDeltas();
       if (event?.usage) setAgentContextUsage(event.usage);
       setAgentMessages((previous) => previous.map((message) => {
         if (message.requestId !== event?.requestId || message.role !== 'assistant') return message;
-        if (event.type === 'delta') {
-          return {
-            ...message,
-            answer: `${message.answer || ''}${event.text || ''}`,
-            status: '正在回复...',
-            streaming: true
-          };
-        }
         if (event.type === 'status') {
           return { ...message, status: event.text || message.status, streaming: true };
         }
@@ -53,6 +89,10 @@ export function useAgentChat({ setNotice } = {}) {
         return message;
       }));
     });
+    return () => {
+      if (flushTimer) window.clearTimeout(flushTimer);
+      unsubscribe?.();
+    };
   }, []);
 
   async function saveSettings(next) {

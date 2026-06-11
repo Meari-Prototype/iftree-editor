@@ -29,6 +29,22 @@ export function sourceRangeForSpans(spans) {
   };
 }
 
+// 多 span 选区不能压成单一包络区间（spans 之间夹着别的节点的正文），
+// 这里保留逐 span 的区间列表，只合并真正相邻/重叠的部分。
+export function sourceRangesForSpans(spans) {
+  const ranges = (spans || [])
+    .map((span) => ({ start: sourceSpanAbsoluteStart(span), end: sourceSpanAbsoluteEnd(span) }))
+    .filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged = [];
+  for (const range of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
+    else merged.push({ ...range });
+  }
+  return merged;
+}
+
 export function sourceSpanAbsoluteStart(span) {
   return Number(span?.absolute_start_offset ?? span?.start_offset ?? 0);
 }
@@ -84,7 +100,7 @@ function SourceMarkdownBlockImpl({
 
   let body;
   if (block.type === 'heading') {
-    const Tag = `h${Math.min(block.level, 6)}`;
+    const Tag = /** @type {any} */ (`h${Math.min(block.level, 6)}`);
     body = <Tag>{textRange(block.contentStart, block.contentEnd, 'heading')}</Tag>;
   } else if (block.type === 'paragraph') {
     body = (

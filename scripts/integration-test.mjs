@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { readSentences } from '../src/core/importers.mjs';
+import { readSentences } from '../src/core/source-text.mjs';
 import { IftreeStore } from '../src/backend/store.mjs';
 import { flattenTree, findNode } from '../src/core/tree.mjs';
 
@@ -26,7 +26,7 @@ test('创建文档 → 列出 → 打开 → 节点操作', () => {
   try {
     // create multiple docs
     const d1 = store.createDoc({ title: '测试文档A', rootText: '根节点文本A' });
-    const d2 = store.createDoc({ title: '测试文档B', rootText: '根节点文本B' });
+    store.createDoc({ title: '测试文档B', rootText: '根节点文本B' });
 
     const list = store.listDocs();
     assert.equal(list.length, 2, '应有2个文档');
@@ -61,7 +61,7 @@ test('创建文档 → 列出 → 打开 → 节点操作', () => {
     assert.equal(reloaded2.tree.children[0].node_type, 'ELSE');
 
     // delete subtree
-    const grandchild = store.insertNode({
+    store.insertNode({
       docId: d1.id,
       parentId: child.id,
       text: '孙子节点',

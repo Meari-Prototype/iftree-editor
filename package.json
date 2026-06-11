@@ -1,7 +1,6 @@
 {
   "name": "iftree-editor",
-  "version": "0.1.0",
-  "description": "本地优先的文档数据管理工具：把多文档语料整理成带稳定地址的 if-tree 条件树，支持精确检索、证据可溯与 MCP agent 协作。",
+  "version": "0.2.0",
   "private": true,
   "license": "Apache-2.0",
   "author": "Meari",
@@ -13,7 +12,8 @@
     "app": "electron .",
     "mcp": "electron scripts/mcp-server.mjs",
     "build": "vite build",
-    "lint": "eslint src",
+    "lint": "eslint src electron scripts tests",
+    "check:types": "tsc --noEmit -p tsconfig.check.json",
     "pretest": "npm run rebuild:native:electron",
     "test": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$env:ELECTRON_RUN_AS_NODE='1'; & .\\node_modules\\.bin\\electron.cmd --test tests/*.test.mjs\"",
     "monitor:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/monitor-hardware.ps1",
@@ -43,8 +43,13 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.4",
+    "@types/node": "^25.9.2",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@typescript-eslint/parser": "^8.61.0",
     "eslint": "^9.39.4",
     "eslint-plugin-react": "^7.37.5",
-    "eslint-plugin-unused-imports": "^4.4.1"
+    "eslint-plugin-unused-imports": "^4.4.1",
+    "typescript": "^6.0.3"
   }
 }

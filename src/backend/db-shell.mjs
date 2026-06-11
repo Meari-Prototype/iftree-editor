@@ -1,4 +1,6 @@
+import { readFileSync } from 'node:fs';
 import { normalizeStableId } from './db/ids.mjs';
+import { runImportJson } from './import-json.mjs';
 import { normalizeNodeType, nodeTypeDisplayLabel } from '../core/node-model.mjs';
 
 function cleanLine(value = '') {
@@ -65,7 +67,7 @@ function parseFlags(argv = []) {
       index += 1;
       continue;
     }
-    if (['branch', 'base', 'owner', 'history', 'source-branch', 'target-branch', 'target-base', 'entry-id', 'entry-index', 'mode', 'doc-id', 'session-id', 'set', 'insert', 'cwd', 'at'].includes(name)) {
+    if (['branch', 'base', 'owner', 'history', 'source-branch', 'target-branch', 'target-base', 'entry-id', 'entry-index', 'mode', 'doc-id', 'session-id', 'set', 'insert', 'cwd', 'at', 'state', 'agent'].includes(name)) {
       const value = argv[index + 1];
       if (!value || value.startsWith('--')) throw new Error(`db --${name} requires a value`);
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = parseValue(value);
@@ -86,7 +88,7 @@ function parseFlags(argv = []) {
       index += 1;
       continue;
     }
-    if (['tags', 'meta', 'node', 'source', 'axioms', 'links', 'neighbors', 'blame', 'all-docs', 'all', 'or', 'semantic', 'yes', 'detail', 'delete', 'uuid'].includes(name)) {
+    if (['tags', 'meta', 'node', 'source', 'axioms', 'links', 'neighbors', 'blame', 'all-docs', 'all', 'or', 'semantic', 'yes', 'detail', 'delete', 'uuid', 'dry-run', 'allow-gaps', 'vectors', 'force'].includes(name)) {
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
@@ -162,6 +164,9 @@ function formatNodeLine(item = {}, options = {}) {
   const score = options.score ?? node.score ?? item.score ?? null;
   const parts = [label, node.address || '', nodeTypeLabel(node), nodeTitle(node)];
   if (score != null) parts.push(Number(score).toFixed(2));
+  // 召回结果必须附带时间元数据（projectneed 15-12-6）：命中行尾缀更新时间。
+  const updated = node.updatedAt || node.updated_at || null;
+  if (updated) parts.push(`upd:${String(updated).replace(' ', 'T')}`);
   return parts.filter(Boolean).join(' ');
 }
 
@@ -846,11 +851,19 @@ export function dbShellHelp() {
     '    --set fields: text/node_title/node_note/node_type/trust_level；node_type: 文本/如果/那么/否则/循环/遍历/跳出/继续/错误/人工-阻塞/人工-汇总',
     '  db edit <doc_id> <address> --insert child|sibling <text> [--owner <owner>] [--base <doc_id>]',
     '  db edit <doc_id> <address> --delete [--owner <owner>] [--base <doc_id>]',
+    '  db push <json_payload>  (流式写入 4-16；payload: {docId?,title?,parentId?,nodes:[...],idempotencyKey?,vectors?})',
+    '  db set-mode <doc_id> <readonly|incremental|full>  (4-16-8 编辑模式)',
+    '  db bulk begin|end  (海量流式导入加速会话：begin 设异步写+延迟索引，end 恢复+重建索引)',
     '  db export <doc_id>',
     '  db restore <history_id|saved_at|tag> [doc_id]',
     '  db import <library_relative_path> [--mode simple|complete|direct|smart|vector]',
+    '  db import-json <json_file> <source_file> [--dry-run] [--allow-gaps] [--vectors]  (智能导入 4-3-3：校验节点树 JSON 并入库；JSON 与 db push 同契约)',
     '  db vectors <doc_id>',
     '  db forget <doc_id>',
+    '  db memory list [--state active|sealed|distillable|distilled] [--agent <name>] [--session-id <id>] [--limit N]',
+    '  db memory deliver <json_payload|json_file>  (事件卷投递 18-8-4；payload: {agent,sessionId,hostAnchor?,title?,startedAt?,endedAt?,nodes:[...]}，节点一律 trust_level=不受控)',
+    '  db memory seal-due  (物理封卷到期卷：末次活动+24h，15-10-1)',
+    '  db memory mark-distilled <doc_id> [--force]  (提炼状态标记 15-11-5；force=用户明确指示跳过冷却期)',
     '  db changes [doc_id] [--detail] [--branch <id> | --base <doc_id>] [--owner <owner>]',
     '  db discard --branch <id> | --base <doc_id> [--owner <owner>] [--yes]',
     '  db undo --branch <id> | --base <doc_id> [--owner <owner>]',
@@ -1154,6 +1167,48 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     return { kind: 'db_edit', text: JSON.stringify(result, null, 2) };
   }
 
+  if (command === 'push') {
+    // 流式写入（projectneed 4-16）：独立于 edit branch，不加 editBranchOwner。
+    const { positional } = parseFlags(args.slice(1));
+    const payload = parseJsonObjectArgument(positional.join(' '), {});
+    const result = await database.run({ operation: 'write', payload: { ...payload, action: 'stream.push' } }, 'write');
+    return { kind: 'db_push', text: JSON.stringify(result, null, 2) };
+  }
+
+  if (command === 'import-json') {
+    // 智能导入校验 + 入库（projectneed 4-3-3）：JSON 与 db push 同一契约。
+    const { flags, positional } = parseFlags(args.slice(1));
+    const jsonPath = String(positional[0] || '').trim();
+    const sourcePath = String(positional[1] || '').trim();
+    if (!jsonPath || !sourcePath) throw new Error('db import-json requires <json_file> <source_file>');
+    const result = await runImportJson({
+      database,
+      jsonPath,
+      sourcePath,
+      dryRun: flags.dryRun === true,
+      allowGaps: flags.allowGaps === true,
+      vectors: flags.vectors === true
+    });
+    return { kind: 'db_import_json', text: JSON.stringify(result, null, 2) };
+  }
+
+  if (command === 'set-mode') {
+    const { positional } = parseFlags(args.slice(1));
+    const docId = normalizeShellDocId(positional[0], null);
+    const mode = String(positional[1] || '').trim();
+    if (!docId || !mode) throw new Error('db set-mode requires <doc_id> <readonly|incremental|full>');
+    const result = await database.run({ operation: 'write', payload: { action: 'doc.setEditMode', docId, mode, includeDoc: false } }, 'write');
+    return { kind: 'db_set_mode', text: JSON.stringify(result, null, 2) };
+  }
+
+  if (command === 'bulk') {
+    const sub = String(args[1] || '').trim();
+    if (sub !== 'begin' && sub !== 'end') throw new Error('db bulk begin|end');
+    const action = sub === 'begin' ? 'stream.bulkBegin' : 'stream.bulkEnd';
+    const result = await database.run({ operation: 'write', payload: { action } }, 'write');
+    return { kind: 'db_bulk', text: JSON.stringify(result, null, 2) };
+  }
+
   if (command === 'export') {
     const { positional } = parseFlags(args.slice(1));
     const docId = normalizeShellDocId(positional[0], null);
@@ -1207,6 +1262,50 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       payload: { action: 'doc.delete', docId }
     }, 'write');
     return { kind: 'db_forget', text: JSON.stringify(result, null, 2) };
+  }
+
+  if (command === 'memory') {
+    // 完整记忆动词（projectneed 15-10 / 15-11-5 / 18-8-4）：MCP/agent 与人共用同一套 db 契约。
+    const sub = String(args[1] || 'list').trim();
+    if (sub === 'list') {
+      const { flags } = parseFlags(args.slice(2));
+      const result = await database.run({
+        operation: 'read',
+        payload: {
+          action: 'memory.listVolumes',
+          state: flags.state ? String(flags.state) : null,
+          agent: flags.agent ? String(flags.agent) : null,
+          sessionId: flags.sessionId ?? null,
+          limit: flags.limit
+        }
+      }, 'read');
+      return { kind: 'db_memory_list', text: JSON.stringify(result, null, 2) };
+    }
+    if (sub === 'deliver') {
+      const { positional } = parseFlags(args.slice(2));
+      const raw = positional.join(' ').trim();
+      if (!raw) throw new Error('db memory deliver requires <json_payload|json_file>');
+      const payload = raw.startsWith('{')
+        ? parseJsonObjectArgument(raw, {})
+        : parseJsonObjectArgument(readFileSync(raw, 'utf8'), {});
+      const result = await database.run({ operation: 'write', payload: { ...payload, action: 'memory.deliverVolume' } }, 'write');
+      return { kind: 'db_memory_deliver', text: JSON.stringify(result, null, 2) };
+    }
+    if (sub === 'seal-due') {
+      const result = await database.run({ operation: 'write', payload: { action: 'memory.sealDue' } }, 'write');
+      return { kind: 'db_memory_seal', text: JSON.stringify(result, null, 2) };
+    }
+    if (sub === 'mark-distilled') {
+      const { flags, positional } = parseFlags(args.slice(2));
+      const docId = normalizeShellDocId(positional[0], null);
+      if (!docId) throw new Error('db memory mark-distilled requires <doc_id>');
+      const result = await database.run({
+        operation: 'write',
+        payload: { action: 'memory.markDistilled', docId, force: flags.force === true }
+      }, 'write');
+      return { kind: 'db_memory_distilled', text: JSON.stringify(result, null, 2) };
+    }
+    throw new Error('db memory list|deliver|seal-due|mark-distilled');
   }
 
   if (command === 'branch') {

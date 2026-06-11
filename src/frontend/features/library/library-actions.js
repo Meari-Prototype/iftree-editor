@@ -26,8 +26,7 @@ export function createLibraryActions({
   setMultiSelectedNodeIds,
   setCollapsed,
   setExpanded,
-  updateUndoStack,
-  updateRedoStack,
+  clearHistoryStacks,
   setSearchResults,
   setLocateRequest
 }) {
@@ -129,8 +128,7 @@ export function createLibraryActions({
         setMultiSelectedNodeIds(new Set());
         setCollapsed(new Set());
         setExpanded(new Set());
-        updateUndoStack([]);
-        updateRedoStack([]);
+        clearHistoryStacks();
         setSearchResults([]);
         setLocateRequest({ seq: 0, nodeId: null });
       }
@@ -161,8 +159,7 @@ export function createLibraryActions({
     setMultiSelectedNodeIds(new Set());
     setCollapsed(new Set());
     setExpanded(new Set());
-    updateUndoStack([]);
-    updateRedoStack([]);
+    clearHistoryStacks();
     setSearchResults([]);
     setLocateRequest({ seq: 0, nodeId: null });
     setNotice('未导入原始文件，请先手动导入');

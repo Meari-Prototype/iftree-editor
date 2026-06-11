@@ -1,4 +1,4 @@
-import { readDocxSourceDocument } from '../importers.mjs';
+import { readDocxSourceDocument } from '../source-docx.mjs';
 import { importSourceDocumentForMode } from './shared.mjs';
 
 export async function importDocxDocument(filePath, options = {}) {

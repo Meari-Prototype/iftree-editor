@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS docs (
   folder_id INTEGER REFERENCES doc_folders(id) ON DELETE SET NULL,
   doc_sort_order INTEGER NOT NULL DEFAULT 0,
   axioms_collapsed INTEGER NOT NULL DEFAULT 0,
-  tree_view_state TEXT NOT NULL DEFAULT '{}'
+  tree_view_state TEXT NOT NULL DEFAULT '{}',
+  nodes_hash_dirty INTEGER NOT NULL DEFAULT 1,
+  edit_mode TEXT NOT NULL DEFAULT 'full' CHECK(edit_mode IN ('readonly', 'incremental', 'full'))
 );
 
 CREATE TABLE IF NOT EXISTS doc_folders (
@@ -39,6 +41,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   node_note TEXT NOT NULL DEFAULT '',
   source_position REAL,
   trust_level TEXT CHECK(trust_level IN ('受控', '不受控') OR trust_level IS NULL),
+  content_hash TEXT,
+  subtree_hash TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );

@@ -6,7 +6,10 @@ export function requireDocId(payload = {}) {
   return docId;
 }
 
-export function requirePositiveId(payload = {}, ...keys) {
+// 接受两套主键：uuidv7（nodes/axioms/refs/docs）与正整数（doc_folders/save_history
+// 的 INTEGER 主键）。tmp-… id 不会到这里——分支模式写操作在 mutation-api 就被
+// stageEditBranch* 拦走。
+export function requireId(payload = {}, ...keys) {
   for (const key of keys) {
     const value = normalizeStableId(payload[key]);
     if (value) return value;

@@ -1,13 +1,11 @@
 import {
   existsSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
-  statSync,
-  writeFileSync
+  statSync
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { extname, join, parse, relative, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { env as transformersEnv, pipeline } from '@huggingface/transformers';
 
@@ -23,177 +21,32 @@ import {
   normalizeVectorConfig,
   zeroEmbedding
 } from '../../vector/embeddings.mjs';
+import { createRemoteEmbedder, resolveEmbedBackendConfig } from '../../vector/remote-embedding.mjs';
 import {
   configuredMaxOutputTokens,
-  llmProtocol,
-  normalizeApiProtocol,
-  normalizeReasoningEffortMap,
-  normalizeReasoningEfforts
+  llmProtocol
 } from '../../agent/llm-api-config.mjs';
 import {
   DEFAULT_SUMMARY_STRATEGIES,
-  defaultSummaryStrategies,
-  llmId,
-  normalizeAgentToolSettings,
-  normalizeSummaryConcurrency,
   normalizeSummaryStrategy
 } from './defaults.mjs';
 import { anthropicMessagesUrl, chatCompletionUrl, fetchLlmResponse } from './chat-client.mjs';
 import { createAgentRuntime } from './agent-runtime.mjs';
+import {
+  LLM_PROVIDERS_ENV_KEY,
+  LLM_SUMMARY_PROVIDERS_ENV_KEY,
+  activeLlmApiFromSettings,
+  createLlmSettingsReader
+} from './settings.mjs';
+import {
+  createLibraryFs,
+  createLlmWorkspace,
+  isSameOrChildPath,
+  normalizeLibraryRelativePath,
+  pathKey
+} from '../library-fs.mjs';
 
 const DEFAULT_TREE_SLICE_DEPTH = 1;
-const DEFAULT_LLM_WORKSPACE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
-
-const LLM_PROVIDERS_ENV_KEY = 'IFTREE_LLM_PROVIDERS_JSON';
-const LLM_ACTIVE_PROVIDER_ENV_KEY = 'IFTREE_LLM_ACTIVE_PROVIDER_ID';
-const LLM_ACTIVE_API_ENV_KEY = 'IFTREE_LLM_ACTIVE_API_ID';
-const LLM_INDEPENDENT_ENV_KEY = 'IFTREE_LLM_SUMMARY_INDEPENDENT_CONFIG';
-const LLM_SUMMARY_PROVIDERS_ENV_KEY = 'IFTREE_LLM_SUMMARY_PROVIDERS_JSON';
-const LLM_SUMMARY_ACTIVE_PROVIDER_ENV_KEY = 'IFTREE_LLM_SUMMARY_ACTIVE_PROVIDER_ID';
-const LLM_SUMMARY_ACTIVE_API_ENV_KEY = 'IFTREE_LLM_SUMMARY_ACTIVE_API_ID';
-const LLM_SUMMARY_STRATEGIES_ENV_KEY = 'IFTREE_LLM_SUMMARY_STRATEGIES_JSON';
-const LLM_SUMMARY_ARTICLE_STRATEGY_ENV_KEY = 'IFTREE_LLM_SUMMARY_ARTICLE_STRATEGY_ID';
-const LLM_SUMMARY_NODE_STRATEGY_ENV_KEY = 'IFTREE_LLM_SUMMARY_NODE_STRATEGY_ID';
-const AGENT_PERSONAL_PROMPT_ENV_KEY = 'IFTREE_AGENT_PERSONAL_PROMPT';
-
-function hasOwn(value, key) {
-  return Object.prototype.hasOwnProperty.call(value || {}, key);
-}
-
-function decodeDotEnvMultiline(value) {
-  return String(value || '').replace(/\\n/g, '\n');
-}
-
-function readDotEnv(envPath) {
-  const values = {};
-  if (!existsSync(envPath)) return values;
-  const raw = readFileSync(envPath, 'utf8');
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eq = trimmed.indexOf('=');
-    if (eq <= 0) continue;
-    const key = trimmed.slice(0, eq).trim();
-    let value = trimmed.slice(eq + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    values[key] = value;
-  }
-  return values;
-}
-
-function safeEnvKey(value) {
-  const text = String(value || '')
-    .trim()
-    .replace(/[^A-Za-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .toUpperCase();
-  return text || 'DEFAULT';
-}
-
-function llmApiKeyEnvKey(providerId, apiId) {
-  return `IFTREE_LLM_API_KEY_${safeEnvKey(providerId)}_${safeEnvKey(apiId)}`;
-}
-
-function normalizeLlmApi(api = {}, index = 0) {
-  const contextLimit = Number(api.contextLimit ?? api.contextWindowTokens ?? api.contextWindow ?? api.maxContextTokens ?? api.modelCard?.contextLimit ?? api.metadata?.contextLimit);
-  const maxOutputTokens = Number(api.maxOutputTokens ?? api.maxTokens ?? api.max_tokens);
-  const hasReasoningEfforts = hasOwn(api, 'reasoningEfforts') || hasOwn(api, 'reasoning_efforts');
-  const hasReasoningMap = hasOwn(api, 'reasoningEffortMap') || hasOwn(api, 'reasoning_effort_map');
-  return {
-    id: llmId('api', api.id, index),
-    name: String(hasOwn(api, 'name') ? api.name : `API ${index + 1}`).trim(),
-    note: String(api.note || '').trim(),
-    apiKey: String(api.apiKey || '').trim(),
-    baseUrl: String(api.baseUrl || '').trim(),
-    fullUrl: api.fullUrl === true,
-    model: String(api.model || '').trim(),
-    protocol: normalizeApiProtocol(api.protocol),
-    contextLimit: Number.isFinite(contextLimit) && contextLimit > 0 ? Math.round(contextLimit) : 0,
-    maxOutputTokens: Number.isFinite(maxOutputTokens) && maxOutputTokens > 0 ? Math.round(maxOutputTokens) : 0,
-    reasoningEfforts: hasReasoningEfforts ? normalizeReasoningEfforts(api.reasoningEfforts ?? api.reasoning_efforts) : [],
-    reasoningEffortMap: hasReasoningMap ? normalizeReasoningEffortMap(api.reasoningEffortMap ?? api.reasoning_effort_map) : {},
-    enabled: api.enabled !== false
-  };
-}
-
-function normalizeLlmProvider(provider = {}, index = 0) {
-  const apis = (Array.isArray(provider.apis) ? provider.apis : [])
-    .map((api, apiIndex) => normalizeLlmApi(api, apiIndex));
-  if (apis.length === 0) apis.push(normalizeLlmApi({}, 0));
-  return {
-    id: llmId('provider', provider.id, index),
-    name: String(hasOwn(provider, 'name') ? provider.name : `供应商 ${index + 1}`).trim(),
-    note: String(provider.note || '').trim(),
-    websiteUrl: String(provider.websiteUrl || '').trim(),
-    apis
-  };
-}
-
-function normalizeLlmSettings(config = {}, env = {}) {
-  const providers = (Array.isArray(config.providers) ? config.providers : [])
-    .map((provider, index) => normalizeLlmProvider(provider, index));
-  if (providers.length === 0) providers.push(defaultLlmProvider(env));
-  let activeProviderId = String(config.activeProviderId || env[LLM_ACTIVE_PROVIDER_ENV_KEY] || '').trim();
-  if (!providers.some((provider) => provider.id === activeProviderId)) activeProviderId = providers[0].id;
-  const activeProvider = providers.find((provider) => provider.id === activeProviderId) || providers[0];
-  let activeApiId = String(config.activeApiId || env[LLM_ACTIVE_API_ENV_KEY] || '').trim();
-  if (!activeProvider.apis.some((api) => api.id === activeApiId)) activeApiId = activeProvider.apis[0]?.id || '';
-  return { activeProviderId, activeApiId, providers };
-}
-
-function defaultLlmProvider(env = {}) {
-  const apiKey = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY || env.DEEPSEEK_API_KEY || env.OPENAI_API_KEY || '';
-  const baseUrl = process.env.DEEPSEEK_BASE_URL || process.env.OPENAI_BASE_URL || env.DEEPSEEK_BASE_URL || env.OPENAI_BASE_URL || 'https://api.deepseek.com';
-  const model = process.env.DEEPSEEK_MODEL || process.env.OPENAI_MODEL || env.DEEPSEEK_MODEL || env.OPENAI_MODEL || 'deepseek-v4-pro';
-  return normalizeLlmProvider({
-    id: 'deepseek',
-    name: 'DeepSeek',
-    websiteUrl: 'https://api.deepseek.com',
-    apis: [{
-      id: 'deepseek-default',
-      name: '默认 API',
-      apiKey,
-      baseUrl,
-      fullUrl: false,
-      model,
-      protocol: 'openai-compatible',
-      enabled: true
-    }]
-  }, 0);
-}
-
-function activeLlmApiFromSettings(settings) {
-  const provider = settings.providers.find((item) => item.id === settings.activeProviderId) || settings.providers[0];
-  if (!provider) return null;
-  const api = provider.apis.find((item) => item.id === settings.activeApiId) || provider.apis[0];
-  if (!api) return null;
-  return { ...api, providerName: provider.name };
-}
-
-function pathKey(value) {
-  return resolve(String(value || '')).toLowerCase();
-}
-
-function normalizeLibraryRelativePath(value = '') {
-  const normalized = String(value || '')
-    .replace(/\\/g, '/')
-    .split('/')
-    .filter(Boolean)
-    .join('/');
-  if (!normalized || normalized === '.') return '';
-  if (normalized.split('/').some((part) => part === '..')) {
-    throw new Error('Library path cannot escape the library folder');
-  }
-  return normalized;
-}
-
-function isSameOrChildPath(target, parent) {
-  const targetKey = pathKey(target);
-  const parentKey = pathKey(parent);
-  return targetKey === parentKey || targetKey.startsWith(`${parentKey}${sep}`);
-}
 
 function replacePathPrefix(target, fromPath, toPath) {
   const targetResolved = resolve(target);
@@ -248,6 +101,7 @@ export function createHeadlessAgentHost(options = {}) {
   let llmWorkspaceState = null;
   const dbShellState = {};
   let vectorConfigCache = null;
+  let embedBackendPromise = null;
   const extractorPromises = new Map();
   const streamRequestIds = new Map();
   const summaryRequests = new Map();
@@ -255,158 +109,19 @@ export function createHeadlessAgentHost(options = {}) {
   function readProjectConfig() {
     if (!existsSync(configPath)) return {};
     try {
-      return JSON.parse(readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '')) || {};
+      return JSON.parse(readFileSync(configPath, 'utf8')) || {};
     } catch {
       return {};
     }
   }
 
-  function apiKeyFor(providerId, apiId, legacyValue = '') {
-    const env = readDotEnv(envPath);
-    const key = llmApiKeyEnvKey(providerId, apiId);
-    const specific = process.env[key] || env[key] || legacyValue || '';
-    if (specific) return specific;
-    const provider = String(providerId || '').toLowerCase();
-    if (provider.includes('deepseek')) {
-      return process.env.DEEPSEEK_API_KEY || env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY || env.OPENAI_API_KEY || '';
-    }
-    if (provider.includes('openai')) return process.env.OPENAI_API_KEY || env.OPENAI_API_KEY || '';
-    return '';
-  }
-
-  function attachLlmSecrets(settings = {}) {
-    return {
-      ...settings,
-      providers: (settings.providers || []).map((provider) => ({
-        ...provider,
-        apis: (provider.apis || []).map((api) => ({
-          ...api,
-          apiKey: apiKeyFor(provider.id, api.id, api.apiKey)
-        }))
-      }))
-    };
-  }
-
-  function readStoredSharedSettings(env = readDotEnv(envPath)) {
-    const configured = readProjectConfig().llm?.shared;
-    if (configured) return configured;
-    const raw = env[LLM_PROVIDERS_ENV_KEY];
-    if (!raw) return null;
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? { providers: parsed } : parsed;
-    } catch {
-      return null;
-    }
-  }
-
-  function readStoredIndependentSummarySettings(env = readDotEnv(envPath)) {
-    const configured = readProjectConfig().llm?.summary;
-    if (configured?.providers) return configured;
-    const raw = env[LLM_SUMMARY_PROVIDERS_ENV_KEY];
-    if (!raw) return null;
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? { providers: parsed } : parsed;
-    } catch {
-      return null;
-    }
-  }
-
-  function readSharedLlmSettings() {
-    const env = readDotEnv(envPath);
-    const stored = readStoredSharedSettings(env);
-    return attachLlmSecrets(normalizeLlmSettings(stored || { providers: [defaultLlmProvider(env)] }, env));
-  }
-
-  function normalizeSummaryStrategySettings(config = {}) {
-    const strategies = (Array.isArray(config.summaryStrategies) ? config.summaryStrategies : [])
-      .map((strategy, index) => normalizeSummaryStrategy(strategy, index));
-    const summaryStrategies = strategies.length ? strategies : defaultSummaryStrategies();
-    let activeArticleSummaryStrategyId = String(config.activeArticleSummaryStrategyId || '').trim();
-    if (!summaryStrategies.some((strategy) => strategy.id === activeArticleSummaryStrategyId)) {
-      activeArticleSummaryStrategyId = summaryStrategies.find((strategy) => strategy.id === 'article-default')?.id || summaryStrategies[0].id;
-    }
-    let activeNodeSummaryStrategyId = String(config.activeNodeSummaryStrategyId || '').trim();
-    if (!summaryStrategies.some((strategy) => strategy.id === activeNodeSummaryStrategyId)) {
-      activeNodeSummaryStrategyId = summaryStrategies.find((strategy) => strategy.id === 'node-default')?.id || summaryStrategies[0].id;
-    }
-    return {
-      summaryStrategies,
-      activeArticleSummaryStrategyId,
-      activeNodeSummaryStrategyId,
-      summaryConcurrency: normalizeSummaryConcurrency(config.summaryConcurrency)
-    };
-  }
-
-  function readSummaryStrategySettings(env = readDotEnv(envPath)) {
-    const configured = readProjectConfig().llm?.summary || {};
-    if (
-      configured.summaryStrategies
-      || configured.activeArticleSummaryStrategyId
-      || configured.activeNodeSummaryStrategyId
-      || configured.summaryConcurrency
-    ) {
-      return normalizeSummaryStrategySettings(configured);
-    }
-    let parsed = null;
-    const raw = env[LLM_SUMMARY_STRATEGIES_ENV_KEY];
-    if (raw) {
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        parsed = null;
-      }
-    }
-    const source = Array.isArray(parsed) ? { summaryStrategies: parsed } : (parsed || {});
-    return normalizeSummaryStrategySettings({
-      summaryStrategies: source.summaryStrategies || source.strategies,
-      activeArticleSummaryStrategyId: env[LLM_SUMMARY_ARTICLE_STRATEGY_ENV_KEY] || source.activeArticleSummaryStrategyId,
-      activeNodeSummaryStrategyId: env[LLM_SUMMARY_NODE_STRATEGY_ENV_KEY] || source.activeNodeSummaryStrategyId,
-      summaryConcurrency: source.summaryConcurrency
-    });
-  }
-
-  function readLlmSummarySettings() {
-    const env = readDotEnv(envPath);
-    const configuredSummary = readProjectConfig().llm?.summary || {};
-    const independent = Object.prototype.hasOwnProperty.call(configuredSummary, 'independent')
-      ? configuredSummary.independent === true
-      : Object.prototype.hasOwnProperty.call(env, LLM_INDEPENDENT_ENV_KEY)
-        ? env[LLM_INDEPENDENT_ENV_KEY] === 'true'
-        : false;
-    if (!independent) {
-      return {
-        ...readSharedLlmSettings(),
-        ...readSummaryStrategySettings(env),
-        independent: false
-      };
-    }
-    const stored = readStoredIndependentSummarySettings(env);
-    const base = stored || readSharedLlmSettings();
-    return attachLlmSecrets({
-      ...normalizeLlmSettings({
-        ...base,
-        activeProviderId: configuredSummary.activeProviderId || env[LLM_SUMMARY_ACTIVE_PROVIDER_ENV_KEY] || base.activeProviderId,
-        activeApiId: configuredSummary.activeApiId || env[LLM_SUMMARY_ACTIVE_API_ENV_KEY] || base.activeApiId
-      }, env),
-      ...readSummaryStrategySettings(env),
-      independent: true
-    });
-  }
-
-  function readAgentSettings() {
-    const env = readDotEnv(envPath);
-    const agentConfig = readProjectConfig().llm?.agent || {};
-    return {
-      ...readSharedLlmSettings(),
-      personalPrompt: agentConfig.personalPrompt ?? decodeDotEnvMultiline(env[AGENT_PERSONAL_PROMPT_ENV_KEY]),
-      toolSettings: normalizeAgentToolSettings(agentConfig.toolSettings || {})
-    };
-  }
+  // LLM 三套设置（shared/summary/agent + 策略）统一走共享读取器；
+  // 进程特异的只有 envPath/configPath 两个事实。
+  const llmSettings = createLlmSettingsReader({ envPath, configPath, readProjectConfig });
+  const { readEnv, readLlmSummarySettings, readAgentSettings } = llmSettings;
 
   function activeAgentApi() {
-    const env = readDotEnv(envPath);
+    const env = readEnv();
     const stored = Boolean(readProjectConfig().llm?.shared?.providers || env[LLM_PROVIDERS_ENV_KEY]);
     const active = activeLlmApiFromSettings(readAgentSettings());
     if (active?.apiKey && active.enabled !== false) return active;
@@ -452,7 +167,7 @@ export function createHeadlessAgentHost(options = {}) {
   function activeLlmSummaryApi() {
     const settings = readLlmSummarySettings();
     if (settings.independent !== true) return activeAgentApi();
-    const env = readDotEnv(envPath);
+    const env = readEnv();
     const stored = Boolean(readProjectConfig().llm?.summary?.providers || env[LLM_SUMMARY_PROVIDERS_ENV_KEY]);
     const active = activeLlmApiFromSettings(settings);
     if (active?.apiKey && active.enabled !== false) return active;
@@ -646,17 +361,8 @@ export function createHeadlessAgentHost(options = {}) {
     return libraryRoot;
   }
 
-  function libraryPath(relativePath = '') {
-    const root = ensureLibraryRoot();
-    const rel = normalizeLibraryRelativePath(relativePath);
-    const target = resolve(root, rel);
-    const rootKey = pathKey(root);
-    const targetKey = pathKey(target);
-    if (targetKey !== rootKey && !targetKey.startsWith(`${rootKey}${sep}`)) {
-      throw new Error('Library path cannot escape the library folder');
-    }
-    return target;
-  }
+  const libraryFs = createLibraryFs({ ensureRoot: ensureLibraryRoot });
+  const { libraryPath, listLibraryChildren, libraryRelativePathForAgent } = libraryFs;
 
   function normalizeAgentLibraryPath(value = '') {
     const raw = String(value || '').trim();
@@ -666,108 +372,10 @@ export function createHeadlessAgentHost(options = {}) {
     return normalizeLibraryRelativePath(raw);
   }
 
-  function libraryRelativePathForAgent(filePath = '') {
-    if (!filePath) return '';
-    const root = ensureLibraryRoot();
-    const target = resolve(String(filePath));
-    const rootKey = pathKey(root);
-    const targetKey = pathKey(target);
-    if (targetKey !== rootKey && !targetKey.startsWith(`${rootKey}${sep}`)) return '';
-    return normalizeLibraryRelativePath(relative(root, target));
-  }
-
-  function libraryEntry(relativePath, dirent) {
-    const abs = libraryPath(relativePath);
-    const stat = statSync(abs);
-    const type = dirent?.isDirectory?.() || stat.isDirectory() ? 'folder' : 'file';
-    const entry = {
-      type,
-      name: parse(abs).base,
-      relativePath: normalizeLibraryRelativePath(relativePath),
-      fullPath: abs,
-      extension: type === 'file' ? extname(abs).toLowerCase() : '',
-      size: stat.size,
-      mtimeMs: stat.mtimeMs
-    };
-    if (type === 'folder') entry.children = listLibraryChildren(entry.relativePath);
-    return entry;
-  }
-
-  function sortLibraryEntries(left, right) {
-    if (left.type !== right.type) return left.type === 'folder' ? -1 : 1;
-    return String(left.name || '').localeCompare(String(right.name || ''), 'zh-Hans-CN', { numeric: true });
-  }
-
-  function listLibraryChildren(relativePath = '') {
-    const folder = libraryPath(relativePath);
-    return readdirSync(folder, { withFileTypes: true })
-      .filter((entry) => entry.name !== '.DS_Store' && entry.name !== 'Thumbs.db' && !entry.isSymbolicLink())
-      .map((entry) => libraryEntry(normalizeLibraryRelativePath(join(relativePath, entry.name)), entry))
-      .sort(sortLibraryEntries);
-  }
-
-  function llmWorkspaceLimitBytes() {
-    const configured = Number(
-      process.env.IFTREE_LLM_WORKSPACE_LIMIT_BYTES
-      || readProjectConfig().llm?.agent?.workspaceLimitBytes
-      || readProjectConfig().llmWorkspaceLimitBytes
-    );
-    return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : DEFAULT_LLM_WORKSPACE_LIMIT_BYTES;
-  }
-
-  function ensureLlmWorkspaceRoot() {
-    mkdirSync(workspaceRoot, { recursive: true });
-    mkdirSync(workspaceBin, { recursive: true });
-    const dbScript = join(projectRoot, 'scripts', 'db.mjs');
-    writeFileSync(join(workspaceBin, 'db.cmd'), [
-      '@echo off',
-      `"${process.execPath}" "${dbScript}" %*`
-    ].join('\r\n'), 'utf8');
-    writeFileSync(join(workspaceBin, 'db'), [
-      '#!/bin/sh',
-      `exec "${process.execPath}" "${dbScript}" "$@"`
-    ].join('\n'), 'utf8');
-    return workspaceRoot;
-  }
-
-  function measureWorkspaceEntry(entryPath) {
-    const stat = statSync(entryPath);
-    let sizeBytes = stat.size;
-    if (stat.isDirectory()) {
-      for (const entry of readdirSync(entryPath, { withFileTypes: true })) {
-        if (entry.isSymbolicLink()) continue;
-        sizeBytes += measureWorkspaceEntry(join(entryPath, entry.name)).sizeBytes;
-      }
-    }
-    return { sizeBytes, mtimeMs: stat.mtimeMs };
-  }
+  const llmWorkspace = createLlmWorkspace({ workspaceRoot, workspaceBin, projectRoot, readProjectConfig });
 
   function refreshLlmWorkspaceState() {
-    const root = ensureLlmWorkspaceRoot();
-    const limitBytes = llmWorkspaceLimitBytes();
-    const measured = measureWorkspaceEntry(root);
-    const cleanupCandidates = readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.name !== '.bin' && !entry.isSymbolicLink())
-      .map((entry) => {
-        const fullPath = join(root, entry.name);
-        const item = measureWorkspaceEntry(fullPath);
-        return {
-          name: entry.name,
-          relativePath: relative(root, fullPath).replace(/\\/g, '/'),
-          type: entry.isDirectory() ? 'folder' : 'file',
-          sizeBytes: item.sizeBytes,
-          mtimeMs: item.mtimeMs
-        };
-      })
-      .sort((left, right) => left.mtimeMs - right.mtimeMs);
-    llmWorkspaceState = {
-      root,
-      relativePath: '.iftree-llm-workspace',
-      sizeBytes: measured.sizeBytes,
-      limitBytes,
-      overLimit: measured.sizeBytes > limitBytes,
-      cleanupCandidates: measured.sizeBytes > limitBytes ? cleanupCandidates : []
-    };
+    llmWorkspaceState = llmWorkspace.refreshLlmWorkspaceState();
     return llmWorkspaceState;
   }
 
@@ -859,10 +467,55 @@ export function createHeadlessAgentHost(options = {}) {
     throw new Error(`向量输出形状异常：dims=${JSON.stringify(dims)} expected=${expectedCount}`);
   }
 
+  // 本地 transformers（onnxruntime，GPU=DirectML）后端：批量抽取，返回与输入同序的向量。
+  async function transformersEmbed(textList, runtime = headlessVectorRuntime()) {
+    const extractor = textList.length > 0 ? await getExtractor(runtime) : null;
+    const out = new Array(textList.length);
+    for (let offset = 0; offset < textList.length; offset += runtime.batchSize) {
+      const batch = textList.slice(offset, offset + runtime.batchSize);
+      const output = await extractor(batch, { pooling: runtime.pooling, normalize: true });
+      const vectors = tensorToVectors(output, batch.length);
+      for (let i = 0; i < batch.length; i += 1) {
+        out[offset + i] = assertEmbeddingVector(
+          vectors[i],
+          `${runtime.label} headless vector for text ${offset + i + 1}`,
+          runtime.dimensions
+        );
+      }
+    }
+    return out;
+  }
+
+  // 解析嵌入后端（一次性、带兜底）：IFTREE_EMBED_BACKEND=ollama|openai|llamacpp 时切到
+  // GPU 加速的 HTTP 服务（ollama /api/embed 或 OpenAI 兼容 /v1/embeddings = llama.cpp server）；
+  // 未声明或健康检查失败（且未禁用兜底）时回落本地 transformers。
+  function resolveEmbedBackend(config) {
+    if (!embedBackendPromise) {
+      embedBackendPromise = (async () => {
+        const remoteConfig = resolveEmbedBackendConfig(process.env);
+        const local = {
+          label: 'transformers',
+          embed: (textList) => transformersEmbed(textList, headlessVectorRuntime(config))
+        };
+        if (!remoteConfig) return local;
+        try {
+          const embedder = createRemoteEmbedder({ ...remoteConfig, dimensions: config.dimensions });
+          const health = await embedder.healthCheck();
+          process.stderr.write(`[embed] backend=${health.backend} url=${health.url} model=${health.model} dim=${health.dimensions}\n`);
+          return { label: `${remoteConfig.backend}`, embed: (textList) => embedder.embed(textList) };
+        } catch (error) {
+          if (!remoteConfig.fallback) throw error;
+          process.stderr.write(`[embed] remote backend 不可用，回落本地 transformers：${error?.message || error}\n`);
+          return local;
+        }
+      })();
+    }
+    return embedBackendPromise;
+  }
+
   async function headlessEmbeddings(texts) {
     assertVectorModuleEnabled();
     const config = getVectorConfig();
-    const runtime = headlessVectorRuntime(config);
     const source = Array.isArray(texts) ? texts : [];
     const results = new Array(source.length);
     const pending = [];
@@ -874,21 +527,15 @@ export function createHeadlessAgentHost(options = {}) {
       }
       pending.push({ index, text });
     }
-    const extractor = pending.length > 0 ? await getExtractor(runtime) : null;
-    for (let offset = 0; offset < pending.length; offset += runtime.batchSize) {
-      const batch = pending.slice(offset, offset + runtime.batchSize);
-      const output = await extractor(batch.map((item) => item.text), {
-        pooling: runtime.pooling,
-        normalize: true
-      });
-      const vectors = tensorToVectors(output, batch.length);
-      for (const [batchIndex, item] of batch.entries()) {
-        results[item.index] = assertEmbeddingVector(
-          vectors[batchIndex],
-          `${runtime.label} headless vector for text ${item.index + 1}`,
-          runtime.dimensions
-        );
-      }
+    if (pending.length === 0) return results;
+    const backend = await resolveEmbedBackend(config);
+    const vectors = await backend.embed(pending.map((item) => item.text));
+    for (let i = 0; i < pending.length; i += 1) {
+      results[pending[i].index] = assertEmbeddingVector(
+        vectors[i],
+        `${backend.label} headless vector for text ${pending[i].index + 1}`,
+        config.dimensions
+      );
     }
     return results;
   }
@@ -1172,6 +819,7 @@ export function createHeadlessAgentHost(options = {}) {
   }
 
   ensureLibraryRoot();
+  llmWorkspace.cleanupExpiredWorkspaceEntries();
   refreshLlmWorkspaceState();
 
   return {

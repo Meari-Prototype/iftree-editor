@@ -1,4 +1,4 @@
-import { readChmSourceDocument } from '../importers.mjs';
+import { readChmSourceDocument } from '../source-chm.mjs';
 import { normalizeImportMode } from './shared.mjs';
 
 export async function importChmDocument(filePath, options = {}) {

@@ -1,5 +1,6 @@
 import { handleAxiomMutation, handleRefMutation } from './handlers/write/axiom-ref.mjs';
-import { handleDocFolderMutation, handleDocMutation } from './handlers/write/doc.mjs';
+import { handleDocFolderMutation, handleDocMutation, handleStreamMutation } from './handlers/write/doc.mjs';
+import { handleMemoryMutation } from './handlers/write/memory.mjs';
 import { handleEditorHistoryMutation, handleHistoryMutation } from './handlers/write/history.mjs';
 import { handleNodeMutation } from './handlers/write/node.mjs';
 import { plain } from './handlers/write/shared.mjs';
@@ -15,9 +16,19 @@ const ACTIONS = Object.freeze([
   'doc.moveToFolder',
   'doc.delete',
   'doc.updateAxiomsCollapsed',
+  'doc.setEditMode',
+  'stream.push',
+  'stream.bulkBegin',
+  'stream.bulkEnd',
+  'stream.attachSource',
+  'memory.deliverVolume',
+  'memory.appendSessionTurn',
+  'memory.sealDue',
+  'memory.markDistilled',
   'editBranch.begin',
   'editBranch.rebase',
   'editBranch.cherryPick',
+  'editBranch.applyMerge',
   'editBranch.save',
   'editBranch.discard',
   'editBranch.undo',
@@ -138,6 +149,22 @@ export function databaseWriteToolSchema() {
       depthKey: { type: 'string' },
       nodeIds: { type: 'array', items: STABLE_ID_SCHEMA },
       deltaY: { type: 'number' },
+      mode: { type: 'string' },
+      nodes: { type: 'array' },
+      idempotencyKey: { type: 'string' },
+      agent: { type: 'string', description: '记忆卷 agent 身份（memory.deliverVolume 必填）' },
+      sessionId: { type: 'string', description: '记忆卷 session id（memory.deliverVolume 必填）' },
+      hostAnchor: { type: 'string', description: '宿主原始记录锚（路径+session id），允许悬空' },
+      startedAt: { type: 'string', description: '卷起始时间 ISO 8601' },
+      endedAt: { type: 'string', description: '卷结束时间 ISO 8601' },
+      force: { type: 'boolean', description: 'memory.markDistilled：用户明确指示时跳过冷却期立即触发' },
+      sourcePath: { type: 'string' },
+      sourceType: { type: 'string' },
+      rawMarkdown: { type: 'string' },
+      spans: { type: 'array' },
+      pdfPages: { type: 'array' },
+      pdfChars: { type: 'array' },
+      nodeIdsBySentenceIndex: { type: 'object' },
       refreshOptions: { type: 'object' }
     },
     required: ['action']
@@ -150,6 +177,21 @@ function shouldRouteToEditBranch(action) {
   if (action.startsWith('ref.')) return true;
   if (action.startsWith('entity.')) return true;
   return false;
+}
+
+// 编辑模式互斥（projectneed 4-16-8）：增量编辑（流式写入）文档拒绝分支编辑/合并；只读文档拒绝一切编辑。
+// 流式写入自身（stream.push）的模式校验在 store.pushStreamNodes 内（含首推自建文档）。
+function guardEditMode(store, action, payload) {
+  if (!(shouldRouteToEditBranch(action) || action.startsWith('editBranch.'))) return;
+  const docId = store.docIdForMutationPayload(payload);
+  if (!docId) return;
+  const mode = store.getDocEditMode(docId);
+  if (mode === 'incremental') {
+    throw new Error('文档处于增量编辑（流式写入）模式，不能分支编辑/合并；如需修订请先 doc.setEditMode 切回 full');
+  }
+  if (mode === 'readonly') {
+    throw new Error('文档为只读模式，拒绝编辑');
+  }
 }
 
 function requestedEditBranchOwner(payload = {}, ctx = {}) {
@@ -258,6 +300,7 @@ export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
   if (!action) throw new Error(`Unknown database_write action: ${payload.action || payload.type || ''}`);
   if (action === 'mutation.actions') return { actions: databaseWriteActions() };
   requireStore(store);
+  guardEditMode(store, action, payload);
 
   const routeOwner = requestedEditBranchOwner(payload, ctx);
   if (routeOwner) {
@@ -286,6 +329,8 @@ export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
   else if (action.startsWith('editorHistory.')) result = await handleEditorHistoryMutation(store, payload, ctx, action, effects);
   else if (action.startsWith('history.')) result = await handleHistoryMutation(store, payload, ctx, action, effects);
   else if (action.startsWith('entity.')) result = runEntityWrite(store, payload, action);
+  else if (action.startsWith('stream.')) result = await handleStreamMutation(store, payload, ctx, action, effects);
+  else if (action.startsWith('memory.')) result = await handleMemoryMutation(store, payload, ctx, action, effects);
   else throw new Error(`Unhandled database_write action: ${action}`);
 
   return result;

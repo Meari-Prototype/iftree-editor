@@ -135,7 +135,7 @@ export function buildLiteralMatcher(patterns = []) {
   }
 
   return {
-    scan(text = '', visit = () => {}) {
+    scan(text = '', visit = /** @type {(output: any) => void} */ (() => {})) {
       const haystack = String(text || '').toLocaleLowerCase();
       let state = 0;
       for (const char of haystack) {

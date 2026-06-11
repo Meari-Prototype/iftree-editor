@@ -4,8 +4,17 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createHeadlessAgentHost } from '../src/backend/llm/headless-agent-host.mjs';
+import { createSharedBackendServer } from '../src/backend/llm/backend-shared-server.mjs';
+import {
+  backendDescriptorPath,
+  backendPipeName,
+  removeBackendDescriptorIfOwn,
+  resolveBackendDbPath,
+  writeBackendDescriptor
+} from '../src/backend/llm/backend-discovery.mjs';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const SHARED_MODE = process.argv.includes('--shared');
 
 function writeJson(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -94,7 +103,61 @@ async function main() {
   finishIfClosed();
 }
 
-main().catch((error) => {
+// 共享模式（projectneed 18-6-1）：监听本地管道服务多客户端，写连接描述文件；
+// 存活不系于任何客户端（detached 拉起），退出只经 shutdown 请求或系统信号。
+async function mainShared() {
+  const dbPath = resolveBackendDbPath(PROJECT_ROOT);
+  const pipeName = backendPipeName(dbPath);
+  const descriptorPath = backendDescriptorPath(dbPath);
+  let host = null;
+
+  const exitCleanly = () => {
+    removeBackendDescriptorIfOwn(descriptorPath, process.pid);
+    try { host?.close(); } catch { /* 已关闭 */ }
+    process.exit(0);
+  };
+
+  const server = createSharedBackendServer({
+    handleRequest: (request) => host.handleRequest(request),
+    onShutdown: () => {
+      server.close();
+      exitCleanly();
+    }
+  });
+  host = createHeadlessAgentHost({
+    projectRoot: PROJECT_ROOT,
+    fetchers,
+    sendEvent: (event) => server.sendEvent(event)
+  });
+
+  try {
+    await server.listen(pipeName);
+  } catch (error) {
+    if (error?.code === 'IFTREE_BACKEND_EXISTS') {
+      // 会合让位：已有共享后端在跑（双写实例同时启动只活一个）。stderr 是 detached
+      // 模式下唯一落日志的通道，留一行痕迹供排查「为什么起过第二个后端」。
+      process.stderr.write(`[agent-host] ${error.message}；本进程(pid=${process.pid})让位退出\n`);
+      host.close();
+      process.exit(0);
+    }
+    throw error;
+  }
+  writeBackendDescriptor(descriptorPath, {
+    pipe: pipeName,
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    projectRoot: PROJECT_ROOT,
+    dbPath
+  });
+  writeJson({ id: null, type: 'ready', pid: process.pid, shared: true, pipe: pipeName });
+  process.on('SIGINT', exitCleanly);
+  process.on('SIGTERM', exitCleanly);
+}
+
+(SHARED_MODE ? mainShared() : main()).catch((error) => {
+  // 错误双写：共享模式 detached 拉起时 stdout 被丢弃、只有 stderr 接进日志文件，
+  // 不双写的话致命错误会无声消失。
+  process.stderr.write(`[agent-host] fatal: ${error?.stack || error?.message || error}\n`);
   writeJson({ id: null, type: 'error', error: errorPayload(error) });
   process.exit(1);
 });

@@ -4,7 +4,7 @@ import {
   plain,
   refDocId,
   requireDocId,
-  requirePositiveId,
+  requireId,
   rowById
 } from './shared.mjs';
 
@@ -49,13 +49,13 @@ export function handleAxiomMutation(store, payload, action, effects) {
   }
 
   if (action === 'axiom.update') {
-    const axiomId = requirePositiveId(payload, 'axiomId', 'axiom_id');
+    const axiomId = requireId(payload, 'axiomId', 'axiom_id');
     const axiom = store.updateAxiom(axiomId, ownPatch(payload));
     return docRefresh(action, axiom.doc_id, { axiom: plain(axiom), sideEffects: effects });
   }
 
   if (action === 'axiom.delete') {
-    const axiomId = requirePositiveId(payload, 'axiomId', 'axiom_id');
+    const axiomId = requireId(payload, 'axiomId', 'axiom_id');
     const before = rowById(store, 'axioms', axiomId);
     const changed = store.deleteAxiom(axiomId);
     return docRefresh(action, before?.doc_id ?? payload.docId ?? null, { changed: Boolean(changed), sideEffects: effects });
@@ -86,7 +86,7 @@ export function handleRefMutation(store, payload, action, effects) {
     return docRefresh(action, docId, { ref: plain(ref), sideEffects: effects });
   }
   if (action === 'ref.delete') {
-    const refId = requirePositiveId(payload, 'refId', 'ref_id');
+    const refId = requireId(payload, 'refId', 'ref_id');
     const docId = refDocId(store, refId) ?? payload.docId ?? null;
     const changed = store.deleteRef(refId);
     return docRefresh(action, docId, { changed: Boolean(changed), sideEffects: effects });

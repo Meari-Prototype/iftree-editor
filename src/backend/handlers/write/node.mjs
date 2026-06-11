@@ -5,7 +5,7 @@ import {
   ownPatch,
   plain,
   requireDocId,
-  requirePositiveId,
+  requireId,
   rowById,
   runOptionalEffect
 } from './shared.mjs';
@@ -38,7 +38,7 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
   }
 
   if (action === 'node.update') {
-    const nodeId = requirePositiveId(payload, 'nodeId', 'node_id');
+    const nodeId = requireId(payload, 'nodeId', 'node_id');
     const patch = ownPatch(payload);
     const node = store.updateNode(nodeId, patch);
     if (Object.prototype.hasOwnProperty.call(patch, 'text')) {
@@ -56,7 +56,7 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
     return nodeRefresh(action, node.doc_id, node.id, { node: plain(node), sideEffects: effects });
   }
 
-  const nodeId = requirePositiveId(payload, 'nodeId', 'node_id');
+  const nodeId = requireId(payload, 'nodeId', 'node_id');
   const before = rowById(store, 'nodes', nodeId);
   const docId = payload.docId ?? payload.doc_id ?? before?.doc_id;
   if (!docId) throw new Error(`${action} requires docId or an existing nodeId`);
@@ -69,19 +69,19 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
   else if (action === 'node.mergePrevious') changed = store.mergeNodeIntoPreviousSibling(nodeId);
   else if (action === 'node.mergeInto') changed = store.mergeNodeIntoTarget({
     nodeId,
-    targetNodeId: requirePositiveId(payload, 'targetNodeId', 'target_node_id')
+    targetNodeId: requireId(payload, 'targetNodeId', 'target_node_id')
   });
   else if (action === 'node.reparent') changed = store.moveNodeToParent({
     nodeId,
-    newParentId: requirePositiveId(payload, 'newParentId', 'new_parent_id')
+    newParentId: requireId(payload, 'newParentId', 'new_parent_id')
   });
   else if (action === 'node.moveBefore') changed = store.moveNodeBeforeSibling({
     nodeId,
-    targetNodeId: requirePositiveId(payload, 'targetNodeId', 'target_node_id')
+    targetNodeId: requireId(payload, 'targetNodeId', 'target_node_id')
   });
   else if (action === 'node.moveAfter') changed = store.moveNodeAfterSibling({
     nodeId,
-    targetNodeId: requirePositiveId(payload, 'targetNodeId', 'target_node_id')
+    targetNodeId: requireId(payload, 'targetNodeId', 'target_node_id')
   });
   else throw new Error(`Unhandled database_write action: ${action}`);
 

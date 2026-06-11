@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { buildMarkdownStructureRecords, buildSourceDocument } from '../src/core/source-doc.mjs';
+import { buildMarkdownStructureRecords, buildSourceDocument } from '../src/core/source-markdown.mjs';
 import { IftreeStore } from '../src/backend/store.mjs';
 
 async function withStore(fn) {
@@ -28,6 +28,28 @@ test('creates a document with one root node and computed address', async () => {
     assert.equal(loaded.tree.text, '需求总目标');
     assert.equal(loaded.tree.address, '1');
     assert.deepEqual(loaded.tree.children, []);
+  });
+});
+
+test('deleteDoc handles ultra-deep parent chains without trigger-recursion overflow', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'Deep', rootText: 'root' });
+    // 1500 层深的父链，超过 SQLite 触发器递归上限(1000)：未打断 parent_id 链时
+    // ON DELETE CASCADE 会 "too many levels of trigger recursion" 崩。
+    const insert = store.db.prepare(
+      'INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, trust_level) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    let parent = doc.rootNodeId;
+    for (let i = 0; i < 1500; i += 1) {
+      const id = `deep-${i}`;
+      insert.run(id, doc.id, parent, 1, 'TEXT', `n${i}`, '不受控');
+      parent = id;
+    }
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ?').get(doc.id).c, 1501);
+
+    assert.equal(store.deleteDoc(doc.id), true);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ?').get(doc.id).c, 0);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS c FROM docs WHERE id = ?').get(doc.id).c, 0);
   });
 });
 
@@ -532,5 +554,133 @@ test('merges a node into a selected target and preserves moved children', async 
     assert.equal(loaded.tree.children[0].children[0].id, child.id);
     assert.equal(loaded.tree.children[0].children[0].address, '1-1-1');
     assert.equal(loaded.tree.children[1].address, '1-2');
+  });
+});
+
+test('getSubtreeTextWindow accepts uuid node ids (regression: hyphenated id was interpolated into ORDER BY)', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'Window', rootText: 'root text' });
+    // 回归前提：节点 id 是含连字符的 uuid，旧实现把它直接拼进 ORDER BY 导致 unrecognized token
+    assert.match(String(doc.rootNodeId), /-/);
+    const insert = store.db.prepare(
+      'INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, trust_level) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    // id 字典序与插入序故意不同，验证默认分支按 id 排序
+    insert.run('0197aaaa-bbbb-7ccc-8ddd-000000000002', doc.id, doc.rootNodeId, 1, 'TEXT', 'child a', '不受控');
+    insert.run('0197aaaa-bbbb-7ccc-8ddd-000000000000', doc.id, doc.rootNodeId, 2, 'TEXT', 'child b', '不受控');
+    insert.run('0197aaaa-bbbb-7ccc-8ddd-000000000001', doc.id, doc.rootNodeId, 3, 'TEXT', 'child c', '不受控');
+    store.refreshDocAddresses(doc.id);
+
+    const window = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId });
+    assert.equal(window.rows.length, 4);
+    assert.equal(window.rows[0].id, doc.rootNodeId);
+    assert.deepEqual(window.rows.slice(1).map((row) => row.id), [
+      '0197aaaa-bbbb-7ccc-8ddd-000000000000',
+      '0197aaaa-bbbb-7ccc-8ddd-000000000001',
+      '0197aaaa-bbbb-7ccc-8ddd-000000000002'
+    ]);
+    assert.equal(window.hasMore, false);
+    assert.equal(window.textChars, 'root text'.length + 'child a'.length * 3);
+
+    // 分页：窗口根永远排第一页最前，nextOffset 接力不丢行
+    const page = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId, limit: 2 });
+    assert.equal(page.rows.length, 2);
+    assert.equal(page.rows[0].id, doc.rootNodeId);
+    assert.equal(page.hasMore, true);
+    const rest = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId, offset: page.nextOffset, limit: 2 });
+    assert.equal(rest.rows.length, 2);
+    assert.equal(rest.hasMore, false);
+    assert.equal(new Set([...page.rows, ...rest.rows].map((row) => row.id)).size, 4);
+  });
+});
+
+test('getSubtreeTextWindow orders by source_position when the window root has one', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'SourceWindow', rootText: 'root' });
+    store.db.prepare('UPDATE nodes SET source_position = 0 WHERE id = ?').run(doc.rootNodeId);
+    const insert = store.db.prepare(
+      'INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, trust_level, source_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    // id 字典序与 source_position 顺序相反，确保排序键确实是 source_position
+    insert.run('0197bbbb-0000-7000-8000-000000000001', doc.id, doc.rootNodeId, 1, 'TEXT', 'second', '不受控', 20);
+    insert.run('0197bbbb-0000-7000-8000-000000000000', doc.id, doc.rootNodeId, 2, 'TEXT', 'first', '不受控', 10);
+    store.refreshDocAddresses(doc.id);
+
+    const window = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId });
+    assert.deepEqual(window.rows.map((row) => row.text), ['root', 'first', 'second']);
+  });
+});
+
+test('getSubtreeTextWindow charLimit caps the page by accumulated text chars', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'CharWindow', rootText: '12345' });
+    const insert = store.db.prepare(
+      'INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, trust_level) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    insert.run('0197cccc-0000-7000-8000-000000000000', doc.id, doc.rootNodeId, 1, 'TEXT', 'abcde', '不受控');
+    insert.run('0197cccc-0000-7000-8000-000000000001', doc.id, doc.rootNodeId, 2, 'TEXT', 'fghij', '不受控');
+    store.refreshDocAddresses(doc.id);
+
+    // root(5 字) 未达预算 8，累计第二行后 10 >= 8 截断
+    const first = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId, charLimit: 8 });
+    assert.equal(first.rows.length, 2);
+    assert.equal(first.textChars, 10);
+    assert.equal(first.charLimit, 8);
+    assert.equal(first.hasMore, true);
+    assert.equal(first.nextOffset, 2);
+
+    const second = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId, offset: first.nextOffset, charLimit: 8 });
+    assert.deepEqual(second.rows.map((row) => row.text), ['fghij']);
+    assert.equal(second.hasMore, false);
+
+    // 预算比单行还小：至少返回一行，保证分页始终前进
+    const tiny = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId, charLimit: 1 });
+    assert.equal(tiny.rows.length, 1);
+    assert.equal(tiny.rows[0].id, doc.rootNodeId);
+    assert.equal(tiny.hasMore, true);
+
+    // 省略 charLimit 表示不限字符
+    const all = store.getSubtreeTextWindow({ docId: doc.id, nodeId: doc.rootNodeId });
+    assert.equal(all.rows.length, 3);
+    assert.equal(all.charLimit, 0);
+    assert.equal(all.hasMore, false);
+  });
+});
+
+// 引用生命周期：节点被摧毁 → 指向它的引用连带蒸发（refs 无外键，靠各删除路径手工清）。
+test('deleteNodeSubtree 蒸发指向子树内节点的引用，无关引用保留', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'RefsDelete', rootText: '根' });
+    const a = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'a' });
+    const a1 = store.insertNode({ docId: doc.id, parentId: a.id, text: 'a1' });
+    const w = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'w' });
+    const y = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'y' });
+    const intoDeep = store.addNodeRefToNode({ docId: doc.id, sourceNodeId: w.id, targetNodeId: a1.id, refKind: '相关' });
+    const fromDeep = store.addNodeRefToNode({ docId: doc.id, sourceNodeId: a1.id, targetNodeId: w.id, refKind: '相关' });
+    const unrelated = store.addNodeRefToNode({ docId: doc.id, sourceNodeId: w.id, targetNodeId: y.id, refKind: '相关' });
+
+    store.deleteNodeSubtree(a.id);
+
+    const remaining = new Set(store.db.prepare('SELECT id FROM refs').all().map((row) => String(row.id)));
+    assert.ok(!remaining.has(String(intoDeep.id)), '指向子树内节点的引用已蒸发');
+    assert.ok(!remaining.has(String(fromDeep.id)), '子树内节点发出的引用已蒸发');
+    assert.ok(remaining.has(String(unrelated.id)), '无关引用保留');
+  });
+});
+
+test('mergeNodeIntoPreviousSibling 蒸发指向被合并节点的引用，前一兄弟的引用保留', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'RefsMergePrev', rootText: '根' });
+    const prev = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '前段' });
+    const node = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '后段' });
+    const w = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'w' });
+    const intoNode = store.addNodeRefToNode({ docId: doc.id, sourceNodeId: w.id, targetNodeId: node.id, refKind: '相关' });
+    const intoPrev = store.addNodeRefToNode({ docId: doc.id, sourceNodeId: w.id, targetNodeId: prev.id, refKind: '相关' });
+
+    assert.equal(store.mergeNodeIntoPreviousSibling(node.id), true);
+
+    const remaining = new Set(store.db.prepare('SELECT id FROM refs').all().map((row) => String(row.id)));
+    assert.ok(!remaining.has(String(intoNode.id)), '指向被合并节点的引用已蒸发');
+    assert.ok(remaining.has(String(intoPrev.id)), '前一兄弟的引用保留');
   });
 });

@@ -1,4 +1,4 @@
-import { readPdfSourceDocument } from '../importers.mjs';
+import { readPdfSourceDocument } from '../source-pdf.mjs';
 import { importSourceDocumentForMode } from './shared.mjs';
 
 export async function importPdfDocument(filePath, options = {}) {

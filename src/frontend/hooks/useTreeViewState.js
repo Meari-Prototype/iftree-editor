@@ -9,6 +9,7 @@ import {
 } from '../lib/doc-utils.mjs';
 import { treeViewRepository } from '../data/repositories.js';
 
+/** @param {{ currentDoc?: any, setCurrentDoc?: any, setNotice?: any }} [options] */
 export function useTreeViewState({ currentDoc = null, setCurrentDoc, setNotice } = {}) {
   const [depthLimit, setDepthLimit] = useState(1);
   const [axiomsCollapsed, setAxiomsCollapsed] = useState(false);

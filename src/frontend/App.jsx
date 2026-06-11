@@ -18,11 +18,11 @@ import {
   hasKnownChildren,
   idSetFromArray, treeViewStateFromDoc,
   normalizeFsPath, isSupportedLibraryImport, docSourcePath,
-  docDisplayTitle, defaultCollapsedOutlineIds, visibleOutlineRows,
-  outlineParentTrailRows, buildParagraphLabelMap, mergeNodeChildrenIntoTree, isEditableTarget,
+  docDisplayTitle, defaultCollapsedOutlineIds,
+  buildParagraphLabelMap, mergeNodeChildrenIntoTree, isEditableTarget,
   normalizeDocId, readPersistedActiveDocId, persistActiveDocId,
   readPersistedSummaryNotesVisible, persistSummaryNotesVisible,
-  OUTLINE_ROW_HEIGHT, OUTLINE_VIRTUAL_OVERSCAN, NODE_CHILDREN_PAGE_SIZE,
+  NODE_CHILDREN_PAGE_SIZE,
   SOURCE_WINDOW_BEFORE_CHARS
 } from './lib/doc-utils.mjs';
 import {
@@ -31,7 +31,6 @@ import {
 import { normalizeSummaryStrategy,
   normalizeSummaryConcurrency, normalizeSummaryStrategySettings, summaryStrategyForMode, applySummarySkipStrategy, summarySkipBelowCount
 } from './lib/summary-utils.mjs';
-import { buildFixedVirtualRange } from './lib/ui-utils.mjs';
 import { debugLog, debugPerfBegin, debugPerfEnd, setDebugLoggingEnabled } from './lib/debug-log.mjs';
 import { debugElementTarget, debugShouldLogKey } from './features/debug/ui-debug-actions.js';
 import { createLibraryActions } from './features/library/library-actions.js';
@@ -46,7 +45,7 @@ import {
   openEntityMaintenanceAction
 } from './features/entity/entity-actions.js';
 import { ChoiceDialog, ViewAlignedEmptyState, WindowTitlebar } from './components/common.jsx';
-import { C2DMapView } from './components/MindMapView.jsx';
+import { C2DMapView } from './components/MindMapView';
 import { IdeView } from './components/IdeView.jsx';
 import { RichTextView } from './components/RichTextView.jsx';
 import { SearchView } from './components/SearchView.jsx';
@@ -57,8 +56,8 @@ import { ProgressOverlay } from './components/ProgressOverlay.jsx';
 import { OutlinePanel } from './components/OutlinePanel.jsx';
 import { WorkspaceHeader } from './components/WorkspaceHeader.jsx';
 import { EditBranchDiffDialog } from './components/EditBranchDiffDialog.jsx';
+import { MergeConflictDialog } from './components/MergeConflictDialog.jsx';
 import { DocBrowser } from './components/DocBrowser.jsx';
-import { useScrollViewport } from './hooks/useScrollViewport.js';
 import { useAppUI } from './hooks/useAppUI.js';
 import { useEditorOps } from './hooks/useEditorOps.js';
 import { useLayout } from './hooks/useLayout.js';
@@ -93,14 +92,14 @@ const E2E_TEXT_MIN_HEIGHT = 6;
 const E2E_EDGE_MIN_WIDTH = 12;
 const E2E_EDGE_MIN_HEIGHT = 6;
 const ENTITY_NODE_SEARCH_PAGE_LIMIT = 100;
-const EMPTY_ENTITY_NODE_PAGE = Object.freeze({
+const EMPTY_ENTITY_NODE_PAGE = Object.freeze(/** @type {{ total: number, returned: number, offset: number, limit: number, hasMore: boolean, truncated: boolean }} */ ({
   total: 0,
   returned: 0,
   offset: 0,
   limit: ENTITY_NODE_SEARCH_PAGE_LIMIT,
   hasMore: false,
   truncated: false
-});
+}));
 
 function waitForPaintAfterUiUpdate() {
   return new Promise((resolve) => {
@@ -359,6 +358,13 @@ export function App() {
     view: null,
     error: ''
   });
+  const [mergeConflictDialog, setMergeConflictDialog] = useState({
+    open: false,
+    applying: false,
+    view: null,
+    error: '',
+    ctx: null
+  });
 
   useEffect(() => {
     setEntityQuery('');
@@ -444,40 +450,6 @@ export function App() {
     }
     return byPath;
   }, [docs]);
-  const visibleOutline = useMemo(
-    () => visibleOutlineRows(currentDoc?.tree, collapsedOutlineNodeIds),
-    [currentDoc?.tree, collapsedOutlineNodeIds]
-  );
-  const visibleOutlineById = useMemo(() => (
-    new Map(visibleOutline.map((node) => [node.id, node]))
-  ), [visibleOutline]);
-  const visibleOutlineIndexById = useMemo(() => (
-    new Map(visibleOutline.map((node, index) => [node.id, index]))
-  ), [visibleOutline]);
-  const {
-    scrollRef: outlineScrollRef,
-    viewport: outlineViewport,
-    onScroll: handleOutlineScroll
-  } = useScrollViewport();
-  const outlineVirtual = useMemo(() => (
-    buildFixedVirtualRange(
-      visibleOutline.length,
-      OUTLINE_ROW_HEIGHT,
-      outlineViewport.scrollTop,
-      outlineViewport.height,
-      OUTLINE_VIRTUAL_OVERSCAN
-    )
-  ), [visibleOutline.length, outlineViewport.scrollTop, outlineViewport.height]);
-  const renderedOutline = visibleOutline.slice(outlineVirtual.start, outlineVirtual.end);
-  const outlineAnchorIndex = Math.max(0, Math.floor((Number(outlineViewport.scrollTop) || 0) / OUTLINE_ROW_HEIGHT));
-  const outlineParentTrail = useMemo(
-    () => outlineParentTrailRows(visibleOutline, outlineAnchorIndex, visibleOutlineById),
-    [visibleOutline, outlineAnchorIndex, visibleOutlineById]
-  );
-  const outlineStickyRows = useMemo(() => (
-    outlineParentTrail.filter((node) => (visibleOutlineIndexById.get(node.id) ?? Infinity) < outlineAnchorIndex)
-  ), [outlineParentTrail, visibleOutlineIndexById, outlineAnchorIndex]);
-  const outlineTopSpacer = Math.max(0, outlineVirtual.top - outlineStickyRows.length * OUTLINE_ROW_HEIGHT);
   const treeDepthStats = useMemo(() => docDepthStats(currentDoc), [currentDoc?.doc?.id, currentDoc?.tree, currentDoc?.treeDepthStats]);
   const actualMaxDepth = treeDepthStats.maxDepth;
   const visibleNodeCount = Number(currentDoc?.doc?.node_count) > 0
@@ -707,6 +679,9 @@ export function App() {
   }
 
   function syncEditBranchHistoryStacks(branch = activeEditBranch()) {
+    // 进入编辑模式时旧栈里是非编辑模式的快照 token，整栈替换前先释放；
+    // 编辑模式内的常规刷新旧栈是 diff entry，discard 会被前缀过滤成空操作。
+    discardHistoryTokens([...undoStackRef.current, ...redoStackRef.current]);
     updateUndoStack(editBranchUndoEntries(branch));
     updateRedoStack(editBranchRedoEntries(branch));
   }
@@ -796,6 +771,7 @@ export function App() {
     return documentRepository.getDoc(treeDocRequest(docId, depth));
   }
 
+  /** @type {(nextDoc: any, sourceDoc: any, options?: { editMode?: boolean, persistedDocId?: any, noticeText?: string }) => void} */
   function switchDocPreservingView(nextDoc, sourceDoc, { editMode, persistedDocId, noticeText } = {}) {
     if (!nextDoc?.doc?.id) return;
     const nextMaxDepth = fullDepthForDoc(nextDoc);
@@ -819,10 +795,7 @@ export function App() {
     setCollapsedOutlineNodeIds(nextOutlineCollapsed);
     persistTreeViewState(nextDepthLimit, nextCollapsed, nextExpanded, nextDoc.doc.id, nextOutlineCollapsed);
     if (editMode) syncEditBranchHistoryStacks(nextDoc.editBranch);
-    else {
-      updateUndoStack([]);
-      updateRedoStack([]);
-    }
+    else clearHistoryStacks();
     if (noticeText) setNotice(noticeText);
   }
 
@@ -843,8 +816,7 @@ export function App() {
     setCurrentDoc((current) => (
       current?.editBranch ? { ...current, editBranch: null } : current
     ));
-    updateUndoStack([]);
-    updateRedoStack([]);
+    clearHistoryStacks();
     if (noticeText) setNotice(noticeText);
   }
 
@@ -900,63 +872,93 @@ export function App() {
     }
     const baseDocId = editBranchBaseDocId(branch);
     const shadowDocId = editBranchShadowDocId(branch);
+    // 审核通道统一：保存/丢弃按分支实际 owner 操作（llm 分支同走本流程），不写死 human。
+    const branchOwner = String(branch?.owner || 'human');
     if (targetDocId && (sameDocId(targetDocId, baseDocId) || sameDocId(targetDocId, shadowDocId))) return true;
-    const choice = await promptEditExitChoice();
-    if (choice !== 'save' && choice !== 'discard') return false;
-    setBusy(true);
+    // 离场转移锁（与 enterEditMode 同一把 ref）：弹窗悬停或保存进行中再次触发离场
+    // （锁按钮、切文档、关窗）一律拒绝——防重复弹窗与重复 applyMerge（实际翻过车：
+    // busy 中连点三次保存发出三发 applyMerge，第二发起全是 Edit branch not found）。
+    if (editModeTransitionRef.current) return false;
+    editModeTransitionRef.current = true;
     try {
-      const sourceDoc = currentDoc;
-      if (choice === 'discard') {
-        // Tell the backend to skip the post-discard refreshDoc so this stays a
-        // pure entries-delete; we re-fetch ourselves with the depth the view
-        // actually needs.
-        await documentRepository.discardEditBranch({ shadowDocId, owner: 'human', includeDoc: false });
-        const nextDoc = await loadDocForCurrentView(baseDocId, sourceDoc);
+      const choice = await promptEditExitChoice();
+      if (choice !== 'save' && choice !== 'discard') return false;
+      setBusy(true);
+      // 保存/丢弃成功后的统一离场：重载主干、退出编辑投影、刷新文档列表。
+      const leaveWithTrunk = async (docIdToLoad, sourceDoc, noticeText) => {
+        const nextDoc = await loadDocForCurrentView(docIdToLoad, sourceDoc);
         switchDocPreservingView(nextDoc, sourceDoc, {
           editMode: false,
-          persistedDocId: baseDocId,
-          noticeText: '已丢弃本次编辑并退出'
+          persistedDocId: docIdToLoad,
+          noticeText
         });
         setDocs(await documentRepository.listDocs());
-        return true;
-      }
-      const result = await documentRepository.saveEditBranch({ shadowDocId, owner: 'human', includeDoc: false });
-      if (result?.changed) {
-        const nextDoc = await loadDocForCurrentView(result?.baseDocId || baseDocId, sourceDoc);
-        switchDocPreservingView(nextDoc, sourceDoc, {
-          editMode: false,
-          persistedDocId: result?.baseDocId || baseDocId,
-          noticeText: '已保存当前编辑状态并退出编辑模式'
-        });
-        setDocs(await documentRepository.listDocs());
-      } else {
-        setCurrentDoc((current) => (
-          current?.doc?.id === sourceDoc?.doc?.id ? { ...current, editBranch: null } : current
-        ));
-        updateUndoStack([]);
-        updateRedoStack([]);
-        setNotice('已退出编辑模式');
-      }
-      return true;
-    } catch (error) {
-      if (/Edit branch not found/i.test(String(error?.message || error))) {
-        try {
-          const nextDoc = await loadDocForCurrentView(baseDocId, currentDoc);
-          switchDocPreservingView(nextDoc, currentDoc, {
-            editMode: false,
-            persistedDocId: baseDocId,
-            noticeText: '编辑状态已不存在，已退出编辑模式'
-          });
-          setDocs(await documentRepository.listDocs());
-        } catch (refreshError) {
-          clearEditModeState(`编辑状态已不存在，已退出编辑模式；刷新失败：${refreshError.message}`);
+      };
+      try {
+        const sourceDoc = currentDoc;
+        if (choice === 'discard') {
+          // Tell the backend to skip the post-discard refreshDoc so this stays a
+          // pure entries-delete; we re-fetch ourselves with the depth the view
+          // actually needs.
+          await documentRepository.discardEditBranch({ shadowDocId, owner: branchOwner, includeDoc: false });
+          await leaveWithTrunk(baseDocId, sourceDoc, '已丢弃本次编辑并退出');
+          return true;
         }
+        const result = await documentRepository.applyEditBranchMerge({ shadowDocId, owner: branchOwner, includeDoc: false });
+        if (!result?.applied) {
+          // 主干在编辑期间前移：字段级冲突 → 三列面板人裁；结构性失配（blocked）→
+          // 「主干已被修改，无法保存」，只能放弃本次编辑或取消保留分支。两种都留在编辑模式，不静默覆盖。
+          setMergeConflictDialog({
+            open: true,
+            applying: false,
+            view: result,
+            error: '',
+            ctx: { shadowDocId, baseDocId, owner: branchOwner, sourceDoc }
+          });
+          return false;
+        }
+        // 保存成功（applied）一律重载主干离场：changed=false（空 diff 分支被关闭）也要
+        // 离开编辑投影，否则视图停在编辑态，用户会以为保存没有生效。
+        await leaveWithTrunk(
+          result?.baseDocId || baseDocId,
+          sourceDoc,
+          result?.changed ? '已保存当前编辑状态并退出编辑模式' : '没有有效变更，已退出编辑模式'
+        );
         return true;
+      } catch (error) {
+        // 写库与视图刷新分开归因：分支已不在 = 保存/丢弃其实已提交（响应丢失、重复点击、
+        // 或提交成功后刷新那步抛错），必须按成功离场重载主干——不能把刷新失败误报成
+        // 「保存失败」让用户白白重试（实际翻过车：31 条已落主干、前端却报错）。
+        let branchGone = /Edit branch not found/i.test(String(error?.message || error));
+        if (!branchGone) {
+          try {
+            const pending = await documentRepository.getPendingEditBranches();
+            branchGone = !(pending?.branches || []).some((row) => (
+              sameDocId(row.base_doc_id, baseDocId) || sameDocId(row.shadow_doc_id, shadowDocId)
+            ));
+          } catch {
+            branchGone = false;
+          }
+        }
+        if (branchGone) {
+          try {
+            await leaveWithTrunk(
+              baseDocId,
+              currentDoc,
+              choice === 'save' ? '已保存当前编辑状态并退出编辑模式' : '已丢弃本次编辑并退出'
+            );
+          } catch (refreshError) {
+            clearEditModeState(`已退出编辑模式；视图刷新失败：${refreshError.message}`);
+          }
+          return true;
+        }
+        setNotice(error.message);
+        return false;
+      } finally {
+        setBusy(false);
       }
-      setNotice(error.message);
-      return false;
     } finally {
-      setBusy(false);
+      editModeTransitionRef.current = false;
     }
   }
 
@@ -1040,7 +1042,8 @@ export function App() {
         setCurrentDoc((current) => mergeDocView(current, doc));
         setSelectedLibraryEntry(null);
         persistActiveDocId(doc?.doc?.id || targetDoc.id);
-        setSelectedNodeId((existing) => existing || doc?.tree?.id || null);
+        // 同文档刷新保留选中；切到别的文档时旧选中是幽灵 id，清空而不是默认选 root
+        setSelectedNodeId((existing) => (isDifferentDoc ? null : existing));
         if (isDifferentDoc) applyTreeViewState(doc);
         setBusy(false);
         if (!renderUnlockArmed) {
@@ -1085,14 +1088,11 @@ export function App() {
       setCurrentDoc(doc);
       persistActiveDocId(openedBaseDocId || doc?.doc?.id || docId);
       setSelectedLibraryEntry(null);
-      setSelectedNodeId(doc?.tree?.id || null);
+      setSelectedNodeId(null);
       setMultiSelectedNodeIds(new Set());
       applyTreeViewState(doc);
       if (openedBranch) syncEditBranchHistoryStacks(openedBranch);
-      else {
-        updateUndoStack([]);
-        updateRedoStack([]);
-      }
+      else clearHistoryStacks();
       setSearchResults([]);
       setLocateRequest((prev) => ({ seq: (prev?.seq || 0) + 1, nodeId: doc?.tree?.id || null }));
       setBusy(false);
@@ -1120,11 +1120,10 @@ export function App() {
       setCurrentDoc(doc);
       setSelectedLibraryEntry(null);
       persistActiveDocId(null);
-      setSelectedNodeId(doc?.tree?.id || null);
+      setSelectedNodeId(null);
       setMultiSelectedNodeIds(new Set());
       applyTreeViewState(doc);
-      updateUndoStack([]);
-      updateRedoStack([]);
+      clearHistoryStacks();
       setSearchResults([]);
       setLocateRequest((prev) => ({ seq: (prev?.seq || 0) + 1, nodeId: doc?.tree?.id || null }));
       return doc;
@@ -1176,7 +1175,8 @@ export function App() {
     Promise.all([
       documentRepository.listDocs(),
       getStartupOptions().catch(() => ({ startupDocId: null, renderMode: 'hardware', e2eChm: false, debugLogging: false })),
-      documentRepository.getPendingEditBranches({ owner: 'human' }).catch(() => ({ branches: [] }))
+      // 审核通道统一：不限 owner——llm 待审分支同样在启动时被发现、提示恢复审阅。
+      documentRepository.getPendingEditBranches({}).catch(() => ({ branches: [] }))
     ]).then(async ([list = [], startupOptions = {}, pendingEdit = {}]) => {
       const docsList = Array.isArray(list) ? list : [];
       setDocs(docsList);
@@ -1667,16 +1667,31 @@ export function App() {
     return attachEditorHistoryViewState(result?.token || result, viewState, effect);
   }
 
+  // 只有后端 editorSnapshotTokens 里的快照 token（id 形如 editor-N）需要释放；
+  // 编辑分支栈里的 diff entry 会被 normalizeHistoryToken 误判成 token（docId 有兜底），靠前缀挡掉。
   function tokenIds(tokens) {
     return (Array.isArray(tokens) ? tokens : [])
       .map((token) => normalizeHistoryToken(token)?.id)
-      .filter(Boolean);
+      .filter((id) => id && id.startsWith('editor-'));
   }
 
   function discardHistoryTokens(tokens) {
     const ids = tokenIds(tokens);
     if (ids.length === 0) return;
     historyRepository.discardEditorHistoryTokens({ tokenIds: ids }).catch((error) => setNotice(error.message));
+  }
+
+  // 栈封顶 80：被挤出的旧 token 必须通知后端释放对应全量快照，否则滞留到进程退出。
+  function pushHistoryToken(stack, token) {
+    const evicted = stack.slice(0, -79);
+    if (evicted.length > 0) discardHistoryTokens(evicted);
+    return [...stack.slice(-79), token];
+  }
+
+  function clearHistoryStacks() {
+    discardHistoryTokens([...undoStackRef.current, ...redoStackRef.current]);
+    updateUndoStack([]);
+    updateRedoStack([]);
   }
 
   function isSuccessfulWriteResult(result) {
@@ -1704,7 +1719,7 @@ export function App() {
         }
         if (treeEditMode) syncEditBranchHistoryStacks(nextDoc?.editBranch || next.editBranch || activeEditBranch());
         if (writeOk && undoToken) {
-          const nextUndoStack = updateUndoStack((stack) => [...stack.slice(-79), undoToken]);
+          const nextUndoStack = updateUndoStack((stack) => pushHistoryToken(stack, undoToken));
           updateRedoStack([]);
           debugLog('editor.history.pushUndo', {
             docId: undoToken.docId,
@@ -1897,10 +1912,10 @@ export function App() {
       const inverseToken = attachEditorHistoryViewState(result?.token, inverseViewState, targetEffect);
       if (direction === 'undo' && inverseToken) {
         updateUndoStack((stack) => stack.slice(0, -1));
-        updateRedoStack((stack) => [...stack.slice(-79), inverseToken]);
+        updateRedoStack((stack) => pushHistoryToken(stack, inverseToken));
       } else if (direction === 'redo' && inverseToken) {
         updateRedoStack((stack) => stack.slice(0, -1));
-        updateUndoStack((stack) => [...stack.slice(-79), inverseToken]);
+        updateUndoStack((stack) => pushHistoryToken(stack, inverseToken));
       }
       const nextDoc = await resolveWriteDoc(result, { minDepth: refreshDepth });
       if (nextDoc) {
@@ -1959,9 +1974,10 @@ export function App() {
         undoDepth: undoStackRef.current.length,
         redoDepth: redoStackRef.current.length
       });
+      const branchOwner = String(branch?.owner || 'human');
       const result = direction === 'undo'
-        ? await documentRepository.undoEditBranch({ shadowDocId, owner: 'human', includeDoc: false })
-        : await documentRepository.redoEditBranch({ shadowDocId, owner: 'human', includeDoc: false });
+        ? await documentRepository.undoEditBranch({ shadowDocId, owner: branchOwner, includeDoc: false })
+        : await documentRepository.redoEditBranch({ shadowDocId, owner: branchOwner, includeDoc: false });
       syncEditBranchHistoryStacks(result?.branch || branch);
       const nextDoc = await loadDocForCurrentView(baseDocId, currentDoc);
       setCurrentDoc((current) => mergeDocView(current, nextDoc));
@@ -1989,6 +2005,13 @@ export function App() {
     }
   }
 
+  // full agent 直写 base 后的紧邻回退窗口：编辑模式下栈顶若是 base 快照 token
+  //（agent 改动后、下一次分支编辑前），undo/redo 优先恢复 base 快照而非分支条目。
+  // 窗口由 syncEditBranchHistoryStacks 重建栈时连带 discard 自然关闭。
+  function isEditorHistoryToken(entry) {
+    return String(entry?.id || '').startsWith('editor-');
+  }
+
   async function undoEdit() {
     const stack = undoStackRef.current;
     debugLog('editor.undo.request', {
@@ -2003,7 +2026,7 @@ export function App() {
     if (historyOpInFlightRef.current || busy) return;
     historyOpInFlightRef.current = true;
     try {
-      if (treeEditMode) {
+      if (treeEditMode && !isEditorHistoryToken(stack[stack.length - 1])) {
         await restoreEditBranchStep('undo');
         return;
       }
@@ -2025,7 +2048,7 @@ export function App() {
     if (historyOpInFlightRef.current || busy) return;
     historyOpInFlightRef.current = true;
     try {
-      if (treeEditMode) {
+      if (treeEditMode && !isEditorHistoryToken(stack[stack.length - 1])) {
         await restoreEditBranchStep('redo');
         return;
       }
@@ -2087,8 +2110,7 @@ export function App() {
     setMultiSelectedNodeIds,
     setCollapsed,
     setExpanded,
-    updateUndoStack,
-    updateRedoStack,
+    clearHistoryStacks,
     setSearchResults,
     setLocateRequest
   });
@@ -2211,6 +2233,60 @@ export function App() {
     });
   }
 
+  async function applyMergeResolutions(resolutions) {
+    const ctx = mergeConflictDialog.ctx;
+    if (!ctx) return;
+    setMergeConflictDialog((current) => ({ ...current, applying: true, error: '' }));
+    try {
+      const result = await documentRepository.applyEditBranchMerge({
+        shadowDocId: ctx.shadowDocId,
+        owner: ctx.owner,
+        includeDoc: false,
+        resolutions
+      });
+      if (!result?.applied) {
+        // 仍未应用（如结构冲突）→ 留面板，刷新冲突视图与 resolutionErrors。
+        setMergeConflictDialog((current) => ({ ...current, applying: false, view: result, error: '' }));
+        return;
+      }
+      setMergeConflictDialog({ open: false, applying: false, view: null, error: '', ctx: null });
+      const nextDoc = await loadDocForCurrentView(result?.baseDocId || ctx.baseDocId, ctx.sourceDoc);
+      switchDocPreservingView(nextDoc, ctx.sourceDoc, {
+        editMode: false,
+        persistedDocId: result?.baseDocId || ctx.baseDocId,
+        noticeText: '已解决冲突并合并，退出编辑模式'
+      });
+      setDocs(await documentRepository.listDocs());
+    } catch (error) {
+      setMergeConflictDialog((current) => ({ ...current, applying: false, error: error.message || String(error) }));
+    }
+  }
+
+  function closeMergeConflictDialog() {
+    // 取消解决：保留分支（不写回），留在编辑模式，稍后可重试或继续编辑。
+    setMergeConflictDialog({ open: false, applying: false, view: null, error: '', ctx: null });
+  }
+
+  // blocked（主干已被修改，结构性失配不可裁）→ 用户确认「放弃本次编辑」：丢弃分支并退出编辑模式。
+  async function discardMergeBlockedBranch() {
+    const ctx = mergeConflictDialog.ctx;
+    if (!ctx) return;
+    setMergeConflictDialog((current) => ({ ...current, applying: true, error: '' }));
+    try {
+      await documentRepository.discardEditBranch({ shadowDocId: ctx.shadowDocId, owner: ctx.owner, includeDoc: false });
+      setMergeConflictDialog({ open: false, applying: false, view: null, error: '', ctx: null });
+      const nextDoc = await loadDocForCurrentView(ctx.baseDocId, ctx.sourceDoc);
+      switchDocPreservingView(nextDoc, ctx.sourceDoc, {
+        editMode: false,
+        persistedDocId: ctx.baseDocId,
+        noticeText: '已放弃本次编辑并退出'
+      });
+      setDocs(await documentRepository.listDocs());
+    } catch (error) {
+      setMergeConflictDialog((current) => ({ ...current, applying: false, error: error.message || String(error) }));
+    }
+  }
+
   async function openSettings() {
     await openSettingsAction({
       settingsRepository,
@@ -2303,11 +2379,20 @@ export function App() {
       if (changedDocIds.length > 0) {
         if (beforeFullAccessToken && changedDocIds.includes(normalizeDocId(beforeFullAccessToken.docId))) {
           discardHistoryTokens(redoStackRef.current);
-          updateUndoStack((stack) => [...stack.slice(-79), beforeFullAccessToken]);
+          updateUndoStack((stack) => pushHistoryToken(stack, beforeFullAccessToken));
           updateRedoStack([]);
           beforeFullAccessToken = null;
         }
-        await refreshDocs(changedDocIds[0] || currentDoc?.doc?.id);
+        if (treeEditMode && changedDocIds.includes(normalizeDocId(currentDoc?.doc?.id))) {
+          // full agent 直写 base：refreshDocs 的编辑分支保护会早退、视图不动，
+          // 这里显式重取投影让 agent 改动立即可见；不调 syncEditBranchHistoryStacks，
+          // 保住栈顶 base 快照 token 的紧邻回退窗口（Ctrl+Z 一键回退 agent 改动）。
+          const nextDoc = await loadDocForCurrentView(currentDoc.doc.id, currentDoc);
+          setCurrentDoc((current) => mergeDocView(current, nextDoc));
+          await refreshDocList();
+        } else {
+          await refreshDocs(changedDocIds[0] || currentDoc?.doc?.id);
+        }
       }
       if (beforeFullAccessToken) {
         discardHistoryTokens([beforeFullAccessToken]);
@@ -2369,7 +2454,7 @@ export function App() {
       const result = await agentRepository.applyDiff({ diffId });
       if (result?.ok !== false && undoToken) {
         discardHistoryTokens(redoStackRef.current);
-        updateUndoStack((stack) => [...stack.slice(-79), undoToken]);
+        updateUndoStack((stack) => pushHistoryToken(stack, undoToken));
         updateRedoStack([]);
         undoToken = null;
       }
@@ -2477,7 +2562,7 @@ export function App() {
         setCurrentDoc(opened);
         setSelectedLibraryEntry(null);
         persistActiveDocId(opened?.doc?.id || last?.doc?.id);
-        setSelectedNodeId(opened?.tree?.id || last?.tree?.id || null);
+        setSelectedNodeId(null);
         applyTreeViewState(opened);
         const importUnlock = () => {
           setBusy(false);
@@ -3002,6 +3087,11 @@ export function App() {
   }
 
   async function runSummaryGeneration(request, summaryStrategy) {
+    // 与 generateSummary 的入口约束保持一致：摘要写入只允许落在编辑分支上。
+    if (!treeEditMode) {
+      setNotice('请先进入编辑模式');
+      return;
+    }
     const strategyIndex = Number.isInteger(request?.strategyIndex)
       ? request.strategyIndex
       : (summaryStrategyModeForScope(request?.mode) === 'article' ? 0 : 1);
@@ -3021,13 +3111,11 @@ export function App() {
       requestIds: new Set()
     };
     summaryRunRef.current = run;
-    let undoToken = null;
     setBusy(true);
     let generated = 0;
     let processed = 0;
-    let firstError = null;
+    let firstError = /** @type {{ index: number, error: any } | null} */ (null);
     try {
-      undoToken = treeEditMode ? null : await captureEditorHistoryToken();
       const total = summaryItems.length;
       const progressFor = (label) => ({
         label,
@@ -3139,15 +3227,6 @@ export function App() {
       const failedAt = Math.min((firstError?.index ?? processed) + 1, summaryItems.length);
       setNotice(`摘要生成失败（${failedAt} / ${summaryItems.length}）：${error.message}`);
     } finally {
-      if (generated > 0 && undoToken) {
-        discardHistoryTokens(redoStackRef.current);
-        updateUndoStack((stack) => [...stack.slice(-79), undoToken]);
-        updateRedoStack([]);
-        undoToken = null;
-      }
-      if (undoToken) {
-        discardHistoryTokens([undoToken]);
-      }
       setBusy(false);
       setProgress(null);
       if (summaryRunRef.current?.id === run.id) summaryRunRef.current = null;
@@ -3240,7 +3319,7 @@ export function App() {
           onNodeLayoutChange={saveNodeLayoutSettings}
           canEditNodeLayout={treeEditMode}
           treeEditMode={treeEditMode}
-          onToggleTreeEditMode={() => toggleTreeEditMode({ stayOnScreen: true })}
+          onToggleTreeEditMode={toggleTreeEditMode}
           onChooseLocalModelRoot={chooseLocalModelRoot}
           onDownloadVectorModel={downloadVectorModel}
           progress={progress}
@@ -3329,13 +3408,8 @@ export function App() {
         />
 
         <OutlinePanel
-          scrollRef={outlineScrollRef}
-          onScroll={handleOutlineScroll}
-          stickyRows={outlineStickyRows}
-          topSpacer={outlineTopSpacer}
-          renderedRows={renderedOutline}
-          bottomSpacer={outlineVirtual.bottom}
-          selectedNodeId={selectedNode?.id}
+          tree={currentDoc?.tree}
+          selectedNodeId={selectedNodeId}
           collapsedOutlineNodeIds={collapsedOutlineNodeIds}
           onToggle={toggleOutlineNode}
           onSelect={setSelectedNodeId}
@@ -3392,7 +3466,7 @@ export function App() {
                 <C2DMapView
                   docId={currentDoc.doc.id}
                   rootNode={currentDoc.tree}
-                  selectedNodeId={selectedNodeId || selectedNode?.id}
+                  selectedNodeId={selectedNodeId}
                   setSelectedNodeId={setSelectedNodeId}
                   setMultiSelectedIds={setMultiSelectedNodeIds}
                   onRenderReady={handleMindMapRenderReady}
@@ -3418,7 +3492,7 @@ export function App() {
               <div style={{ display: activeTab === 'ide' ? 'contents' : 'none' }}>
                 <IdeView
                   tree={currentDoc.tree}
-                  selectedNodeId={selectedNode?.id}
+                  selectedNodeId={selectedNodeId}
                   setSelectedNodeId={setSelectedNodeId}
                   collapsed={collapsed}
                   expanded={expanded}
@@ -3436,7 +3510,7 @@ export function App() {
                 <RichTextView
                   currentDoc={currentDoc}
                   docId={currentDoc.doc.id}
-                  selectedNodeId={selectedNode?.id}
+                  selectedNodeId={selectedNodeId}
                   setSelectedNodeId={setSelectedNodeId}
                   depthLimit={depthLimit}
                   collapsed={collapsed}
@@ -3545,6 +3619,17 @@ export function App() {
         />
       )}
 
+      {mergeConflictDialog.open && (
+        <MergeConflictDialog
+          view={mergeConflictDialog.view}
+          applying={mergeConflictDialog.applying}
+          error={mergeConflictDialog.error}
+          onApply={applyMergeResolutions}
+          onDiscard={discardMergeBlockedBranch}
+          onClose={closeMergeConflictDialog}
+        />
+      )}
+
       {axiomDialog && (
         <div className="dialog-overlay" onClick={cancelAxiomDialog}>
           <form
@@ -3627,7 +3712,7 @@ export function App() {
                 value={axiomRefDialog.axiomId}
                 onChange={(event) => setAxiomRefDialog((current) => current ? {
                   ...current,
-                  axiomId: Number(event.target.value)
+                  axiomId: event.target.value
                 } : current)}
                 onKeyDown={(event) => {
                   if (event.key === 'Escape') cancelAxiomRefDialog();

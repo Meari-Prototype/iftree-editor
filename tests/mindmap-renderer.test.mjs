@@ -76,7 +76,7 @@ test('measureButtonTops follows the visible center of expandable cards', () => {
     element({ top: 80, bottom: 260, offsetHeight: 180 })
   ]]);
 
-  const tops = measureButtonTops(columns, new Set(), colEls, cards);
+  const tops = measureButtonTops(columns, colEls, cards);
 
   assert.equal(tops.get('1'), 84);
 });

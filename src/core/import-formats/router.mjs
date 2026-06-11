@@ -1,6 +1,9 @@
 import { extname } from 'node:path';
 
-import { readChmSourceDocument, readDocxSourceDocument, readPdfSourceDocument, readSourceDocument } from '../importers.mjs';
+import { readChmSourceDocument } from '../source-chm.mjs';
+import { readDocxSourceDocument } from '../source-docx.mjs';
+import { readPdfSourceDocument } from '../source-pdf.mjs';
+import { readSourceDocument } from '../source-text.mjs';
 import { importChmDocument } from './chm.mjs';
 import { importDocxDocument } from './docx.mjs';
 import { importPdfDocument } from './pdf.mjs';

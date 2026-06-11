@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { buildTreeIndex, getChildren, getDescendants, getNodeByAddress, getSiblings } from '../../core/node-model.mjs';
+import { buildTreeIndex, getChildren, getNodeByAddress, getSiblings } from '../../core/node-model.mjs';
 import { NODE_TYPES } from '../../core/tree.mjs';
 import { plainNodeNote } from '../../core/node-notes.mjs';
 import { nodeTypeLabel } from '../lib/doc-utils.mjs';
@@ -9,14 +10,17 @@ import { nodeTypeLabel } from '../lib/doc-utils.mjs';
 import {
   clampCenterScrollTop, deriveColumns, subtreePreviewText,
   measureConnectorLines, measureButtonTops,
-  COLUMN_GAP, EXPAND_BTN, EXPAND_ICON, TEXT_CHAR_LIMIT
+  buildStatsIndex, statsForNode,
+  COLUMN_GAP, EXPAND_ICON, TEXT_CHAR_LIMIT
 } from './c2d-measure.mjs';
 
 import {
   handleColumnWheel, startColumnResize, syncParentColumn
-} from './c2d-events.mjs';
+} from './c2d-events';
 
-const NODE_TYPE_COLORS = {
+import type { C2DBlock, C2DColumn, C2DTreeIndex, ConnectorMeasure, StatsIndex } from './c2d-types';
+
+const NODE_TYPE_COLORS: Record<string, string> = {
   TEXT: 'transparent',
   IF: '#3b73a8',
   THEN: '#5f8f55',
@@ -32,138 +36,153 @@ const NODE_TYPE_COLORS = {
 const C2D_DRAG_HOLD_MS = 500;
 const C2D_DRAG_CANCEL_DISTANCE = 6;
 const C2D_DRAG_GHOST_TEXT_LIMIT = 160;
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
-function axiomBlock(axiom, index) {
-  // axiom.id can be a numeric base id or a `tmp-axiom-…` string in lazy edit
-  // branches; keep the raw value so updateAxiom/deleteAxiom payloads stay
-  // resolvable on the backend.
+type EditField = 'title' | 'text' | 'note';
+
+interface InlineEditState {
+  nodeId: string;
+  field: EditField;
+  draft: string;
+}
+
+interface DragState {
+  nodeId: string;
+  address: string;
+  title: string;
+  text: string;
+  x: number;
+  y: number;
+  offsetX: number;
+  offsetY: number;
+  targetNodeId: string | null;
+}
+
+interface DragChoiceState {
+  sourceNodeId: string;
+  targetNodeId: string;
+  x: number;
+  y: number;
+}
+
+interface CtxMenuState {
+  x: number;
+  y: number;
+  block: C2DBlock;
+  subtreePreviewVisible: boolean;
+}
+
+interface MoveDialogState {
+  nodeId: string;
+  address: string;
+  error: string;
+}
+
+interface DragSession {
+  nodeId: string;
+  startX: number;
+  startY: number;
+  x: number;
+  y: number;
+  offsetX: number;
+  offsetY: number;
+  active: boolean;
+}
+
+// 卡片通过这个稳定的 api 对象回调父组件，自身才能 memo 化。
+// 方法实现每次渲染刷新（impl ref），对象身份永不变化。
+interface CardApi {
+  clickBlock(event: ReactMouseEvent, block: C2DBlock): void;
+  openContextMenu(event: ReactMouseEvent, block: C2DBlock, subtreePreviewVisible: boolean): void;
+  pointerDownBlock(event: ReactPointerEvent<HTMLElement>, block: C2DBlock): void;
+  toggleExpand(block: C2DBlock): void;
+  toggleAxioms(): void;
+  openStats(block: C2DBlock): void;
+  startTextEdit(block: C2DBlock, subtreePreviewVisible: boolean): void;
+  setInlineDraft(draft: string): void;
+  saveInline(exit: boolean): void;
+  cancelInline(): void;
+  registerCard(addr: string, el: HTMLElement | null): void;
+  registerExpandBtn(addr: string, el: HTMLButtonElement | null): void;
+  inlineInputRef: RefObject<HTMLTextAreaElement | null>;
+}
+
+function axiomBlock(axiom: any, index: number): C2DBlock {
+  // axiom.id 是 uuid 或 lazy 编辑分支的 `tmp-axiom-…` 字符串；保留原值，
+  // updateAxiom/deleteAxiom 的 payload 才能在后端解析。
   const rawAxiomId = axiom?.id ?? null;
   const label = String(axiom?.label || `A${index + 1}`);
   return {
     id: `axiom:${rawAxiomId ?? label}`,
     axiomId: rawAxiomId,
     address: label,
-    depth: 0,
-    sortOrder: index + 1,
     parentId: null,
     childCount: 0,
     nodeType: 'AXIOMS',
-    kind: 'axiom',
     title: String(axiom?.node_title || '').trim(),
     text: String(axiom?.content || '').trim(),
-    note: String(axiom?.node_note || '').trim(),
-    status: axiom?.status || 'pending'
+    note: String(axiom?.node_note || '').trim()
   };
 }
 
-function nodeContentText(node) {
-  return [node?.title, node?.text, node?.note]
-    .map((part) => String(part || '').trim())
-    .filter(Boolean)
-    .join('\n');
-}
-
-function contentStats(text) {
-  const value = String(text || '');
-  const wordMatches = value.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]|[\p{L}\p{N}]+/gu) || [];
-  const noSpace = value.replace(/\s+/g, '');
-  return {
-    words: wordMatches.length,
-    charsNoSpace: Array.from(noSpace).length,
-    charsWithSpace: Array.from(value).length
-  };
-}
-
-function nodeStats(index, node) {
-  const descendants = node ? getDescendants(index, node.id) : [];
-  const subtreeNodes = node ? [node, ...descendants] : [];
-  const own = contentStats(nodeContentText(node));
-  const subtree = contentStats(subtreeNodes.map(nodeContentText).filter(Boolean).join('\n'));
-  const nodeDepth = Number(node?.depth) || String(node?.address || '1').split('-').filter(Boolean).length || 1;
-  const maxDepth = subtreeNodes.reduce((max, item) => Math.max(max, Number(item?.depth) || nodeDepth), nodeDepth);
-  return {
-    own,
-    subtree,
-    subtreeNodeCount: subtreeNodes.length,
-    remainingDepth: Math.max(0, maxDepth - nodeDepth),
-    nextDepthWidth: node ? getChildren(index, node.id).length : 0
-  };
-}
-
-function isRootNode(node) {
+function isRootNode(node: C2DBlock | null | undefined) {
   return !node?.parentId || String(node?.address || '') === '1';
 }
 
-function isAxiomNode(node) {
-  return String(node?.nodeType || '').toUpperCase() === 'AXIOMS' || String(node?.address || '').startsWith('A');
+function isAxiomNode(node: C2DBlock | null | undefined) {
+  return node?.nodeType === 'AXIOMS';
 }
 
-// In lazy edit-branch mode some nodes have tmp ids like `tmp-node-…`, so
-// id comparisons and Map lookups must use string keys rather than Number().
-function sameNodeId(left, right) {
-  if (left === null || left === undefined || right === null || right === undefined) return false;
-  return String(left) === String(right);
+// id 全链路是字符串（uuidv7 / `tmp-…`，见 c2d-types），byId 键即原值。
+function lookupBlock(index: C2DTreeIndex, id: string | null | undefined): C2DBlock | null {
+  return (id && index.byId.get(id)) || null;
 }
 
-// Look up a block in `index.byId` tolerating legacy numeric ids and stable text ids.
-function lookupBlock(index, id) {
-  if (id === null || id === undefined) return null;
-  const direct = index.byId.get(id);
-  if (direct) return direct;
-  if (typeof id === 'string' && id.startsWith('tmp-')) return null;
-  const numeric = Number(id);
-  if (Number.isInteger(numeric)) {
-    const byNumber = index.byId.get(numeric);
-    if (byNumber) return byNumber;
-  }
-  return index.byId.get(String(id)) || null;
-}
-
-function isValidDragTarget(source, target) {
+function isValidDragTarget(source: C2DBlock | null, target: C2DBlock | null): target is C2DBlock {
   if (!source || !target) return false;
   if (isAxiomNode(source) || isAxiomNode(target)) return false;
-  if (sameNodeId(source.id, target.id)) return false;
+  if (source.id === target.id) return false;
   const sourceAddress = String(source.address || '');
   const targetAddress = String(target.address || '');
   if (sourceAddress && targetAddress.startsWith(`${sourceAddress}-`)) return false;
   return true;
 }
 
-function ancestorAddresses(address) {
+function ancestorAddresses(address: string) {
   const parts = String(address || '').split('-').filter(Boolean);
-  const result = [];
+  const result: string[] = [];
   for (let i = 1; i < parts.length; i++) {
     result.push(parts.slice(0, i).join('-'));
   }
   return result;
 }
 
-function focusAddressForExpandedNode(index, node) {
+function focusAddressForExpandedNode(index: C2DTreeIndex, node: C2DBlock | null) {
   if (!node) return null;
   const firstChild = getChildren(index, node.id)[0];
   return firstChild?.address || node.address || null;
 }
 
-function addressDepth(address) {
+function addressDepth(address: string | null | undefined) {
   return String(address || '').split('-').filter(Boolean).length || 1;
 }
 
-function addressAtDepth(address, depth) {
+function addressAtDepth(address: string | null | undefined, depth: number) {
   const parts = String(address || '').split('-').filter(Boolean);
   const targetDepth = Math.max(1, Math.floor(Number(depth) || 1));
   return parts.slice(0, Math.min(parts.length, targetDepth)).join('-') || null;
 }
 
-function expandedAddressesForVisibleDepth(root, visibleDepthLimit, index) {
+function expandedAddressesForVisibleDepth(root: C2DBlock | null, visibleDepthLimit: number, index: C2DTreeIndex) {
   const targetDepth = Math.max(1, Math.floor(Number(visibleDepthLimit) || 1));
-  const next = new Set();
+  const next = new Set<string>();
   if (!root) return next;
   // index.root 经 toTreeNode 重建后没有 children 属性，必须用 index.childrenOf 走树。
-  const stack = [root];
+  const stack: C2DBlock[] = [root];
   while (stack.length > 0) {
-    const node = stack.pop();
+    const node = stack.pop()!;
     const nodeDepth = Math.max(1, Number(node.depth) || addressDepth(node.address));
-    const children = index ? getChildren(index, node.id) : (Array.isArray(node.children) ? node.children : []);
+    const children = index ? getChildren(index, node.id) : [];
     if (nodeDepth < targetDepth && (Number(node.childCount) > 0 || children.length > 0)) {
       next.add(node.address);
     }
@@ -172,7 +191,7 @@ function expandedAddressesForVisibleDepth(root, visibleDepthLimit, index) {
   return next;
 }
 
-function isVisibleDepthFullyExpanded(root, visibleDepthLimit, expanded, index) {
+function isVisibleDepthFullyExpanded(root: C2DBlock | null, visibleDepthLimit: number, expanded: Set<string>, index: C2DTreeIndex) {
   const required = expandedAddressesForVisibleDepth(root, visibleDepthLimit, index);
   for (const address of required) {
     if (!expanded.has(address)) return false;
@@ -180,13 +199,13 @@ function isVisibleDepthFullyExpanded(root, visibleDepthLimit, expanded, index) {
   return true;
 }
 
-function clampVisibleDepth(value, maxDepth) {
+function clampVisibleDepth(value: number, maxDepth: number) {
   const max = Math.max(1, Math.floor(Number(maxDepth) || 1));
   const depth = Math.max(1, Math.floor(Number(value) || 1));
   return Math.min(max, depth);
 }
 
-function visibleDepthForExpandedAddresses(expanded, maxDepth) {
+function visibleDepthForExpandedAddresses(expanded: Iterable<string>, maxDepth: number) {
   let depth = 1;
   for (const address of expanded || []) {
     depth = Math.max(depth, addressDepth(address) + 1);
@@ -194,18 +213,217 @@ function visibleDepthForExpandedAddresses(expanded, maxDepth) {
   return clampVisibleDepth(depth, maxDepth);
 }
 
-function sourcePositionText(value) {
+function sourcePositionText(value: unknown) {
   const position = Number(value);
   if (!Number.isFinite(position)) return '';
   return String(position);
 }
 
-function emptyNodePlaceholder(block, paragraphLabelByNodeId) {
-  const position = sourcePositionText(block?.sourcePosition ?? block?.source_position);
+function emptyNodePlaceholder(block: C2DBlock, paragraphLabelByNodeId: Map<string, string> | null | undefined) {
+  const position = sourcePositionText(block.sourcePosition);
   if (!position) return '空节点';
-  const paragraphLabel = paragraphLabelByNodeId?.get?.(String(block?.id));
+  const paragraphLabel = paragraphLabelByNodeId?.get(block.id);
   return paragraphLabel ? `段落 ${paragraphLabel}，句位 ${position}` : `句位 ${position}`;
 }
+
+// 连接线层完全在 React 之外命令式维护：path 池按需增删、逐条写 d 与
+// data-edge-*（e2e 视觉探针读这些属性），不触发任何 React 渲染。
+function syncConnectorLayer(svg: SVGSVGElement | null, conn: ConnectorMeasure) {
+  if (!svg) return;
+  svg.setAttribute('width', String(conn.w));
+  svg.setAttribute('height', String(conn.h));
+  svg.setAttribute('viewBox', `0 0 ${conn.w} ${conn.h}`);
+  while (svg.children.length > conn.lines.length) {
+    svg.removeChild(svg.lastElementChild!);
+  }
+  while (svg.children.length < conn.lines.length) {
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('class', 'c2d-connector-line');
+    svg.appendChild(path);
+  }
+  for (let i = 0; i < conn.lines.length; i++) {
+    const line = conn.lines[i];
+    const path = svg.children[i] as SVGPathElement;
+    path.setAttribute('d', line.d);
+    path.setAttribute('data-edge-left', String(line.bounds?.left ?? 0));
+    path.setAttribute('data-edge-top', String(line.bounds?.top ?? 0));
+    path.setAttribute('data-edge-width', String(line.bounds?.width ?? 0));
+    path.setAttribute('data-edge-height', String(line.bounds?.height ?? 0));
+  }
+}
+
+function renderTypeBar(block: C2DBlock) {
+  const type = String(block?.nodeType || 'TEXT').toUpperCase();
+  if (type === 'TEXT') return null;
+  const color = NODE_TYPE_COLORS[type];
+  if (!color || color === 'transparent') return null;
+  return (
+    <div
+      className="c2d-node-type-bar"
+      style={{ '--c2d-node-type-color': color }}
+      title={nodeTypeLabel(type)}
+      aria-label={nodeTypeLabel(type)}
+    />
+  );
+}
+
+function InlineEditor({ edit, field, api }: { edit: InlineEditState | null; field: EditField; api: CardApi }) {
+  if (!edit || edit.field !== field) return null;
+  const label = field === 'title' ? '编辑标题' : field === 'note' ? '编辑摘要备注' : '编辑正文';
+  return (
+    <form
+      className={`c2d-inline-editor c2d-inline-editor-${field}`}
+      onSubmit={(event) => {
+        event.preventDefault();
+        api.saveInline(true);
+      }}
+    >
+      <span className="c2d-inline-label">{label}</span>
+      <textarea
+        ref={api.inlineInputRef}
+        className="c2d-inline-input"
+        value={edit.draft}
+        rows={field === 'text' ? 4 : 2}
+        onChange={(event) => api.setInlineDraft(event.target.value)}
+        onKeyDown={(event) => {
+          event.stopPropagation();
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            api.cancelInline();
+          } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault();
+            api.saveInline(true);
+          }
+        }}
+        autoFocus
+      />
+      <div className="c2d-inline-actions">
+        <button type="button" onClick={() => api.saveInline(false)}>保存</button>
+        <button type="submit">保存并退出</button>
+        <button type="button" onClick={api.cancelInline}>取消</button>
+      </div>
+    </form>
+  );
+}
+
+interface C2DNodeCardProps {
+  block: C2DBlock;
+  index: C2DTreeIndex;
+  statsIndex: StatsIndex;
+  api: CardApi;
+  selected: boolean;
+  isExpanded: boolean;
+  hasAxioms: boolean;
+  showAxiomColumn: boolean;
+  showNotes: boolean;
+  isDragSource: boolean;
+  isDragTarget: boolean;
+  /** 仅当本卡片处于行内编辑时非 null，其它卡片保持 null 以命中 memo。 */
+  inlineEdit: InlineEditState | null;
+  paragraphLabelByNodeId: Map<string, string> | null | undefined;
+}
+
+const C2DNodeCard = memo(function C2DNodeCard({
+  block, index, statsIndex, api,
+  selected, isExpanded, hasAxioms, showAxiomColumn, showNotes,
+  isDragSource, isDragTarget, inlineEdit, paragraphLabelByNodeId
+}: C2DNodeCardProps) {
+  const addr = block.address;
+  const hasChildren = block.childCount > 0;
+  const Icon = isExpanded ? ChevronLeft : ChevronRight;
+  const AxiomIcon = showAxiomColumn ? ChevronRight : ChevronLeft;
+  const isAxiom = isAxiomNode(block);
+  const hasAxiomToggle = !isAxiom && isRootNode(block) && hasAxioms;
+
+  const title = block.title || '';
+  const noteText = plainNodeNote(block.note || '');
+  let ownText = block.text || '';
+  let subtreePreview = '';
+  // 节点 text 字段里通常已经包含子节点 text（PDF 解析就这么存的）。无论展开还是收起，
+  // ownText 都要先剥掉直接子节点的 text 再渲染；否则收起态下 ownText + subtreePreview
+  // 会重复显示同一段内容。
+  if (hasChildren) {
+    const children = getChildren(index, block.id);
+    if (children.length > 0) {
+      let stripped = ownText;
+      for (const child of children) {
+        if (child.text) stripped = stripped.replace(child.text, '');
+      }
+      ownText = stripped.trim();
+    }
+    if (!isExpanded) {
+      subtreePreview = subtreePreviewText(index, block.id, TEXT_CHAR_LIMIT);
+    }
+  }
+  const stats = statsForNode(statsIndex, index, block);
+  const subtreePreviewVisible = Boolean(subtreePreview);
+  const emptyPlaceholder = emptyNodePlaceholder(block, paragraphLabelByNodeId);
+  const editTextFromBody = (event: ReactMouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    api.startTextEdit(block, subtreePreviewVisible);
+  };
+  const titleEditor = <InlineEditor edit={inlineEdit} field="title" api={api} />;
+  const textEditor = <InlineEditor edit={inlineEdit} field="text" api={api} />;
+  const noteEditor = <InlineEditor edit={inlineEdit} field="note" api={api} />;
+  const editingField = inlineEdit?.field ?? null;
+
+  return (
+    <article
+      data-node-id={block.id}
+      data-node-address={addr}
+      ref={(el) => api.registerCard(addr, el)}
+      className={`c2d-node-card${selected ? ' selected' : ''}${isExpanded ? ' expanded' : ''}${hasAxiomToggle ? ' has-axiom-toggle' : ''}${isAxiom ? ' axiom-node' : ''}${isDragSource ? ' drag-source' : ''}${isDragTarget ? ' drag-target' : ''}`}
+      onPointerDown={(event) => api.pointerDownBlock(event, block)}
+      onClick={(event) => api.clickBlock(event, block)}
+      onContextMenu={(event) => api.openContextMenu(event, block, subtreePreviewVisible)}
+    >
+      {renderTypeBar(block)}
+      <button
+        type="button"
+        className="c2d-node-stats-button"
+        title="节点统计"
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          api.openStats(block);
+        }}
+      >
+        {stats.subtree.words}
+      </button>
+      <div className="c2d-node-meta">{addr}</div>
+      {editingField === 'title' ? titleEditor : (title ? <div className="c2d-node-title">{title}</div> : null)}
+      {editingField === 'text' ? textEditor : (ownText
+        ? <div className="c2d-node-body" onDoubleClick={editTextFromBody}>{ownText}</div>
+        : !subtreePreview && <div className="c2d-node-body muted" onDoubleClick={editTextFromBody}>{emptyPlaceholder}</div>)}
+      {subtreePreview ? <div className="c2d-node-body c2d-subtree-preview" onDoubleClick={editTextFromBody}>{subtreePreview}</div> : null}
+      {editingField === 'note' ? noteEditor : (showNotes && noteText ? <div className="c2d-node-note">{noteText}</div> : null)}
+      {hasAxiomToggle ? (
+        <button
+          type="button"
+          className="c2d-expand-button c2d-axiom-expand-button"
+          aria-label={showAxiomColumn ? '收起事实前提' : '展开事实前提'}
+          title={showAxiomColumn ? '收起事实前提' : '展开事实前提'}
+          onClick={(event) => { event.stopPropagation(); event.preventDefault(); api.toggleAxioms(); }}
+        >
+          <AxiomIcon aria-hidden="true" size={EXPAND_ICON} strokeWidth={2.2} />
+        </button>
+      ) : null}
+      {hasChildren ? (
+        <button
+          type="button"
+          ref={(el) => api.registerExpandBtn(addr, el)}
+          className="c2d-expand-button c2d-child-expand-button"
+          aria-label={isExpanded ? '收起' : '展开'}
+          title={isExpanded ? '收起' : '展开'}
+          onClick={(event) => { event.stopPropagation(); event.preventDefault(); api.toggleExpand(block); }}
+        >
+          <Icon aria-hidden="true" size={EXPAND_ICON} strokeWidth={2.2} />
+        </button>
+      ) : null}
+    </article>
+  );
+});
 
 // ══════════════════════════════════════════════════════════
 // C2DMapView — 组件只做三件事：
@@ -214,8 +432,36 @@ function emptyNodePlaceholder(block, paragraphLabelByNodeId) {
 //   3. 输出 JSX
 //
 // 布局计算 → c2d-measure.mjs
-// 事件处理 → c2d-events.mjs
+// 事件处理 → c2d-events.ts
+// 卡片渲染 → C2DNodeCard（memo，经稳定 CardApi 回调）
+// 连接线 / 展开按钮位置 → applyMeasure 命令式写 DOM，不进 React state
 // ══════════════════════════════════════════════════════════
+
+interface C2DMapViewProps {
+  docId?: string | number | null;
+  rootNode: unknown;
+  selectedNodeId?: string | null;
+  setSelectedNodeId?: (id: string) => void;
+  setMultiSelectedIds?: (ids: Set<unknown>) => void;
+  onRenderReady?: ((info: { docId: string | number | null; renderBackend: string; visual: null }) => void) | null;
+  onNotice?: ((message: string) => void) | null;
+  locateRequest?: { address?: string | null; seq?: number | null } | null;
+  axioms?: unknown[];
+  axiomsCollapsed?: boolean;
+  onToggleAxiomsCollapsed?: (() => void) | null;
+  showNotes?: boolean;
+  paragraphLabelByNodeId?: Map<string, string> | null;
+  visibleDepthLimit?: number;
+  depthControlSeq?: number;
+  depthControlAction?: string;
+  maxVisibleDepth?: number;
+  onVisibleDepthChange?: ((depth: number) => void) | null;
+  treeEditMode?: boolean;
+  runWrite?: ((task: () => any) => any) | null;
+  nodeActions?: Record<string, (payload: Record<string, any>) => any>;
+  onAddAxiom?: ((nodeId: string) => void) | null;
+  onAddAxiomRef?: ((nodeId: string) => void) | null;
+}
 
 export function C2DMapView({
   docId = null,
@@ -241,44 +487,53 @@ export function C2DMapView({
   nodeActions = {},
   onAddAxiom = null,
   onAddAxiomRef = null,
-}) {
+}: C2DMapViewProps) {
   // ── 状态 ────────────────────────────────────
-  const [expanded, setExpanded]       = useState(() => new Set());
-  const [colWidths, setColWidths]     = useState([]);
-  const [hovered, setHovered]         = useState(null);
-  const [ctxMenu, setCtxMenu]         = useState(null);
-  const [inlineEdit, setInlineEdit]   = useState(null);
-  const [moveDialog, setMoveDialog]   = useState(null);
-  const [statsNodeId, setStatsNodeId] = useState(null);
-  const [dragState, setDragState]     = useState(null);
-  const [dragChoice, setDragChoice]   = useState(null);
-  const [selectedBlockId, setSelectedBlockId] = useState(null);
-  const [conn, setConn]               = useState({ lines: [], w: 1, h: 1 });
-  const [btnTops, setBtnTops]         = useState(() => new Map());
+  const [expanded, setExpanded]       = useState<Set<string>>(() => new Set());
+  const [colWidths, setColWidths]     = useState<number[]>([]);
+  const [ctxMenu, setCtxMenu]         = useState<CtxMenuState | null>(null);
+  const [inlineEdit, setInlineEdit]   = useState<InlineEditState | null>(null);
+  const [moveDialog, setMoveDialog]   = useState<MoveDialogState | null>(null);
+  const [statsNodeId, setStatsNodeId] = useState<string | null>(null);
+  const [dragState, setDragState]     = useState<DragState | null>(null);
+  const [dragChoice, setDragChoice]   = useState<DragChoiceState | null>(null);
+  const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
 
   // ── Ref ─────────────────────────────────────
-  const surfaceRef     = useRef(null);
-  const stripRef       = useRef(null);
-  const spacerRef      = useRef(null);
-  const cards          = useRef(new Map());
-  const colEls         = useRef(new Map());
+  const surfaceRef     = useRef<HTMLDivElement | null>(null);
+  const stripRef       = useRef<HTMLDivElement | null>(null);
+  const spacerRef      = useRef<HTMLDivElement | null>(null);
+  const svgRef         = useRef<SVGSVGElement | null>(null);
+  const cards          = useRef(new Map<string, HTMLElement>());
+  const colEls         = useRef(new Map<number, HTMLElement>());
+  const expandBtnEls   = useRef(new Map<string, HTMLButtonElement>());
   const readyFired     = useRef(false);
   const savedScrollX   = useRef(0);
   const prevColCount   = useRef(0);
-  const scrollTargets  = useRef(new Map());
+  const scrollTargets  = useRef(new Map<number | string, number | ReturnType<typeof setTimeout>>());
   const surfaceWidth   = useRef(0);
-  const pendingLocate  = useRef(null);
-  const lastHotspot    = useRef(null);
+  const pendingLocate  = useRef<string | null>(null);
+  const lastHotspot    = useRef<string | null>(null);
   const expandedRef    = useRef(expanded);
   const handledDepthControlSeq = useRef(0);
   const skipNextColumnAutoCenter = useRef(false);
-  const previousShowAxiomColumn = useRef(null);
-  const dragHoldTimer  = useRef(null);
-  const dragSession    = useRef(null);
-  const dragHandlers   = useRef({ move: null, up: null, cancel: null });
-  const dragListeners  = useRef(null);
+  const previousShowAxiomColumn = useRef<boolean | null>(null);
+  const dragHoldTimer  = useRef<number | null>(null);
+  const dragSession    = useRef<DragSession | null>(null);
+  const dragHandlers   = useRef<{
+    move: ((event: PointerEvent) => void) | null;
+    up: ((event: PointerEvent) => void) | null;
+    cancel: ((event: PointerEvent) => void) | null;
+  }>({ move: null, up: null, cancel: null });
+  const dragListeners  = useRef<{
+    move: (event: PointerEvent) => void;
+    up: (event: PointerEvent) => void;
+    cancel: (event: PointerEvent) => void;
+  } | null>(null);
   const suppressClick  = useRef(false);
-  const inlineInputRef = useRef(null);
+  const inlineInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const measureRaf     = useRef(0);
+  const applyMeasureRef = useRef<() => void>(() => {});
   if (!dragListeners.current) {
     dragListeners.current = {
       move: (event) => dragHandlers.current.move?.(event),
@@ -288,13 +543,15 @@ export function C2DMapView({
   }
 
   // ── 推导数据 ─────────────────────────────────
-  const index = useMemo(() => buildTreeIndex(rootNode), [rootNode]);
+  const index = useMemo<C2DTreeIndex>(() => buildTreeIndex(rootNode), [rootNode]);
   const root = index.root;
-  const columns = useMemo(() => deriveColumns(root, expanded, index), [root, expanded, index]);
+  const columns = useMemo<C2DColumn[]>(() => deriveColumns(root, expanded, index), [root, expanded, index]);
+  // 字数/字符统计整树一次预计算，渲染路径 O(1) 取数。
+  const statsIndex = useMemo<StatsIndex>(() => buildStatsIndex(index), [index]);
   const axiomBlocks = useMemo(() => (Array.isArray(axioms) ? axioms : []).map(axiomBlock), [axioms]);
   const hasAxioms = axiomBlocks.length > 0;
   const showAxiomColumn = hasAxioms && !axiomsCollapsed;
-  const displayColumns = useMemo(() => {
+  const displayColumns = useMemo<C2DColumn[]>(() => {
     if (!showAxiomColumn || !root) return columns;
     return [
       { kind: 'axioms', groups: [{ parent: root, blocks: axiomBlocks, direction: 'left' }] },
@@ -325,7 +582,7 @@ export function C2DMapView({
     input.setSelectionRange(end, end);
   }, [inlineEdit?.nodeId, inlineEdit?.field]);
 
-  const runNodeAction = useCallback((action, payload) => {
+  const runNodeAction = useCallback((action: string, payload: Record<string, any>) => {
     if (!canEdit) return null;
     const handler = nodeActions?.[action];
     if (typeof handler !== 'function') {
@@ -336,17 +593,17 @@ export function C2DMapView({
     return runWrite ? runWrite(task) : task();
   }, [canEdit, nodeActions, onNotice, runWrite]);
 
-  function blockById(blockId) {
-    const axiom = axiomBlocks.find((item) => String(item.id) === String(blockId));
+  function blockById(blockId: string | null | undefined): C2DBlock | null {
+    const axiom = axiomBlocks.find((item) => item.id === blockId);
     if (axiom) return axiom;
     return lookupBlock(index, blockId);
   }
 
-  function resultNodeId(result) {
+  function resultNodeId(result: any): string | null {
     return result?.insertedNodeId || result?.node?.id || result?.nodeId || null;
   }
 
-  async function addChild(block) {
+  async function addChild(block: C2DBlock) {
     if (isAxiomNode(block)) return;
     const result = await runNodeAction('insertNode', {
       docId,
@@ -358,7 +615,7 @@ export function C2DMapView({
     if (nextNodeId) setSelectedNodeId?.(nextNodeId);
   }
 
-  async function addSibling(block) {
+  async function addSibling(block: C2DBlock) {
     if (!block?.parentId || isAxiomNode(block)) return;
     const result = await runNodeAction('insertNode', {
       docId,
@@ -371,9 +628,9 @@ export function C2DMapView({
     if (nextNodeId) setSelectedNodeId?.(nextNodeId);
   }
 
-  async function updateNode(block, patch) {
+  async function updateNode(block: C2DBlock, patch: Record<string, unknown>) {
     if (isAxiomNode(block)) {
-      const nextPatch = {};
+      const nextPatch: Record<string, unknown> = {};
       if (Object.prototype.hasOwnProperty.call(patch, 'text')) nextPatch.content = patch.text;
       if (Object.prototype.hasOwnProperty.call(patch, 'node_title')) nextPatch.node_title = patch.node_title;
       if (Object.prototype.hasOwnProperty.call(patch, 'node_note')) nextPatch.node_note = patch.node_note;
@@ -391,24 +648,24 @@ export function C2DMapView({
     });
   }
 
-  async function moveNode(block, direction) {
+  async function moveNode(block: C2DBlock, direction: 'up' | 'down') {
     if (isAxiomNode(block)) return;
     await runNodeAction('moveNode', { docId, nodeId: block.id, direction });
   }
 
-  async function promoteNode(block) {
+  async function promoteNode(block: C2DBlock) {
     const parent = block?.parentId ? lookupBlock(index, block.parentId) : null;
     if (!block?.parentId || !parent?.parentId) return;
     await runNodeAction('promoteNode', { docId, nodeId: block.id });
   }
 
-  async function splitNode(block) {
+  async function splitNode(block: C2DBlock) {
     if (isAxiomNode(block)) return;
     const result = await runNodeAction('splitNode', { docId, nodeId: block.id });
     if (result?.changed === false) onNotice?.('当前节点无法自动拆分。');
   }
 
-  async function deleteNode(block) {
+  async function deleteNode(block: C2DBlock) {
     if (isAxiomNode(block)) {
       if (!block?.axiomId) return;
       const ok = window.confirm(`删除事实前提 ${block.address} 及其引用？`);
@@ -422,7 +679,7 @@ export function C2DMapView({
     await runNodeAction('deleteNode', { docId, nodeId: block.id });
   }
 
-  function startInlineEdit(block, field, options = {}) {
+  function startInlineEdit(block: C2DBlock, field: EditField, options: { subtreePreviewVisible?: boolean } = {}) {
     if (!canEdit) return;
     if (field === 'text' && options.subtreePreviewVisible) {
       onNotice?.('请先展开子树再编辑节点文本');
@@ -458,7 +715,7 @@ export function C2DMapView({
     if (exit) setInlineEdit(null);
   }
 
-  function openMoveDialog(block) {
+  function openMoveDialog(block: C2DBlock) {
     setMoveDialog({ nodeId: block.id, address: '', error: '' });
     setCtxMenu(null);
   }
@@ -476,7 +733,7 @@ export function C2DMapView({
 
   function endDragSession() {
     clearDragHoldTimer();
-    const listeners = dragListeners.current;
+    const listeners = dragListeners.current!;
     window.removeEventListener('pointermove', listeners.move, true);
     window.removeEventListener('pointerup', listeners.up, true);
     window.removeEventListener('pointercancel', listeners.cancel, true);
@@ -485,9 +742,9 @@ export function C2DMapView({
     setDragState(null);
   }
 
-  function validDragTargetAt(clientX, clientY) {
+  function validDragTargetAt(clientX: number, clientY: number) {
     const element = document.elementFromPoint(clientX, clientY);
-    const card = element?.closest?.('.c2d-node-card');
+    const card = (element?.closest?.('.c2d-node-card') || null) as HTMLElement | null;
     const targetId = card?.dataset?.nodeId || null;
     const session = dragSession.current;
     const source = session ? lookupBlock(index, session.nodeId) : null;
@@ -522,10 +779,10 @@ export function C2DMapView({
     });
   }
 
-  function startDragHold(event, block) {
+  function startDragHold(event: ReactPointerEvent<HTMLElement>, block: C2DBlock) {
     if (!canEdit || !block || isRootNode(block)) return;
     if (event.button !== undefined && event.button !== 0) return;
-    if (event.target?.closest?.('button, input, textarea, select, .c2d-inline-editor')) return;
+    if ((event.target as HTMLElement)?.closest?.('button, input, textarea, select, .c2d-inline-editor')) return;
     const rect = event.currentTarget.getBoundingClientRect();
     dragSession.current = {
       nodeId: block.id,
@@ -539,13 +796,13 @@ export function C2DMapView({
     };
     clearDragHoldTimer();
     dragHoldTimer.current = window.setTimeout(beginDragSession, C2D_DRAG_HOLD_MS);
-    const listeners = dragListeners.current;
+    const listeners = dragListeners.current!;
     window.addEventListener('pointermove', listeners.move, true);
     window.addEventListener('pointerup', listeners.up, true);
     window.addEventListener('pointercancel', listeners.cancel, true);
   }
 
-  function handleDragPointerMove(event) {
+  function handleDragPointerMove(event: PointerEvent) {
     const session = dragSession.current;
     if (!session) return;
     session.x = event.clientX;
@@ -567,7 +824,7 @@ export function C2DMapView({
     } : current);
   }
 
-  function handleDragPointerUp(event) {
+  function handleDragPointerUp(event: PointerEvent) {
     const session = dragSession.current;
     if (!session) return;
     const wasActive = Boolean(session.active);
@@ -599,7 +856,7 @@ export function C2DMapView({
   dragHandlers.current.up = handleDragPointerUp;
   dragHandlers.current.cancel = handleDragPointerCancel;
 
-  async function applyDragChoice(mode) {
+  async function applyDragChoice(mode: 'merge' | 'sibling' | 'child') {
     if (!dragChoice) return;
     const source = lookupBlock(index, dragChoice.sourceNodeId);
     const target = lookupBlock(index, dragChoice.targetNodeId);
@@ -609,15 +866,15 @@ export function C2DMapView({
     }
     setDragChoice(null);
     if (mode === 'merge') {
-      await runNodeAction('mergeNodeIntoTarget', { docId, nodeId: source.id, targetNodeId: target.id });
+      await runNodeAction('mergeNodeIntoTarget', { docId, nodeId: source!.id, targetNodeId: target.id });
     } else if (mode === 'sibling') {
-      await runNodeAction('moveNodeAfterSibling', { docId, nodeId: source.id, targetNodeId: target.id });
+      await runNodeAction('moveNodeAfterSibling', { docId, nodeId: source!.id, targetNodeId: target.id });
     } else {
-      await runNodeAction('moveNodeToParent', { docId, nodeId: source.id, newParentId: target.id });
+      await runNodeAction('moveNodeToParent', { docId, nodeId: source!.id, newParentId: target.id });
     }
   }
 
-  async function applyMoveDialog(mode) {
+  async function applyMoveDialog(mode: 'merge' | 'sibling' | 'child') {
     if (!moveDialog) return;
     const node = lookupBlock(index, moveDialog.nodeId);
     const target = getNodeByAddress(index, String(moveDialog.address || '').trim());
@@ -635,22 +892,38 @@ export function C2DMapView({
     setMoveDialog(null);
   }
 
-  // ── 统一测量入口（effect 和事件都调这一个）──
-  const runMeasure = useCallback(() => {
-    setConn(measureConnectorLines(
+  // ── 统一测量入口 ─────────────────────────────
+  // 测量结果不进 React state：连接线写进 svg path 池，按钮位置直接写
+  // style.top。滚动期间不触发任何 React 渲染。
+  const applyMeasure = useCallback(() => {
+    const conn = measureConnectorLines(
       stripRef.current, surfaceRef.current,
       colEls.current, cards.current, displayColumns
-    ));
-    const next = measureButtonTops(displayColumns, expanded, colEls.current, cards.current);
-    setBtnTops(prev => {
-      if (prev.size !== next.size) return next;
-      for (const [k, v] of prev) if (Math.abs((next.get(k) ?? -1) - v) > 0.5) return next;
-      return prev;
+    ) as ConnectorMeasure;
+    syncConnectorLayer(svgRef.current, conn);
+    const tops = measureButtonTops(displayColumns, colEls.current, cards.current) as Map<string, number>;
+    for (const [addr, btn] of expandBtnEls.current) {
+      const top = tops.get(addr);
+      if (Number.isFinite(top)) btn.style.top = `${top}px`;
+    }
+  }, [displayColumns]);
+  applyMeasureRef.current = applyMeasure;
+
+  // rAF 合并：同一帧内的多次调度只测一次。
+  const scheduleMeasure = useCallback(() => {
+    if (measureRaf.current) return;
+    measureRaf.current = requestAnimationFrame(() => {
+      measureRaf.current = 0;
+      applyMeasureRef.current();
     });
-  }, [displayColumns, expanded]);
+  }, []);
+
+  useEffect(() => () => {
+    if (measureRaf.current) cancelAnimationFrame(measureRaf.current);
+  }, []);
 
   // ── 展开 / 收起 ────────────────────────────
-  const toggleExpand = useCallback((block) => {
+  const toggleExpand = useCallback((block: C2DBlock) => {
     const addr = block?.address;
     if (!addr) return;
     const wasExpanded = expanded.has(addr);
@@ -678,6 +951,76 @@ export function C2DMapView({
     setExpanded(next);
   }, [docId, expanded, index, maxVisibleDepth]);
 
+  // ── 卡片回调 api：对象身份稳定，实现每次渲染刷新 ──
+  const cardApiImpl = useRef<Omit<CardApi, 'inlineInputRef' | 'registerCard' | 'registerExpandBtn'> | null>(null);
+  cardApiImpl.current = {
+    clickBlock(event, block) {
+      if (suppressClick.current) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      setCtxMenu(null);
+      setSelectedBlockId(block.id);
+      if (!isAxiomNode(block)) setSelectedNodeId?.(block.id);
+      setMultiSelectedIds(new Set());
+    },
+    openContextMenu(event, block, subtreePreviewVisible) {
+      event.preventDefault();
+      event.stopPropagation();
+      setSelectedBlockId(block.id);
+      setCtxMenu({ x: event.clientX, y: event.clientY, block, subtreePreviewVisible });
+      if (!isAxiomNode(block)) setSelectedNodeId?.(block.id);
+    },
+    pointerDownBlock(event, block) {
+      startDragHold(event, block);
+    },
+    toggleExpand(block) {
+      toggleExpand(block);
+    },
+    toggleAxioms() {
+      onToggleAxiomsCollapsed?.();
+    },
+    openStats(block) {
+      setStatsNodeId(block.id);
+      setSelectedBlockId(block.id);
+      if (!isAxiomNode(block)) setSelectedNodeId?.(block.id);
+    },
+    startTextEdit(block, subtreePreviewVisible) {
+      startInlineEdit(block, 'text', { subtreePreviewVisible });
+    },
+    setInlineDraft(draft) {
+      setInlineEdit((current) => current ? { ...current, draft } : current);
+    },
+    saveInline(exit) {
+      saveInlineEdit(exit);
+    },
+    cancelInline() {
+      cancelInlineEdit();
+    }
+  };
+  const cardApi = useMemo<CardApi>(() => ({
+    clickBlock: (event, block) => cardApiImpl.current!.clickBlock(event, block),
+    openContextMenu: (event, block, visible) => cardApiImpl.current!.openContextMenu(event, block, visible),
+    pointerDownBlock: (event, block) => cardApiImpl.current!.pointerDownBlock(event, block),
+    toggleExpand: (block) => cardApiImpl.current!.toggleExpand(block),
+    toggleAxioms: () => cardApiImpl.current!.toggleAxioms(),
+    openStats: (block) => cardApiImpl.current!.openStats(block),
+    startTextEdit: (block, visible) => cardApiImpl.current!.startTextEdit(block, visible),
+    setInlineDraft: (draft) => cardApiImpl.current!.setInlineDraft(draft),
+    saveInline: (exit) => cardApiImpl.current!.saveInline(exit),
+    cancelInline: () => cardApiImpl.current!.cancelInline(),
+    registerCard: (addr, el) => {
+      if (el) cards.current.set(addr, el);
+      else cards.current.delete(addr);
+    },
+    registerExpandBtn: (addr, el) => {
+      if (el) expandBtnEls.current.set(addr, el);
+      else expandBtnEls.current.delete(addr);
+    },
+    inlineInputRef
+  }), []);
+
   // ══════════════════════════════════════════════
   // Effect 区：数据获取 + 视图同步
   // ══════════════════════════════════════════════
@@ -699,8 +1042,8 @@ export function C2DMapView({
   }, [canEdit]);
 
   useLayoutEffect(() => {
-    let restored = new Set();
-    let hotspot = null;
+    const restored = new Set<string>();
+    let hotspot: string | null = null;
     lastHotspot.current = null;
     if (docId) {
       try {
@@ -737,7 +1080,7 @@ export function C2DMapView({
       return { nextExpanded: next, targetDepth: 1 };
     };
 
-    let resolved = null;
+    let resolved: { nextExpanded: Set<string>; targetDepth: number } | null = null;
     if (action === 'collapseAll') {
       resolved = collapseToRoot();
     } else if (action === 'collapseOne') {
@@ -813,15 +1156,15 @@ export function C2DMapView({
         }
       }
       previousShowAxiomColumn.current = showAxiomColumn;
-      requestAnimationFrame(runMeasure);
+      scheduleMeasure();
     }
-  }, [showAxiomColumn, displayColumns, runMeasure]);
+  }, [showAxiomColumn, displayColumns, scheduleMeasure]);
 
   useEffect(() => {
     if (!locateRequest?.address || !locateRequest?.seq) return;
     const addr = locateRequest.address;
     const parts = addr.split('-');
-    const ancestors = [];
+    const ancestors: string[] = [];
     for (let i = 1; i < parts.length; i++) {
       ancestors.push(parts.slice(0, i).join('-'));
     }
@@ -863,8 +1206,8 @@ export function C2DMapView({
       }
       break;
     }
-    requestAnimationFrame(runMeasure);
-  }, [displayColumns, runMeasure]);
+    scheduleMeasure();
+  }, [displayColumns, scheduleMeasure]);
 
   // ── 事件绑定：wheel ───────────────────────
   useEffect(() => {
@@ -874,13 +1217,13 @@ export function C2DMapView({
       columns: displayColumns,
       expandedSet: expanded,
       scrollTargets: scrollTargets.current,
-      onMeasure: runMeasure
+      onMeasure: scheduleMeasure
     };
-    function onWheel(event) { handleColumnWheel(event, ctx); }
+    function onWheel(event: WheelEvent) { handleColumnWheel(event, ctx); }
     const els = [...colEls.current.values()];
     for (const el of els) el.addEventListener('wheel', onWheel, { passive: false });
     return () => { for (const el of els) el.removeEventListener('wheel', onWheel); };
-  }, [displayColumns, expanded, runMeasure]);
+  }, [displayColumns, expanded, scheduleMeasure]);
 
   // ── 列变化后：居中新列、横向滚动 ──────────
   useLayoutEffect(() => {
@@ -930,7 +1273,7 @@ export function C2DMapView({
 
   // ── 测量 + ResizeObserver ─────────────────
   useLayoutEffect(() => {
-    runMeasure();
+    applyMeasure();
     const surface = surfaceRef.current;
     if (!surface) return;
     function syncSpacer() {
@@ -939,11 +1282,11 @@ export function C2DMapView({
       }
     }
     syncSpacer();
-    const onResize = () => { runMeasure(); syncSpacer(); };
+    const onResize = () => { scheduleMeasure(); syncSpacer(); };
     const ro = new ResizeObserver(onResize);
     ro.observe(surface);
     return () => ro.disconnect();
-  }, [displayColumns, runMeasure, showNotes]);
+  }, [applyMeasure, scheduleMeasure, showNotes]);
 
   // ── 渲染就绪回调 ──────────────────────────
   useLayoutEffect(() => {
@@ -953,9 +1296,6 @@ export function C2DMapView({
       onRenderReady?.({
         docId,
         renderBackend: 'dom',
-        requiresGpu: false,
-        forceGpuBackend: false,
-        hasGpuScene: false,
         visual: null
       });
     });
@@ -965,184 +1305,24 @@ export function C2DMapView({
   // 渲染区
   // ══════════════════════════════════════════════
 
-  function renderInlineEditor(block, field) {
-    if (!inlineEdit || inlineEdit.nodeId !== block.id || inlineEdit.field !== field) return null;
-    const label = field === 'title' ? '编辑标题' : field === 'note' ? '编辑摘要备注' : '编辑正文';
-    return (
-      <form
-        className={`c2d-inline-editor c2d-inline-editor-${field}`}
-        onSubmit={(event) => {
-          event.preventDefault();
-          saveInlineEdit(true);
-        }}
-      >
-        <span className="c2d-inline-label">{label}</span>
-        <textarea
-          ref={inlineInputRef}
-          className="c2d-inline-input"
-          value={inlineEdit.draft}
-          rows={field === 'text' ? 4 : 2}
-          onChange={(event) => setInlineEdit((current) => current ? { ...current, draft: event.target.value } : current)}
-          onKeyDown={(event) => {
-            event.stopPropagation();
-            if (event.key === 'Escape') {
-              event.preventDefault();
-              cancelInlineEdit();
-            } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-              event.preventDefault();
-              saveInlineEdit(true);
-            }
-          }}
-          autoFocus
-        />
-        <div className="c2d-inline-actions">
-          <button type="button" onClick={() => saveInlineEdit(false)}>保存</button>
-          <button type="submit">保存并退出</button>
-          <button type="button" onClick={cancelInlineEdit}>取消</button>
-        </div>
-      </form>
-    );
-  }
-
-  function renderTypeBar(block) {
-    const type = String(block?.nodeType || 'TEXT').toUpperCase();
-    if (type === 'TEXT') return null;
-    const color = NODE_TYPE_COLORS[type];
-    if (!color || color === 'transparent') return null;
-    return (
-      <div
-        className="c2d-node-type-bar"
-        style={{ '--c2d-node-type-color': color }}
-        title={nodeTypeLabel(type)}
-        aria-label={nodeTypeLabel(type)}
-      />
-    );
-  }
-
-  function renderBlock(block) {
-    const addr = block.address;
-    const selected = String(selectedBlockId ?? '') === String(block.id);
-    const isExpanded = expanded.has(addr);
-    const isHovered = hovered === addr;
-    const hasChildren = block.childCount > 0;
-    const Icon = isExpanded ? ChevronLeft : ChevronRight;
-    const AxiomIcon = showAxiomColumn ? ChevronRight : ChevronLeft;
-    const btnTop = btnTops.get(addr);
-    const isAxiom = isAxiomNode(block);
-    const hasAxiomToggle = !isAxiom && isRootNode(block) && hasAxioms;
-    const isDragSource = sameNodeId(dragState?.nodeId, block.id);
-    const isDragTarget = sameNodeId(dragState?.targetNodeId, block.id);
-
-    const title = block.title || '';
-    const noteText = plainNodeNote(block.note || '');
-    let ownText = block.text;
-    let subtreePreview = '';
-    // 节点 text 字段里通常已经包含子节点 text（PDF 解析就这么存的）。无论展开还是收起，
-    // ownText 都要先剥掉直接子节点的 text 再渲染；否则收起态下 ownText + subtreePreview
-    // 会重复显示同一段内容。
-    if (hasChildren) {
-      const children = getChildren(index, block.id);
-      if (children.length > 0) {
-        let stripped = ownText;
-        for (const child of children) {
-          if (child.text) stripped = stripped.replace(child.text, '');
-        }
-        ownText = stripped.trim();
-      }
-      if (!isExpanded) {
-        subtreePreview = subtreePreviewText(index, block.id, TEXT_CHAR_LIMIT);
-      }
-    }
-    const textLoading = false;
-    const stats = nodeStats(index, block);
-    const subtreePreviewVisible = Boolean(subtreePreview);
-    const emptyPlaceholder = emptyNodePlaceholder(block, paragraphLabelByNodeId);
-    const editTextFromBody = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      startInlineEdit(block, 'text', { subtreePreviewVisible });
-    };
-
-    return (
-      <article
-        key={block.id}
-        data-node-id={block.id}
-        data-node-address={addr}
-        ref={el => { if (el) cards.current.set(addr, el); else cards.current.delete(addr); }}
-        className={`c2d-node-card${selected ? ' selected' : ''}${isExpanded ? ' expanded' : ''}${hasAxiomToggle ? ' has-axiom-toggle' : ''}${isAxiom ? ' axiom-node' : ''}${isDragSource ? ' drag-source' : ''}${isDragTarget ? ' drag-target' : ''}`}
-        onPointerEnter={() => setHovered(addr)}
-        onPointerLeave={() => setHovered(p => p === addr ? null : p)}
-        onPointerDown={(event) => startDragHold(event, block)}
-        onClick={(event) => {
-          if (suppressClick.current) {
-            event.preventDefault();
-            event.stopPropagation();
-            return;
-          }
-          setCtxMenu(null);
-          setSelectedBlockId(block.id);
-          if (!isAxiom) setSelectedNodeId?.(block.id);
-          setMultiSelectedIds(new Set());
-        }}
-        onContextMenu={e => {
-          e.preventDefault();
-          e.stopPropagation();
-          setSelectedBlockId(block.id);
-          setCtxMenu({ x: e.clientX, y: e.clientY, block, subtreePreviewVisible });
-          if (!isAxiom) setSelectedNodeId?.(block.id);
-        }}
-      >
-        {renderTypeBar(block)}
-        <button
-          type="button"
-          className="c2d-node-stats-button"
-          title="节点统计"
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            setStatsNodeId(block.id);
-            setSelectedBlockId(block.id);
-            if (!isAxiom) setSelectedNodeId?.(block.id);
-          }}
-        >
-          {stats.subtree.words}
-        </button>
-        <div className="c2d-node-meta">{addr}</div>
-        {renderInlineEditor(block, 'title') || (title ? <div className="c2d-node-title">{title}</div> : null)}
-        {renderInlineEditor(block, 'text') || (ownText
-          ? <div className="c2d-node-body" onDoubleClick={editTextFromBody}>{ownText}</div>
-          : !subtreePreview && <div className="c2d-node-body muted" onDoubleClick={editTextFromBody}>{textLoading ? '正在读取子树正文。' : emptyPlaceholder}</div>)}
-        {subtreePreview ? <div className="c2d-node-body c2d-subtree-preview" onDoubleClick={editTextFromBody}>{subtreePreview}</div> : null}
-        {renderInlineEditor(block, 'note') || (showNotes && noteText ? <div className="c2d-node-note">{noteText}</div> : null)}
-        {hasAxiomToggle && isHovered ? (
-          <button
-            type="button"
-            className="c2d-expand-button c2d-axiom-expand-button"
-            aria-label={showAxiomColumn ? '收起事实前提' : '展开事实前提'}
-            title={showAxiomColumn ? '收起事实前提' : '展开事实前提'}
-            onClick={e => { e.stopPropagation(); e.preventDefault(); onToggleAxiomsCollapsed?.(); }}
-          >
-            <AxiomIcon aria-hidden="true" size={EXPAND_ICON} strokeWidth={2.2} />
-          </button>
-        ) : null}
-        {hasChildren && isHovered ? (
-          <button
-            type="button"
-            className="c2d-expand-button"
-            aria-label={isExpanded ? '收起' : '展开'}
-            title={isExpanded ? '收起' : '展开'}
-            style={{
-              '--c2d-expand-button-size': `${EXPAND_BTN}px`,
-              top: Number.isFinite(btnTop) ? `${btnTop}px` : undefined
-            }}
-            onClick={e => { e.stopPropagation(); e.preventDefault(); toggleExpand(block); }}
-          >
-            <Icon aria-hidden="true" size={EXPAND_ICON} strokeWidth={2.2} />
-          </button>
-        ) : null}
-      </article>
-    );
-  }
+  const renderBlock = (block: C2DBlock) => (
+    <C2DNodeCard
+      key={block.id}
+      block={block}
+      index={index}
+      statsIndex={statsIndex}
+      api={cardApi}
+      selected={selectedBlockId === block.id}
+      isExpanded={expanded.has(block.address)}
+      hasAxioms={hasAxioms}
+      showAxiomColumn={showAxiomColumn}
+      showNotes={showNotes}
+      isDragSource={dragState?.nodeId === block.id}
+      isDragTarget={dragState?.targetNodeId === block.id}
+      inlineEdit={inlineEdit && inlineEdit.nodeId === block.id ? inlineEdit : null}
+      paragraphLabelByNodeId={paragraphLabelByNodeId}
+    />
+  );
 
   return (
     <div
@@ -1161,25 +1341,7 @@ export function C2DMapView({
           className="c2d-column-strip"
           style={{ '--c2d-column-gap': `${COLUMN_GAP}px`, '--c2d-column-gutter': '0px' }}
         >
-          <svg
-            className="c2d-connector-layer"
-            width={conn.w}
-            height={conn.h}
-            viewBox={`0 0 ${conn.w} ${conn.h}`}
-            aria-hidden="true"
-          >
-            {conn.lines.map(l => (
-              <path
-                key={l.key}
-                d={l.d}
-                className="c2d-connector-line"
-                data-edge-left={l.bounds?.left ?? 0}
-                data-edge-top={l.bounds?.top ?? 0}
-                data-edge-width={l.bounds?.width ?? 0}
-                data-edge-height={l.bounds?.height ?? 0}
-              />
-            ))}
-          </svg>
+          <svg ref={svgRef} className="c2d-connector-layer" aria-hidden="true" />
           {displayColumns.map((col, i) => {
             const blocks = col.groups.flatMap(g => g.blocks);
             return (
@@ -1189,7 +1351,7 @@ export function C2DMapView({
                   className={`c2d-column${col.kind === 'axioms' ? ' c2d-axiom-column' : ''}`}
                   style={{ width: `${colWidths[i] || 240}px` }}
                   onScroll={() => {
-                    requestAnimationFrame(runMeasure);
+                    scheduleMeasure();
                     syncParentColumn(i, colEls.current, cards.current, displayColumns);
                   }}
                 >
@@ -1204,7 +1366,7 @@ export function C2DMapView({
                     onWidthChange: (ci, w) => setColWidths(prev => {
                       const next = [...prev]; next[ci] = w; return next;
                     }),
-                    onEnd: () => requestAnimationFrame(runMeasure)
+                    onEnd: () => scheduleMeasure()
                   })}
                 />
               </div>
@@ -1221,27 +1383,27 @@ export function C2DMapView({
         const parentBlock = block?.parentId ? lookupBlock(index, block.parentId) : null;
         const canPromoteToParentSibling = !isAxiom && Boolean(block?.parentId && parentBlock?.parentId);
         const siblings = block && !isAxiom ? getSiblings(index, block.id) : [];
-        const siblingIndex = siblings.findIndex((item) => sameNodeId(item.id, block?.id));
+        const siblingIndex = siblings.findIndex((item: C2DBlock) => item.id === block.id);
         const canMoveUp = siblingIndex > 0;
         const canMoveDown = siblingIndex >= 0 && siblingIndex < siblings.length - 1;
-        const menuAction = (handler) => (event) => {
+        const menuAction = (handler: () => void) => (event: ReactMouseEvent) => {
           event.preventDefault();
           event.stopPropagation();
           setCtxMenu(null);
           handler();
         };
-        const editModePromptAction = (event) => {
+        const editModePromptAction = (event: ReactMouseEvent) => {
           event.preventDefault();
           event.stopPropagation();
           onNotice?.('请先进入编辑模式');
           setCtxMenu(null);
         };
-        const editButtonProps = (disabled, handler) => (
+        const editButtonProps = (disabled: boolean, handler: () => void) => (
           canEdit
             ? { disabled, onClick: disabled ? undefined : menuAction(handler) }
-            : { 'aria-disabled': 'true', onClick: editModePromptAction }
+            : { 'aria-disabled': 'true' as const, onClick: editModePromptAction }
         );
-        const clampMenu = el => {
+        const clampMenu = (el: HTMLDivElement | null) => {
           if (!el) return;
           const margin = 8;
           const r = el.getBoundingClientRect();
@@ -1282,7 +1444,7 @@ export function C2DMapView({
               <div className="context-submenu">
                 <div className={`context-sub-trigger${canEdit ? '' : ' disabled'}`} onClick={canEdit ? undefined : editModePromptAction}>修改类型 ▸</div>
                 <div className="context-sub-items">
-                  {NODE_TYPES.map(t => (
+                  {NODE_TYPES.map((t: string) => (
                     <button
                       key={t}
                       {...editButtonProps(block?.nodeType === t, () => updateNode(block, { node_type: t }))}
@@ -1321,12 +1483,12 @@ export function C2DMapView({
         if (!source || !target) return null;
         const canAttachSibling = Boolean(target.parentId);
         const close = () => setDragChoice(null);
-        const run = (mode) => (event) => {
+        const run = (mode: 'merge' | 'sibling' | 'child') => (event: ReactMouseEvent) => {
           event.preventDefault();
           event.stopPropagation();
           applyDragChoice(mode);
         };
-        const clampDragChoice = el => {
+        const clampDragChoice = (el: HTMLDivElement | null) => {
           if (!el) return;
           const margin = 8;
           const r = el.getBoundingClientRect();
@@ -1355,8 +1517,8 @@ export function C2DMapView({
       {statsNodeId && (() => {
         const node = blockById(statsNodeId);
         if (!node) return null;
-        const stats = nodeStats(index, node);
-        const statRow = (label, ownValue, subtreeValue) => (
+        const stats = statsForNode(statsIndex, index, node);
+        const statRow = (label: string, ownValue: number, subtreeValue: number) => (
           <>
             <div className="c2d-stat-label">{label}</div>
             <div className="c2d-stat-value">{ownValue}</div>

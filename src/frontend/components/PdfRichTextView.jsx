@@ -11,7 +11,7 @@ import { plainNodeNote } from '../../core/node-notes.mjs';
 
 
 import { collectNodeAndDescendantIds } from './RichTextView.jsx';
-import { base64ToUint8Array, formatSourceSentenceLabel, sourceRangeForSpans, sourceSpanAbsoluteStart, sourceSpanKey } from './SourceBlocks.jsx';
+import { base64ToUint8Array, formatSourceSentenceLabel, sourceRangeForSpans, sourceRangesForSpans, sourceSpanAbsoluteStart, sourceSpanKey } from './SourceBlocks.jsx';
 import { readSourcePdfData, readSourcePdfHighlights, readSourcePdfSpanRects } from '../data/source-repository.js';
 import { depthOf, hasKnownChildren } from '../lib/doc-utils.mjs';
 
@@ -49,6 +49,7 @@ function buildPdfGutterRows(nodes, { baseDepth, collapsed, expanded, depthLimit,
         spans,
         sentenceLabel: formatSourceSentenceLabel(spans),
         range: sourceRangeForSpans(spans),
+        ranges: sourceRangesForSpans(spans),
         hasChildren,
         expanded: rowExpanded,
         localDepth: Math.max(0, nodeDepth - baseDepth),
@@ -71,10 +72,33 @@ function rangeKey(range) {
   return range ? `${range.start}:${range.end}` : '';
 }
 
+function rangesKey(ranges) {
+  return (ranges || []).map(rangeKey).join(',');
+}
+
 function rectSortKey(left, right) {
   return Number(left.page_number) - Number(right.page_number) ||
     Number(left.y0) - Number(right.y0) ||
     Number(left.x0) - Number(right.x0);
+}
+
+function pdfRectStyle(rect, scale) {
+  return {
+    left: `${Number(rect.x0) * scale}px`,
+    top: `${Number(rect.y0) * scale}px`,
+    width: `${Math.max(1, Number(rect.x1) - Number(rect.x0)) * scale}px`,
+    height: `${Math.max(1, Number(rect.y1) - Number(rect.y0)) * scale}px`
+  };
+}
+
+function groupRectsByPage(rects) {
+  const map = new Map();
+  for (const rect of rects || []) {
+    const page = Number(rect.page_number);
+    if (!map.has(page)) map.set(page, []);
+    map.get(page).push(rect);
+  }
+  return map;
 }
 
 function rectOverlapsRange(rect, range) {
@@ -84,9 +108,10 @@ function rectOverlapsRange(rect, range) {
   return Number.isFinite(start) && Number.isFinite(end) && start < range.end && end > range.start;
 }
 
-function firstRectForRange(rects, range) {
+function firstRectForRanges(rects, ranges) {
+  if (!ranges?.length) return null;
   return (rects || [])
-    .filter((rect) => rectOverlapsRange(rect, range))
+    .filter((rect) => ranges.some((range) => rectOverlapsRange(rect, range)))
     .sort(rectSortKey)[0] || null;
 }
 
@@ -103,16 +128,19 @@ function sourceSpansForNodeSelection(nodeId, nodeById, sourceSpans) {
 
 function nodeSelection(nodeId, nodeById, sourceSpans, origin) {
   if (nodeId === null || nodeId === undefined) return null;
-  const range = sourceRangeForSpans(sourceSpansForNodeSelection(nodeId, nodeById, sourceSpans));
-  if (!range) return null;
-  return { key: `node:${nodeId}`, kind: 'node', nodeId, range, origin };
+  const spans = sourceSpansForNodeSelection(nodeId, nodeById, sourceSpans);
+  const range = sourceRangeForSpans(spans);
+  const ranges = sourceRangesForSpans(spans);
+  if (!range || ranges.length === 0) return null;
+  return { key: `node:${nodeId}`, kind: 'node', nodeId, range, ranges, origin };
 }
 
 function spanSelection(span, origin) {
   const range = rangeForSpan(span);
-  if (!range) return null;
+  const ranges = sourceRangesForSpans(span ? [span] : []);
+  if (!range || ranges.length === 0) return null;
   const key = sourceSpanKey(span) || `${span?.node_id ?? ''}:${span?.sentence_index ?? ''}:${rangeKey(range)}`;
-  return { key: `span:${key}`, kind: 'span', nodeId: span?.node_id ?? null, range, origin };
+  return { key: `span:${key}`, kind: 'span', nodeId: span?.node_id ?? null, range, ranges, origin };
 }
 
 export function PdfRichTextView({
@@ -134,9 +162,10 @@ export function PdfRichTextView({
   const sourcePdfPages = currentDoc?.sourcePdfPages || [];
   const [pdfDoc, setPdfDoc] = useState(null);
   const [pdfError, setPdfError] = useState('');
-  const [highlightRects, setHighlightRects] = useState([]);
+  const [selectionRects, setSelectionRects] = useState([]);
+  const [hoverRects, setHoverRects] = useState([]);
   const [spanHitRects, setSpanHitRects] = useState([]);
-  const [hoverRange, setHoverRange] = useState(null);
+  const [hoverRanges, setHoverRanges] = useState(null);
   const [hoverNodeId, setHoverNodeId] = useState(null);
   const [selection, setSelection] = useState(null);
   const [gutterCollapsed, setGutterCollapsed] = useState(false);
@@ -190,8 +219,9 @@ export function PdfRichTextView({
     setPdfDoc(null);
     setPdfError('');
     setSpanHitRects([]);
-    setHighlightRects([]);
-    setHoverRange(null);
+    setSelectionRects([]);
+    setHoverRects([]);
+    setHoverRanges(null);
     setHoverNodeId(null);
     setSelection(null);
     pdfScrollKeyRef.current = '';
@@ -236,36 +266,49 @@ export function PdfRichTextView({
     }
     return externalSelection;
   }, [selection, selectedNodeId, externalSelection]);
-  const activeRange = hoverRange || activeSelection?.range || null;
-  const activeRangeKey = activeRange ? `${activeRange.start}:${activeRange.end}` : '';
+  // 选区与悬停分两层互不替换：选区是常驻淡色底（父节点选中会覆盖全部
+  // 后代正文，染太亮等于"全选"），悬停是亮色跟手层（指哪亮哪）。
+  // 合并成一个 ranges 会让悬停反复抹掉/恢复选区底色，大面积闪烁。
+  const selectionRanges = activeSelection?.ranges || null;
+  const selectionRangesKey = rangesKey(selectionRanges);
+  const hoverRangesKey = rangesKey(hoverRanges);
 
   useEffect(() => {
     let alive = true;
-    if (!activeRange) {
-      setHighlightRects([]);
+    if (!selectionRanges?.length) {
+      setSelectionRects([]);
       return () => { alive = false; };
     }
     readSourcePdfHighlights({
       docId,
-      startOffset: activeRange.start,
-      endOffset: activeRange.end
+      ranges: selectionRanges.map((range) => ({ start: range.start, end: range.end }))
     }).then((rects) => {
-      if (alive) setHighlightRects(rects || []);
+      if (alive) setSelectionRects(rects || []);
     }).catch(() => {
-      if (alive) setHighlightRects([]);
+      if (alive) setSelectionRects([]);
     });
     return () => { alive = false; };
-  }, [docId, activeRangeKey]);
+  }, [docId, selectionRangesKey]);
 
-  const rectsByPage = useMemo(() => {
-    const map = new Map();
-    for (const rect of highlightRects || []) {
-      const page = Number(rect.page_number);
-      if (!map.has(page)) map.set(page, []);
-      map.get(page).push(rect);
+  useEffect(() => {
+    let alive = true;
+    if (!hoverRanges?.length) {
+      setHoverRects([]);
+      return () => { alive = false; };
     }
-    return map;
-  }, [highlightRects]);
+    readSourcePdfHighlights({
+      docId,
+      ranges: hoverRanges.map((range) => ({ start: range.start, end: range.end }))
+    }).then((rects) => {
+      if (alive) setHoverRects(rects || []);
+    }).catch(() => {
+      if (alive) setHoverRects([]);
+    });
+    return () => { alive = false; };
+  }, [docId, hoverRangesKey]);
+
+  const selectionRectsByPage = useMemo(() => groupRectsByPage(selectionRects), [selectionRects]);
+  const hoverRectsByPage = useMemo(() => groupRectsByPage(hoverRects), [hoverRects]);
 
   const pages = sourcePdfPages.length > 0
     ? sourcePdfPages
@@ -275,8 +318,12 @@ export function PdfRichTextView({
       height: 842
     }));
 
+  // 取消选中必须连 hover 一起清：再次单击取消时鼠标还停在原句/原行上，
+  // hover 高亮不清的话取消前后画面一个像素都不变，看起来就是"取消没生效"。
   function clearSelection() {
     setSelection(null);
+    setHoverNodeId(null);
+    setHoverRanges(null);
     pdfScrollKeyRef.current = '';
     gutterScrollKeyRef.current = '';
     setSelectedNodeId(null);
@@ -317,7 +364,7 @@ export function PdfRichTextView({
   }
 
   function selectGutterRow(row) {
-    const next = { key: `node:${row.node.id}`, kind: 'node', nodeId: row.node.id, range: row.range, origin: 'gutter' };
+    const next = { key: `node:${row.node.id}`, kind: 'node', nodeId: row.node.id, range: row.range, ranges: row.ranges, origin: 'gutter' };
     if (activeSelection?.key === next.key) {
       clearSelection();
       return;
@@ -352,14 +399,14 @@ export function PdfRichTextView({
   function hoverPdfSpan(rect) {
     const span = spanFromHitRect(rect);
     setHoverNodeId(span.node_id || null);
-    setHoverRange(rangeForSpan(span));
+    setHoverRanges(sourceRangesForSpans(span ? [span] : []));
   }
 
   useEffect(() => {
     if (!activeSelection || activeSelection.origin === 'pdf') return;
     const scrollKey = `${activeSelection.origin}:${activeSelection.key}`;
     if (pdfScrollKeyRef.current === scrollKey) return;
-    const firstRect = firstRectForRange(spanHitRects, activeSelection.range);
+    const firstRect = firstRectForRanges(spanHitRects, activeSelection.ranges);
     if (firstRect && scrollPdfToRect(firstRect)) pdfScrollKeyRef.current = scrollKey;
   }, [activeSelection, spanHitRects, pdfDoc, pages.length, scale]);
 
@@ -410,11 +457,11 @@ export function PdfRichTextView({
                     style={{ '--depth': row.localDepth }}
                     onMouseEnter={() => {
                       setHoverNodeId(row.node.id);
-                      setHoverRange(row.range);
+                      setHoverRanges(row.ranges);
                     }}
                     onMouseLeave={() => {
                       setHoverNodeId(null);
-                      setHoverRange(null);
+                      setHoverRanges(null);
                     }}
                     onClick={() => selectGutterRow(row)}
                     onKeyDown={(event) => {
@@ -457,12 +504,13 @@ export function PdfRichTextView({
             pdfDoc={pdfDoc}
             pageInfo={page}
             scale={scale}
-            highlights={rectsByPage.get(Number(page.page_number)) || []}
+            selectionHighlights={selectionRectsByPage.get(Number(page.page_number)) || []}
+            hoverHighlights={hoverRectsByPage.get(Number(page.page_number)) || []}
             hitRects={hitRectsByPage.get(Number(page.page_number)) || []}
             onHitHover={hoverPdfSpan}
             onHitLeave={() => {
               setHoverNodeId(null);
-              setHoverRange(null);
+              setHoverRanges(null);
             }}
             onHitClick={selectPdfSpan}
           />
@@ -472,7 +520,7 @@ export function PdfRichTextView({
   );
 }
 
-export function PdfPageView({ pdfDoc, pageInfo, scale, highlights, hitRects = [], onHitHover, onHitLeave, onHitClick }) {
+export function PdfPageView({ pdfDoc, pageInfo, scale, selectionHighlights = [], hoverHighlights = [], hitRects = [], onHitHover, onHitLeave, onHitClick }) {
   const canvasRef = useRef(null);
   const pageNumber = Number(pageInfo.page_number);
 
@@ -505,16 +553,18 @@ export function PdfPageView({ pdfDoc, pageInfo, scale, highlights, hitRects = []
     <div className="pdf-page-shell" data-page-number={pageNumber} style={{ width, minHeight: height }}>
       <canvas ref={canvasRef} className="pdf-page-canvas" />
       <div className="pdf-highlight-layer">
-        {(highlights || []).map((rect, index) => (
+        {(selectionHighlights || []).map((rect, index) => (
           <span
-            key={`${pageNumber}-${index}`}
+            key={`sel-${pageNumber}-${index}`}
+            className="pdf-highlight-rect is-selection"
+            style={pdfRectStyle(rect, scale)}
+          />
+        ))}
+        {(hoverHighlights || []).map((rect, index) => (
+          <span
+            key={`hover-${pageNumber}-${index}`}
             className="pdf-highlight-rect"
-            style={{
-              left: `${Number(rect.x0) * scale}px`,
-              top: `${Number(rect.y0) * scale}px`,
-              width: `${Math.max(1, Number(rect.x1) - Number(rect.x0)) * scale}px`,
-              height: `${Math.max(1, Number(rect.y1) - Number(rect.y0)) * scale}px`
-            }}
+            style={pdfRectStyle(rect, scale)}
           />
         ))}
       </div>
@@ -525,12 +575,7 @@ export function PdfPageView({ pdfDoc, pageInfo, scale, highlights, hitRects = []
             role="button"
             tabIndex={-1}
             className="pdf-hit-rect"
-            style={{
-              left: `${Number(rect.x0) * scale}px`,
-              top: `${Number(rect.y0) * scale}px`,
-              width: `${Math.max(1, Number(rect.x1) - Number(rect.x0)) * scale}px`,
-              height: `${Math.max(1, Number(rect.y1) - Number(rect.y0)) * scale}px`
-            }}
+            style={pdfRectStyle(rect, scale)}
             onMouseEnter={() => onHitHover?.(rect)}
             onMouseLeave={() => onHitLeave?.()}
             onClick={(event) => {

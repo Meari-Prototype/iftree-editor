@@ -2,14 +2,12 @@
 // Pure layout computation and DOM measurement for C2DMapView.
 // No React, no side effects — takes inputs, returns data.
 
-import { toTreeNode, parentAddress, getChildren } from '../../core/node-model.mjs';
-
-export { toTreeNode as toNode, parentAddress as parentAddr };
+import { getChildren } from '../../core/node-model.mjs';
 
 export const COLUMN_GAP = 40;
+// 按钮尺寸有两处来源：这里（测量用）和 styles.css 的 var(--c2d-expand-button-size, 32px) 兜底值，改动须同步。
 export const EXPAND_BTN = 32;
 export const EXPAND_ICON = 30;
-export const CHILD_LIMIT = 200;
 export const TEXT_CHAR_LIMIT = 3000;
 
 export function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
@@ -108,6 +106,109 @@ export function subtreePreviewText(index, nodeId, limit = TEXT_CHAR_LIMIT) {
   return parts.join('\n').slice(0, limit);
 }
 
+// ── 节点内容统计 ─────────────────────────────────────────
+// 一次自底向上遍历把整棵树的字数/字符数/子树规模算完（buildStatsIndex），
+// 渲染路径上按节点 id O(1) 取数（statsForNode）。输出与逐节点全子树遍历
+// 完全同值：subtree 各项等价于「子树内非空 nodeContentText 以 \n join 后
+// 再统计」——words / charsNoSpace 可直接逐节点求和；charsWithSpace 需补回
+// join 分隔符数（非空片段数 - 1）。
+
+export function nodeContentText(node) {
+  return [node?.title, node?.text, node?.note]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** @returns {import('./c2d-types').ContentStats} */
+export function contentStats(text) {
+  const value = String(text || '');
+  const wordMatches = value.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]|[\p{L}\p{N}]+/gu) || [];
+  const noSpace = value.replace(/\s+/g, '');
+  return {
+    words: wordMatches.length,
+    charsNoSpace: Array.from(noSpace).length,
+    charsWithSpace: Array.from(value).length
+  };
+}
+
+// toTreeNode 保证树内节点 depth ≥ 1，|| 1 只兜缺字段的非常规输入。
+function nodeDepthOf(node) {
+  return Math.max(1, Number(node?.depth) || 1);
+}
+
+/** @returns {import('./c2d-types').StatsIndex} */
+export function buildStatsIndex(index) {
+  /** @type {import('./c2d-types').StatsIndex} */
+  const result = new Map();
+  const root = index?.root;
+  if (!root) return result;
+  // 前序入栈展平后逆序聚合：子节点必然先于父节点被处理。
+  const order = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    order.push(node);
+    const children = getChildren(index, node.id);
+    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+  }
+  for (let i = order.length - 1; i >= 0; i--) {
+    const node = order[i];
+    const own = contentStats(nodeContentText(node));
+    const entry = {
+      own,
+      words: own.words,
+      charsNoSpace: own.charsNoSpace,
+      charsSum: own.charsWithSpace,
+      nonEmptyCount: own.charsWithSpace > 0 ? 1 : 0,
+      nodeCount: 1,
+      maxDepth: nodeDepthOf(node)
+    };
+    for (const child of getChildren(index, node.id)) {
+      const c = result.get(child.id);
+      if (!c) continue;
+      entry.words += c.words;
+      entry.charsNoSpace += c.charsNoSpace;
+      entry.charsSum += c.charsSum;
+      entry.nonEmptyCount += c.nonEmptyCount;
+      entry.nodeCount += c.nodeCount;
+      entry.maxDepth = Math.max(entry.maxDepth, c.maxDepth);
+    }
+    result.set(node.id, entry);
+  }
+  return result;
+}
+
+// 不在树索引里的块（事实前提）走单节点兜底：subtree 即自身。
+/**
+ * @param {import('./c2d-types').StatsIndex | null | undefined} statsIndex
+ * @returns {import('./c2d-types').NodeStats}
+ */
+export function statsForNode(statsIndex, index, node) {
+  const entry = node ? statsIndex?.get(node.id) : null;
+  const own = entry ? entry.own : contentStats(nodeContentText(node));
+  if (!entry) {
+    return {
+      own,
+      subtree: own,
+      subtreeNodeCount: 1,
+      remainingDepth: 0,
+      nextDepthWidth: node ? getChildren(index, node.id).length : 0
+    };
+  }
+  return {
+    own,
+    subtree: {
+      words: entry.words,
+      charsNoSpace: entry.charsNoSpace,
+      charsWithSpace: entry.charsSum + Math.max(0, entry.nonEmptyCount - 1)
+    },
+    subtreeNodeCount: entry.nodeCount,
+    remainingDepth: Math.max(0, entry.maxDepth - nodeDepthOf(node)),
+    nextDepthWidth: getChildren(index, node.id).length
+  };
+}
+
 export function measureConnectorLines(stripEl, surfaceEl, colElsMap, cardsMap, columns) {
   if (!stripEl || !surfaceEl || columns.length < 2) {
     return { lines: [], w: 1, h: 1 };
@@ -151,7 +252,7 @@ export function measureConnectorLines(stripEl, surfaceEl, colElsMap, cardsMap, c
   return { lines, w, h };
 }
 
-export function measureButtonTops(columns, expandedSet, colElsMap, cardsMap) {
+export function measureButtonTops(columns, colElsMap, cardsMap) {
   const result = new Map();
   columns.forEach((col, ci) => {
     const colEl = colElsMap.get(ci);

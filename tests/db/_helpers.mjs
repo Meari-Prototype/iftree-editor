@@ -25,7 +25,9 @@ export async function runDb(dbPath, args, options = {}) {
     ...process.env,
     ELECTRON_RUN_AS_NODE: '1',
     IFTREE_DB: dbPath,
-    ...(options.homePath ? { IFTREE_HOME: options.homePath } : {})
+    // 默认隔离 IFTREE_HOME：否则关键词/向量索引会落在用户真实 ~/.iftree 的
+    // LanceDB 大库上，import 被拖到分钟级并污染真实数据
+    IFTREE_HOME: options.homePath || isolatedHomeForDb(dbPath)
   };
   try {
     const result = await execFileAsync(electronBin, ['scripts/db.mjs', ...args], {

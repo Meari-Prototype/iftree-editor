@@ -1,6 +1,7 @@
 import { X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
+import { diffTextSegments } from '../../core/text-diff.mjs';
 import { nodeTypeLabel } from '../lib/doc-utils.mjs';
 
 const FIELD_LABELS = {
@@ -11,8 +12,36 @@ const FIELD_LABELS = {
   trust_level: '信任',
   source_position: '来源位置',
   parent_id: '父节点',
-  sort_order: '顺序'
+  sort_order: '顺序',
+  // 公理（事实前提）行专属字段。
+  content: '内容',
+  status: '状态'
 };
+
+const AXIOM_STATUS_LABELS = { pending: '待确认', confirmed: '已确认' };
+
+// 卡片本体只展示长文本字段（标题/正文/备注）；这些短值字段的差异在本体上不可见，
+// footer 必须带上本侧值、左右各取各的，对照才看得出改了什么（信任: 未标注 ↔ 信任: 受控）。
+// parent_id 不在列：移动差异由同址对齐与占位行呈现，uuid 本身没有可读性。
+const VALUE_BADGE_FIELDS = new Set(['node_type', 'trust_level', 'sort_order', 'source_position', 'status']);
+
+function fieldValueLabel(node, field) {
+  if (field === 'node_type') return nodeTypeLabel(node?.nodeType || node?.node_type || 'TEXT');
+  if (field === 'trust_level') {
+    const value = String(node?.trustLevel ?? node?.trust_level ?? '').trim();
+    return value || '未标注';
+  }
+  if (field === 'sort_order') return String(node?.sortOrder ?? node?.sort_order ?? '');
+  if (field === 'source_position') {
+    const value = node?.sourcePosition ?? node?.source_position;
+    return value === null || value === undefined || value === '' ? '无' : String(value);
+  }
+  if (field === 'status') {
+    const value = String(node?.status || 'pending');
+    return AXIOM_STATUS_LABELS[value] || value;
+  }
+  return '';
+}
 
 function ownerLabel(owner) {
   return String(owner || 'human') === 'llm' ? 'LLM' : 'human';
@@ -50,6 +79,19 @@ function expandedRows(rows, expandedKeys) {
   return result;
 }
 
+// 片段级高亮（修改行专用）：同一节点旧/新文本做字符级 diff，
+// 左卡片渲染 equal+del（删除片段红遮罩），右卡片渲染 equal+ins（新增片段绿遮罩）。
+function InlineDiffText({ before, after, side }) {
+  const segments = useMemo(() => diffTextSegments(before, after), [before, after]);
+  const skip = side === 'left' ? 'ins' : 'del';
+  const visible = segments.filter((segment) => segment.type !== skip);
+  return visible.map((segment, index) => (
+    segment.type === 'equal'
+      ? <span key={index}>{segment.text}</span>
+      : <mark key={index} className={segment.type === 'del' ? 'diff-inline-del' : 'diff-inline-ins'}>{segment.text}</mark>
+  ));
+}
+
 function DiffNodeCard({ node, side, row }) {
   const emptyText = side === 'left' ? '右侧新增' : '左侧删除';
   if (!node) {
@@ -62,20 +104,33 @@ function DiffNodeCard({ node, side, row }) {
   const title = nodeTitle(node);
   const text = nodeText(node);
   const note = nodeNote(node);
+  const isAxiom = row.kind === 'axiom';
+  // 修改行且两侧都在：长文本字段按片段染色；新增/删除行保持整卡绿/红。
+  const inline = row.status === 'modified' && row.left && row.right;
+  const renderField = (pick, fallback = '') => {
+    const leftValue = pick(row.left);
+    const rightValue = pick(row.right);
+    const own = side === 'left' ? leftValue : rightValue;
+    if (!inline || leftValue === rightValue) return own || fallback;
+    return <InlineDiffText before={leftValue} after={rightValue} side={side} />;
+  };
   return (
     <article className={`diff-node-card ${side} ${row.status}`}>
       <header>
         <code>{node.address || row.address}</code>
-        <span>{nodeTypeLabel(node.nodeType || node.node_type || 'TEXT')}</span>
+        <span>{isAxiom ? '事实前提' : nodeTypeLabel(node.nodeType || node.node_type || 'TEXT')}</span>
         <em>{statusLabel(row.status)}</em>
       </header>
-      {title ? <strong>{title}</strong> : null}
-      <p>{text || '空节点'}</p>
-      {note ? <p className="diff-node-note">{note}</p> : null}
+      {title ? <strong>{renderField(nodeTitle)}</strong> : null}
+      <p>{renderField(nodeText, text ? '' : '空节点')}</p>
+      {note ? <p className="diff-node-note">{renderField(nodeNote)}</p> : null}
       {row.status === 'modified' && row.changedFields?.length ? (
         <footer>
           {row.changedFields.map((field) => (
-            <span key={field}>{FIELD_LABELS[field] || field}</span>
+            <span key={field}>
+              {FIELD_LABELS[field] || field}
+              {VALUE_BADGE_FIELDS.has(field) ? `: ${fieldValueLabel(node, field)}` : ''}
+            </span>
           ))}
         </footer>
       ) : null}

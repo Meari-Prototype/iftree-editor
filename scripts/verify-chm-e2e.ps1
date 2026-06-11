@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$ChmPath = '',
   [int]$ImportTimeoutSeconds = 180,
   [int]$LaunchTimeoutSeconds = 180
@@ -147,14 +147,24 @@ function Get-ChmTopLevelTocNames($ChmPath, $WorkRoot) {
 
 function Invoke-DbSql($IftreeHomePath, $Sql, $Limit = 1000) {
   $oldHomeForQuery = $env:IFTREE_HOME
+  $oldDbForQuery = $env:IFTREE_DB
   $queryId = [System.Guid]::NewGuid().ToString('N')
   $queryOut = Join-Path $IftreeHomePath "query-$queryId.out.log"
   $queryErr = Join-Path $IftreeHomePath "query-$queryId.err.log"
   $querySql = Join-Path $IftreeHomePath "query-$queryId.sql"
   try {
     $env:IFTREE_HOME = $IftreeHomePath
+    # query-db.mjs 只认 IFTREE_DB（不读 IFTREE_HOME），不设则会静默查到主库。
+    $env:IFTREE_DB = Join-Path $IftreeHomePath 'store.sqlite'
     [System.IO.File]::WriteAllText($querySql, $Sql, [System.Text.UTF8Encoding]::new($false))
-    $queryProcess = Start-Process -FilePath $electronExe -ArgumentList @('scripts/query-db.mjs', 'sql', '--sqlFile', $querySql, '--limit', ([string]$Limit)) -WorkingDirectory (Get-Location) -PassThru -WindowStyle Hidden -RedirectStandardOutput $queryOut -RedirectStandardError $queryErr
+    # --db 显式传库路径：本机可能存在用户级 IFTREE_DB（指向压测库）把查询劫持走。
+    $queryProcess = $null
+    try {
+      $queryProcess = Start-Process -FilePath $electronExe -ArgumentList @('scripts/query-db.mjs', 'sql', '--sqlFile', $querySql, '--limit', ([string]$Limit), '--db', (Join-Path $IftreeHomePath 'store.sqlite')) -WorkingDirectory (Get-Location) -PassThru -WindowStyle Hidden -RedirectStandardOutput $queryOut -RedirectStandardError $queryErr -ErrorAction Stop
+    } catch {
+      throw "query-db Start-Process failed: $($_.Exception.Message)"
+    }
+    if (-not $queryProcess) { throw 'query-db Start-Process returned null process' }
     if (-not $queryProcess.WaitForExit(30000)) {
       Stop-Tree $queryProcess.Id
       throw "query-db sql timed out after 30 seconds: $Sql"
@@ -169,6 +179,7 @@ function Invoke-DbSql($IftreeHomePath, $Sql, $Limit = 1000) {
     return ((@($stdout) -join "`n") | ConvertFrom-Json)
   } finally {
     $env:IFTREE_HOME = $oldHomeForQuery
+    $env:IFTREE_DB = $oldDbForQuery
   }
 }
 
@@ -192,7 +203,7 @@ function Assert-ChmImportStructure($IftreeHomePath, $DocId, $ChmPath) {
     "SELECT COUNT(*) AS rootChildCount",
     "FROM nodes doc_root",
     "JOIN nodes child ON child.parent_id = doc_root.id",
-    "WHERE doc_root.doc_id = $DocId AND doc_root.parent_id IS NULL"
+    "WHERE doc_root.doc_id = '$DocId' AND doc_root.parent_id IS NULL"
   ) -join ' '
   $rootChildCountResult = Invoke-DbSql $IftreeHomePath $rootChildCountSql
   $rootChildCountRow = Get-FirstDbRow $rootChildCountResult 'root child count'
@@ -201,7 +212,7 @@ function Assert-ChmImportStructure($IftreeHomePath, $DocId, $ChmPath) {
     "SELECT child.sort_order, COALESCE(NULLIF(child.node_title, ''), child.text) AS name",
     "FROM nodes doc_root",
     "JOIN nodes child ON child.parent_id = doc_root.id",
-    "WHERE doc_root.doc_id = $DocId AND doc_root.parent_id IS NULL",
+    "WHERE doc_root.doc_id = '$DocId' AND doc_root.parent_id IS NULL",
     "ORDER BY child.sort_order, child.id"
   ) -join ' '
   $rootChildren = Invoke-DbSql $IftreeHomePath $rootChildrenSql $limit
@@ -219,13 +230,13 @@ function Assert-ChmImportStructure($IftreeHomePath, $DocId, $ChmPath) {
     "SELECT COUNT(*) AS nodeCount, MAX(depth) AS maxDepth,",
     "SUM(CASE WHEN parent_id IS NULL THEN 1 ELSE 0 END) AS rootCount",
     "FROM nodes",
-    "WHERE doc_id = $DocId"
+    "WHERE doc_id = '$DocId'"
   ) -join ' '
   $shape = Invoke-DbSql $IftreeHomePath $shapeSql
   $topParentsSql = @(
     "SELECT parent_id, COUNT(*) AS childCount",
     "FROM nodes",
-    "WHERE doc_id = $DocId",
+    "WHERE doc_id = '$DocId'",
     "GROUP BY parent_id",
     "ORDER BY childCount DESC",
     "LIMIT 5"
@@ -236,50 +247,8 @@ function Assert-ChmImportStructure($IftreeHomePath, $DocId, $ChmPath) {
   Write-Step "STRUCTURE from HHC ok nodes=$($shapeRow.nodeCount) maxDepth=$($shapeRow.maxDepth) rootChildren=$dbCount topParentChildCount=$($topParentRow.childCount)"
 }
 
-function Assert-RenderPositionAddresses($IftreeHomePath, $DocId) {
-  $addressMismatchSql = @(
-    "SELECT COUNT(*) AS mismatchCount",
-    "FROM render_positions",
-    "JOIN nodes ON nodes.id = render_positions.node_id AND nodes.doc_id = render_positions.doc_id",
-    "WHERE render_positions.doc_id = $DocId",
-    "AND render_positions.address != nodes.address"
-  ) -join ' '
-  $addressMismatch = Get-FirstDbRow (Invoke-DbSql $IftreeHomePath $addressMismatchSql) 'render address mismatch'
-  $mismatchCount = [int]$addressMismatch.mismatchCount
-  if ($mismatchCount -ne 0) {
-    throw "Render cache address mismatch: $mismatchCount rows differ from nodes.address"
-  }
-
-  $badDepthAddressSql = @(
-    "SELECT COUNT(*) AS badAddressCount",
-    "FROM render_positions",
-    "JOIN nodes ON nodes.id = render_positions.node_id AND nodes.doc_id = render_positions.doc_id",
-    "WHERE render_positions.doc_id = $DocId",
-    "AND nodes.depth > 1",
-    "AND render_positions.address NOT LIKE '%-%'"
-  ) -join ' '
-  $badDepthAddress = Get-FirstDbRow (Invoke-DbSql $IftreeHomePath $badDepthAddressSql) 'render depth address'
-  $badAddressCount = [int]$badDepthAddress.badAddressCount
-  if ($badAddressCount -ne 0) {
-    throw "Render cache address format failed: $badAddressCount depth>1 rows do not contain '-'"
-  }
-
-  $emptyTextSql = @(
-    "SELECT COUNT(*) AS emptyTextCount",
-    "FROM render_positions",
-    "JOIN nodes ON nodes.id = render_positions.node_id AND nodes.doc_id = render_positions.doc_id",
-    "WHERE render_positions.doc_id = $DocId",
-    "AND NULLIF(TRIM(nodes.text), '') IS NOT NULL",
-    "AND NULLIF(TRIM(render_positions.display_text), '') IS NULL"
-  ) -join ' '
-  $emptyText = Get-FirstDbRow (Invoke-DbSql $IftreeHomePath $emptyTextSql) 'render display text'
-  $emptyTextCount = [int]$emptyText.emptyTextCount
-  if ($emptyTextCount -ne 0) {
-    throw "Render cache display text failed: $emptyTextCount rows have node text but empty display_text"
-  }
-
-  Write-Step "RENDER cache addresses ok mismatches=0 badDepthAddress=0 emptyDisplayText=0"
-}
+# render_positions 断言已删除：该表只存在于 million-node-perf-plan.md 的方案里，
+# 代码从未建过；当前渲染是 DOM 路径（C2DMapView），断言只可能抛 no such table。
 
 $electronExe = Join-Path (Get-Location) 'node_modules\electron\dist\electron.exe'
 if (-not (Test-Path -LiteralPath $electronExe)) { throw "Electron exe not found: $electronExe" }
@@ -343,10 +312,14 @@ $oldStartupDocId = $env:IFTREE_STARTUP_DOC_ID
 $oldE2e = $env:IFTREE_E2E_CHM
 $oldStatus = $env:IFTREE_STARTUP_STATUS_PATH
 $oldScreenshot = $env:IFTREE_E2E_SCREENSHOT_PATH
+$oldDb = $env:IFTREE_DB
 
 $appProcess = $null
 try {
   $env:IFTREE_HOME = $iftreeHome
+  # 应用本体解析 SQLite 路径时 IFTREE_DB 优先于 IFTREE_HOME（electron/main.mjs），
+  # 本机可能存在指向压测库的用户级 IFTREE_DB，必须显式覆盖到隔离库。
+  $env:IFTREE_DB = Join-Path $iftreeHome 'store.sqlite'
   $env:IFTREE_LAUNCHER_AUTOSTART = '1'
   $env:IFTREE_STARTUP_DOC_ID = [string]$importResult.docId
   $env:IFTREE_E2E_CHM = '1'
@@ -406,7 +379,6 @@ try {
   if (-not $passed) { throw "E2E validation timed out after $LaunchTimeoutSeconds seconds" }
   Write-Step "E2E ok status=$statusPath"
   Write-Step "SCREENSHOT ok path=$screenshotPath"
-  Assert-RenderPositionAddresses $iftreeHome $importResult.docId
   $mainProcesses = @(Get-MainAppProcesses $appProcess.Id | Where-Object { $_.MainWindowHandle -and $_.MainWindowHandle -ne 0 })
   if ($mainProcesses.Count -ne 1) {
     Get-MainAppProcesses $appProcess.Id | Select-Object Id,ProcessName,MainWindowHandle,MainWindowTitle,StartTime | Format-Table | Out-Host
@@ -445,6 +417,7 @@ try {
   $env:IFTREE_E2E_CHM = $oldE2e
   $env:IFTREE_STARTUP_STATUS_PATH = $oldStatus
   $env:IFTREE_E2E_SCREENSHOT_PATH = $oldScreenshot
+  $env:IFTREE_DB = $oldDb
 }
 
 $residual = Get-RunElectronProcesses

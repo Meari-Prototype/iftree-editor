@@ -46,6 +46,7 @@ export const documentRepository = {
   getSubtreeSlotRange(payload) { return readRows('subtree.getSlotRange', payload); },
   getAncestorChain(payload) { return readRows('node.getAncestorChain', payload); },
   getEditBranchDiffView(payload) { return read('editBranch.diffView', payload); },
+  getThreeWayMerge(payload) { return read('editBranch.threeWayMerge', payload); },
 
   createDoc(payload) { return write('doc.create', payload, 'doc'); },
   deleteDoc(payload) { return write('doc.delete', payload, 'docs'); },
@@ -55,7 +56,7 @@ export const documentRepository = {
   deleteDocFolder(payload) { return write('docFolder.delete', payload, 'folders'); },
   refreshAddresses(payload) { return writeDatabase({ action: 'doc.refreshAddresses', ...(payload || {}) }); },
   beginEditBranch(payload) { return writeDatabase({ action: 'editBranch.begin', ...(payload || {}) }); },
-  saveEditBranch(payload) { return writeDatabase({ action: 'editBranch.save', ...(payload || {}) }); },
+  applyEditBranchMerge(payload) { return writeDatabase({ action: 'editBranch.applyMerge', ...(payload || {}) }); },
   discardEditBranch(payload) { return writeDatabase({ action: 'editBranch.discard', ...(payload || {}) }); },
   undoEditBranch(payload) { return writeDatabase({ action: 'editBranch.undo', ...(payload || {}) }); },
   redoEditBranch(payload) { return writeDatabase({ action: 'editBranch.redo', ...(payload || {}) }); },

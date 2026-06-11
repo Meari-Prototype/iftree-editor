@@ -1,8 +1,8 @@
 ﻿import { ArrowDown, ArrowUp
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { plainNodeNote } from '../../core/node-notes.mjs';
-import { parseSourceMarkdownBlocks } from '../../core/source-doc.mjs';
+import { parseSourceMarkdownBlocks } from '../../core/source-markdown.mjs';
 import { flattenTree } from '../../core/tree.mjs';
 import { debugPerfBegin, debugPerfEnd } from '../lib/debug-log.mjs';
 import {
@@ -150,9 +150,23 @@ export function RichTextView({
   }, [setSelectedNodeId]);
   const { scrollRef, viewport, onScroll } = useScrollViewport();
   const autoWindowRef = useRef({ lastScrollTop: 0, requestKey: '', suppress: false });
-  const blockHeights = useMemo(() => (
-    filteredBlocks.map((block) => estimateSourceBlockHeight(block, rawMarkdown))
-  ), [filteredBlocks, rawMarkdown]);
+  // 抖动修复：estimateSourceBlockHeight 只是估算，估算误差会在块进出虚拟窗口时
+  // 表现为内容跳动（spacer 高度 ≠ 真实 DOM 高度）。这里把渲染后的真实高度量回来缓存，
+  // 已测量的块用实测值，未渲染过的块才用估算兜底。换正文窗口时缓存整体作废。
+  const readerRef = useRef(null);
+  const measuredHeightsRef = useRef(new Map());
+  const [measureVersion, setMeasureVersion] = useState(0);
+  useEffect(() => {
+    measuredHeightsRef.current = new Map();
+    setMeasureVersion((version) => version + 1);
+  }, [rawMarkdown]);
+  const blockHeights = useMemo(() => {
+    const measured = measuredHeightsRef.current;
+    return filteredBlocks.map((block) => (
+      measured.get(`${block.type}:${block.start}:${block.end}`)
+        ?? estimateSourceBlockHeight(block, rawMarkdown)
+    ));
+  }, [filteredBlocks, rawMarkdown, measureVersion]);
   // virtual 引用稳定化：滚动一格通常 start/end/top/bottom/totalHeight 都没变，
   // 浅比较命中时复用旧对象，让 visibleBlocks.slice 之后 .map 出的 children
   // 在 React.memo 浅比较中保持 prop 引用稳定。
@@ -172,6 +186,36 @@ export function RichTextView({
     return next;
   }, [blockHeights, viewport]);
   const visibleBlocks = filteredBlocks.slice(virtual.start, virtual.end);
+
+  // 量回真实块高：用相邻子元素 offsetTop 差值（含 margin），头尾两个子元素是 spacer。
+  // ResizeObserver 盯住每个渲染块，图片异步加载撑开后也会触发回写。
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader || typeof ResizeObserver === 'undefined') return undefined;
+    const measure = () => {
+      const children = reader.children;
+      if (children.length !== visibleBlocks.length + 2) return;
+      let changed = false;
+      for (let index = 0; index < visibleBlocks.length; index += 1) {
+        const block = visibleBlocks[index];
+        const height = children[index + 2].offsetTop - children[index + 1].offsetTop;
+        if (height <= 0) continue;
+        const key = `${block.type}:${block.start}:${block.end}`;
+        const previous = measuredHeightsRef.current.get(key);
+        if (previous === undefined || Math.abs(previous - height) > 0.5) {
+          measuredHeightsRef.current.set(key, height);
+          changed = true;
+        }
+      }
+      if (changed) setMeasureVersion((version) => version + 1);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    for (let index = 1; index < reader.children.length - 1; index += 1) {
+      observer.observe(reader.children[index]);
+    }
+    return () => observer.disconnect();
+  }, [filteredBlocks, virtual]);
 
   // 跳转定位（16-3）：用现成的 span↔块映射找到目标节点所在的源文本块，按累加块高居中滚动。
   // 96 与 virtual 的头部偏移一致；定位滚动前置 suppress，避免被自动翻窗逻辑误判为用户滚动。
@@ -323,7 +367,7 @@ export function RichTextView({
           <RichAxiomProperties axioms={currentDoc?.axioms} onAddAxiom={onAddAxiom} />
         ) : null}
         <SourceDocumentLead node={tree} showNotes={showNotes} />
-        <div className="source-reader">
+        <div className="source-reader" ref={readerRef}>
           <div className="source-virtual-spacer" style={{ height: virtual.top }} />
           {visibleBlocks.map((block, index) => (
             <SourceMarkdownBlock

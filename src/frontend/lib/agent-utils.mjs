@@ -50,8 +50,9 @@ export function agentDiffTraceTarget(diff, docs = []) {
 }
 
 export function formatAgentElapsed(value) {
-  const seconds = Math.max(1, Math.round(Number(value || 0) / 1000));
-  if (!Number.isFinite(seconds)) return '';
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms)) return '';
+  const seconds = Math.max(1, Math.round(ms / 1000));
   if (seconds < 60) return `已处理 ${seconds} 秒`;
   return `已处理 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
 }
@@ -61,7 +62,16 @@ export function agentHistoryForRequest(messages = []) {
     .map((message) => ({
       role: message.role === 'assistant' ? 'assistant' : 'user',
       mode: message.mode,
-      content: message.role === 'assistant' ? message.answer : message.content
+      content: message.role === 'assistant' ? message.answer : message.content,
+      // 结构压缩的原料：历史压缩按 toolEvents 提取触达过的 doc/address/path 指针。
+      // 只传压缩所需的最小子集，resultPreview 体积大且指针从 args 已可提取。
+      toolEvents: message.role === 'assistant' && Array.isArray(message.toolEvents)
+        ? message.toolEvents.map((event) => ({
+            name: event?.name,
+            status: event?.status,
+            argsPreview: event?.argsPreview
+          }))
+        : undefined
     }))
     .filter((message) => String(message.content || '').trim());
 }
@@ -250,6 +260,13 @@ export function agentToolStatusText(status) {
   if (status === 'done') return '完成';
   if (status === 'error') return '失败';
   return '运行中';
+}
+
+// 工具行单行摘要：取参数预览压成一行，剥掉最外层 JSON 花括号，类似 cc 的 Tool(args) 形态。
+export function agentToolArgsSummary(tool, limit = 60) {
+  let text = String(tool?.argsPreview || '').replace(/\s+/g, ' ').trim();
+  if (text.startsWith('{') && text.endsWith('}')) text = text.slice(1, -1).trim();
+  return clipText(text, limit);
 }
 
 export function agentToolNameText(name) {

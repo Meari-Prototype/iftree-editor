@@ -31,9 +31,178 @@
       ],
       "activeArticleSummaryStrategyId": "article-default",
       "activeNodeSummaryStrategyId": "node-default"
+    },
+    "shared": {
+      "activeProviderId": "deepseek",
+      "activeApiId": "api-mowypu3h-qh0g9",
+      "providers": [
+        {
+          "id": "deepseek",
+          "name": "DeepSeek",
+          "note": "默认摘要供应商",
+          "websiteUrl": "https://api.deepseek.com",
+          "apis": [
+            {
+              "id": "deepseek-default",
+              "name": "deepseek-v4-pro",
+              "note": "",
+              "baseUrl": "https://api.deepseek.com",
+              "fullUrl": false,
+              "model": "deepseek-v4-pro",
+              "enabled": true
+            },
+            {
+              "id": "api-mowypu3h-qh0g9",
+              "name": "deepseek-v4-flash",
+              "note": "",
+              "baseUrl": "https://api.deepseek.com",
+              "fullUrl": false,
+              "model": "deepseek-v4-flash",
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "openai",
+          "name": "OpenAI",
+          "note": "官方 Chat Completions",
+          "websiteUrl": "https://platform.openai.com/docs/api-reference/chat/create",
+          "apis": [
+            {
+              "id": "api-mowviq0h-3ca2w",
+              "name": "OpenAI GPT-5.2",
+              "note": "",
+              "baseUrl": "https://api.openai.com/v1",
+              "fullUrl": false,
+              "model": "gpt-5.2",
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "claude",
+          "name": "Anthropic",
+          "note": "Anthropic OpenAI SDK compatibility",
+          "websiteUrl": "https://docs.anthropic.com/en/api/openai-sdk",
+          "apis": [
+            {
+              "id": "api-mowviycz-izd9e",
+              "name": "Claude Opus 4.1",
+              "note": "",
+              "baseUrl": "https://api.anthropic.com/v1",
+              "fullUrl": false,
+              "model": "claude-opus-4-1-20250805",
+              "enabled": true
+            },
+            {
+              "id": "api-mowviycz-fgp6x",
+              "name": "Claude Sonnet 4",
+              "note": "",
+              "baseUrl": "https://api.anthropic.com/v1",
+              "fullUrl": false,
+              "model": "claude-sonnet-4-20250514",
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "minimax",
+          "name": "MiniMax",
+          "note": "MiniMax OpenAI API 兼容",
+          "websiteUrl": "https://platform.minimaxi.com/docs/api-reference/text-chat-openai",
+          "apis": [
+            {
+              "id": "api-mowvizq8-qlc85",
+              "name": "MiniMax 中国站",
+              "note": "",
+              "baseUrl": "https://api.minimaxi.com/v1",
+              "fullUrl": false,
+              "model": "MiniMax-M2.7",
+              "enabled": true
+            },
+            {
+              "id": "api-mowvizq8-o3uvy",
+              "name": "MiniMax Global",
+              "note": "",
+              "baseUrl": "https://api.minimax.io/v1",
+              "fullUrl": false,
+              "model": "MiniMax-M2.7",
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "glm",
+          "name": "智谱 GLM",
+          "note": "智谱 AI OpenAI API 兼容",
+          "websiteUrl": "https://docs.bigmodel.cn/cn/guide/develop/openai/introduction",
+          "apis": [
+            {
+              "id": "api-mowvj0mn-wnkqh",
+              "name": "GLM-5",
+              "note": "",
+              "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+              "fullUrl": false,
+              "model": "glm-5",
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "kimi",
+          "name": "Kimi",
+          "note": "Kimi OpenAI API 兼容",
+          "websiteUrl": "https://platform.kimi.ai/docs/api/overview",
+          "apis": [
+            {
+              "id": "api-mowvj7ki-wm1wl",
+              "name": "Kimi K2.6",
+              "note": "",
+              "baseUrl": "https://api.moonshot.ai/v1",
+              "fullUrl": false,
+              "model": "kimi-k2.6",
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "gemini",
+          "name": "Gemini",
+          "note": "Google Gemini OpenAI compatibility",
+          "websiteUrl": "https://ai.google.dev/gemini-api/docs/openai",
+          "apis": [
+            {
+              "id": "api-mowvj9q7-ilg7s",
+              "name": "Gemini 3 Flash",
+              "note": "",
+              "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+              "fullUrl": false,
+              "model": "gemini-3-flash-preview",
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "grok",
+          "name": "Grok / xAI",
+          "note": "xAI OpenAI-compatible endpoint",
+          "websiteUrl": "https://docs.x.ai/overview",
+          "apis": [
+            {
+              "id": "api-mowvjcc2-cwh08",
+              "name": "Grok 4.20 Reasoning",
+              "note": "",
+              "baseUrl": "https://api.x.ai/v1",
+              "fullUrl": false,
+              "model": "grok-4.20-reasoning",
+              "enabled": true
+            }
+          ]
+        }
+      ]
     }
   },
-  "renderMode": "hardware",
-  "forceHardwareAcceleration": true,
-  "debugLogging": false
+  "renderMode": "compatible",
+  "forceHardwareAcceleration": false,
+  "debugLogging": true
 }

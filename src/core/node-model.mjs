@@ -38,10 +38,10 @@ export const NODE_TYPE_LABELS = Object.freeze({
   HUMAN_SUMMARY: '人工-汇总'
 });
 
-const NODE_TYPE_ALIASES = new Map([
+const NODE_TYPE_ALIASES = new Map(/** @type {Array<[string, string]>} */ ([
   ...NODE_TYPES.map((type) => [type, type]),
   ...Object.entries(NODE_TYPE_LABELS).map(([type, label]) => [label, type])
-]);
+]));
 
 export function normalizeNodeType(value, fallback = 'TEXT') {
   const raw = String(value ?? '').trim();
@@ -75,7 +75,7 @@ export function toTreeNode(row) {
   return {
     id,
     docId:          normalizeNodeId(row.docId ?? row.doc_id),
-    parentId:       normalizeNodeId(row.parentId ?? row.parent_id ?? row.parentDbId),
+    parentId:       normalizeNodeId(row.parentId ?? row.parent_id),
     address:        String(row.address || ''),
     depth:          Math.max(1, Number(row.depth ?? row.tree_depth) || 1),
     sortOrder:      Number(row.sortOrder ?? row.sort_order) || 0,
@@ -109,7 +109,7 @@ export function buildTreeIndex(source) {
   let root = null;
 
   for (const r of raw) {
-    const node = r._normalized ? r : toTreeNode(r);
+    const node = toTreeNode(r);
     if (!node) continue;
     byId.set(node.id, node);
     if (node.address) byAddress.set(node.address, node);

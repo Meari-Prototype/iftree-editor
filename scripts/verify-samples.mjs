@@ -2,7 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, parse } from 'node:path';
 
-import { readSentences } from '../src/core/importers.mjs';
+import { readSentences } from '../src/core/source-text.mjs';
 import { IftreeStore } from '../src/backend/store.mjs';
 
 const verifyDir = join(tmpdir(), 'iftree-editor-verify');

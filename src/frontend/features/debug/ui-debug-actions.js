@@ -31,7 +31,7 @@ export function debugElementTarget(target) {
     type: safeDebugLabel(control.getAttribute('type') || ''),
     label: safeDebugLabel(label)
   };
-  const value = control.value;
+  const value = /** @type {any} */ (control).value;
   if (typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,40}$/.test(value)) descriptor.value = value;
   return descriptor;
 }

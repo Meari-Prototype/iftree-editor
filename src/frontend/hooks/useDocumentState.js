@@ -19,6 +19,7 @@ import { buildTreeWithIndex, nextFrame } from '../lib/mindmap-utils.mjs';
 import { debugPerfBegin, debugPerfEnd } from '../lib/debug-log.mjs';
 import { documentRepository } from '../data/document-repository.js';
 
+/** @param {{ setNotice?: any, setProgress?: any, lock?: any, unlock?: any }} [options] */
 export function useDocumentState({ setNotice, setProgress, lock, unlock } = {}) {
   const [docs, setDocs] = useState([]);
   const [docFolders, setDocFolders] = useState([]);

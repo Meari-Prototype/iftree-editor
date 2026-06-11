@@ -1,0 +1,19 @@
+{
+  "// 用途": "全仓类型检查闸门：npm run check:types，与 lint 成对跑。不参与构建，noEmit 永远为 true。eslint 对 TS 文件关闭 no-undef，未定义名检查只有这一道。见 ts-migration-eval.md",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "types": ["node"],
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*", "electron/**/*", "scripts/**/*", "tests/**/*"],
+  "exclude": ["node_modules", "dist", "benchmark"]
+}

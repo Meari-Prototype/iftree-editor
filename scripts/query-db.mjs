@@ -92,7 +92,10 @@ function printHelp() {
     `Actions: ${databaseReadActions().join(', ')}`,
     '',
     'Environment:',
-    '  IFTREE_DB    Query a specific SQLite database path.'
+    '  IFTREE_DB    Query a specific SQLite database path.',
+    '',
+    'Options:',
+    '  --db <path>  Query a specific SQLite database path (overrides IFTREE_DB).'
   ].join('\n'));
 }
 
@@ -135,7 +138,9 @@ async function main() {
     return;
   }
 
-  const dbPath = resolve(defaultDbPath());
+  // --db 显式指定优先于 IFTREE_DB 环境变量（环境变量可能被机器级配置占用，如压测 F 库）。
+  const dbPath = resolve(String(payload.db || defaultDbPath()));
+  delete payload.db;
   const action = payload.action || payload.type;
   if (action !== 'library.getTree' && !existsSync(dbPath)) {
     throw new Error(`Database not found: ${dbPath}`);
@@ -149,7 +154,7 @@ async function main() {
   try {
     const result = await database.run({ operation: 'read', payload }, 'read');
     if (result?.format === 'ascii_tree' && typeof result.text === 'string') console.log(result.text);
-    else console.log(JSON.stringify(result, null, 2));
+    else console.log(JSON.stringify({ dbPath, ...result }, null, 2));
   } finally {
     database.close();
   }

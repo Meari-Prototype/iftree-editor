@@ -122,7 +122,7 @@ export function assertEmbeddingVector(vector, context = 'Embedding vector', expe
   if (!Array.isArray(vector) && !(ArrayBuffer.isView(vector))) {
     throw new Error(`${context} must be an array-like vector`);
   }
-  const values = Array.from(vector, Number);
+  const values = Array.from(/** @type {ArrayLike<any>} */ (vector), Number);
   const exactDimensions = Number(expectedDimensions) || null;
   if (exactDimensions && values.length !== exactDimensions) {
     throw new Error(`${context} must have exactly ${exactDimensions} dimensions; got ${values.length}`);

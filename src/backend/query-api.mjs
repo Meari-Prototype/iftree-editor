@@ -1,6 +1,6 @@
 import { parseJsonObject, compareNodeAddress } from './shared.mjs';
+import { listMemoryVolumes } from './memory-volumes.mjs';
 import { handleDebugOverviewQuery, handleDebugSqlQuery } from './handlers/read/debug.mjs';
-import { keywordIndexRowsForPayload } from './keyword-index.mjs';
 import { ENTITY_READ_ACTIONS, runEntityRead } from './entities/read.mjs';
 import { normalizeStableId } from './db/ids.mjs';
 
@@ -21,11 +21,13 @@ const ACTIONS = Object.freeze([
   'content.searchAll',
   ...ENTITY_READ_ACTIONS,
   'library.getTree',
+  'memory.listVolumes',
   'doc.list',
   'docFolder.list',
   'history.diff',
   'editBranch.listPending',
   'editBranch.diffView',
+  'editBranch.threeWayMerge',
   'doc.get',
   'doc.exportMarkdown',
   'doc.getInfo',
@@ -262,8 +264,11 @@ function contentFormat(payload = {}) {
 }
 
 function subtreeBodyText(rows = []) {
+  // 整棵子树正文 = 容器节点自身 + 子树（projectneed 4-16）：流式写入「一条消息一个节点」，
+  // 消息正文可能落在之后挂了子节点的容器节点上，旧逻辑只取叶子会漏读。
+  // 排除文档根（其 text 是文件名、非正文，parent_id 为 NULL）。
   return rows
-    .filter((row) => Number(row.child_count) === 0)
+    .filter((row) => row.parent_id !== null && row.parent_id !== undefined)
     .map((row) => String(row.text || ''))
     .filter((text) => text.trim())
     .join('\n');
@@ -640,7 +645,7 @@ function subtreeAddressPredicate(root = {}) {
 
 function subtreeTextScope(root = {}, relativeDepth = null) {
   const predicate = subtreeAddressPredicate(root);
-  const params = [...predicate.params];
+  const params = /** @type {any[]} */ ([...predicate.params]);
   const clauses = [predicate.where];
   if (relativeDepth) {
     clauses.push('depth - ? < ?');
@@ -667,7 +672,7 @@ function subtreeBodyTextSummary(store, root = {}, relativeDepth = null) {
     SELECT COUNT(*) AS node_count,
       COALESCE(SUM(
         CASE
-          WHEN NOT EXISTS (SELECT 1 FROM nodes child WHERE child.parent_id = nodes.id)
+          WHEN nodes.parent_id IS NOT NULL
           THEN LENGTH(COALESCE(text, ''))
           ELSE 0
         END
@@ -955,6 +960,14 @@ function keywordRowsByIds(store, ids = []) {
   return orderedIds.map((id) => byId.get(id)).filter(Boolean);
 }
 
+// 召回结果必须附带时间元数据（projectneed 15-12-6）：检索命中一律带 createdAt/updatedAt，
+// agent 采信前先看时间；树索引等导航输出不在此列。
+function includeWithTimestamps(include = new Set()) {
+  const next = new Set(include);
+  next.add('timestamps');
+  return next;
+}
+
 function formatKeywordResultRows(rows = [], terms = [], payload = {}, include = new Set()) {
   return rows.map((row) => ({
     doc: {
@@ -963,7 +976,7 @@ function formatKeywordResultRows(rows = [], terms = [], payload = {}, include = 
     },
     node: formatContentNode({ ...row, score: keywordHitCount(row, terms) }, {
       detail: 'summary',
-      include,
+      include: includeWithTimestamps(include),
       previewChars: payload.previewChars ?? payload.preview_chars
     })
   }));
@@ -1025,12 +1038,13 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
   const offset = normalizeNonNegativeInteger(payload.offset ?? payload.start ?? payload.startOffset ?? payload.start_offset, 0);
   const include = contentIncludeSet(payload);
   const matchMode = normalizeKeywordMatchMode(payload);
-  if (typeof ctx.ensureKeywordIndexRows !== 'function' || typeof ctx.keywordSearch !== 'function') {
+  if (typeof ctx.ensureKeywordIndexReady !== 'function' || typeof ctx.keywordSearch !== 'function') {
     return queryContentKeywordSql(store, payload, terms);
   }
 
-  const indexRows = keywordIndexRowsForPayload(store, payload);
-  await ctx.ensureKeywordIndexRows(indexRows);
+  // 入库时已增量维护 FTS（流式 push add / 普通导入 rebuild）。查询不再全量重建：
+  // 只在该 doc 于 keyword store 缺失时分批补建（projectneed 4-16）。
+  await ctx.ensureKeywordIndexReady(payload);
   const docId = payload.allDocs === true || payload.all_docs === true || payload.scope === 'all'
     ? null
     : normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
@@ -1120,7 +1134,7 @@ async function queryContentSearch(store, payload = {}, ctx = {}) {
       query,
       rows: results.map((result) => {
         const row = byId.get(String(result.node_id));
-        return row ? formatContentNode({ ...row, score: result.score }, { detail: 'summary', include }) : null;
+        return row ? formatContentNode({ ...row, score: result.score }, { detail: 'summary', include: includeWithTimestamps(include) }) : null;
       }).filter(Boolean)
     };
   }
@@ -1130,7 +1144,7 @@ async function queryContentSearch(store, payload = {}, ctx = {}) {
     mode: 'keyword',
     docId,
     query,
-    rows: rows.map((row) => formatContentNode(row, { detail: 'summary', include }))
+    rows: rows.map((row) => formatContentNode(row, { detail: 'summary', include: includeWithTimestamps(include) }))
   };
 }
 
@@ -1215,6 +1229,9 @@ function formatCrossDocSearchRow(row, payload = {}, ctx = {}) {
       textChars: nodeTextChars(row)
     }
   };
+  // 召回结果必须附带时间元数据（projectneed 15-12-6）。
+  node.createdAt = row.created_at || null;
+  node.updatedAt = row.updated_at || null;
   const include = contentIncludeSet(payload);
   if (include.has('note') && row.node_note) node.notePreview = clipText(row.node_note, previewChars);
   if (include.has('tags')) {
@@ -1398,7 +1415,7 @@ function historyEntryRow(store, ref, docId = null) {
 }
 
 function historyMetaRow(row = {}) {
-  const rest = { ...(row || {}) };
+  const rest = /** @type {Record<string, any>} */ ({ ...(row || {}) });
   delete rest.diff;
   return rest;
 }
@@ -1527,6 +1544,15 @@ function queryEditBranchDiffView(store, payload = {}) {
   });
 }
 
+function queryThreeWayMerge(store, payload = {}) {
+  return store.computeThreeWayMerge({
+    branchId: payload.branchId ?? payload.branch_id ?? null,
+    shadowDocId: payload.shadowDocId ?? payload.shadow_doc_id ?? null,
+    baseDocId: payload.baseDocId ?? payload.base_doc_id ?? null,
+    owner: payload.owner ?? 'human'
+  });
+}
+
 function queryNode(store, payload = {}) {
   const docId = requireDocId(payload);
   const nodeId = normalizeQueryId(payload.nodeId ?? payload.node_id);
@@ -1627,7 +1653,7 @@ function querySubtreeTextWindow(store, payload = {}) {
     nodeId: payload.nodeId ?? payload.node_id,
     offset: payload.offset,
     limit: normalizeLimit(payload.limit, 1000, 1000),
-    charLimit: normalizeLimit(payload.charLimit ?? payload.char_limit, 1, 200000)
+    charLimit: normalizeLimit(payload.charLimit ?? payload.char_limit, 0, 200000)
   });
   return {
     ...result,
@@ -1708,7 +1734,7 @@ export function databaseReadToolSchema() {
       subtree: { type: 'boolean' },
       includeSubtree: { type: 'boolean' },
       previewChars: { type: 'number' },
-      charLimit: { type: 'number' },
+      charLimit: { type: 'number', description: 'subtree.getTextWindow 的本页字符预算：累计达到预算即截断本页（至少返回一行）；省略或 0 表示不限。' },
       maxTreeDepth: { type: 'number' },
       includeNodes: { type: 'boolean' },
       includeSourceSpans: { type: 'boolean' },
@@ -1751,12 +1777,21 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   if (action === 'content.search') return queryContentSearch(store, payload, ctx);
   if (action === 'content.searchAll') return queryContentSearchAll(store, payload, ctx);
   if (ENTITY_READ_ACTIONS.includes(action)) return runEntityRead(store, payload, action, ctx);
+  if (action === 'memory.listVolumes') {
+    return listMemoryVolumes(store, {
+      state: payload.state ?? null,
+      agent: payload.agent ?? null,
+      sessionId: payload.sessionId ?? payload.session_id ?? null,
+      limit: payload.limit
+    });
+  }
   if (action === 'debug.overview') return handleDebugOverviewQuery(store);
   if (action === 'doc.list') return store.listDocs().map(normalizeDocRow);
   if (action === 'docFolder.list') return store.listDocFolders().map(plainRow);
   if (action === 'history.diff') return queryHistoryDiff(store, payload);
   if (action === 'editBranch.listPending') return queryPendingEditBranches(store, payload);
   if (action === 'editBranch.diffView') return queryEditBranchDiffView(store, payload);
+  if (action === 'editBranch.threeWayMerge') return queryThreeWayMerge(store, payload);
   if (action === 'doc.get') return queryDoc(store, payload);
   if (action === 'doc.exportMarkdown') return queryDocExportMarkdown(store, payload);
   if (action === 'doc.getInfo') return docInfo(store, payload);

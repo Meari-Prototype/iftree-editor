@@ -1180,37 +1180,55 @@ button {
 }
 
 .outline-list {
-  overflow-y: auto;
-}
-
-.outline-list.outline-list-virtual {
   display: block;
+  overflow-y: auto;
+  /* 滚轮路径由组件按行步进；拖滚动条、折叠重排后由 snap 吸回行格 */
+  scroll-snap-type: y proximity;
 }
 
-.outline-list-virtual .outline-item {
-  margin-bottom: 4px;
+/* 行距 4px 并入透明 border 而不是 margin：margin 间隙不属于内容流，
+   两个子树交接时旧驻留行已被推走、新行还没到钉位，槽位会露底闪一下；
+   border 让行盒首尾相接，推挤交接处处有内容。 */
+.outline-list .outline-item {
+  min-height: 32px;
+  border-bottom: 4px solid transparent;
+  scroll-snap-align: start;
 }
 
-.outline-list-virtual .outline-item.is-outline-sticky {
+/* 高亮背景裁掉行距，视觉与 margin 方案一致 */
+.outline-list .outline-item:not(.is-outline-sticky) {
+  background-clip: padding-box;
+}
+
+/* 展开的父行原生驻留（top/z-index 按深度由组件内联）。
+   4px 行距在驻留行上重新分配为 3px 背景延伸 + 1px 实线：分割线就是
+   行盒底边本身，内容从线底下钻入，行体和线之间没有第三种视觉元素。
+   未选中的驻留行不能是另一种颜色，但又必须不透明才能盖住钻入的行：
+   #fefefe = 左栏实际底色（.sidebar 的 rgba(255,255,255,0.92) 叠在
+   .app-shell 的 #f6f5f2 上；左缘绿调渐变经 92% 白衰减后不足 1 色阶）。
+   方角，圆角会把钉住的行衬成一张悬浮卡片而不是表头。 */
+.outline-list .outline-item.is-outline-sticky {
   position: sticky;
-  top: var(--outline-sticky-top, 0px);
-  z-index: var(--outline-sticky-z, 10);
-  background: #fffdfa;
-  box-shadow: 0 1px 0 rgba(216, 213, 204, 0.72);
+  border-radius: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(216, 213, 204, 0.72);
+  background: #fefefe;
 }
 
-.outline-list-virtual .outline-item.is-outline-sticky:hover {
+/* 驻留堆叠的顶行（root）补上侧分隔线，驻留区上下边界都有线；
+   border-top 占掉 1px，padding-top 相应减 1 保持行盒 32 与文字位置。 */
+.outline-list > .outline-node > .outline-item.is-outline-sticky {
+  border-top: 1px solid rgba(216, 213, 204, 0.72);
+  padding-top: 4px;
+}
+
+.outline-list .outline-item.is-outline-sticky:hover {
   background: #f4f1eb;
 }
 
-.outline-list-virtual .outline-item.is-outline-sticky.active,
-.outline-list-virtual .outline-item.is-outline-sticky.active:hover {
+.outline-list .outline-item.is-outline-sticky.active,
+.outline-list .outline-item.is-outline-sticky.active:hover {
   background: #eaf1ec;
-}
-
-.outline-spacer {
-  width: 1px;
-  pointer-events: none;
 }
 
 .outline-item {
@@ -2477,53 +2495,96 @@ code {
   font-size: 12px;
 }
 
-.agent-tool-log {
-  margin-top: 2px;
-  color: #6d675f;
-  font-size: 12px;
-}
-
-.agent-tool-log summary {
-  cursor: pointer;
-  user-select: none;
-}
-
 .agent-tool-list {
   display: grid;
-  gap: 7px;
-  margin-top: 7px;
-  padding-left: 12px;
-  border-left: 1px solid #e4dfd6;
+  gap: 2px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #6d675f;
 }
 
-.agent-tool-item {
-  display: grid;
-  gap: 4px;
-  padding: 0;
-}
-
-.agent-tool-title {
+.agent-tool-row summary {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.agent-tool-row summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-tool-status-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #b3ada3;
+}
+
+.agent-tool-row.done .agent-tool-status-dot {
+  background: #4e6b58;
+}
+
+.agent-tool-row.error .agent-tool-status-dot {
+  background: #b54e3c;
+}
+
+.agent-tool-row.running .agent-tool-status-dot {
+  background: #bd8744;
+  animation: agent-tool-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes agent-tool-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.agent-tool-name {
+  flex: none;
   color: #413d36;
 }
 
-.agent-tool-title em {
+.agent-tool-args {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #8a847b;
+}
+
+.agent-tool-state {
+  flex: none;
+  margin-left: auto;
   color: #817a70;
   font-style: normal;
+  font-size: 11px;
+}
+
+.agent-tool-row.error .agent-tool-state {
+  color: #b54e3c;
+}
+
+.agent-tool-body {
+  display: grid;
+  gap: 4px;
+  margin: 4px 0 6px;
+  padding-left: 13px;
+  border-left: 1px solid #e4dfd6;
 }
 
 .agent-tool-label {
-  padding-left: 10px;
   color: #817a70;
   font-size: 11px;
 }
 
-.agent-tool-item pre {
+.agent-tool-body pre {
   max-height: 260px;
   margin: 0;
-  padding-left: 10px;
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -5201,6 +5262,12 @@ body.ide-resizing {
   box-shadow: 0 0 0 1px rgba(213, 179, 61, 0.45);
 }
 
+/* 选区是常驻底色：父节点选中会覆盖全部后代正文，必须淡到不抢悬停层 */
+.pdf-highlight-rect.is-selection {
+  background: rgba(255, 225, 0, 0.16);
+  box-shadow: none;
+}
+
 .pdf-hit-layer {
   position: absolute;
   inset: 0;
@@ -5696,6 +5763,7 @@ body.ide-resizing {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  /* 32px 兜底值须与 c2d-measure.mjs 的 EXPAND_BTN 保持一致 */
   width: var(--c2d-expand-button-size, 32px);
   height: var(--c2d-expand-button-size, 32px);
   border: 0;
@@ -5713,6 +5781,16 @@ body.ide-resizing {
 .c2d-expand-button:hover {
   background: transparent;
   color: #8f897f;
+}
+
+/* 展开/收起按钮常驻 DOM（位置由测量代码直接写 style.top），
+   显隐交给 CSS：仅悬停所在卡片时可见。 */
+.c2d-node-card .c2d-expand-button {
+  display: none;
+}
+
+.c2d-node-card:hover .c2d-expand-button {
+  display: inline-flex;
 }
 
 .c2d-expand-button svg {
@@ -6209,6 +6287,27 @@ body.ide-resizing {
   background: #fff8dc;
 }
 
+/* 修改行做片段级高亮：差异可能在任意行，不能被 4 行截断折叠掉。 */
+.edit-branch-diff-row.modified .diff-node-card p {
+  display: block;
+  -webkit-line-clamp: unset;
+}
+
+.diff-node-card mark.diff-inline-del,
+.diff-node-card mark.diff-inline-ins {
+  padding: 0 1px;
+  border-radius: 2px;
+  color: inherit;
+}
+
+.diff-node-card mark.diff-inline-del {
+  background: rgba(214, 86, 64, 0.24);
+}
+
+.diff-node-card mark.diff-inline-ins {
+  background: rgba(64, 160, 92, 0.24);
+}
+
 .edit-branch-diff-state {
   display: grid;
   place-items: center;
@@ -6226,6 +6325,185 @@ body.ide-resizing {
     min-width: 0;
     width: 96vw;
   }
+}
+
+.merge-conflict-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(1080px, 96vw);
+  max-width: 96vw;
+  min-width: min(720px, 96vw);
+  height: min(820px, 82vh);
+  max-height: 82vh;
+  padding: 16px;
+}
+
+.merge-conflict-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.merge-conflict-header div { display: grid; gap: 3px; min-width: 0; }
+.merge-conflict-header strong { color: #2f2e2b; font-size: 16px; }
+.merge-conflict-header span { color: #736d64; font-size: 12px; }
+
+.merge-conflict-state {
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: #f5f3ee;
+  color: #6d665d;
+  font-size: 12px;
+}
+
+.merge-conflict-state.error { border: 1px solid #dfb4a9; background: #f8ece8; color: #8b3c31; }
+.merge-conflict-state.warn { border: 1px solid #dccd83; background: #fff8dc; color: #6d5e24; }
+
+.merge-conflict-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.merge-conflict-row {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid #dccd83;
+  border-radius: 8px;
+  background: #fff8dc;
+}
+
+.merge-conflict-row.unresolvable { border-color: #dfb4a9; background: #f8ece8; }
+
+.merge-conflict-row > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.merge-conflict-row > header code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(70, 66, 58, 0.1);
+  color: #3c3831;
+  font-size: 11px;
+}
+
+.merge-conflict-row > header strong { overflow-wrap: anywhere; font-size: 12px; color: #312e28; }
+.merge-conflict-row > header em { margin-left: auto; color: #766f64; font-size: 11px; font-style: normal; }
+
+.merge-conflict-cols {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.merge-col {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  align-content: start;
+  padding: 7px;
+  border: 1px solid #dfdacf;
+  border-radius: 6px;
+  background: #fffdfa;
+}
+
+.merge-col span { color: #766f64; font-size: 11px; }
+
+.merge-col p {
+  margin: 0;
+  color: #454039;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.merge-col.ours { border-color: #a9cdb4; background: #f1f8f3; }
+.merge-col.theirs { border-color: #a9bcd0; background: #eef3f8; }
+
+.merge-conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.merge-conflict-actions.disabled { color: #8b6b62; font-size: 12px; }
+
+.merge-conflict-actions button {
+  padding: 4px 10px;
+  border: 1px solid #d7d2c8;
+  border-radius: 6px;
+  background: #fffdfa;
+  color: #514c44;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.merge-conflict-actions button:hover { background: #f1efea; }
+
+.merge-conflict-actions button.active {
+  border-color: #8a7529;
+  background: #efe6c8;
+  color: #5c4f1f;
+}
+
+.merge-fill {
+  flex: 1 0 100%;
+  min-height: 56px;
+  padding: 6px 8px;
+  border: 1px solid #cfc9bd;
+  border-radius: 6px;
+  background: #fffdfa;
+  color: #312e28;
+  font-size: 12px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.merge-conflict-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.merge-conflict-footer button {
+  padding: 7px 14px;
+  border: 1px solid #d7d2c8;
+  border-radius: 7px;
+  background: #fffdfa;
+  color: #514c44;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.merge-conflict-footer button:hover { background: #f1efea; }
+
+.merge-conflict-footer button.primary {
+  border-color: #6f8a72;
+  background: #e6f1e8;
+  color: #2f5237;
+}
+
+.merge-conflict-footer button.primary:disabled {
+  border-color: #d7d2c8;
+  background: #f0eee9;
+  color: #a59f93;
+  cursor: not-allowed;
+}
+
+@media (max-width: 760px) {
+  .merge-conflict-dialog { min-width: 0; width: 96vw; }
+  .merge-conflict-cols { grid-template-columns: minmax(0, 1fr); }
 }
 
 .summary-confirm-dialog {

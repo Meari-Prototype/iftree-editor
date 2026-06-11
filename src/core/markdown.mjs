@@ -1,5 +1,5 @@
 export function parseMarkdownBlocks(markdown) {
-  const blocks = [];
+  const blocks = /** @type {Array<Record<string, any>>} */ ([]);
   const lines = String(markdown || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
   let paragraph = [];
   let mathLines = null;

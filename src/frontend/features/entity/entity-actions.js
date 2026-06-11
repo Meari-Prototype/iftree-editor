@@ -30,6 +30,7 @@ export function entityFromDragEvent(event) {
   }
 }
 
+/** @param {{ docId?: any, docIds?: any[], allDocs?: boolean }} [scope] */
 function scopedEntityPayload({ docId, docIds, allDocs } = {}) {
   if (allDocs) return { allDocs: true };
   const ids = Array.isArray(docIds) ? docIds.filter(Boolean) : [];
@@ -38,6 +39,7 @@ function scopedEntityPayload({ docId, docIds, allDocs } = {}) {
   return docId ? { docId } : {};
 }
 
+/** @param {{ readDatabase: any, docId?: any, docIds?: any[], allDocs?: boolean, query?: string, limit?: number }} options */
 export async function fetchEntityList({ readDatabase, docId, docIds, allDocs = false, query, limit = 100 }) {
   const scope = scopedEntityPayload({ docId, docIds, allDocs });
   if (!scope.docId && !scope.docIds && !scope.allDocs) return { rows: [] };
@@ -167,6 +169,7 @@ export async function fetchEntityNodeSearch({
   };
 }
 
+/** @param {{ docId?: any, openWindow?: any, setNotice?: any }} [options] */
 export async function openEntityMaintenanceAction({ docId, openWindow, setNotice } = {}) {
   if (typeof openWindow !== 'function') {
     setNotice?.('实体库维护窗口入口不可用。');

@@ -16,6 +16,7 @@ function hasLoadedChildren(node) {
   return Array.isArray(node?.children) && node.children.length > 0;
 }
 
+/** @param {{ tree?: any, selectedNodeId?: any, selectedNodeIds?: any, mode?: string }} [options] */
 export function summaryTargetsForMode({ tree, selectedNodeId = null, selectedNodeIds = [], mode } = {}) {
   if (!tree) return [];
 
@@ -58,6 +59,7 @@ function selectedNodesForSummary(tree, selectedNodeIds) {
   return flattenTree(tree).filter((node) => ids.has(node.id) || ids.has(String(node.id)));
 }
 
+/** @param {{ tree?: any, collapsed?: Set<any> | any[], depthLimit?: number }} [options] */
 export function collapsedForDepthLimit({ tree, collapsed = new Set(), depthLimit } = {}) {
   if (!tree) return new Set();
   const limit = Math.max(1, Number(depthLimit) || 1);

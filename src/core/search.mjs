@@ -21,6 +21,7 @@ function countOccurrences(haystack, needle) {
   return count;
 }
 
+/** @param {{ tree?: any, query?: string, limit?: number }} [options] */
 export function buildKeywordSearchResults({ tree, query, limit = 80 } = {}) {
   const terms = normalizeQuery(query);
   if (!tree || terms.length === 0) return [];

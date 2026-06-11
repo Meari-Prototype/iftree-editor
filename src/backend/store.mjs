@@ -5,7 +5,11 @@ import Database from 'better-sqlite3';
 import { mergeNodeNotes } from '../core/node-notes.mjs';
 import { normalizeNodeType } from '../core/node-model.mjs';
 import { buildTree, splitSentences } from '../core/tree.mjs';
+import { classifyTreeDiff } from '../core/merkle-diff.mjs';
+import { classifyThreeWayMerge } from '../core/merkle-merge.mjs';
+import { computeSubtreeHashes, contentHash } from '../core/merkle.mjs';
 import { compareNodeAddress, parseJsonObject } from './shared.mjs';
+import { memoryVolumeMetaOf } from './memory-volumes.mjs';
 import { AXIOM_ORDER_SQL, TABLES_SQL } from './db/schema.mjs';
 import {
   compareStableIds,
@@ -45,10 +49,31 @@ import {
   isTmpId,
   nextTmpId,
   projectEditBranchDoc,
+  resolveConflictEntries,
   undoneEditBranchEntries
 } from './edit-branch-projection.mjs';
 
 export { normalizePositiveCount, normalizePositiveId, normalizePositiveNumber };
+
+// 文档编辑模式三态（projectneed 4-16-8）：只读 / 增量编辑（流式写入）/ 完整编辑（2way/3way）。
+const EDIT_MODES = Object.freeze(['readonly', 'incremental', 'full']);
+// 流式写入请求级防抖窗口（毫秒）：短时间内携带同一幂等键的重复推送只生效一次（projectneed 4-16-5）。
+const STREAM_PUSH_DEDUPE_MS = 10000;
+
+// PDF 高亮多区间入参清洗：去掉非法区间，按 start 排序并合并相邻/重叠段。
+function mergeHighlightOffsetRanges(ranges) {
+  const normalized = (Array.isArray(ranges) ? ranges : [])
+    .map((range) => ({ start: Number(range?.start), end: Number(range?.end) }))
+    .filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged = [];
+  for (const range of normalized) {
+    const last = merged[merged.length - 1];
+    if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
+    else merged.push(range);
+  }
+  return merged;
+}
 
 function createLazyEditBranchBaseSnapshot({ owner, baseDocId, shadowDocId, baseCommitId = null }) {
   return {
@@ -283,36 +308,6 @@ function nodeRowWithClientAliases(row) {
   };
 }
 
-const EDIT_BRANCH_DIFF_NODE_FIELDS = [
-  'text',
-  'node_title',
-  'node_note',
-  'node_type',
-  'trust_level',
-  'source_position',
-  'parent_id',
-  'sort_order'
-];
-
-function normalizeDiffFieldValue(row, field) {
-  if (!row) return null;
-  if (field === 'parent_id') {
-    return row.parent_id === null || row.parent_id === undefined ? null : String(row.parent_id);
-  }
-  if (field === 'sort_order') return Number(row.sort_order) || 0;
-  if (field === 'source_position') {
-    return row.source_position === null || row.source_position === undefined ? null : Number(row.source_position);
-  }
-  return row[field] === null || row[field] === undefined ? '' : String(row[field]);
-}
-
-function editBranchChangedNodeFields(left, right) {
-  if (!left || !right) return [];
-  return EDIT_BRANCH_DIFF_NODE_FIELDS.filter((field) => (
-    normalizeDiffFieldValue(left, field) !== normalizeDiffFieldValue(right, field)
-  ));
-}
-
 function editBranchDiffNode(row) {
   if (!row) return null;
   const node = nodeRowWithClientAliases(row);
@@ -320,16 +315,6 @@ function editBranchDiffNode(row) {
     ...node,
     childCount: Math.max(0, Number(row.child_count) || 0)
   };
-}
-
-function parentAddressForDiff(address) {
-  const parts = String(address || '').split('-').filter(Boolean);
-  parts.pop();
-  return parts.join('-');
-}
-
-function diffDepthForAddress(address) {
-  return Math.max(1, String(address || '').split('-').filter(Boolean).length || 1);
 }
 
 function flattenDiffTreeItem(item) {
@@ -342,19 +327,8 @@ function diffHiddenNodeCount(items) {
   return items.reduce((sum, item) => sum + flattenDiffTreeItem(item).length, 0);
 }
 
-function buildEditBranchDiffRows(baseNodes = [], projectedNodes = []) {
-  const leftByAddress = new Map();
-  const rightByAddress = new Map();
-  for (const node of baseNodes) {
-    if (node?.address) leftByAddress.set(String(node.address), node);
-  }
-  for (const node of projectedNodes) {
-    if (node?.address) rightByAddress.set(String(node.address), node);
-  }
-
-  const addresses = [...new Set([...leftByAddress.keys(), ...rightByAddress.keys()])]
-    .sort((left, right) => compareNodeAddress({ address: left }, { address: right }));
-  const itemsByAddress = new Map();
+function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], baseHashes = null) {
+  const { roots, items } = classifyTreeDiff(baseNodes, projectedNodes, baseHashes ? { baseHashes } : {});
   const stats = {
     added: 0,
     deleted: 0,
@@ -364,41 +338,11 @@ function buildEditBranchDiffRows(baseNodes = [], projectedNodes = []) {
     visibleRows: 0,
     totalRows: 0
   };
-
-  for (const address of addresses) {
-    const left = leftByAddress.get(address) || null;
-    const right = rightByAddress.get(address) || null;
-    const changedFields = editBranchChangedNodeFields(left, right);
-    const status = !left && right
-      ? 'added'
-      : left && !right
-        ? 'deleted'
-        : changedFields.length > 0
-          ? 'modified'
-          : 'unchanged';
-    stats[status] += 1;
+  for (const item of items) {
+    item.row.left = editBranchDiffNode(item.row.left);
+    item.row.right = editBranchDiffNode(item.row.right);
+    stats[item.row.status] += 1;
     stats.totalRows += 1;
-    itemsByAddress.set(address, {
-      row: {
-        kind: 'node',
-        key: `node:${address}`,
-        address,
-        depth: Number(left?.depth ?? right?.depth) || diffDepthForAddress(address),
-        status,
-        changedFields,
-        left: editBranchDiffNode(left),
-        right: editBranchDiffNode(right)
-      },
-      children: [],
-      hasChangedDescendant: false
-    });
-  }
-
-  const roots = [];
-  for (const item of itemsByAddress.values()) {
-    const parent = itemsByAddress.get(parentAddressForDiff(item.row.address));
-    if (parent) parent.children.push(item);
-    else roots.push(item);
   }
 
   function markChangedDescendants(item) {
@@ -462,6 +406,76 @@ function buildEditBranchDiffRows(baseNodes = [], projectedNodes = []) {
   return { rows, stats };
 }
 
+// 公理（事实前提）卡片行：伪装成对比视图节点卡片的形状，address 用 A 标号。
+function axiomDiffCard(axiom) {
+  if (!axiom) return null;
+  return {
+    id: axiom.id,
+    address: axiom.label || '',
+    node_type: 'AXIOM',
+    nodeType: 'AXIOM',
+    text: axiom.content ?? '',
+    node_title: axiom.node_title || '',
+    nodeTitle: axiom.node_title || '',
+    node_note: axiom.node_note || '',
+    nodeNote: axiom.node_note || '',
+    status: axiom.status || 'pending',
+    childCount: 0
+  };
+}
+
+// 公理（事实前提）对比：对比视图此前只对比 nodes，公理变更完全不可见
+// （active diff 有数、统计全 0，实际翻过车）。by id 配对；content/status/标题/备注
+// 任一变即 modified；label 是地址不是内容（删除引发的重排不算修改）；
+// node_width/height/size_mode 是视图偏好，不进 diff（8-3-2-1）。
+// 未修改公理不显示也不进折叠计数（折叠条语义是"未修改节点"）。
+function buildAxiomDiffRows(baseAxioms = [], projectedAxioms = []) {
+  const AXIOM_DIFF_FIELDS = ['content', 'status', 'node_title', 'node_note'];
+  const rows = [];
+  const stats = { added: 0, deleted: 0, modified: 0 };
+  const baseById = new Map(baseAxioms.map((axiom) => [String(axiom.id), axiom]));
+  const seen = new Set();
+  for (const proj of projectedAxioms) {
+    const id = String(proj.id);
+    seen.add(id);
+    const base = baseById.get(id) || null;
+    let status = 'added';
+    let changedFields = [];
+    if (base) {
+      changedFields = AXIOM_DIFF_FIELDS.filter((field) => String(base[field] ?? '') !== String(proj[field] ?? ''));
+      status = changedFields.length ? 'modified' : 'unchanged';
+    }
+    if (status === 'unchanged') continue;
+    stats[status] += 1;
+    rows.push({
+      kind: 'axiom',
+      key: `axiom:${id}`,
+      address: proj.label || base?.label || '',
+      depth: 1,
+      status,
+      changedFields,
+      left: axiomDiffCard(base),
+      right: axiomDiffCard(proj)
+    });
+  }
+  for (const base of baseAxioms) {
+    const id = String(base.id);
+    if (seen.has(id)) continue;
+    stats.deleted += 1;
+    rows.push({
+      kind: 'axiom',
+      key: `axiom:${id}`,
+      address: base.label || '',
+      depth: 1,
+      status: 'deleted',
+      changedFields: [],
+      left: axiomDiffCard(base),
+      right: null
+    });
+  }
+  return { rows, stats };
+}
+
 function isGeneratedImportParagraphTitle(value) {
   return /^段\d+\s*[·・]\s*\d+句$/u.test(String(value || '').trim());
 }
@@ -471,21 +485,82 @@ export class IftreeStore {
     this.dbPath = dbPath;
     this.db = null;
     this.inTransaction = false;
+    this.readonly = false;
     this.editorSnapshotTokens = new Map();
     this.editorSnapshotSeq = 1;
   }
 
   init(options = {}) {
     const readonly = options.readonly === true;
+    this.readonly = readonly;
+    // WAL 不支持网络文件系统，数据库必须在本地盘（projectneed 18-6-2）；
+    // 映射盘符无法廉价识别，这里只拦最明显的 UNC 形态。
+    if (/^(\\\\|\/\/)/.test(String(this.dbPath))) {
+      throw new Error(`数据库路径不能是网络位置（WAL 要求本地盘）：${this.dbPath}`);
+    }
     if (!readonly) mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new Database(this.dbPath, readonly ? { readonly: true, fileMustExist: true } : undefined);
+    this.db.pragma('busy_timeout = 5000');
     if (readonly) {
       this.db.pragma('query_only = ON');
       return;
     }
-    this.db.pragma('journal_mode = PERSIST');
+    // WAL：写入持续发生（事件卷落库）时只读实例并发读不被阻塞（projectneed 18-6-2）。
+    // 切换需要短暂独占；被旧 rollback 模式连接占着时 SQLite 静默返回原模式，必须炸而不是带病运行。
+    const journalMode = String(this.db.pragma('journal_mode = WAL', { simple: true }));
+    if (journalMode.toLowerCase() !== 'wal') {
+      throw new Error(`journal_mode 切换 WAL 失败（仍为 ${journalMode}）：关闭其他占用该库的进程后重试`);
+    }
+    // WAL 标准搭配：NORMAL 在断电时最多丢最近 checkpoint 后的提交，不损坏库。
+    this.db.pragma('synchronous = NORMAL');
     this.db.exec(TABLES_SQL);
     this.migrateData();
+    this.ensureNodeHashTriggers();
+  }
+
+  ensureNodeHashTriggers() {
+    // DB 层失效：对 nodes 内容/结构列的任何写都把所属 doc 标脏（O(1)），
+    // 覆盖一切写路径（full 编辑 / commit / merge / import），写代码零改动、漏不掉。
+    // 触发器只挂在非哈希列上 fire，故 ensureNodeHashes 回写 content_hash/subtree_hash 不会自我失效。
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_insert
+      AFTER INSERT ON nodes BEGIN
+        UPDATE docs SET nodes_hash_dirty = 1 WHERE id = NEW.doc_id AND nodes_hash_dirty = 0;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_update
+      AFTER UPDATE OF text, node_title, node_note, node_type, trust_level, parent_id, sort_order ON nodes BEGIN
+        UPDATE docs SET nodes_hash_dirty = 1 WHERE id = NEW.doc_id AND nodes_hash_dirty = 0;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_delete
+      AFTER DELETE ON nodes BEGIN
+        UPDATE docs SET nodes_hash_dirty = 1 WHERE id = OLD.doc_id AND nodes_hash_dirty = 0;
+      END;
+    `);
+  }
+
+  // 读时惰性补算 base 文档的 Merkle 哈希缓存（nodes.content_hash/subtree_hash 列）。
+  // doc 未脏 → 直接读列；脏（编辑过 / 新导入 / 旧库迁移）→ 整树重算并回写、清脏标记（即「必要时整树重算」）。
+  // 返回 Map<id,{contentHash,subtreeHash}> 供 diff 当 base 侧用，免去每个 session 重算整个 base。
+  ensureNodeHashes(docId) {
+    const rows = this.db.prepare(
+      'SELECT id, parent_id, sort_order, text, node_title, node_note, node_type, trust_level, content_hash, subtree_hash FROM nodes WHERE doc_id = ?'
+    ).all(docId);
+    if (rows.length === 0) return new Map();
+    const doc = this.db.prepare('SELECT nodes_hash_dirty FROM docs WHERE id = ?').get(docId);
+    const clean = doc && Number(doc.nodes_hash_dirty) === 0
+      && rows.every((row) => row.content_hash && row.subtree_hash);
+    if (clean) {
+      return new Map(rows.map((row) => [String(row.id), { contentHash: row.content_hash, subtreeHash: row.subtree_hash }]));
+    }
+    const hashes = computeSubtreeHashes(rows);
+    if (!this.readonly) {
+      const update = this.db.prepare('UPDATE nodes SET content_hash = ?, subtree_hash = ? WHERE id = ?');
+      this.withTransaction(() => {
+        for (const [id, hash] of hashes) update.run(hash.contentHash, hash.subtreeHash, id);
+        this.db.prepare('UPDATE docs SET nodes_hash_dirty = 0 WHERE id = ?').run(docId);
+      });
+    }
+    return hashes;
   }
 
   migrateData() {
@@ -496,6 +571,11 @@ export class IftreeStore {
     this.ensureColumn('nodes','node_title', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('nodes','node_note', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('nodes','source_position', 'REAL');
+    // Merkle 缓存列（A5-2）：可空持久缓存；失效靠 nodes 触发器把所属 doc 标脏，diff 读时惰性补算。
+    this.ensureColumn('nodes','content_hash', 'TEXT');
+    this.ensureColumn('nodes','subtree_hash', 'TEXT');
+    this.ensureColumn('docs','nodes_hash_dirty', 'INTEGER NOT NULL DEFAULT 1');
+    this.ensureColumn('docs','edit_mode', "TEXT NOT NULL DEFAULT 'full'");
     this.ensureColumn('save_history', 'commit_id', 'TEXT');
     this.foldHumanTagIntoNodeType();
     this.dropColumnIfExists('nodes', 'human_tag');
@@ -1453,14 +1533,6 @@ export class IftreeStore {
     return { updated };
   }
 
-  refreshNodeStructureMetadataChains() {
-    return { updated: 0, nodes: 0 };
-  }
-
-  refreshNodeStructureMetadataChain() {
-    return { updated: 0, nodes: 0 };
-  }
-
   removeRootAxiomRefs(docId = null) {
     try {
       const params = [];
@@ -1489,10 +1561,14 @@ export class IftreeStore {
   }
 
   listDocs() {
+    // 只隐藏「独立副本形态」的影子文档（shadow ≠ base 的旧形态行）；op-log 形态下
+    // shadow_doc_id == base_doc_id，开着活跃分支的文档本体必须照常列出——
+    // 否则 base 文档被自己的影子滤掉，前端文件树把它当「未导入」（实际翻过车）。
     const shadowFilter = this.hasEditBranchesTable()
       ? `WHERE NOT EXISTS (
         SELECT 1 FROM edit_branches eb
         WHERE eb.shadow_doc_id = d.id AND eb.status = 'active'
+          AND eb.shadow_doc_id != eb.base_doc_id
       )`
       : '';
     return this.db.prepare(`
@@ -1601,15 +1677,18 @@ export class IftreeStore {
         ON CONFLICT(doc_id) DO NOTHING
       `).run(docId);
       this.refreshDocAddresses(docId);
-      this.refreshNodeStructureMetadataChain(rootNodeId);
 
       return { id: docId, title, rootNodeId };
     });
   }
 
   deleteDoc(docId) {
-    const doc = this.db.prepare('SELECT id FROM docs WHERE id = ?').get(docId);
+    const doc = this.db.prepare('SELECT id, meta FROM docs WHERE id = ?').get(docId);
     if (!doc) return false;
+    // 完整记忆永不删除（projectneed 15-10）：由结构保证而非纪律。
+    if (memoryVolumeMetaOf(doc.meta)) {
+      throw new Error(`记忆卷不可删除（完整记忆永不删除，projectneed 15-10）：${docId}`);
+    }
 
     this.withTransaction(() => {
       this.db.prepare('DELETE FROM edit_branches WHERE base_doc_id = ? OR shadow_doc_id = ?').run(docId, docId);
@@ -1618,10 +1697,218 @@ export class IftreeStore {
         WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
            OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
       `).run(docId, docId);
+      // 打断 nodes.parent_id 自引用链再删：超深树（如导入的深 heading 链）直接 DELETE 会让
+      // ON DELETE CASCADE 沿父链逐层递归，超过 SQLite 触发器递归上限而崩
+      // （SqliteError: too many levels of trigger recursion）。置空 parent_id 后 cascade 即变平删。
+      this.db.prepare('UPDATE nodes SET parent_id = NULL WHERE doc_id = ?').run(docId);
       this.db.prepare('DELETE FROM docs WHERE id = ?').run(docId);
     });
 
     return true;
+  }
+
+  // ─── 流式写入与文档编辑模式（projectneed 4-16）──────────────
+  getDocEditMode(docId) {
+    const row = this.db.prepare('SELECT edit_mode FROM docs WHERE id = ?').get(docId);
+    return row ? (row.edit_mode || 'full') : null;
+  }
+
+  setDocEditMode(docId, mode) {
+    const normalized = String(mode || '').trim();
+    if (!EDIT_MODES.includes(normalized)) {
+      throw new Error(`未知编辑模式：${mode}；只能是 ${EDIT_MODES.join(' / ')}`);
+    }
+    const doc = this.db.prepare('SELECT id FROM docs WHERE id = ?').get(docId);
+    if (!doc) throw new Error(`Doc not found: ${docId}`);
+    this.db.prepare('UPDATE docs SET edit_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(normalized, docId);
+    return this.db.prepare('SELECT id, title, edit_mode FROM docs WHERE id = ?').get(docId);
+  }
+
+  _streamPushFromCache(key) {
+    if (!key || !this._streamPushCache) return null;
+    const hit = this._streamPushCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.at > STREAM_PUSH_DEDUPE_MS) {
+      this._streamPushCache.delete(key);
+      return null;
+    }
+    return hit.result;
+  }
+
+  _rememberStreamPush(key, result) {
+    if (!key) return;
+    if (!this._streamPushCache) this._streamPushCache = new Map();
+    const now = Date.now();
+    for (const [k, v] of this._streamPushCache) {
+      if (now - v.at > STREAM_PUSH_DEDUPE_MS) this._streamPushCache.delete(k);
+    }
+    this._streamPushCache.set(key, { at: now, result });
+  }
+
+  // 一条流式节点：调用方按 4-16-7 给齐标准字段；trust_level 必给（4-16-4，不闭眼填），node_type 缺省 TEXT。
+  // 流式节点标准字段：trust_level 必给（4-16-4），source_position 可选（配合 stream.attachSource
+  // 的源文档层，流式文档同样能做句位对照），其余缺省。
+  _streamNodeFields(item = {}) {
+    const trustLevel = normalizeNullableText(item.trust_level ?? item.trustLevel ?? null);
+    if (trustLevel !== '受控' && trustLevel !== '不受控') {
+      throw new Error('流式节点必须显式给 trust_level（受控 / 不受控）');
+    }
+    return {
+      trustLevel,
+      nodeType: normalizeNodeType(item.node_type ?? item.nodeType ?? 'TEXT'),
+      text: typeof item.text === 'string' ? item.text : '',
+      nodeTitle: item.node_title ?? item.nodeTitle ?? '',
+      nodeNote: item.node_note ?? item.nodeNote ?? '',
+      sourcePosition: normalizeSourcePosition(item.source_position ?? item.sourcePosition ?? null)
+    };
+  }
+
+  _assertVolumeNodesUncontrolled(items) {
+    for (const item of items || []) {
+      const trust = item?.trust_level ?? item?.trustLevel ?? null;
+      if (trust === '受控') {
+        throw new Error('记忆卷节点一律不受控（projectneed 15-10-3）；收到 trust_level=受控');
+      }
+      const children = Array.isArray(item?.children) ? item.children : [];
+      if (children.length) this._assertVolumeNodesUncontrolled(children);
+    }
+  }
+
+  _insertStreamNode(docId, parentId, item = {}) {
+    const f = this._streamNodeFields(item);
+    return this.insertNode({ docId, parentId, text: f.text, nodeType: f.nodeType, nodeTitle: f.nodeTitle, nodeNote: f.nodeNote, sourcePosition: f.sourcePosition, trustLevel: f.trustLevel });
+  }
+
+  // 校验调用方给的 address 是纯追加（连续、不重复、与父自洽，4-16-2）；违反报错带定位，调用方读结构重算重推。
+  _validateStreamAddresses(items, parentAddress, startOrder) {
+    let expected = startOrder + 1;
+    for (const item of items) {
+      const addr = String(item?.address ?? '').trim();
+      if (!addr) throw new Error('流式节点缺少 address');
+      const cut = addr.lastIndexOf('-');
+      const prefix = cut > 0 ? addr.slice(0, cut) : '';
+      const order = Number(addr.slice(cut + 1));
+      if (prefix !== parentAddress) {
+        throw new Error(`地址 ${addr} 的父前缀应为 ${parentAddress || '(根)'}`);
+      }
+      if (!Number.isInteger(order) || order <= 0) {
+        throw new Error(`地址 ${addr} 末段必须是正整数`);
+      }
+      if (order !== expected) {
+        throw new Error(`地址不连续：父 ${parentAddress} 下期望下一个 ${parentAddress}-${expected}，收到 ${addr}`);
+      }
+      expected += 1;
+      const children = Array.isArray(item.children) ? item.children : [];
+      if (children.length) this._validateStreamAddresses(children, addr, 0);
+    }
+  }
+
+  // 单一标准推送入口（4-16-7）：直接 append，不走 edit branch。
+  // 首次省略 docId + 给 title => 新建增量编辑文档并挂根下；之后给 docId + parentId(uuid 挂载点) 追加。
+  // 调用方给 address => 校验纯追加 + 批量直写（不重排、不刷结构链），地址/深度由 address 决定（4-16-2）；
+  // 不给 address => 自动续号兜底（小流友好，O(n)）。去重是调用方责任，系统只按 idempotencyKey 请求级防抖（4-16-5）。
+  pushStreamNodes({ docId = null, title = null, parentId = null, nodes = [], idempotencyKey = null } = {}) {
+    const list = Array.isArray(nodes) ? nodes : [];
+    if (list.length === 0) throw new Error('stream.push 需要至少一个节点');
+
+    const cached = this._streamPushFromCache(idempotencyKey);
+    if (cached) return { ...cached, deduped: true };
+
+    const result = this.withTransaction(() => {
+      let targetDocId = docId;
+      let createdDoc = null;
+      if (targetDocId === null || targetDocId === undefined || targetDocId === '') {
+        const docTitle = String(title || '').trim();
+        if (!docTitle) throw new Error('首次流式写入需要 title 以新建文档');
+        createdDoc = this.createDoc({ title: docTitle });
+        this.setDocEditMode(createdDoc.id, 'incremental');
+        targetDocId = createdDoc.id;
+      } else {
+        const mode = this.getDocEditMode(targetDocId);
+        if (mode === null) throw new Error(`Doc not found: ${targetDocId}`);
+        if (mode !== 'incremental') {
+          throw new Error('流式写入要求文档处于增量编辑模式；请先 doc.setEditMode 切到 incremental');
+        }
+        // 事件卷一律不受控（projectneed 15-10-3）：拒绝而非静默改写，让调用方知道契约被违反。
+        const metaRow = this.db.prepare('SELECT meta FROM docs WHERE id = ?').get(targetDocId);
+        if (memoryVolumeMetaOf(metaRow?.meta)) this._assertVolumeNodesUncontrolled(list);
+      }
+
+      const rootId = createdDoc
+        ? createdDoc.rootNodeId
+        : this.db.prepare('SELECT id FROM nodes WHERE doc_id = ? AND parent_id IS NULL').get(targetDocId)?.id;
+      const mountId = parentId ?? rootId;
+      const mount = this.db.prepare('SELECT id, address FROM nodes WHERE id = ? AND doc_id = ?').get(mountId, targetDocId);
+      if (!mount) throw new Error(`挂载点 ${mountId} 不在文档 ${targetDocId} 中`);
+
+      const useAddresses = list.some((item) => item && item.address != null);
+      let createdCount = 0;
+      let created;
+
+      if (useAddresses) {
+        const maxRow = this.db.prepare('SELECT MAX(sort_order) AS m FROM nodes WHERE doc_id = ? AND parent_id = ?').get(targetDocId, mountId);
+        this._validateStreamAddresses(list, String(mount.address || ''), Number(maxRow?.m) || 0);
+        const insert = this.db.prepare(`
+          INSERT INTO nodes (id, doc_id, parent_id, sort_order, depth, address, node_type, text, node_title, node_note, source_position, trust_level)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        const writeTree = (items, parentDbId) => items.map((item) => {
+          const f = this._streamNodeFields(item);
+          const addr = String(item.address).trim();
+          const order = Number(addr.slice(addr.lastIndexOf('-') + 1));
+          const id = newStableId();
+          insert.run(id, targetDocId, parentDbId, order, addr.split('-').length, addr, f.nodeType, f.text, f.nodeTitle || '', f.nodeNote || '', f.sourcePosition, f.trustLevel);
+          createdCount += 1;
+          const children = Array.isArray(item.children) ? item.children : [];
+          return { id, address: addr, children: children.length ? writeTree(children, id) : [] };
+        });
+        created = writeTree(list, mountId);
+        this.touchDoc(targetDocId);
+      } else {
+        const insertTree = (items, parent) => items.map((item) => {
+          const node = this._insertStreamNode(targetDocId, parent, item);
+          createdCount += 1;
+          const children = Array.isArray(item.children) ? item.children : [];
+          return { id: node.id, address: node.address, children: children.length ? insertTree(children, node.id) : [] };
+        });
+        created = insertTree(list, mountId);
+      }
+      // createdRootId：首推新建文档时带回根节点 id，调用侧（handler）要把根节点
+      // 补进增量 FTS——根不在推送列表里，漏掉会让索引行数永远比 SQL 少 1。
+      return { docId: targetDocId, parentId: mountId, created, createdCount, createdRootId: createdDoc ? createdDoc.rootNodeId : null };
+    });
+
+    this._rememberStreamPush(idempotencyKey, result);
+    return result;
+  }
+
+  // bulk 导入会话（projectneed 4-16）：海量流式写入前临时开，导完关。
+  // 只做异步写（synchronous=OFF，省 fsync；崩溃丢最近批由地址校验+幂等重推兜底）。
+  // journal 保持 WAL 不降级：WAL 下切 journal 需独占库（有并发读者即失败），
+  // 且保持 WAL 才能让批导期间只读实例不被写阻塞（projectneed 18-6-2）。
+  // 不再 drop 二级索引：SQL/FTS 都是增量维护、全程在线，没必要等导完重建；drop 反而让删除 cascade
+  // 退化成 O(n²)、崩溃后索引悬空。唯一真正延迟的重活是 bge-m3 向量（离线补）。
+  // 数值：cache_size 1GB、mmap 1GB（benchmark 机器合理默认，可调）。
+  // pragma 挂在连接上：私有后端=只影响发起方；共享后端一条连接服务所有客户端，等效全局——
+  // 由共享服务端的独占闸门兜底（begin 需独占、期间他人写被拒、独占者掉线自动 end，
+  // 见 backend-shared-server）。
+  beginBulkImport() {
+    this.db.pragma('synchronous = OFF');
+    this.db.pragma('temp_store = MEMORY');
+    this.db.pragma('cache_size = -1048576');
+    this.db.pragma('mmap_size = 1073741824');
+    return {
+      ok: true,
+      pragmas: { synchronous: 'OFF', journal_mode: 'WAL', cache_size: '1GB', mmap_size: '1GB' }
+    };
+  }
+
+  endBulkImport() {
+    // 不再重建索引（begin 不再 drop，索引全程在线，base schema 也已保证其存在）。
+    // 先恢复安全写入再 checkpoint(TRUNCATE)：把批导膨胀的 -wal 押回主库并截断，且本次 checkpoint 落盘有 fsync。
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('wal_checkpoint(TRUNCATE)');
+    return { ok: true };
   }
 
   normalizeEditBranchOwner(owner = 'human') {
@@ -1823,7 +2110,15 @@ export class IftreeStore {
       axioms: baseAxioms,
       refs: baseRefs
     }, activeEntries);
-    const { rows, stats } = buildEditBranchDiffRows(baseNodes, projected.nodes);
+    const baseHashes = this.ensureNodeHashes(docId);
+    const { rows, stats } = buildEditBranchDiffRows(baseNodes, projected.nodes, baseHashes);
+    // 公理（事实前提）差异行排最前——树视图里它们也画在正文树之外。
+    const axiomDiff = buildAxiomDiffRows(baseAxioms, projected.axioms);
+    stats.added += axiomDiff.stats.added;
+    stats.deleted += axiomDiff.stats.deleted;
+    stats.modified += axiomDiff.stats.modified;
+    stats.totalRows += axiomDiff.rows.length;
+    stats.visibleRows += axiomDiff.rows.length;
     const historyState = this.editBranchHistoryState(branch);
 
     return {
@@ -1848,8 +2143,369 @@ export class IftreeStore {
         undoDepth: historyState.undoDepth,
         redoDepth: historyState.redoDepth
       },
-      rows
+      rows: [...axiomDiff.rows, ...rows]
     };
+  }
+
+  // 三方合并物化（A5-10）：取 merge-base（分支 fork 点 commit 的 snapshot）/ ours（当前主干 = live nodes）/
+  // theirs（分支 entries 投影到 merge-base），交给 classifyThreeWayMerge 按稳定 id 逐字段三方分类。
+  // fast-forward（分支 base commit == 当前 head）时无需三方调和，照现行直接应用本分支生效 diff 即可。
+  computeThreeWayMerge({ branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' } = {}) {
+    const branch = this.findEditBranch({ branchId, shadowDocId, baseDocId, owner });
+    if (!branch) throw new Error('Edit branch not found');
+    const docId = branch.base_doc_id;
+    const baseSnapshot = parseJsonObject(branch.base_snapshot) || {};
+    const baseCommitId = baseSnapshot.baseCommitId || null;
+    const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(docId);
+    const headCommitId = head?.head_commit_id || null;
+    const fastForward = (baseCommitId || null) === (headCommitId || null);
+
+    // ours = 当前主干 = live nodes
+    const oursNodes = this.db.prepare(`
+      SELECT * FROM nodes WHERE doc_id = ?
+      ORDER BY parent_id IS NOT NULL, parent_id, sort_order, id
+    `).all(docId);
+
+    // merge-base = 分支 fork 点 commit 的 snapshot；缺 fork commit 时退化为 ours（等价快进）
+    let mergeBaseNodes = oursNodes;
+    let mergeBaseAxioms = this.listAxioms(docId);
+    let mergeBaseRefs = this._fetchBaseRefsForDoc(docId);
+    if (baseCommitId) {
+      const commitRow = this.db.prepare('SELECT snapshot FROM commits WHERE id = ?').get(baseCommitId);
+      const snap = commitRow ? parseJsonObject(commitRow.snapshot) : null;
+      if (snap && Array.isArray(snap.nodes)) {
+        mergeBaseNodes = snap.nodes;
+        mergeBaseAxioms = Array.isArray(snap.axioms) ? snap.axioms : [];
+        mergeBaseRefs = Array.isArray(snap.refs) ? snap.refs : [];
+      }
+    }
+
+    // theirs = 本分支：entries 投影到 merge-base（不是投影到 live，避免与主干变更混淆）
+    const diff = parseJsonObject(branch.diff) || {};
+    const entries = activeEditBranchEntries(diff.entries);
+    const theirs = projectEditBranchDoc({
+      docId,
+      nodes: mergeBaseNodes,
+      axioms: mergeBaseAxioms,
+      refs: mergeBaseRefs
+    }, entries);
+
+    const merge = classifyThreeWayMerge(mergeBaseNodes, oursNodes, theirs.nodes);
+    // 给逐节点结果附上 address/title 供冲突解决 UI 标识节点（ours=live 优先，其次 theirs，再 base）。
+    const displayById = new Map();
+    for (const list of [mergeBaseNodes, theirs.nodes, oursNodes]) {
+      for (const node of list) {
+        displayById.set(String(node.id), {
+          address: node.address || '',
+          title: node.node_title ?? node.nodeTitle ?? ''
+        });
+      }
+    }
+    const nodes = merge.nodes.map((node) => ({
+      ...node,
+      address: displayById.get(String(node.id))?.address || '',
+      title: displayById.get(String(node.id))?.title || ''
+    }));
+    return {
+      kind: 'editBranch.threeWayMerge',
+      branch: { ...branch },
+      fastForward,
+      baseCommitId,
+      headCommitId,
+      nodeCounts: { base: mergeBaseNodes.length, ours: oursNodes.length, theirs: theirs.nodes.length },
+      ...merge,
+      nodes
+    };
+  }
+
+  // ─── 非快进保存的逐条前置验证（乐观并发，A5-10）──────────────
+  // 账目在 stage 时记了「对什么状态做」：update 的 {field, old, new}、delete 的子树指纹、
+  // split/merge 的正文指纹、移动类的 before_parent_id。保存时按 UUID 主键点查主干现值逐条比：
+  //   现值==原值 → 前置成立；现值==新值 → 两侧收敛；否则冲突。
+  // 成本 O(分支改动数) 次点查，不扫库、不解析快照（仅旧账目缺 before 时退化用 fork 快照补原值）。
+  // 输出两类：conflicts（字段级/删改级，可经三列面板人裁）与 blocked（结构性失配，
+  // v1 不可裁——主干已被修改，只能放弃本次编辑；清理敏感信息等历史重写后属常态）。
+
+  _trunkNodeRow(docId, ref) {
+    if (ref === null || ref === undefined || isTmpId(ref)) return null;
+    return this.db.prepare('SELECT * FROM nodes WHERE id = ? AND doc_id = ?').get(ref, docId) || null;
+  }
+
+  _trunkSubtreeHash(docId, ref) {
+    if (!this._trunkNodeRow(docId, ref)) return null;
+    const rows = this.db.prepare(`
+      WITH RECURSIVE subtree(id) AS (
+        SELECT id FROM nodes WHERE id = ?
+        UNION ALL
+        SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+      )
+      SELECT n.id, n.parent_id, n.sort_order, n.text, n.node_title, n.node_note, n.node_type, n.trust_level
+      FROM nodes n JOIN subtree s ON n.id = s.id
+    `).all(ref);
+    // 子树根的父在集合外：置空让它成为遍历根（subtree_hash 本就 parent-independent）。
+    const detached = rows.map((row) => (sameStableId(row.id, ref) ? { ...row, parent_id: null } : row));
+    return computeSubtreeHashes(detached).get(String(ref))?.subtreeHash || null;
+  }
+
+  _validateEditBranchEntriesAgainstTrunk(branch, entries) {
+    const docId = branch.base_doc_id;
+    const norm = (value) => (value === null || value === undefined ? null : String(value));
+
+    // 分支自建的 tmp 节点：重放时一并创建，引用它们无需主干前置。
+    const tmpCreated = new Set();
+    for (const entry of entries) {
+      if (entry.kind === 'node.insert' && entry.tmp_id) tmpCreated.add(entry.tmp_id);
+      if (entry.kind === 'node.split') {
+        for (const tmpId of entry.new_node_ids || []) tmpCreated.add(tmpId);
+        for (const split of entry.paragraph_splits || []) {
+          for (const span of split.spans || []) if (span.tmp_id) tmpCreated.add(span.tmp_id);
+        }
+      }
+    }
+    const refExists = (ref) => {
+      if (ref === null || ref === undefined) return false;
+      if (isTmpId(ref)) return tmpCreated.has(ref);
+      return Boolean(this._trunkNodeRow(docId, ref));
+    };
+
+    // 旧账目缺 before 数据时退化用 fork 快照补原值（懒解析一次；快照缺失则视为无前置=旧盲存行为）。
+    let forkNodes;
+    const forkNode = (ref) => {
+      if (forkNodes === undefined) {
+        forkNodes = null;
+        const baseCommitId = (parseJsonObject(branch.base_snapshot) || {}).baseCommitId || null;
+        if (baseCommitId) {
+          const row = this.db.prepare('SELECT snapshot FROM commits WHERE id = ?').get(baseCommitId);
+          const snap = row ? parseJsonObject(row.snapshot) : null;
+          if (snap && Array.isArray(snap.nodes)) {
+            forkNodes = new Map(snap.nodes.map((node) => [String(node.id), node]));
+          }
+        }
+      }
+      return forkNodes ? forkNodes.get(String(ref)) || null : null;
+    };
+    const forkSubtreeHash = (ref) => {
+      if (!forkNode(ref)) return null;
+      const detached = [...forkNodes.values()].map((node) => (
+        sameStableId(node.id, ref) ? { ...node, parent_id: null } : node
+      ));
+      return computeSubtreeHashes(detached).get(String(ref))?.subtreeHash || null;
+    };
+
+    const blocked = [];
+    const conflicts = [];
+    const fieldAgg = new Map();
+    const block = (id, kind, reason, address = '') => blocked.push({ id: norm(id), kind, reason, address });
+    // 拆分/并入的内容前置：节点须仍在主干且正文未漂移（拼接/截句都基于入账时所见内容）。
+    const checkContentIntact = (ref, beforeHash, address = '') => {
+      if (ref === null || ref === undefined || isTmpId(ref)) return;
+      const row = this._trunkNodeRow(docId, ref);
+      if (!row) {
+        block(ref, 'node-deleted', '主干已删除该节点，分支的拆分/并入无法应用', address);
+        return;
+      }
+      const fork = forkNode(ref);
+      const before = beforeHash || (fork ? contentHash(fork) : null);
+      if (before && contentHash(row) !== before) {
+        block(ref, 'content-drift', '主干已修改该节点的内容，分支基于旧内容的拆分/并入无法应用', row.address || address);
+      }
+    };
+
+    for (const entry of entries) {
+      switch (entry.kind) {
+        case 'node.update': {
+          const ref = entry.node_id ?? entry.target_ref;
+          if (isTmpId(ref)) break; // 改自己新建的节点，无主干前置
+          const row = this._trunkNodeRow(docId, ref);
+          if (!row) {
+            block(ref, 'node-deleted', '主干已删除该节点，分支对它的修改无法应用（复活不支持）', entry.address || '');
+            break;
+          }
+          const fieldList = Array.isArray(entry.fields) && entry.fields.length > 0
+            ? entry.fields
+            : Object.entries(entry.patch || {}).map(([field, value]) => ({ field, new: value ?? null }));
+          for (const item of fieldList) {
+            if (!item || !item.field) continue;
+            const key = `${norm(ref)}::${item.field}`;
+            if (!fieldAgg.has(key)) {
+              // 链式多次改同字段：取最早一条的 old（=入账时所见原值），最后一条的 new（=分支终值）。
+              const fork = forkNode(ref);
+              const old = Object.prototype.hasOwnProperty.call(item, 'old')
+                ? item.old
+                : (fork ? fork[item.field] : undefined);
+              fieldAgg.set(key, { id: norm(ref), field: item.field, old, next: item.new });
+            } else {
+              fieldAgg.get(key).next = item.new;
+            }
+          }
+          break;
+        }
+        case 'node.insert': {
+          if (!refExists(entry.parent_ref)) {
+            block(entry.parent_ref, 'parent-deleted', '主干已删除目标父节点，分支在其下的新增无法挂载');
+          }
+          break; // after_ref 只定位置，缺了重放容错为追加，不算冲突
+        }
+        case 'node.delete': {
+          const ref = entry.target_ref ?? entry.node_id;
+          if (isTmpId(ref)) break;
+          if (!this._trunkNodeRow(docId, ref)) break; // 主干也删了 → 收敛
+          const before = entry.before_subtree_hash || forkSubtreeHash(ref) || null;
+          if (before && this._trunkSubtreeHash(docId, ref) !== before) {
+            // 分支删 / 主干改 → 删改冲突，可人裁：取主干=撤回删除，取本分支=照删。
+            conflicts.push({ id: norm(ref), field: '__node__', base: 'present', ours: 'modified', theirs: 'deleted' });
+          }
+          break;
+        }
+        case 'node.move':
+          break; // 同父排序，位置不进冲突；节点已删由重放容错跳过
+        case 'node.promote':
+        case 'node.reparent':
+        case 'node.moveBefore':
+        case 'node.moveAfter': {
+          const ref = entry.node_ref ?? entry.target_ref ?? entry.node_id;
+          if (isTmpId(ref)) break;
+          const row = this._trunkNodeRow(docId, ref);
+          if (!row) {
+            // 显式重挂/提升的对象已被主干删除 → 复活不支持；纯排序（moveBefore/After）位置意图失效，跳过即可。
+            if (entry.kind === 'node.reparent' || entry.kind === 'node.promote') {
+              block(ref, 'node-deleted', '主干已删除该节点，分支对它的移动无法应用');
+            }
+            break;
+          }
+          const fork = forkNode(ref);
+          const beforeParent = Object.prototype.hasOwnProperty.call(entry, 'before_parent_id')
+            ? entry.before_parent_id
+            : (fork ? fork.parent_id : undefined);
+          if (beforeParent !== undefined) {
+            const currentParent = norm(row.parent_id);
+            const intended = entry.kind === 'node.reparent' ? norm(entry.new_parent_ref) : undefined;
+            if (currentParent !== norm(beforeParent) && currentParent !== intended) {
+              block(ref, 'parent-conflict', '主干已移动该节点，与分支的移动冲突', row.address || '');
+              break;
+            }
+          }
+          if (entry.kind === 'node.reparent' && !refExists(entry.new_parent_ref)) {
+            block(entry.new_parent_ref, 'parent-deleted', '主干已删除目标父节点，分支的移动无法挂载');
+          }
+          break; // moveBefore/After 的锚点缺失只影响位置，重放容错跳过
+        }
+        case 'node.split': {
+          if (entry.strategy === 'source_paragraphs' && Array.isArray(entry.paragraph_splits)) {
+            for (const split of entry.paragraph_splits) {
+              checkContentIntact(split.paragraph_node_id, split.before_content_hash || null);
+            }
+          } else {
+            checkContentIntact(entry.target_ref ?? entry.node_id, entry.before_content_hash || null, entry.address || '');
+          }
+          break;
+        }
+        case 'node.mergeInto':
+        case 'node.mergePrevious': {
+          checkContentIntact(entry.source_ref ?? entry.node_id, entry.source_before_content_hash || null);
+          if (entry.target_ref !== null && entry.target_ref !== undefined) {
+            checkContentIntact(entry.target_ref, entry.target_before_content_hash || null);
+          }
+          break;
+        }
+        default:
+          break; // axiom/ref/entity：v1 不做主干前置（与既有行为一致），照常重放
+      }
+    }
+
+    // 字段三态：现值==分支终值 → 收敛；现值==原值 → 主干没动；否则冲突（原值不可知时保守按冲突，base 置空）。
+    for (const item of fieldAgg.values()) {
+      const row = this._trunkNodeRow(docId, item.id);
+      if (!row) continue; // 已在 update 处 block
+      const current = norm(row[item.field]);
+      const next = norm(item.next);
+      if (current === next) continue;
+      if (item.old !== undefined && current === norm(item.old)) continue;
+      conflicts.push({
+        id: item.id,
+        field: item.field,
+        base: item.old === undefined ? null : norm(item.old),
+        ours: current,
+        theirs: next
+      });
+    }
+
+    // 面板数据：按节点聚合冲突，附 address/title 标识。
+    const nodes = [];
+    const byNode = new Map();
+    for (const conflict of conflicts) {
+      if (!byNode.has(conflict.id)) {
+        const row = this._trunkNodeRow(docId, conflict.id);
+        const node = {
+          id: conflict.id,
+          resolution: 'conflict',
+          address: row?.address || '',
+          title: row?.node_title || '',
+          conflicts: []
+        };
+        byNode.set(conflict.id, node);
+        nodes.push(node);
+      }
+      byNode.get(conflict.id).conflicts.push(conflict);
+    }
+    return { conflicts, nodes, blocked };
+  }
+
+  // 保存闸门（A5-10）：快进直接重放（lazy diff 本职，前置必然成立）；非快进走逐条前置验证：
+  //   - blocked（结构性失配）→ 拒绝写回：「主干已被修改，无法保存，请放弃本次编辑」；
+  //     前端取消可保留分支（自行留存 diff 后再放弃），确认则丢弃分支退出。
+  //   - conflicts（字段级/删改级）→ 无人裁拒绝并返回冲突；带 resolutions 折进账目后提交。
+  //   - 干净/收敛 → 直接重放写回。
+  applyThreeWayMerge({ branchId = null, shadowDocId = null, baseDocId = null, owner = 'human', summary = '三方合并', resolutions = null } = {}) {
+    const branch = this.findEditBranch({ branchId, shadowDocId, baseDocId, owner });
+    if (!branch) throw new Error('Edit branch not found');
+    const docId = branch.base_doc_id;
+    const baseCommitId = (parseJsonObject(branch.base_snapshot) || {}).baseCommitId || null;
+    const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(docId);
+    const headCommitId = head?.head_commit_id || null;
+    const fastForward = (baseCommitId || null) === (headCommitId || null);
+    const rawPayload = parseJsonObject(branch.diff) || {};
+    const entries = activeEditBranchEntries(rawPayload.entries);
+    const meta = {
+      kind: 'editBranch.threeWayMerge.apply',
+      baseDocId: docId,
+      fastForward,
+      baseCommitId,
+      headCommitId
+    };
+
+    if (fastForward || entries.length === 0) {
+      return { ...meta, applied: true, ...this._commitEditBranchPayload(branch, rawPayload, summary) };
+    }
+
+    const validation = this._validateEditBranchEntriesAgainstTrunk(branch, entries);
+    if (validation.blocked.length > 0) {
+      return {
+        ...meta,
+        applied: false,
+        blocked: true,
+        message: '主干已被修改，无法保存，请放弃本次编辑',
+        blockedConflicts: validation.blocked,
+        conflicts: validation.conflicts,
+        nodes: validation.nodes
+      };
+    }
+    if (validation.conflicts.length > 0) {
+      const picks = Array.isArray(resolutions) ? resolutions : [];
+      if (picks.length === 0) {
+        return { ...meta, applied: false, conflicts: validation.conflicts, nodes: validation.nodes };
+      }
+      const { entries: folded, errors } = resolveConflictEntries({
+        entries: rawPayload.entries,
+        conflicts: validation.conflicts,
+        resolutions: picks
+      });
+      if (errors.length > 0) {
+        return { ...meta, applied: false, resolutionErrors: errors, conflicts: validation.conflicts, nodes: validation.nodes };
+      }
+      return { ...meta, applied: true, resolved: true, ...this._commitEditBranchPayload(branch, { ...rawPayload, entries: folded }, summary) };
+    }
+    return { ...meta, applied: true, ...this._commitEditBranchPayload(branch, rawPayload, summary) };
   }
 
   _replaceEditBranchDiff(branch, diff) {
@@ -2035,7 +2691,10 @@ export class IftreeStore {
     const freshBranch = this._appendEditBranchEntry(branch, {
       kind: 'node.delete',
       target_ref: target.id,
-      address: target.address || ''
+      address: target.address || '',
+      // 乐观并发前置（A5-10）：记下主干当下这棵子树的指纹，保存时一致才允许照删——
+      // 「删除时至少该知道删的是什么」。tmp 目标（分支自建）无主干前置，记 null。
+      before_subtree_hash: this._trunkSubtreeHash(docId, target.id)
     });
     return { branch: freshBranch, changed: true, docId };
   }
@@ -2057,9 +2716,11 @@ export class IftreeStore {
     const docId = normalizePositiveId(branch.base_doc_id);
     const ref = payload.nodeId ?? payload.node_id;
     if (ref === null || ref === undefined) throw new Error('node.promote requires nodeId');
+    const trunkRow = this._trunkNodeRow(docId, ref);
     const freshBranch = this._appendEditBranchEntry(branch, {
       kind: 'node.promote',
-      target_ref: ref
+      target_ref: ref,
+      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
     });
     return { branch: freshBranch, changed: true, docId };
   }
@@ -2103,6 +2764,8 @@ export class IftreeStore {
         if (spans.length === 0) continue;
         paragraphSplits.push({
           paragraph_node_id: candidate.id,
+          // 乐观并发前置：拆分基于该段当下的内容，保存时内容漂移则拒绝（candidate 是主干行）。
+          before_content_hash: contentHash(candidate),
           spans: spans.map((span) => ({
             text: span.text || '',
             sentence_index: span.sentence_index ?? null,
@@ -2126,12 +2789,15 @@ export class IftreeStore {
       return { branch, changed: false, docId };
     }
     const newIds = sentences.slice(1).map(() => nextTmpId('node'));
+    const trunkTarget = this._trunkNodeRow(docId, target.id);
     const freshBranch = this._appendEditBranchEntry(branch, {
       kind: 'node.split',
       target_ref: target.id,
       strategy: 'split_sentences',
       sentences,
-      new_node_ids: newIds
+      new_node_ids: newIds,
+      // 乐观并发前置：拆分基于主干当下的正文，保存时内容漂移则拒绝（tmp 目标无前置）。
+      before_content_hash: trunkTarget ? contentHash(trunkTarget) : null
     });
     return { branch: freshBranch, changed: true, docId };
   }
@@ -2142,10 +2808,15 @@ export class IftreeStore {
     const targetRef = payload.targetNodeId ?? payload.target_node_id;
     if (sourceRef === null || sourceRef === undefined) throw new Error('node.mergeInto requires nodeId');
     if (targetRef === null || targetRef === undefined) throw new Error('node.mergeInto requires targetNodeId');
+    const trunkSource = this._trunkNodeRow(docId, sourceRef);
+    const trunkTarget = this._trunkNodeRow(docId, targetRef);
     const freshBranch = this._appendEditBranchEntry(branch, {
       kind: 'node.mergeInto',
       source_ref: sourceRef,
-      target_ref: targetRef
+      target_ref: targetRef,
+      // 乐观并发前置：拼接结果取决于两侧当下正文，保存时任一侧内容漂移则拒绝。
+      source_before_content_hash: trunkSource ? contentHash(trunkSource) : null,
+      target_before_content_hash: trunkTarget ? contentHash(trunkTarget) : null
     });
     return { branch: freshBranch, changed: true, docId };
   }
@@ -2156,10 +2827,14 @@ export class IftreeStore {
     const newParentRef = payload.newParentId ?? payload.new_parent_id;
     if (ref === null || ref === undefined) throw new Error('node.reparent requires nodeId');
     if (newParentRef === null || newParentRef === undefined) throw new Error('node.reparent requires newParentId');
+    const trunkRow = this._trunkNodeRow(docId, ref);
     const freshBranch = this._appendEditBranchEntry(branch, {
       kind: 'node.reparent',
       node_ref: ref,
-      new_parent_ref: newParentRef
+      new_parent_ref: newParentRef,
+      // 乐观并发前置：记录移动时主干上的父节点；保存时父已被主干改走 → 两侧移动相撞。
+      // 仅主干行存在时记录（缺省=无前置），避免把「未知」误记成「根(null)」。
+      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
     });
     return { branch: freshBranch, changed: true, docId };
   }
@@ -2170,10 +2845,12 @@ export class IftreeStore {
     const targetRef = payload.targetNodeId ?? payload.target_node_id;
     if (ref === null || ref === undefined) throw new Error('node.moveAfter requires nodeId');
     if (targetRef === null || targetRef === undefined) throw new Error('node.moveAfter requires targetNodeId');
+    const trunkRow = this._trunkNodeRow(docId, ref);
     const freshBranch = this._appendEditBranchEntry(branch, {
       kind: 'node.moveAfter',
       node_ref: ref,
-      target_ref: targetRef
+      target_ref: targetRef,
+      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
     });
     return { branch: freshBranch, changed: true, docId };
   }
@@ -2344,6 +3021,9 @@ export class IftreeStore {
       if (!id) throw new Error(`apply: invalid entity id ${ref}`);
       return id;
     };
+    // 位置类容错（非快进合并后允许的降级）：锚点/排序对象已被主干删除时，位置意图失效，
+    // 跳过或退化为追加——位置不进内容身份（A5-2），不算丢改动。内容类缺失仍由前置验证拦在重放前。
+    const nodeRowExists = (id) => Boolean(this.db.prepare('SELECT 1 FROM nodes WHERE id = ?').get(id));
     const normalizeEntityKeyForApply = (value = '') => String(value || '').trim().toLocaleLowerCase();
     const orderedEntityPairForApply = (left, right) => {
       const leftId = resolveEntityId(left);
@@ -2364,29 +3044,36 @@ export class IftreeStore {
         }
         case 'node.insert': {
           const fields = entry.fields || {};
+          const afterId = entry.after_ref ? resolveNodeId(entry.after_ref) : null;
           const inserted = this.insertNode({
             docId: baseDocId,
             parentId: resolveNodeId(entry.parent_ref),
-            afterNodeId: entry.after_ref ? resolveNodeId(entry.after_ref) : null,
+            afterNodeId: afterId && nodeRowExists(afterId) ? afterId : null,
             text: fields.text ?? '',
             nodeType: fields.node_type ?? fields.nodeType ?? 'TEXT',
             nodeTitle: fields.node_title ?? fields.nodeTitle ?? '',
             nodeNote: fields.node_note ?? fields.nodeNote ?? '',
-            sourcePosition: fields.source_position ?? null
+            sourcePosition: fields.source_position ?? null,
+            // stage 侧（stageEditBranchNodeInsert）一直保留 trust_level，重放漏传会让
+            // 分支里声明的信任级别在落主干时静默归 null（实际翻过车：31 条「受控」全丢）。
+            trustLevel: fields.trust_level ?? fields.trustLevel ?? null
           });
           if (entry.tmp_id) nodeIdByTmp.set(entry.tmp_id, inserted.id);
           break;
         }
         case 'node.delete': {
-          this.deleteNodeSubtree(resolveNodeId(entry.target_ref));
+          const targetId = resolveNodeId(entry.target_ref);
+          if (nodeRowExists(targetId)) this.deleteNodeSubtree(targetId); // 主干也删了 → 收敛跳过
           break;
         }
         case 'node.move': {
-          this.moveNode(resolveNodeId(entry.target_ref), entry.direction === 'up' ? 'up' : 'down');
+          const targetId = resolveNodeId(entry.target_ref);
+          if (nodeRowExists(targetId)) this.moveNode(targetId, entry.direction === 'up' ? 'up' : 'down');
           break;
         }
         case 'node.promote': {
-          this.promoteNode(resolveNodeId(entry.target_ref));
+          const targetId = resolveNodeId(entry.target_ref);
+          if (nodeRowExists(targetId)) this.promoteNode(targetId);
           break;
         }
         case 'node.split': {
@@ -2449,17 +3136,19 @@ export class IftreeStore {
           break;
         }
         case 'node.moveBefore': {
-          this.moveNodeBeforeSibling({
-            nodeId: resolveNodeId(entry.node_ref),
-            targetNodeId: resolveNodeId(entry.target_ref)
-          });
+          const nodeId = resolveNodeId(entry.node_ref);
+          const targetId = resolveNodeId(entry.target_ref);
+          if (nodeRowExists(nodeId) && nodeRowExists(targetId)) {
+            this.moveNodeBeforeSibling({ nodeId, targetNodeId: targetId });
+          }
           break;
         }
         case 'node.moveAfter': {
-          this.moveNodeAfterSibling({
-            nodeId: resolveNodeId(entry.node_ref),
-            targetNodeId: resolveNodeId(entry.target_ref)
-          });
+          const nodeId = resolveNodeId(entry.node_ref);
+          const targetId = resolveNodeId(entry.target_ref);
+          if (nodeRowExists(nodeId) && nodeRowExists(targetId)) {
+            this.moveNodeAfterSibling({ nodeId, targetNodeId: targetId });
+          }
           break;
         }
         case 'axiom.add': {
@@ -2785,16 +3474,55 @@ export class IftreeStore {
   }
 
   saveEditBranch({ branchId = null, shadowDocId = null, baseDocId = null, owner = 'human', summary = '保存编辑分支' } = {}) {
-    const branch = this.findEditBranch({ branchId, shadowDocId, baseDocId, owner });
-    if (!branch) throw new Error('Edit branch not found');
-    const rawPayload = JSON.parse(branch.diff || '{}');
+    // 与 applyMerge 同一道闸门：非快进时逐条前置验证，受阻/冲突拒绝写回（MCP commit 不再盲存）。
+    return this.applyThreeWayMerge({ branchId, shadowDocId, baseDocId, owner, summary });
+  }
+
+  // 重放前后的节点签名快照，比对找出本次实际受影响节点。签名分两维，对应两套派生索引
+  // 各自的身份语义：keyword 行绑（地址+全部内容字段，4-6-2），向量只绑正文（15-8-1，
+  // 地址/标题/备注变化不重算）。contentHash 现算（merkle 同款）——content_hash 列是
+  // 惰性回写（触发器只标 doc 脏），事务内不可用。逐 entry 收集容易漏（split/merge/
+  // 级联删除），两次 O(n) 快照比对不会。iterate 逐行算完即弃，不持全文。
+  _docNodeSignatures(docId) {
+    const map = new Map();
+    const rows = this.db.prepare(`
+      SELECT id, address, text, node_title, node_note, node_type, trust_level
+      FROM nodes WHERE doc_id = ?
+    `).iterate(docId);
+    for (const row of rows) {
+      map.set(String(row.id), {
+        keyword: `${row.address || ''}|${contentHash(row)}`,
+        text: contentHash({ text: row.text })
+      });
+    }
+    return map;
+  }
+
+  // 把一份 diff payload（生效 entries）应用到主干、提交、写历史、删分支。
+  // saveEditBranch 用分支存储的 entries 调用；三方合并人裁后用折进 resolution 的 entries 调用。
+  // 返回 touchedNodeIds/deletedNodeIds 供派生索引按受影响节点增量同步（4-6-2）。
+  _commitEditBranchPayload(branch, rawPayload = {}, summary = '保存编辑分支') {
     const entries = activeEditBranchEntries(rawPayload.entries);
     const payload = { ...rawPayload, entries };
     const hasEffectiveDiff = entries.length > 0;
 
     return this.withTransaction(() => {
+      const touchedNodeIds = [];
+      const deletedNodeIds = [];
+      const vectorStaleNodeIds = [];
       if (hasEffectiveDiff) {
+        const before = this._docNodeSignatures(branch.base_doc_id);
         this.applyEditBranchDiffEntries(branch, payload);
+        const after = this._docNodeSignatures(branch.base_doc_id);
+        for (const [id, signature] of after) {
+          const previous = before.get(id);
+          if (!previous || previous.keyword !== signature.keyword) touchedNodeIds.push(id);
+          // 向量陈旧 = 既有节点正文变了；新增节点无旧向量行，地址/标题/备注变化不算。
+          if (previous && previous.text !== signature.text) vectorStaleNodeIds.push(id);
+        }
+        for (const id of before.keys()) {
+          if (!after.has(id)) deletedNodeIds.push(id);
+        }
         const currentSnapshot = this.createSnapshot(branch.base_doc_id);
         const commitPayload = {
           ...payload,
@@ -2822,6 +3550,9 @@ export class IftreeStore {
         baseDocId: branch.base_doc_id,
         branchId: branch.id,
         owner: branch.owner,
+        touchedNodeIds,
+        deletedNodeIds,
+        vectorStaleNodeIds,
         history: hasEffectiveDiff
           ? this.db.prepare(`
             SELECT id, doc_id, commit_id, saved_at, summary
@@ -2881,7 +3612,6 @@ export class IftreeStore {
         }
       }
       this.refreshAddressScopes(doc.id, [chapter.id]);
-      this.refreshNodeStructureMetadataChain(chapter.id);
 
       return { ...doc, importedNodeIds, importedNodeIdsByRecordIndex };
     });
@@ -3121,6 +3851,7 @@ export class IftreeStore {
     };
   }
 
+  /** @param {{ docId?: any, depth?: number }} [payload] */
   hasDocTreeDepth({ docId, depth } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const targetDepth = Math.max(1, Math.floor(Number(depth) || 1));
@@ -3140,6 +3871,7 @@ export class IftreeStore {
     };
   }
 
+  /** @param {{ docId?: any }} [payload] */
   getDocStructureRows({ docId } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     if (normalizedDocId === null) return [];
@@ -3164,6 +3896,7 @@ export class IftreeStore {
     `).all(normalizedDocId, normalizedDocId);
   }
 
+  /** @param {{ docId?: any, nodeIds?: any[] }} [payload] */
   getNodeTextBatch({ docId, nodeIds = [] } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const ids = normalizeNodeIdBatch(nodeIds, 500);
@@ -3202,6 +3935,7 @@ export class IftreeStore {
     `).all(normalizedDocId, ...ids, normalizedDocId);
   }
 
+  /** @param {{ docId?: any, query?: string, limit?: number }} [payload] */
   searchNodes({ docId, query, limit = 20 } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const text = String(query || '').trim();
@@ -3311,6 +4045,7 @@ export class IftreeStore {
     return parts.reverse().join('-');
   }
 
+  /** @param {{ docId?: any, nodeId?: any }} [payload] */
   getSubtreeSlotRange({ docId, nodeId } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const normalizedNodeId = normalizePositiveId(nodeId);
@@ -3364,11 +4099,12 @@ export class IftreeStore {
     `).all(pathKey, normalizedDocId, normalizedNodeId, normalizedDocId, normalizedDocId);
   }
 
+  /** @param {{ docId?: any, nodeId?: any, offset?: number, limit?: number, charLimit?: number }} [payload] */
   getSubtreeTextWindow({ docId, nodeId, offset = 0, limit = 1000, charLimit = 0 } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const normalizedNodeId = normalizePositiveId(nodeId);
     if (normalizedDocId === null || normalizedNodeId === null) {
-      return { rows: [], offset: 0, nextOffset: 0, limit: 0, hasMore: false, totalTextChars: null, totalLineCount: null };
+      return { rows: [], offset: 0, nextOffset: 0, limit: 0, charLimit: 0, textChars: 0, hasMore: false };
     }
     const root = this.db.prepare(`
       SELECT id, address, source_position
@@ -3377,11 +4113,12 @@ export class IftreeStore {
     `).get(normalizedDocId, normalizedNodeId);
     const rootAddress = String(root?.address || '').trim();
     if (!root || !rootAddress) {
-      return { rows: [], offset: 0, nextOffset: 0, limit: 0, hasMore: false, totalTextChars: null, totalLineCount: null };
+      return { rows: [], offset: 0, nextOffset: 0, limit: 0, charLimit: 0, textChars: 0, hasMore: false };
     }
     const safeOffset = Math.max(0, Math.floor(Number(offset) || 0));
     const safeLimit = Math.min(1000, Math.max(1, Math.floor(Number(limit) || 1000)));
-    const safeCharLimit = Math.max(1, Math.floor(Number(charLimit) || 1));
+    // 0 表示不启用字符预算
+    const safeCharLimit = Math.max(0, Math.floor(Number(charLimit) || 0));
     const prefix = `${rootAddress}-%`;
     const orderBySource = Number.isFinite(Number(root.source_position));
     const rows = this.db.prepare(`
@@ -3391,8 +4128,8 @@ export class IftreeStore {
         WHERE doc_id = ?
           AND (address = ? OR address LIKE ?)
         ORDER BY ${orderBySource
-          ? `id = ${normalizedNodeId} DESC, source_position IS NULL, source_position, id`
-          : `id = ${normalizedNodeId} DESC, id`}
+          ? '(id = ?) DESC, source_position IS NULL, source_position, id'
+          : '(id = ?) DESC, id'}
         LIMIT ? OFFSET ?
       ),
       child_counts(parent_id, child_count) AS (
@@ -3419,23 +4156,36 @@ export class IftreeStore {
       FROM selected_nodes
       LEFT JOIN child_counts ON child_counts.parent_id = selected_nodes.id
       ORDER BY ${orderBySource
-        ? `selected_nodes.id = ${normalizedNodeId} DESC, selected_nodes.source_position IS NULL, selected_nodes.source_position, selected_nodes.id`
-        : `selected_nodes.id = ${normalizedNodeId} DESC, selected_nodes.id`}
-    `).all(normalizedDocId, rootAddress, prefix, safeLimit + 1, safeOffset, normalizedDocId);
-    const pageRows = rows.slice(0, safeLimit);
+        ? '(selected_nodes.id = ?) DESC, selected_nodes.source_position IS NULL, selected_nodes.source_position, selected_nodes.id'
+        : '(selected_nodes.id = ?) DESC, selected_nodes.id'}
+    `).all(normalizedDocId, rootAddress, prefix, normalizedNodeId, safeLimit + 1, safeOffset, normalizedDocId, normalizedNodeId);
+    const rowTextChars = (row) => String(row.node_title || '').length + String(row.text || '').length + String(row.node_note || '').length;
+    const fetched = rows.slice(0, safeLimit);
+    let pageRows = fetched;
+    let textChars = 0;
+    if (safeCharLimit > 0) {
+      // 字符预算：至少返回一行；累计达到预算后截断本页，保证 nextOffset 始终前进
+      pageRows = [];
+      for (const row of fetched) {
+        pageRows.push(row);
+        textChars += rowTextChars(row);
+        if (textChars >= safeCharLimit) break;
+      }
+    } else {
+      textChars = fetched.reduce((sum, row) => sum + rowTextChars(row), 0);
+    }
     return {
       rows: pageRows,
       offset: safeOffset,
       nextOffset: safeOffset + pageRows.length,
       limit: safeLimit,
       charLimit: safeCharLimit,
-      textChars: pageRows.reduce((sum, row) => sum + String(row.node_title || '').length + String(row.text || '').length + String(row.node_note || '').length, 0),
-      hasMore: rows.length > pageRows.length,
-      totalTextChars: null,
-      totalLineCount: null
+      textChars,
+      hasMore: rows.length > pageRows.length
     };
   }
 
+  /** @param {{ docId?: any, nodeId?: any }} [payload] */
   getAncestorChain({ docId, nodeId } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const normalizedNodeId = normalizePositiveId(nodeId);
@@ -3553,6 +4303,7 @@ export class IftreeStore {
     };
   }
 
+  /** @param {{ docId?: any, afterId?: number, limit?: number }} [payload] */
   getDocNodesPage({ docId, afterId = 0, limit = 5000 } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     if (!normalizedDocId) {
@@ -3591,6 +4342,7 @@ export class IftreeStore {
     };
   }
 
+  /** @param {{ docId?: any, nodeId?: any, startOffset?: number | null, limit?: number, before?: number, spansLimit?: number }} [payload] */
   getSourceWindow({ docId, nodeId = null, startOffset = null, limit = 80000, before = 12000, spansLimit = 8000 } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     if (!normalizedDocId) return null;
@@ -3797,19 +4549,24 @@ export class IftreeStore {
     });
   }
 
-  getPdfHighlightRects(docId, startOffset, endOffset) {
-    const start = Number(startOffset);
-    const end = Number(endOffset);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
-    const chars = this.db.prepare(`
+  // ranges 是 [start,end) 区间列表：多 span 节点的高亮不能用单一包络区间，
+  // 否则 spans 之间别的节点的正文也会被一起点亮。
+  getPdfHighlightRects(docId, ranges) {
+    const merged = mergeHighlightOffsetRanges(ranges);
+    if (merged.length === 0) return [];
+    const statement = this.db.prepare(`
       SELECT page_number, x0, y0, x1, y1
       FROM source_pdf_chars
       WHERE doc_id = ?
         AND char_offset >= ?
         AND char_offset < ?
       ORDER BY page_number, char_offset
-    `).all(docId, start, end);
-    return mergePdfCharRects(chars);
+    `);
+    const rects = [];
+    for (const range of merged) {
+      rects.push(...mergePdfCharRects(statement.all(docId, range.start, range.end)));
+    }
+    return rects;
   }
 
   getPdfSpanHitRects(docId) {
@@ -3862,7 +4619,7 @@ export class IftreeStore {
     return rows;
   }
 
-  insertNode({ docId, parentId, text = '', nodeType = 'TEXT', nodeTitle = '', nodeNote = '', sourcePosition = null, afterNodeId = null }) {
+  insertNode({ docId, parentId, text = '', nodeType = 'TEXT', nodeTitle = '', nodeNote = '', sourcePosition = null, trustLevel = null, afterNodeId = null }) {
     const siblings = this.db.prepare(`
       SELECT id, sort_order FROM nodes
       WHERE doc_id = ? AND parent_id IS ?
@@ -3884,14 +4641,12 @@ export class IftreeStore {
     const nodeId = newStableId();
     const normalizedNodeType = normalizeNodeType(nodeType);
     this.db.prepare(`
-      INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, node_title, node_note, source_position)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(nodeId, docId, parentId, insertOrder, normalizedNodeType, text, nodeTitle || '', nodeNote || '', normalizeSourcePosition(sourcePosition));
+      INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, node_title, node_note, source_position, trust_level)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(nodeId, docId, parentId, insertOrder, normalizedNodeType, text, nodeTitle || '', nodeNote || '', normalizeSourcePosition(sourcePosition), normalizeNullableText(trustLevel));
 
     this.refreshAddressScopes(docId, [parentId]);
-    this.refreshNodeStructureMetadataChain(nodeId);
     this.touchDoc(docId);
-    if (parentId !== null) this.clearMergedSizeCacheForNodeAndAncestors(parentId);
     return this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
   }
 
@@ -3928,7 +4683,6 @@ export class IftreeStore {
 
     this.touchDoc(current.doc_id);
     if (hasContentSizePatch) {
-      this.refreshNodeStructureMetadataChain(nodeId);
     }
     return this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
   }
@@ -3939,11 +4693,20 @@ export class IftreeStore {
     if (node.parent_id === null) throw new Error('Cannot delete document root node');
 
     this.withTransaction(() => {
-      this.clearMergedSizeCacheForNodeAndAncestors(node.parent_id);
+      // 节点被摧毁 → 指向子树内任何节点的引用连带蒸发（refs 无外键，需手工清）。
+      this.db.prepare(`
+        WITH RECURSIVE subtree(id) AS (
+          SELECT id FROM nodes WHERE id = ?
+          UNION ALL
+          SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+        )
+        DELETE FROM refs
+        WHERE (source_type = 'node' AND source_id IN (SELECT id FROM subtree))
+           OR (target_type = 'node' AND target_id IN (SELECT id FROM subtree))
+      `).run(nodeId);
       this.db.prepare('DELETE FROM nodes WHERE id = ?').run(nodeId);
       this.normalizeSiblingOrder(node.doc_id, node.parent_id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id]);
-      this.refreshNodeStructureMetadataChain(node.parent_id);
       this.touchDoc(node.doc_id);
     });
     return true;
@@ -3967,9 +4730,7 @@ export class IftreeStore {
     this.withTransaction(() => {
       this.db.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(sibling.sort_order, node.id);
       this.db.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(node.sort_order, sibling.id);
-      this.clearMergedSizeCacheForNodeAndAncestors(node.parent_id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id]);
-      this.refreshNodeStructureMetadataChain(node.parent_id);
       this.touchDoc(node.doc_id);
     });
     return true;
@@ -4003,9 +4764,7 @@ export class IftreeStore {
       });
 
       this.normalizeSiblingOrder(node.doc_id, nodeId);
-      this.clearMergedSizeCacheForNodeAndAncestors(nodeId);
       this.refreshAddressScopes(node.doc_id, [nodeId]);
-      this.refreshNodeStructureMetadataChain(nodeId);
       this.touchDoc(node.doc_id);
     });
 
@@ -4067,9 +4826,7 @@ export class IftreeStore {
         }
         this.normalizeSiblingOrder(target.node.doc_id, target.node.id);
       }
-      this.clearMergedSizeCacheForNodeAndAncestors(rootNode.id);
       this.refreshAddressScopes(rootNode.doc_id, targetRows.map((target) => target.node.id));
-      this.refreshNodeStructureMetadataChains(targetRows.map((target) => target.node.id));
       this.touchDoc(rootNode.doc_id);
     });
 
@@ -4116,13 +4873,16 @@ export class IftreeStore {
       });
 
       this.db.prepare('UPDATE source_spans SET node_id = ? WHERE node_id = ?').run(previous.id, node.id);
+      // 被合并节点被摧毁 → 指向它的引用连带蒸发（孩子已搬走、其引用不动）。
+      this.db.prepare(`
+        DELETE FROM refs
+        WHERE (source_type = 'node' AND source_id = ?)
+           OR (target_type = 'node' AND target_id = ?)
+      `).run(node.id, node.id);
       this.db.prepare('DELETE FROM nodes WHERE id = ?').run(node.id);
       this.normalizeSiblingOrder(node.doc_id, node.parent_id);
       this.normalizeSiblingOrder(node.doc_id, previous.id);
-      this.clearMergedSizeCacheForNodeAndAncestors(previous.id);
-      this.clearMergedSizeCacheForNodeAndAncestors(node.parent_id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id, previous.id]);
-      this.refreshNodeStructureMetadataChains([previous.id, node.parent_id]);
       this.touchDoc(node.doc_id);
     });
 
@@ -4166,13 +4926,16 @@ export class IftreeStore {
 
       const oldParentId = node.parent_id;
       this.db.prepare('UPDATE source_spans SET node_id = ? WHERE node_id = ?').run(target.id, node.id);
+      // 被合并节点被摧毁 → 指向它的引用连带蒸发（孩子已搬走、其引用不动）。
+      this.db.prepare(`
+        DELETE FROM refs
+        WHERE (source_type = 'node' AND source_id = ?)
+           OR (target_type = 'node' AND target_id = ?)
+      `).run(node.id, node.id);
       this.db.prepare('DELETE FROM nodes WHERE id = ?').run(node.id);
       this.normalizeSiblingOrder(node.doc_id, oldParentId);
       this.normalizeSiblingOrder(node.doc_id, target.id);
-      this.clearMergedSizeCacheForNodeAndAncestors(target.id);
-      this.clearMergedSizeCacheForNodeAndAncestors(oldParentId);
       this.refreshAddressScopes(node.doc_id, [oldParentId, target.id]);
-      this.refreshNodeStructureMetadataChains([target.id, oldParentId]);
       this.touchDoc(node.doc_id);
     });
 
@@ -4198,10 +4961,7 @@ export class IftreeStore {
 
       this.normalizeSiblingOrder(node.doc_id, parent.id);
       this.normalizeSiblingOrder(node.doc_id, parent.parent_id);
-      this.clearMergedSizeCacheForNodeAndAncestors(parent.id);
-      this.clearMergedSizeCacheForNodeAndAncestors(parent.parent_id);
       this.refreshAddressScopes(node.doc_id, [parent.id, parent.parent_id]);
-      this.refreshNodeStructureMetadataChains([node.id, parent.id, parent.parent_id]);
       this.touchDoc(node.doc_id);
     });
 
@@ -4227,10 +4987,7 @@ export class IftreeStore {
         .run(newParent.id, newOrder, node.id);
       this.normalizeSiblingOrder(node.doc_id, oldParentId);
       this.normalizeSiblingOrder(node.doc_id, newParent.id);
-      this.clearMergedSizeCacheForNodeAndAncestors(oldParentId);
-      this.clearMergedSizeCacheForNodeAndAncestors(newParent.id);
       this.refreshAddressScopes(node.doc_id, [oldParentId, newParent.id]);
-      this.refreshNodeStructureMetadataChains([node.id, oldParentId, newParent.id]);
       this.touchDoc(node.doc_id);
     });
 
@@ -4259,10 +5016,7 @@ export class IftreeStore {
       this.db.prepare('UPDATE nodes SET parent_id = ? WHERE id = ?').run(target.parent_id, node.id);
       this.setSiblingOrder(node.doc_id, target.parent_id, targetSiblings);
       if (node.parent_id !== target.parent_id) this.normalizeSiblingOrder(node.doc_id, node.parent_id);
-      this.clearMergedSizeCacheForNodeAndAncestors(node.parent_id);
-      this.clearMergedSizeCacheForNodeAndAncestors(target.parent_id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id, target.parent_id]);
-      this.refreshNodeStructureMetadataChains([node.id, node.parent_id, target.parent_id]);
       this.touchDoc(node.doc_id);
     });
 
@@ -4293,10 +5047,7 @@ export class IftreeStore {
       this.db.prepare('UPDATE nodes SET parent_id = ? WHERE id = ?').run(target.parent_id, node.id);
       this.setSiblingOrder(node.doc_id, target.parent_id, targetSiblings);
       if (oldParentId !== target.parent_id) this.normalizeSiblingOrder(node.doc_id, oldParentId);
-      this.clearMergedSizeCacheForNodeAndAncestors(oldParentId);
-      this.clearMergedSizeCacheForNodeAndAncestors(target.parent_id);
       this.refreshAddressScopes(node.doc_id, [oldParentId, target.parent_id]);
-      this.refreshNodeStructureMetadataChains([node.id, oldParentId, target.parent_id]);
       this.touchDoc(node.doc_id);
     });
 
@@ -4913,14 +5664,6 @@ export class IftreeStore {
       }
       if (remaining.length === before) throw new Error('Snapshot contains unresolved node parents');
     }
-  }
-
-  clearLineStatsForNode(_nodeId) {
-    // line_count / line_width_sum columns have been removed — no-op
-  }
-
-  clearMergedSizeCacheForNodeAndAncestors(_nodeId) {
-    // node_merged_width / node_merged_height / subtree_line_count / subtree_line_width_sum columns have been removed — no-op
   }
 
   withTransaction(fn) {

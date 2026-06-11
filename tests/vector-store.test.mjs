@@ -12,6 +12,7 @@ import {
 } from '../src/vector/embeddings.mjs';
 import { VectorStore } from '../src/vector/vector-store.mjs';
 
+/** @returns {number[]} */
 function vector(dimensions = MIN_VECTOR_DIMENSIONS, hotIndex = 0) {
   return Array.from({ length: dimensions }, (_, index) => (index === hotIndex ? 1 : 0));
 }

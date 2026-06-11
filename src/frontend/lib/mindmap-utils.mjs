@@ -40,7 +40,7 @@ export async function buildTreeWithIndex(rows, onProgress = null) {
 
   const childLists = [...childrenByParent.values()];
   for (let index = 0; index < childLists.length; index += 1) {
-    childLists[index].sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+    childLists[index].sort((a, b) => a.sortOrder - b.sortOrder || String(a.id).localeCompare(String(b.id)));
     if ((index + 1) % TREE_BUILD_YIELD_EVERY === 0 || index + 1 === childLists.length) {
       await yieldBuildProgress('正在排序子节点...', index + 1, childLists.length);
     }

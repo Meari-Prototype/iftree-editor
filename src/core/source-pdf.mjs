@@ -2,11 +2,11 @@ import { readFileSync } from 'node:fs';
 
 import { getDocument, Util } from 'pdfjs-dist/legacy/build/pdf.mjs';
 
-import { normalizeSourceMarkdown, sourceSpansFromMarkdown } from './source-doc.mjs';
+import { normalizeSourceMarkdown, sourceSpansFromMarkdown } from './source-markdown.mjs';
 
 export async function readPdfSourceDocument(filePath) {
   const data = new Uint8Array(readFileSync(filePath));
-  const pdf = await getDocument({ data, disableWorker: true, useSystemFonts: true }).promise;
+  const pdf = await getDocument({ data, useSystemFonts: true }).promise;
   const pages = [];
   const chars = [];
   const lines = [];
@@ -17,10 +17,10 @@ export async function readPdfSourceDocument(filePath) {
     const viewport = page.getViewport({ scale: 1 });
     pages.push({ pageNumber, width: viewport.width, height: viewport.height });
 
-    const content = await page.getTextContent({ disableCombineTextItems: true });
+    const content = await page.getTextContent();
     const pageItems = [];
     for (const item of content.items || []) {
-      const text = String(item.str || '');
+      const text = String(/** @type {any} */ (item).str || '');
       if (!text) continue;
       const rect = textItemRect(item, viewport);
       if (!rect) continue;
@@ -244,8 +244,7 @@ function isImageOnlyPdf(text, pageCount) {
 async function buildPdfSourceBlocks(pdf, rawMarkdown, rawLines, normalized) {
   const lines = normalizePdfLines(rawMarkdown, rawLines, normalized.offsetMap);
   const outlineBlocks = await pdfOutlineBlocks(pdf, rawMarkdown, normalized.chars);
-  const headingBlocks = (outlineBlocks.length > 0 ? outlineBlocks : inferredPdfHeadingBlocks(lines))
-    .filter((block) => !isPdfHeadingNoise(block.text));
+  const headingBlocks = outlineBlocks.length > 0 ? outlineBlocks : inferredPdfHeadingBlocks(lines);
   const headingKeys = new Set(headingBlocks.map((block) => `${block.start}:${block.end}`));
   const blocks = [];
   let group = [];
@@ -397,17 +396,9 @@ function inferredPdfHeadingBlocks(lines) {
 function isInferredPdfHeading(line, minimumHeight) {
   const text = String(line?.text || '').trim();
   if (!text || isPdfPageNumberLine(text) || text.length > 60) return false;
-  if (isPdfHeadingNoise(text)) return false;
   if (/^◆/.test(text)) return true;
-  if (/^(Chapter|第[零一二三四五六七八九十百千万\d]+[章节篇部卷]|场景\s*(?:\d|[零一二三四五六七八九十百千万]))/iu.test(text)) return true;
-  if (/^译者的话[：:]$/u.test(text)) return true;
+  if (/^(Chapter|第[零一二三四五六七八九十百千万\d]+[章节篇部卷])/iu.test(text)) return true;
   return Number(line.height) >= minimumHeight && !/[。？！；，、,.!?;]/u.test(text);
-}
-
-function isPdfHeadingNoise(text) {
-  return /^(作者|修订|编辑|版面设计|版面布局|封面绘制|出品)[：:]/u.test(text) ||
-    /勿按比例度量/u.test(text) ||
-    /^(煌星工作室|出品)$/u.test(text);
 }
 
 function pdfHeadingLevel(line, bodyHeight) {

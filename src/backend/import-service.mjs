@@ -28,7 +28,7 @@ function docSourcePathKeys(row) {
 }
 
 function sortExistingDocs(left, right) {
-  return String(right.updated_at || '').localeCompare(String(left.updated_at || '')) || Number(right.id) - Number(left.id);
+  return String(right.updated_at || '').localeCompare(String(left.updated_at || '')) || String(right.id || '').localeCompare(String(left.id || ''));
 }
 
 function findExistingImportedDocForSourcePaths(store, sourcePaths = []) {

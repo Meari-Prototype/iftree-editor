@@ -29,8 +29,6 @@ export const NODE_GOLDEN_CARD_RATIO = 1.618;
 export const NODE_LONG_PRESS_MS = 360;
 export const NODE_GESTURE_DRAG_THRESHOLD = 5;
 export const RESIZE_RAIL_DRAG_THRESHOLD = 4;
-export const OUTLINE_ROW_HEIGHT = 32;
-export const OUTLINE_VIRTUAL_OVERSCAN = 640;
 export const MINDMAP_RENDER_OVERSCAN_SCREENS = 1;
 export const DEFAULT_TREE_LOAD_DEPTH = 1;
 export const DEFAULT_LARGE_TREE_OPEN_DEPTH = 2;
@@ -205,22 +203,6 @@ export function docDepthStats(doc) {
     maxDepth,
     depths: depths.length ? depths : [1]
   };
-}
-
-export function hasNodeLineStats(_node) {
-  return false;
-}
-
-export function hasNodeSubtreeLineStats(_node) {
-  return false;
-}
-
-export function hasNodeLayoutCache(_node) {
-  return false;
-}
-
-export function layoutCacheItemsFromMindmap(_mindmap, _nodeRows = []) {
-  return [];
 }
 
 export function hasKnownChildren(node) {
@@ -491,35 +473,6 @@ export function defaultCollapsedOutlineIds(tree) {
   };
   visit(tree);
   return ids;
-}
-
-export function visibleOutlineRows(tree, collapsedIds = new Set()) {
-  const rows = [];
-  const collapsed = collapsedIds instanceof Set ? collapsedIds : new Set(collapsedIds || []);
-  const visit = (node) => {
-    if (!node) return;
-    rows.push(node);
-    if (collapsed.has(node.id)) return;
-    for (const child of node.children || []) visit(child);
-  };
-  visit(tree);
-  return rows;
-}
-
-export function outlineParentTrailRows(rows, startIndex, nodeById) {
-  const source = Array.isArray(rows) ? rows : [];
-  const first = source[Math.max(0, Number(startIndex) || 0)];
-  if (!first) return [];
-  const byId = nodeById instanceof Map
-    ? nodeById
-    : new Map(source.map((node) => [node.id, node]));
-  const trail = [];
-  let current = hasKnownChildren(first) ? first : byId.get(first.parentId);
-  while (current) {
-    trail.unshift(current);
-    current = byId.get(current.parentId);
-  }
-  return trail;
 }
 
 export function buildParagraphLabelMap(tree) {

@@ -3,7 +3,7 @@ import {
   maybeRefreshDoc,
   plain,
   requireDocId,
-  requirePositiveId,
+  requireId,
   rowById,
   runOptionalEffect
 } from './shared.mjs';
@@ -15,7 +15,7 @@ export async function handleHistoryMutation(store, payload, ctx, action, effects
     return docRefresh(action, docId, { history: plain(history), sideEffects: effects });
   }
   if (action === 'history.restore') {
-    const historyId = requirePositiveId(payload, 'historyId', 'history_id');
+    const historyId = requireId(payload, 'historyId', 'history_id');
     const history = rowById(store, 'save_history', historyId);
     const docId = payload.docId ?? payload.doc_id ?? history?.doc_id;
     if (!docId) throw new Error('history.restore requires docId or an existing historyId');

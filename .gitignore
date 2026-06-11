@@ -3,7 +3,6 @@ dist/
 dist-electron/
 .vite/
 
-/docs/
 # Local app/runtime state
 .env
 .env.*
@@ -22,7 +21,9 @@ dist-electron/
 .iftree-dev/
 .iftree-cache/
 .iftree-debug/
-.iftree-llm-workspace/
+# LLM 工作区整体不进库，只放行 skills/（对外 agent 技能文档，随仓库分发）
+.iftree-llm-workspace/*
+!.iftree-llm-workspace/skills/
 .superpowers/
 .claude/
 .obsidian/

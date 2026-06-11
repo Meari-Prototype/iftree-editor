@@ -19,6 +19,10 @@ import { configuredMaxOutputTokens, llmProtocol, normalizeReasoningEffort } from
 import { anthropicMessagesUrl, chatCompletionUrl, fetchLlmResponse, readJsonSseStream } from './chat-client.mjs';
 import { normalizeAgentToolSettings } from './defaults.mjs';
 
+const STABLE_ID_SCHEMA = Object.freeze({
+  anyOf: [{ type: 'string' }, { type: 'number' }]
+});
+
 function sanitize(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -231,7 +235,7 @@ function proposeNodePatchToolSchema() {
   return {
     type: 'object',
     properties: {
-      docId: { type: 'number' },
+      docId: STABLE_ID_SCHEMA,
       address: { type: 'string', description: '要修改的节点地址，例如 1-3-2。' },
       summary: { type: 'string' },
       patch: patchFieldsSchema()
@@ -244,7 +248,7 @@ function proposeNodeInsertToolSchema() {
   return {
     type: 'object',
     properties: {
-      docId: { type: 'number' },
+      docId: STABLE_ID_SCHEMA,
       parentAddress: { type: 'string', description: '新节点的父节点地址。' },
       afterAddress: { type: 'string', description: '可选：插入到哪个兄弟节点之后。' },
       summary: { type: 'string' },
@@ -261,7 +265,7 @@ function proposeNodeDeleteToolSchema() {
   return {
     type: 'object',
     properties: {
-      docId: { type: 'number' },
+      docId: STABLE_ID_SCHEMA,
       address: { type: 'string', description: '要删除的非根节点地址。' },
       summary: { type: 'string' }
     },
@@ -273,7 +277,7 @@ function proposeRefDeleteToolSchema() {
   return {
     type: 'object',
     properties: {
-      docId: { type: 'number' },
+      docId: STABLE_ID_SCHEMA,
       sourceAddress: { type: 'string' },
       targetAddress: { type: 'string' },
       refKind: { type: 'string' },
@@ -287,7 +291,7 @@ function proposeSourceBindPathToolSchema() {
   return {
     type: 'object',
     properties: {
-      docId: { type: 'number' },
+      docId: STABLE_ID_SCHEMA,
       sourcePath: { type: 'string', description: 'library 工作区内的相对路径。' },
       sourceType: { type: 'string' },
       summary: { type: 'string' }
@@ -331,7 +335,7 @@ function deleteLibraryDocumentToolSchema() {
   return {
     type: 'object',
     properties: {
-      docId: { type: 'number', description: '要删除的已导入数据库文档 id；只删数据库数据，不删 library 真实文件。' }
+      docId: { ...STABLE_ID_SCHEMA, description: '要删除的已导入数据库文档 id；只删数据库数据，不删 library 真实文件。' }
     },
     required: ['docId']
   };
@@ -341,7 +345,7 @@ function ensureDocVectorsToolSchema() {
   return {
     type: 'object',
     properties: {
-      docId: { type: 'number', description: '已导入文档 id。只补当前缺失或正文已变更节点的语义向量；节点重挂或地址变化不触发重算。' }
+      docId: { ...STABLE_ID_SCHEMA, description: '已导入文档 id。只补当前缺失或正文已变更节点的语义向量；节点重挂或地址变化不触发重算。' }
     },
     required: ['docId']
   };
@@ -720,161 +724,145 @@ function pushHistoryValue(list, value, limit = 12, maxChars = 320) {
   list.push(text);
 }
 
-function historyActor(item = {}) {
-  return item.role === 'assistant' ? 'assistant' : 'Master';
+// 跨轮历史压缩走「结构压缩」而非语义摘要：内置 agent 的核心目标是定位
+//（把 doc/address/path 找出来），不是记住正文——正文持久化在数据库里，
+// 有指针随时可以用工具重新读取。所以旧轮次只保留结构性事实（谁、调了什么
+// 工具、触达了哪些位置、一句话结论），不做关键词分类，不伪造确定性。
+const HISTORY_PATH_PATTERN = /(?:[A-Za-z]:[\\/][^\s`"'，。；：)）]+|(?:src|electron|docs|tests|scripts)[\\/][\w./\\-]+|projectneed\.md|package\.json|vite\.config\.[\w.]+)/g;
+const HISTORY_TARGET_PATTERN = /\b(?:doc#?\d[0-9a-z-]*|doc id [0-9a-z][0-9a-z-]*|docId[:= ]+[0-9a-z][0-9a-z-]*|node id [0-9a-z][0-9a-z-]*|nodeId[:= ]+[0-9a-z][0-9a-z-]*|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d+(?:-\d+)+)\b/gi;
+const HISTORY_BUDGET_CHARS = 18000;
+const HISTORY_BUDGET_CHARS_TIGHT = 10000;
+const HISTORY_TARGET_LIMIT = 24;
+const HISTORY_LEDGER_LINE_LIMIT = 40;
+
+function pushTurnTargetsFromText(list, content) {
+  const text = String(content || '');
+  if (!text) return;
+  for (const match of text.matchAll(HISTORY_TARGET_PATTERN)) pushHistoryValue(list, match[0], HISTORY_TARGET_LIMIT, 120);
+  for (const match of text.matchAll(HISTORY_PATH_PATTERN)) pushHistoryValue(list, match[0], HISTORY_TARGET_LIMIT, 200);
 }
 
-function historyFragments(content = '') {
-  const text = String(content || '').replace(/\r/g, '').trim();
-  if (!text) return [];
-  return text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+// argsPreview 是 jsonPreview 的产物，可能被截断导致 parse 失败——失败就退回正则。
+function pushTurnTargetsFromPreview(list, preview) {
+  const text = String(preview || '');
+  if (!text) return;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    pushTurnTargetsFromText(list, text);
+    return;
+  }
+  const docId = normalizeStableId(parsed.docId ?? parsed.doc_id, null);
+  const nodeId = normalizeStableId(parsed.nodeId ?? parsed.node_id, null);
+  const address = String(parsed.address || '').trim();
+  if (docId || nodeId || address) {
+    const head = docId ? `doc ${docId}` : '';
+    const at = address ? `@${address}` : (nodeId ? `node ${nodeId}` : '');
+    pushHistoryValue(list, [head, at].filter(Boolean).join(' '), HISTORY_TARGET_LIMIT, 120);
+  }
+  const path = String(parsed.path || parsed.relativePath || '').trim();
+  if (path) pushHistoryValue(list, path, HISTORY_TARGET_LIMIT, 200);
+  const query = String(parsed.query || parsed.q || '').trim()
+    || (Array.isArray(parsed.terms) ? parsed.terms.filter(Boolean).join(' ') : '');
+  if (query) pushHistoryValue(list, `q:"${clipText(query, 40)}"`, HISTORY_TARGET_LIMIT, 60);
 }
 
-function collectHistoryMatches(items = [], patterns = [], limit = 12, maxChars = 320) {
-  const result = [];
+function historyTurnTargets(item = {}) {
+  const targets = [];
+  for (const event of item.toolEvents || []) {
+    pushTurnTargetsFromPreview(targets, event?.argsPreview);
+  }
+  pushTurnTargetsFromText(targets, item.content);
+  return targets;
+}
+
+function historyTurnToolsLine(toolEvents = []) {
+  const counts = new Map();
+  for (const event of toolEvents) {
+    const name = String(event?.name || '').trim();
+    if (!name || name === 'default_context') continue;
+    const entry = counts.get(name) || { total: 0, errors: 0 };
+    entry.total += 1;
+    if (event?.status === 'error') entry.errors += 1;
+    counts.set(name, entry);
+  }
+  return Array.from(counts.entries())
+    .map(([name, { total, errors }]) => `${name}×${total}${errors > 0 ? `(err${errors})` : ''}`)
+    .join(', ');
+}
+
+function historyLedgerLine(item, turn, targets = []) {
+  const head = clipText(String(item.content || '').replace(/\s+/g, ' ').trim(), 2000);
+  if (item.role === 'user') return `T${turn} Master：${head}`;
+  const parts = [`T${turn} assistant(${item.mode})：${head}`];
+  const tools = historyTurnToolsLine(item.toolEvents);
+  if (tools) parts.push(`tools: ${tools}`);
+  if (targets.length > 0) parts.push(`targets: ${targets.slice(0, 8).join('，')}`);
+  return parts.join(' | ');
+}
+
+function buildHistoryLedger(items = []) {
+  const lines = [];
+  const touched = [];
+  let turn = 0;
   for (const item of items) {
-    for (const fragment of historyFragments(item.content)) {
-      if (!patterns.some((pattern) => pattern.test(fragment))) continue;
-      pushHistoryValue(result, `${historyActor(item)}：${fragment}`, limit, maxChars);
-      if (result.length >= limit) return result;
-    }
+    if (item.role === 'user') turn += 1;
+    const targets = historyTurnTargets(item);
+    for (const target of targets) pushHistoryValue(touched, target, HISTORY_TARGET_LIMIT, 200);
+    lines.push(historyLedgerLine(item, turn, targets));
   }
-  return result;
+  // 极端长会话下逐行轨迹自身也会膨胀：只保留最近若干行，更早的触达位置
+  // 已并入聚合（targets 是全量扫的），逐行细节按激进压缩原则放弃。
+  const visibleLines = lines.length > HISTORY_LEDGER_LINE_LIMIT
+    ? [`（更早 ${lines.length - HISTORY_LEDGER_LINE_LIMIT} 条消息的逐行轨迹已省略，其触达位置已并入下方聚合。）`, ...lines.slice(-HISTORY_LEDGER_LINE_LIMIT)]
+    : lines;
+  return [
+    `以下是旧轮次的结构化轨迹（共 ${items.length} 条消息，正文已省略）。数据库是唯一权威：需要旧轮次涉及的内容时，按 docId/address/path 用工具重新读取，不要凭记忆引用旧正文。更早轮次若有范围或禁止类指令，此处未保留——以最近消息和本轮指令为准，不确定时先问 Master。`,
+    ...visibleLines,
+    touched.length > 0 ? `已触达位置：${touched.join('；')}` : ''
+  ].filter(Boolean).join('\n');
 }
 
-function collectLatestHistoryMatch(items = [], patterns = [], maxChars = 320) {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    const fragments = historyFragments(item.content);
-    for (let inner = fragments.length - 1; inner >= 0; inner -= 1) {
-      const fragment = fragments[inner];
-      if (patterns.some((pattern) => pattern.test(fragment))) return clipText(`${historyActor(item)}：${fragment}`, maxChars);
-    }
-  }
-  return '';
-}
-
-function collectHistoryFiles(items = [], context = {}) {
-  const result = [];
-  if (context.file?.sourcePath) pushHistoryValue(result, context.file.sourcePath, 16, 260);
-  const pathPattern = /(?:[A-Za-z]:[\\/][^\s`"'，。；：)）]+|(?:src|electron|docs|tests|scripts)[\\/][\w./\\-]+|projectneed\.md|package\.json|vite\.config\.[\w.]+)/g;
-  for (const item of items) {
-    for (const match of String(item.content || '').matchAll(pathPattern)) pushHistoryValue(result, match[0], 16, 260);
-  }
-  return result;
-}
-
-function collectHistoryTargets(items = [], context = {}) {
-  const result = [];
-  if (context.file?.docId) pushHistoryValue(result, `doc id ${context.file.docId}`, 12, 160);
-  if (context.selectedNode) {
-    pushHistoryValue(
-      result,
-      `doc id ${context.selectedNode.docId}, node id ${context.selectedNode.nodeId}, address ${context.selectedNode.address}`,
-      12,
-      200
-    );
-  }
-  const targetPattern = /\b(?:doc#?\d+|doc id \d+|docId[:= ]+\d+|node id \d+|nodeId[:= ]+\d+|\d+(?:-\d+)+)\b/gi;
-  for (const item of items) {
-    for (const match of String(item.content || '').matchAll(targetPattern)) pushHistoryValue(result, match[0], 12, 160);
-  }
-  return result;
-}
-
-function currentHistoryTask(items = [], resumeState = {}) {
-  const prompt = String(resumeState.prompt || '').trim();
-  if (prompt) return clipText(prompt, 500);
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (items[index].role === 'user') return clipText(items[index].content, 500);
-  }
-  return '';
-}
-
-function structuredAgentHistorySummary(oldItems = [], recentItems = [], resumeState = {}) {
-  const allItems = [...oldItems, ...recentItems];
-  const files = collectHistoryFiles(allItems, resumeState.context || {});
-  const targets = collectHistoryTargets(allItems, resumeState.context || {});
-  const corrections = collectHistoryMatches(oldItems, [
-    /不是|不对|错了|纠正|修正|改成|实际|这里说的就是|没看懂|不是.*而是|不要.*代替/
-  ], 12, 360).map((line) => `后来 Master 修正为：${line}`);
-  const validationResults = collectHistoryMatches(oldItems, [
-    /验证|通过|失败|报错|exit code|node --check|npm run|build|check|test/i
-  ], 10, 320);
-  const pendingConfirmations = collectHistoryMatches(allItems, [
-    /还欠|待确认|需要确认|不确定|缺少|没看懂|ERROR|HUMAN|卡住|等待/
-  ], 10, 320);
-  const prohibitions = collectHistoryMatches(allItems, [
-    /不得|禁止|不要|不能|不许|别动|只改|只需要|范围不能碰|不可|无需|不用/
-  ], 12, 360);
-  const currentTask = currentHistoryTask(allItems, resumeState);
-  return {
-    kind: 'agent_history_summary',
-    '已确认事实': collectHistoryMatches(oldItems, [
-      /确认|结论|规则|需求|必须|应该|已实现|已改|支持|字段|接口|协议|文档|保持/
-    ], 12, 360),
-    '当前任务状态': [
-      currentTask ? `当前任务：${currentTask}` : '',
-      oldItems.length > 0 ? `已压缩旧消息 ${oldItems.length} 条；最近消息保留原文。` : ''
-    ].filter(Boolean),
-    '修改过的文件': files,
-    '未完成事项': collectHistoryMatches(oldItems, [
-      /未完成|待办|TODO|还欠|需要|下一步|继续|没做|缺|不足|半实现|失败|报错/
-    ], 12, 360),
-    '用户纠正过的坑': corrections,
-    '验证结果': validationResults,
-    '后续禁止事项': prohibitions,
-    '冲突修正': corrections,
-    '压缩后恢复行动': {
-      '当前任务': currentTask,
-      '正在编辑文件': files.slice(0, 8),
-      '目标节点': targets.slice(0, 8),
-      '不能碰的文件或范围': prohibitions.slice(0, 8),
-      '还欠 Master 的确认': pendingConfirmations.slice(0, 8),
-      '最近一次验证结果': collectLatestHistoryMatch(allItems, [
-        /验证|通过|失败|报错|exit code|node --check|npm run|build|check|test/i
-      ], 360)
-    }
-  };
-}
-
-function compactAgentHistory(history = [], contextUsage = {}, resumeState = {}) {
+function compactAgentHistory(history = [], contextUsage = {}) {
   if (!Array.isArray(history) || history.length === 0) return [];
   const ratio = Number(contextUsage?.ratio) || 0;
   const clean = history
     .map((item) => ({
       role: item?.role === 'assistant' ? 'assistant' : 'user',
       mode: agentModeText(normalizeAgentMode(item?.mode)),
-      content: String(item?.content || item?.answer || '').trim()
+      content: String(item?.content || item?.answer || '').trim(),
+      toolEvents: Array.isArray(item?.toolEvents) ? item.toolEvents : []
     }))
     .filter((item) => item.content);
   if (clean.length === 0) return [];
-  if (ratio <= 0.55) {
+  // 触发看本次 history 自身的体量；上一轮的 ratio 只用来收紧（首轮 ratio 恒 0，
+  // 不能拿它当放行依据）。
+  const tight = ratio > 0.75;
+  const budget = tight ? HISTORY_BUDGET_CHARS_TIGHT : HISTORY_BUDGET_CHARS;
+  const totalChars = clean.reduce((sum, item) => sum + item.content.length, 0);
+  if (totalChars <= budget) {
     return clean.map((item) => ({
       role: item.role,
       content: item.content
     }));
   }
-  const keepCount = ratio > 0.75 ? 4 : 6;
+  const keepCount = tight ? 4 : 6;
   const recent = clean.slice(-keepCount);
   const older = clean.slice(0, Math.max(0, clean.length - keepCount));
   const messages = [];
   if (older.length > 0) {
-    const summary = structuredAgentHistorySummary(older, recent, resumeState);
-    messages.push({
-      role: 'system',
-      content: [
-        '以下是旧对话的结构化压缩摘要。被写入“后来 Master 修正为”的内容覆盖更早说法；旧说法不得继续作为可执行依据。',
-        JSON.stringify(summary, null, 2)
-      ].join('\n')
-    });
+    messages.push({ role: 'system', content: buildHistoryLedger(older) });
   }
+  // 压缩之外纯拼接：recent 区原文不截断、不随档位改写——同一条历史消息在
+  // 跨轮请求里保持逐字节稳定，避免无谓打碎 prompt 缓存前缀。
   for (const item of recent) {
     messages.push({
       role: item.role,
-      content: clipText(item.content, item.role === 'assistant'
-        ? (ratio > 0.75 ? 1400 : 2400)
-        : (ratio > 0.75 ? 1000 : 1800))
+      content: item.content
     });
   }
   return messages;
@@ -1059,6 +1047,54 @@ const REQUIRED_DEPS = [
   'agentApiFromPayload', 'systemPromptSection', 'libraryPath',
   'libraryRelativePathForAgent'
 ];
+
+// 内置 agent 在记忆卷元信息里的身份标识（15-10-1 卷必带 agent 身份）。
+const BUILTIN_AGENT_ID = 'iftree-builtin';
+
+// schema 自述（15-12-5）：接入第一读物，数百 token 的约定说明，不是内容清单。
+// 正文维护在 system_prompt.md 的 memory.schema 段；这里是文件缺失时的回退。
+const MEMORY_SCHEMA_FALLBACK = [
+  '本库按时态分三层，结构同构（同一套树地址与检索动词）、语义异质：完整记忆（session 事件卷）答"确曾发生"——一个 session 一卷，只追加、封卷不可变、永不删除；长期核心记忆答"现在如此"——经提炼与人工审批产生的当前事实层，每条事实回指事件出处；知识文档答"未来可用"——导入的资料文档。',
+  '你有跨会话记忆：开工先看最近发生过什么（`db memory list` 列卷及状态，按 docId 用 tree/read 下钻卷正文），再看工作区文件。知道库里有什么是检索的产物、不是检索的前提——别等清单，直接检索。',
+  '信任语义：节点分受控/不受控两级。受控=经人工审批的结论；不受控=机器产物未经人审——事件卷一律不受控，这是层级的时态属性，不是质量评分。命中未解决的 ERROR 节点必须停下向用户报告，不得绕过续跑。',
+  '时间纪律：召回结果附带时间元数据，采信前先看时间；同主题证据冲突时新者胜，不得以"内容看起来更合理"推翻时间新旧——合理感是模型先验，时间是客观信号；找不到更新的证据时，旧证据就是最佳可用证据，知旧而用。'
+].join('\n');
+
+// 内置自动落卷的 session→节点树转换（15-10-2）：消息粒度局部展开——一条消息一个节点，
+// 工具事件作为助手消息的子节点；事件卷一律不受控（15-10-3）。
+export function volumeNodesFromTurnMessages(messages = []) {
+  const nodes = [];
+  for (const message of messages) {
+    if (!message) continue;
+    const note = message.createdAt ? `@ ${message.createdAt}` : '';
+    if (message.role === 'user') {
+      nodes.push({
+        node_title: `用户 · ${message.mode || ''}`.trim(),
+        node_note: note,
+        text: String(message.content || ''),
+        trust_level: '不受控'
+      });
+      continue;
+    }
+    const children = (Array.isArray(message.toolEvents) ? message.toolEvents : []).map((event) => ({
+      node_title: `工具 ${event?.name || 'tool'} · ${event?.status || ''}`.trim(),
+      text: [
+        event?.argsPreview ? `args: ${event.argsPreview}` : '',
+        event?.error ? `error: ${event.error}` : '',
+        event?.resultPreview ? `result: ${event.resultPreview}` : ''
+      ].filter(Boolean).join('\n'),
+      trust_level: '不受控'
+    }));
+    nodes.push({
+      node_title: `助手 · ${message.status || '完成'}`,
+      node_note: note,
+      text: String(message.content || ''),
+      trust_level: '不受控',
+      children
+    });
+  }
+  return nodes;
+}
 
 export function createAgentRuntime(deps = {}) {
   for (const key of REQUIRED_DEPS) {
@@ -1535,7 +1571,7 @@ export function createAgentRuntime(deps = {}) {
   }
 
   function agentTools(mode) {
-    const tools = [
+    const tools = /** @type {Array<Record<string, any>>} */ ([
       {
         type: 'function',
         function: {
@@ -1544,7 +1580,7 @@ export function createAgentRuntime(deps = {}) {
           parameters: databaseReadToolSchema()
         }
       }
-    ];
+    ]);
     tools.push(
       {
         type: 'function',
@@ -1880,6 +1916,9 @@ export function createAgentRuntime(deps = {}) {
       baseLines.push('需要改数据库且 permissions.database.canWriteShadow 为 true 时，使用 database_write；数据库变更写入 LLM 影子分支。');
     }
     const basePrompt = deps.systemPromptSection('agent.base', baseLines.join('\n'));
+    // schema 自述（15-12-5）+ 常驻指令（15-12-2）：只点"你有记忆、先看看最近发生什么"，
+    // 不注入正文或命中指针。
+    const memorySchemaPrompt = deps.systemPromptSection('memory.schema', MEMORY_SCHEMA_FALLBACK);
     const modePrompt = deps.systemPromptSection(
       `agent.mode.${mode}`,
       mode === 'edit'
@@ -1890,10 +1929,34 @@ export function createAgentRuntime(deps = {}) {
     );
     return [
       basePrompt,
+      memorySchemaPrompt,
       fixedPrompt ? `用户固定额外说明：\n${fixedPrompt}` : '',
       modePrompt,
       '如果信息不足，说明需要读取哪些来源，不要编造。'
     ].filter(Boolean).join('\n');
+  }
+
+  // 内置自动落卷（15-10-2）：每个对话回合收尾把消息追加进该 session 的记忆卷。
+  // fire-and-forget：落卷是机械记账，不挡回合收尾——done 信号与请求返回都不等它，
+  // 调用处不 await，错误全在本函数内消化。失败只告警：agent_sessions 仍是原始全量记录，
+  // 缺卷可人工补投。
+  async function recordVolumeTurn(sessionId, turnMessages) {
+    try {
+      const nodes = volumeNodesFromTurnMessages(turnMessages);
+      if (!nodes.length) return;
+      await database().run({
+        operation: 'write',
+        payload: {
+          action: 'memory.appendSessionTurn',
+          agent: BUILTIN_AGENT_ID,
+          sessionId: String(sessionId),
+          hostAnchor: `${getAgentStore()?.dbPath || 'agent.sqlite'}#session=${sessionId}`,
+          nodes
+        }
+      }, 'write');
+    } catch (error) {
+      console.warn('[memory] 内置自动落卷失败：', error?.message || error);
+    }
   }
 
   async function runAgent(payload = {}) {
@@ -1934,12 +1997,12 @@ export function createAgentRuntime(deps = {}) {
       storedSessionHistory(existingSession),
       payload.history
     );
-    const messages = [
+    const messages = /** @type {Array<Record<string, any>>} */ ([
       { role: 'system', content: agentSystemPrompt(mode, agentSettings.personalPrompt) },
-      ...compactAgentHistory(history, payload.contextUsage, { prompt, context }),
+      ...compactAgentHistory(history, payload.contextUsage),
       { role: 'system', content: formatAgentContextMessage(context) },
       { role: 'user', content: prompt }
-    ];
+    ]);
     const toolEvents = [];
     const emitToolEvent = (tool) => {
       const id = String(tool?.id || `${tool?.name || 'tool'}-${toolEvents.length}`);
@@ -2032,14 +2095,7 @@ export function createAgentRuntime(deps = {}) {
 
       if (!answer) answer = mode === 'edit' ? '已生成待审变更。' : '没有生成可用回答，请追问或换个问法。';
       const diffs = agentStore.listPendingDiffs();
-      agentStore.finishSessionTurn(session.id, {
-        answer,
-        pendingDiffCount: diffs.length,
-        diffIds: diffs.map((diff) => diff.id),
-        usage,
-        toolEvents,
-        changedDocIds: Array.from(changedDocIds)
-      }, [
+      const turnMessages = [
         {
           role: 'user',
           mode,
@@ -2056,20 +2112,23 @@ export function createAgentRuntime(deps = {}) {
           toolEvents,
           createdAt: new Date().toISOString()
         }
-      ]);
+      ];
+      agentStore.finishSessionTurn(session.id, {
+        answer,
+        pendingDiffCount: diffs.length,
+        diffIds: diffs.map((diff) => diff.id),
+        usage,
+        toolEvents,
+        changedDocIds: Array.from(changedDocIds)
+      }, turnMessages);
       sendAgentStream(requestId, { type: 'done', answer, diffCount: diffs.length, usage });
+      recordVolumeTurn(session.id, turnMessages);
       return { sessionId: session.id, answer, diffs, usage, toolEvents, changedDocIds: Array.from(changedDocIds) };
     } catch (error) {
       if (isAbortError(error)) {
         const answer = '已取消。';
         const diffs = agentStore.listPendingDiffs();
-        agentStore.finishSessionTurn(session.id, {
-          canceled: true,
-          answer,
-          pendingDiffCount: diffs.length,
-          diffIds: diffs.map((diff) => diff.id),
-          toolEvents
-        }, [
+        const turnMessages = [
           {
             role: 'user',
             mode,
@@ -2085,14 +2144,19 @@ export function createAgentRuntime(deps = {}) {
             toolEvents,
             createdAt: new Date().toISOString()
           }
-        ]);
+        ];
+        agentStore.finishSessionTurn(session.id, {
+          canceled: true,
+          answer,
+          pendingDiffCount: diffs.length,
+          diffIds: diffs.map((diff) => diff.id),
+          toolEvents
+        }, turnMessages);
         sendAgentStream(requestId, { type: 'done', answer, diffCount: diffs.length, canceled: true });
+        recordVolumeTurn(session.id, turnMessages);
         return { sessionId: session.id, answer, diffs, toolEvents, canceled: true, changedDocIds: [] };
       }
-      agentStore.finishSessionTurn(session.id, {
-        error: error.message || String(error),
-        toolEvents
-      }, [
+      const turnMessages = [
         {
           role: 'user',
           mode,
@@ -2108,7 +2172,12 @@ export function createAgentRuntime(deps = {}) {
           toolEvents,
           createdAt: new Date().toISOString()
         }
-      ]);
+      ];
+      agentStore.finishSessionTurn(session.id, {
+        error: error.message || String(error),
+        toolEvents
+      }, turnMessages);
+      recordVolumeTurn(session.id, turnMessages);
       throw error;
     } finally {
       if (requestId && activeAgentRequests.get(requestId) === abortController) {

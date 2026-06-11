@@ -1,4 +1,4 @@
-import { readSourceDocument } from '../importers.mjs';
+import { readSourceDocument } from '../source-text.mjs';
 import { importSourceDocumentForMode } from './shared.mjs';
 
 export async function importTextDocument(filePath, options = {}) {

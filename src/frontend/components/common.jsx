@@ -124,6 +124,7 @@ export function ViewAlignedEmptyState({ activeTab, selectedLibraryEntry, onImpor
   );
 }
 
+/** @param {{ onClose?: any, title?: string }} props */
 export function WindowTitlebar({ onClose, title = '条件树编辑器' }) {
   const close = onClose || (() => closeWindow?.());
   return (
