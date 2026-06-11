@@ -299,4 +299,4 @@ npm test                            # 使用 Electron runtime 运行单元测试
 - 界面内置 [Noto Sans CJK](src/frontend/assets/fonts/NOTICE.md) 字体（SIL Open Font License）。
 - 语义向量基于 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) 模型。
 - 以及 Electron、React、Vite、LanceDB、Transformers.js 等开源项目。
-- 开发过程中借助 ChatGPT 5.5 xhigh、Claude Opus 4.8 max 与 DeepSeek V4 辅助。
+- 开发过程中借助 ChatGPT 5.5 xhigh、Claude Opus 4.8 max、Claude Fable 5 与 DeepSeek V4 辅助。
