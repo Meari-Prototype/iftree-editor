@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.2.0%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.3.0%20alpha-orange)
 
-> **项目状态：0.2.0，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
+> **项目状态：0.3.0，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
 >
 > - **前端**：仍有较多已知 bug 未修复。
 > - **后端写入路径**：缺少长期使用的实测——项目开发时间尚短，客观上还没有积累足够的长时运行数据。

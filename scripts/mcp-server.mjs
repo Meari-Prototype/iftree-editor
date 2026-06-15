@@ -885,7 +885,7 @@ async function main() {
     '更详尽的记忆库使用（召回动线、find 范围过滤、写入边界与提炼、存储定位、操作踩坑）见 docs/memory.md。'
   ].join('\n');
 
-  const server = new McpServer({ name: 'iftree-library', version: '0.2.0' }, { instructions: SERVER_INSTRUCTIONS });
+  const server = new McpServer({ name: 'iftree-library', version: '0.3.0' }, { instructions: SERVER_INSTRUCTIONS });
   registerRetrievalTools(server, client);
   registerAgentTools(server, client);
   registerLifecycleTools(server, client);

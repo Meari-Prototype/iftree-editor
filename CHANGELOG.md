@@ -2,6 +2,22 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.3.0 — 2026-06-16
+
+### 新增
+
+- **`inspect` 工具与 `read` 重构**：`read` 收敛为只回正文，新增 `scope=node/subtree/siblings`（同父前中后三条）与 `--at` 读历史快照（默认按节点身份穿透历史、认人不认位置）；元信息 / 出处 / 引用 / 公理 / 批注拆到新的 `inspect` 工具。
+- **`human` / `yolo` 权限档**：在 `full` 之上新增人类身份档——以 human 身份批准（merge）llm 待审分支、写入可标受控（受控内容与人审批准的唯一合法来源）；`full` 档澄清为身份仍 llm、产出标不受控。
+- **记忆提炼链路**：事件卷经 `memory-distill` skill 提炼成长期核心记忆的 diff 提议，由 `human` 档人审落地（门槛在审批、不在提炼）；新增 `docs/memory.md` 记忆库使用手册。
+- **节点级历史**：`log` 可按子树 / 节点列出改动某地址的 commit 与作者，commit 带身份；跨 commit 字段级 diff 渲染。
+- **检索过滤**：`find` 新增 `minScore`（语义按相似度下限、字面按命中次数下限）。
+
+### 工程
+
+- 前端拆分：`App.jsx` 抽出 `useStartup` / `useSummaryRun` / `useEntityTrace` hooks 与 `doc-utils` / `agent-utils`，组件层大幅瘦身。
+- `test:verbs` 补 `pretest:verbs` native 重建前置钩子（与 `pretest` 对齐，避免旧 ABI 检出上 db 用例假失败）；`check:types` 清零。
+- db 动词契约测试套件扩充（read-verbs / read-follow / node-history / snapshot-history / branch-status / diff-text 等）。
+
 ## 0.2.0 — 2026-06-12
 
 ### 新增
