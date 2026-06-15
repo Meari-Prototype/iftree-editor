@@ -15,11 +15,11 @@ export async function handleHistoryMutation(store, payload, ctx, action, effects
     return docRefresh(action, docId, { history: plain(history), sideEffects: effects });
   }
   if (action === 'history.restore') {
-    const historyId = requireId(payload, 'historyId', 'history_id');
-    const history = rowById(store, 'save_history', historyId);
-    const docId = payload.docId ?? payload.doc_id ?? history?.doc_id;
-    if (!docId) throw new Error('history.restore requires docId or an existing historyId');
-    const changed = store.restoreHistory(historyId);
+    const commitId = requireId(payload, 'commitId', 'commit_id');
+    const commit = rowById(store, 'commits', commitId);
+    const docId = payload.docId ?? payload.doc_id ?? commit?.doc_id;
+    if (!docId) throw new Error('history.restore requires docId or an existing commitId');
+    const changed = store.restoreCommit(commitId);
     await runOptionalEffect(effects, 'vector.delete_doc', () => ctx.deleteDocVectors?.(docId));
     await runOptionalEffect(effects, 'vector.ensure_doc', () => ctx.ensureDocVectors?.(docId));
     const doc = maybeRefreshDoc(store, ctx, docId, payload.refreshOptions || {});

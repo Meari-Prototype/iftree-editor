@@ -22,7 +22,7 @@ test('db branch list, begin, diff, merge, and drop handle confirmed and dry-run 
     await editSetText(dbPath, docId, '1-1-6-1-1', modifyChangedText, mergeOwner);
 
     const listText = stdoutOf(await runBashDb(dbPath, ['branch', 'list', docId, '--owner', mergeOwner]));
-    assert.match(listText, new RegExp(`branch:${branch.branchId}\\s+doc:${docId}\\s+owner:${mergeOwner}\\s+active:1\\s+undone:0`));
+    assert.match(listText, new RegExp(`branch:${branch.branchId}\\s+doc:${docId}\\s+owner:${mergeOwner}\\s+改:1\\s+增:0\\s+删:0`));
 
     const diff = parseJsonStdout(await runBashDb(dbPath, ['branch', 'diff', docId, '--owner', mergeOwner]));
     assert.equal(diff.branch.id, branch.branchId);

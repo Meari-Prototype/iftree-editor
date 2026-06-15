@@ -7,43 +7,29 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { appendGeneratedNote, hasGeneratedNote, plainNodeNote } from '../core/node-notes.mjs';
 import { buildNodeSentenceLabelMap } from '../core/source-ranges.mjs';
 import { findNode, flattenTree } from '../core/tree.mjs';
-import { summaryTargetsForMode as buildSummaryTargetsForMode } from '../core/tree-ui.mjs';
 import { createGpuEmbeddingService } from '../vector/gpu-embedding-service.js';
 
 import {
-  depthOf, isFactAxiomRef, clampDepthLimit, normalizeNodeLayoutSettingsByView, fullDepthForDoc, loadedDepthForDoc, treeDocRequest, sameDocId, mergeDocView, docDepthStats,
+  depthOf, isFactAxiomRef, clampDepthLimit, normalizeNodeLayoutSettingsByView, fullDepthForDoc, loadedDepthForDoc, treeDocRequest, sameDocId, mergeDocView,
   hasKnownChildren,
   idSetFromArray, treeViewStateFromDoc,
   normalizeFsPath, isSupportedLibraryImport, docSourcePath,
   docDisplayTitle, defaultCollapsedOutlineIds,
   buildParagraphLabelMap, mergeNodeChildrenIntoTree, isEditableTarget,
-  normalizeDocId, readPersistedActiveDocId, persistActiveDocId,
-  readPersistedSummaryNotesVisible, persistSummaryNotesVisible,
+  normalizeDocId, persistActiveDocId,
+  patchNodeInDoc, remapNodeIdByAddress, remapNodeIdSetByAddress,
   NODE_CHILDREN_PAGE_SIZE,
   SOURCE_WINDOW_BEFORE_CHARS
 } from './lib/doc-utils.mjs';
 import {
-  agentDiffTraceTarget, agentHistoryForRequest
+  agentHistoryForRequest
 } from './lib/agent-utils.mjs';
-import { normalizeSummaryStrategy,
-  normalizeSummaryConcurrency, normalizeSummaryStrategySettings, summaryStrategyForMode, applySummarySkipStrategy, summarySkipBelowCount
-} from './lib/summary-utils.mjs';
-import { debugLog, debugPerfBegin, debugPerfEnd, setDebugLoggingEnabled } from './lib/debug-log.mjs';
+import { debugLog, debugPerfBegin, debugPerfEnd } from './lib/debug-log.mjs';
 import { debugElementTarget, debugShouldLogKey } from './features/debug/ui-debug-actions.js';
 import { createLibraryActions } from './features/library/library-actions.js';
 import { openSettingsAction, saveAgentSettingsAction } from './features/settings/settings-actions.js';
-import {
-  appendEntityTerm,
-  entityDragPayload,
-  entityFromDragEvent,
-  fetchEntityDetail,
-  fetchEntityList,
-  fetchEntityNodeSearch,
-  openEntityMaintenanceAction
-} from './features/entity/entity-actions.js';
 import { ChoiceDialog, ViewAlignedEmptyState, WindowTitlebar } from './components/common.jsx';
 import { C2DMapView } from './components/MindMapView';
 import { IdeView } from './components/IdeView.jsx';
@@ -60,16 +46,17 @@ import { MergeConflictDialog } from './components/MergeConflictDialog.jsx';
 import { DocBrowser } from './components/DocBrowser.jsx';
 import { useAppUI } from './hooks/useAppUI.js';
 import { useEditorOps } from './hooks/useEditorOps.js';
+import { useEntityTrace } from './hooks/useEntityTrace.js';
 import { useLayout } from './hooks/useLayout.js';
 import { useNodeSelection } from './hooks/useNodeSelection.js';
 import { useSettings } from './hooks/useSettings.js';
+import { useStartup } from './hooks/useStartup.js';
+import { useSummaryRun } from './hooks/useSummaryRun.js';
 import { useAgentChat } from './hooks/useAgentChat.js';
 import { useDocumentState } from './hooks/useDocumentState.js';
 import { usePromptDialog } from './hooks/usePromptDialog.js';
 import { useTreeViewState } from './hooks/useTreeViewState.js';
-import { captureE2EWindow, closeWindow, getStartupOptions, onLibraryChanged, onProgress, reportStartupFailure, reportStartupSuccess, startupHeartbeat } from './data/iftree-api.js';
-import { openEntityMaintenanceWindow } from './data/window-service.js';
-import { readDatabase } from './data/database-client.js';
+import { closeWindow, onLibraryChanged, onProgress } from './data/iftree-api.js';
 import {
   agentRepository,
   assetRepository,
@@ -81,145 +68,8 @@ import {
   nodeRepository,
   refRepository,
   settingsRepository,
-  summaryService,
   vectorService
 } from './data/repositories.js';
-
-// Keep these gates aligned with electron/main.mjs analyzeE2ECapture.
-const E2E_PROBE_LIMIT = 30;
-const E2E_TEXT_MIN_WIDTH = 8;
-const E2E_TEXT_MIN_HEIGHT = 6;
-const E2E_EDGE_MIN_WIDTH = 12;
-const E2E_EDGE_MIN_HEIGHT = 6;
-const ENTITY_NODE_SEARCH_PAGE_LIMIT = 100;
-const EMPTY_ENTITY_NODE_PAGE = Object.freeze(/** @type {{ total: number, returned: number, offset: number, limit: number, hasMore: boolean, truncated: boolean }} */ ({
-  total: 0,
-  returned: 0,
-  offset: 0,
-  limit: ENTITY_NODE_SEARCH_PAGE_LIMIT,
-  hasMore: false,
-  truncated: false
-}));
-
-function waitForPaintAfterUiUpdate() {
-  return new Promise((resolve) => {
-    window.setTimeout(() => {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(resolve);
-      });
-    }, 0);
-  });
-}
-
-function viewportRectPayload(rect) {
-  return {
-    x: Math.max(0, Number(rect?.left) || 0),
-    y: Math.max(0, Number(rect?.top) || 0),
-    width: Math.max(0, Number(rect?.width) || 0),
-    height: Math.max(0, Number(rect?.height) || 0)
-  };
-}
-
-function rectIntersectsViewport(rect, minWidth = 1, minHeight = 1) {
-  if (!rect || rect.width < minWidth || rect.height < minHeight) return false;
-  return rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;
-}
-
-function visibleElements(selector, minWidth = 1, minHeight = 1) {
-  return Array.from(document.querySelectorAll(selector)).filter((element) => {
-    const rect = element.getBoundingClientRect();
-    return rectIntersectsViewport(rect, minWidth, minHeight);
-  });
-}
-
-function edgeProbeRect(edge, svgRect) {
-  const pad = Math.ceil(E2E_EDGE_MIN_HEIGHT / 2);
-  const dataLeft = Number(edge.dataset?.edgeLeft);
-  const dataTop = Number(edge.dataset?.edgeTop);
-  const dataWidth = Number(edge.dataset?.edgeWidth);
-  const dataHeight = Number(edge.dataset?.edgeHeight);
-  if ([dataLeft, dataTop, dataWidth, dataHeight].every(Number.isFinite)) {
-    return {
-      left: svgRect.left + dataLeft - pad,
-      top: svgRect.top + dataTop - pad,
-      right: svgRect.left + dataLeft + dataWidth + pad,
-      bottom: svgRect.top + dataTop + dataHeight + pad,
-      width: dataWidth + pad * 2,
-      height: dataHeight + pad * 2
-    };
-  }
-  const x1 = Number(edge.getAttribute('x1')) || 0;
-  const y1 = Number(edge.getAttribute('y1')) || 0;
-  const x2 = Number(edge.getAttribute('x2')) || 0;
-  const y2 = Number(edge.getAttribute('y2')) || 0;
-  return {
-    left: svgRect.left + Math.min(x1, x2) - pad,
-    top: svgRect.top + Math.min(y1, y2) - pad,
-    right: svgRect.left + Math.max(x1, x2) + pad,
-    bottom: svgRect.top + Math.max(y1, y2) + pad,
-    width: Math.abs(x2 - x1) + pad * 2,
-    height: Math.abs(y2 - y1) + pad * 2
-  };
-}
-
-function collectStartupVisualProbe() {
-  const cards = visibleElements('.c2d-node-card', E2E_TEXT_MIN_WIDTH, E2E_TEXT_MIN_WIDTH);
-  const textProbeRects = cards
-    .map((card) => card.querySelector('.c2d-node-title, .c2d-node-body, .c2d-node-note, .c2d-node-meta'))
-    .filter(Boolean)
-    .map((element) => element.getBoundingClientRect())
-    .filter((rect) => rectIntersectsViewport(rect, E2E_TEXT_MIN_WIDTH, E2E_TEXT_MIN_HEIGHT))
-    .slice(0, E2E_PROBE_LIMIT)
-    .map(viewportRectPayload);
-
-  const svg = document.querySelector('.c2d-connector-layer');
-  const svgRect = svg?.getBoundingClientRect?.();
-  const edgeProbeRects = svg && svgRect
-    ? Array.from(svg.querySelectorAll('.c2d-connector-line'))
-        .map((line) => edgeProbeRect(line, svgRect))
-        .filter((rect) => rectIntersectsViewport(rect, E2E_EDGE_MIN_WIDTH, E2E_EDGE_MIN_HEIGHT))
-        .slice(0, E2E_PROBE_LIMIT)
-        .map(viewportRectPayload)
-    : [];
-  const hasText = cards.some((card) => String(card.textContent || '').trim().length > 0);
-  const overlayClear = !document.querySelector('.operation-lock-overlay, .progress-overlay');
-  return {
-    visual: {
-      visibleNodeCount: cards.length,
-      visibleEdgeCount: edgeProbeRects.length,
-      gpuCardCount: cards.length,
-      gpuEdgeCount: edgeProbeRects.length,
-      hasText,
-      hasEdges: edgeProbeRects.length > 0,
-      overlayClear
-    },
-    textProbeRects,
-    edgeProbeRects
-  };
-}
-
-async function moveStartupCameraProbe() {
-  const surface = document.querySelector('.c2d-map-surface');
-  if (!surface) return 0;
-  const before = Number(surface.scrollLeft) || 0;
-  const maxScroll = Math.max(0, Number(surface.scrollWidth) - Number(surface.clientWidth));
-  if (maxScroll <= 0) return 0;
-  surface.scrollLeft = before < maxScroll ? maxScroll : 0;
-  surface.dispatchEvent(new Event('scroll', { bubbles: true }));
-  await waitForPaintAfterUiUpdate();
-  return Math.abs((Number(surface.scrollLeft) || 0) - before);
-}
-
-function keywordRowToSearchResult(row) {
-  const node = row?.node || row || {};
-  return {
-    node_id: node.id,
-    doc_id: node.docId ?? row?.doc?.docId ?? null,
-    address: node.address || null,
-    text: node.textPreview || node.text || node.title || '',
-    score: Number(node.score) || 0
-  };
-}
 
 export function App() {
   const ui = useAppUI();
@@ -237,10 +87,17 @@ export function App() {
     refreshLibrary: refreshLibraryTree,
     refreshList: refreshDocList
   } = docState;
-  const treeView = useTreeViewState({ currentDoc, setCurrentDoc, setNotice });
+  const treeView = useTreeViewState({
+    currentDoc, setCurrentDoc, setNotice,
+    setProgress, setOperationLock,
+    loadTreeDepth: loadDocTreeDepth
+  });
   const {
     depthLimit, axiomsCollapsed, collapsed, expanded, collapsedOutlineNodeIds,
     setDepthLimit, setAxiomsCollapsed, setCollapsed, setExpanded, setCollapsedOutlineNodeIds, outlineCollapseDocRef,
+    actualMaxDepth, depthOptions,
+    c2dDepthControlSeq, c2dDepthControlAction,
+    setVisibleDepth, collapseVisibleDepthOne, syncC2dVisibleDepth,
     applyState: applyTreeViewState,
     persist: persistTreeViewState,
     setPersisted: setPersistedTreeView,
@@ -252,9 +109,6 @@ export function App() {
     selectedNodeId, selectedNode, multiSelectedNodeIds, locateRequest,
     setSelectedNodeId, setMultiSelectedNodeIds, setLocateRequest
   } = selection;
-  const [c2dDepthControlSeq, setC2dDepthControlSeq] = useState(0);
-  const [c2dDepthControlAction, setC2dDepthControlAction] = useState('setDepth');
-  const [summaryNotesVisible, setSummaryNotesVisible] = useState(true);
   const editor = useEditorOps();
   const {
     undoStack, redoStack, setUndoStack: setUndoStackState, setRedoStack: setRedoStackState
@@ -307,8 +161,8 @@ export function App() {
   } = layout;
   const settingsState = useSettings({ setNotice });
   const {
-    vectorSettings, llmSummarySettings, nodeLayoutSettings,
-    setVectorSettings, setLlmSummarySettings, setNodeLayoutSettings, saveVectorSettings, saveLlmSummarySettings, saveNodeLayoutSettings
+    vectorSettings, memorySettings, llmSummarySettings, nodeLayoutSettings,
+    setVectorSettings, setLlmSummarySettings, setNodeLayoutSettings, saveVectorSettings, saveMemorySettings, saveLlmSummarySettings, saveNodeLayoutSettings
   } = settingsState;
   const agentChat = useAgentChat({ setNotice });
   const {
@@ -334,15 +188,37 @@ export function App() {
   const activeAgentRequestIdRef = useRef(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
-  const [entityQuery, setEntityQuery] = useState('');
-  const [entityRows, setEntityRows] = useState([]);
-  const [selectedEntity, setSelectedEntity] = useState(null);
-  const [entityDetail, setEntityDetail] = useState(null);
-  const [entityNodeQuery, setEntityNodeQuery] = useState('');
-  const [entityNodeMatchMode, setEntityNodeMatchMode] = useState('and');
-  const [entityNodeResults, setEntityNodeResults] = useState([]);
-  const [entityNodeGroups, setEntityNodeGroups] = useState([]);
-  const [entityNodePage, setEntityNodePage] = useState(EMPTY_ENTITY_NODE_PAGE);
+  const {
+    entityQuery, setEntityQuery, entityRows, selectedEntity, entityDetail,
+    entityNodeQuery, entityNodeMatchMode, entityNodeResults, entityNodeGroups, entityNodePage,
+    changeEntityNodeMatchMode, changeEntityNodeQuery,
+    runEntitySearch, runEntityNodeSearch, selectEntityTraceEntity, useEntityTraceKeyword,
+    pageEntityNodeSearch, dragEntityTraceEntity, dropEntityIntoNodeSearch, openEntityMaintenance
+  } = useEntityTrace({
+    docId: currentDoc?.doc?.id,
+    activeTab,
+    setBusy,
+    setNotice
+  });
+  const {
+    summaryNotesVisible, toggleSummaryNotesVisible,
+    generateSummary, runSummaryGeneration, cancelSummaryGeneration
+  } = useSummaryRun({
+    currentDoc,
+    treeEditMode,
+    selectedNode,
+    selectedNodeId,
+    multiSelectedNodeIds,
+    llmSummarySettings,
+    setBusy,
+    setNotice,
+    setProgress,
+    setDocs,
+    setCurrentDoc,
+    resolveWriteDoc,
+    syncEditBranchHistoryStacks,
+    activeEditBranch
+  });
   const [axiomDialog, setAxiomDialog] = useState(null);
   const [axiomRefDialog, setAxiomRefDialog] = useState(null);
   const editExitDialog = usePromptDialog();
@@ -365,33 +241,6 @@ export function App() {
     error: '',
     ctx: null
   });
-
-  useEffect(() => {
-    setEntityQuery('');
-    setEntityRows([]);
-    setSelectedEntity(null);
-    setEntityDetail(null);
-    setEntityNodeQuery('');
-    setEntityNodeResults([]);
-    setEntityNodeGroups([]);
-    setEntityNodePage(EMPTY_ENTITY_NODE_PAGE);
-  }, [currentDoc?.doc?.id]);
-
-  useEffect(() => {
-    const docId = currentDoc?.doc?.id;
-    if (activeTab !== 'entity' || !docId) return undefined;
-    let alive = true;
-    fetchEntityList({ readDatabase, docId, query: '', limit: 100 })
-      .then((result) => {
-        if (alive) setEntityRows(result?.rows || []);
-      })
-      .catch((error) => {
-        if (alive) setNotice(error.message);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [activeTab, currentDoc?.doc?.id, setNotice]);
 
   useEffect(() => {
     const onClick = (event) => {
@@ -450,156 +299,35 @@ export function App() {
     }
     return byPath;
   }, [docs]);
-  const treeDepthStats = useMemo(() => docDepthStats(currentDoc), [currentDoc?.doc?.id, currentDoc?.tree, currentDoc?.treeDepthStats]);
-  const actualMaxDepth = treeDepthStats.maxDepth;
   const visibleNodeCount = Number(currentDoc?.doc?.node_count) > 0
     ? Number(currentDoc.doc.node_count)
     : Number(currentDoc?.nodes?.length || 0);
-  const depthOptions = useMemo(() => (
-    [...new Set((treeDepthStats.depths.length > 0
-      ? treeDepthStats.depths
-      : Array.from({ length: actualMaxDepth }, (_, index) => index + 1))
-      .map((depth) => Math.floor(Number(depth) || 0))
-      .filter((depth) => depth > 0 && depth <= actualMaxDepth))]
-      .sort((left, right) => left - right)
-  ), [actualMaxDepth, treeDepthStats]);
   const visibleDepthLimit = depthLimit;
   const visibleDepthOptions = depthOptions;
-  const startupSuccessReportedRef = useRef(false);
-  const startupPendingDocRef = useRef(null);
-  const startupOptionsRef = useRef({ startupDocId: null, renderMode: 'hardware', e2eChm: false, forceHardwareAcceleration: false, debugLogging: false });
-  const renderReadyLogSignatureRef = useRef('');
-  const renderUnlockPendingRef = useRef(null);
-  const e2eDragRequestedRef = useRef(false);
   const closeAfterEditModeSaveRef = useRef(false);
-  const summaryRunRef = useRef(null);
-  const sendStartupHeartbeat = useCallback((stage, extra = {}) => {
-    startupHeartbeat({
-      ...extra,
-      stage,
-      docId: extra.docId ?? currentDoc?.doc?.id ?? null,
-      nodeCount: extra.nodeCount ?? currentDoc?.doc?.node_count ?? null,
-      progress: extra.progress || null
-    });
-  }, [currentDoc?.doc?.id, currentDoc?.doc?.node_count]);
-  const completeStartup = useCallback((payload = {}) => {
-    if (startupSuccessReportedRef.current) return;
-    startupSuccessReportedRef.current = true;
-    startupPendingDocRef.current = null;
-    renderUnlockPendingRef.current = null;
-    debugLog('frontend.startup.complete', payload);
-    reportStartupSuccess(payload).catch(() => {});
-  }, []);
-  const failStartup = useCallback((error, payload = {}) => {
-    if (startupSuccessReportedRef.current) return;
-    startupSuccessReportedRef.current = true;
-    startupPendingDocRef.current = null;
-    renderUnlockPendingRef.current = null;
-    debugLog('frontend.startup.failure', {
-      ...payload,
-      error: error?.message || String(error || 'startup-failure')
-    });
-    reportStartupFailure({
-      message: error?.message || String(error || '启动失败'),
-      stage: payload.stage || 'startup-failure',
-      docId: payload.docId ?? null,
-      nodeCount: payload.nodeCount ?? null,
-      progress: payload.progress || null
-    }).catch(() => {});
-  }, []);
-  const armRenderUnlock = useCallback((docId, reason = 'open-doc') => {
-    const normalizedDocId = normalizeDocId(docId);
-    if (!normalizedDocId || activeTab !== 'tree') return false;
-    renderUnlockPendingRef.current = { docId: normalizedDocId, reason };
-    return true;
-  }, [activeTab]);
-  const releaseRenderUnlock = useCallback((docId) => {
-    const pending = renderUnlockPendingRef.current;
-    if (!pending || !sameDocId(docId, pending.docId)) return false;
-    renderUnlockPendingRef.current = null;
-    setProgress(null);
-    setOperationLock(null);
-    return true;
-  }, [setOperationLock, setProgress]);
-  const runStartupE2ECheck = useCallback(async (info = {}, pending = {}) => {
-    if (e2eDragRequestedRef.current) return;
-    e2eDragRequestedRef.current = true;
-    const reportDocId = pending.reportDocId || pending.docId;
-    sendStartupHeartbeat('e2e-render-complete-start-drag', {
-      docId: reportDocId,
-      nodeCount: pending.nodeCount,
-      renderBackend: info.renderBackend || null,
-      e2e: { phase: 'drag-probe-start' }
-    });
-    const cameraDeltaX = await moveStartupCameraProbe();
-    const { visual, textProbeRects, edgeProbeRects } = collectStartupVisualProbe();
-    const screenshot = await captureE2EWindow({ textProbeRects, edgeProbeRects });
-    const ok = Boolean(
-      visual.visibleNodeCount > 1 &&
-      visual.gpuCardCount > 1 &&
-      visual.gpuEdgeCount > 0 &&
-      visual.hasText &&
-      visual.hasEdges &&
-      visual.overlayClear &&
-      screenshot?.ok === true &&
-      cameraDeltaX > 0
-    );
-    completeStartup({
-      stage: 'e2e-drag-fps-complete',
-      docId: reportDocId,
-      nodeCount: pending.nodeCount,
-      renderBackend: info.renderBackend || null,
-      e2e: {
-        ok,
-        avgFps: null,
-        minFps: null,
-        cameraDeltaX,
-        visual,
-        screenshot
-      }
-    });
-  }, [completeStartup, sendStartupHeartbeat]);
-  const handleMindMapRenderReady = useCallback((info = {}) => {
-    const pending = startupPendingDocRef.current;
-    const visual = info.visual || {};
-    const signature = [
-      info.docId ?? '',
-      info.renderBackend || '',
-      Number(info.nodeCount) || 0,
-      Number(visual.visibleNodeCount) || 0,
-      Number(visual.visibleEdgeCount) || 0
-    ].join('|');
-    if (renderReadyLogSignatureRef.current !== signature) {
-      renderReadyLogSignatureRef.current = signature;
-      debugLog('frontend.render.ready', {
-        ...info,
-        pendingDocId: pending?.docId ?? null,
-        pendingNodeCount: pending?.nodeCount ?? null
-      });
-    }
-    releaseRenderUnlock(info.docId);
-    if (!pending || !sameDocId(info.docId, pending.docId)) return;
-    (async () => {
-      await waitForPaintAfterUiUpdate();
-      const reportDocId = pending.reportDocId || pending.docId;
-      if (startupOptionsRef.current.e2eChm) {
-        await runStartupE2ECheck(info, pending);
-        return;
-      }
-      completeStartup({
-        stage: 'active-doc-rendered',
-        docId: reportDocId,
-        nodeCount: pending.nodeCount,
-        renderBackend: info.renderBackend || null
-      });
-    })().catch((error) => {
-      failStartup(error, {
-        stage: 'startup-render-ready-failed',
-        docId: pending.reportDocId || pending.docId,
-        nodeCount: pending.nodeCount
-      });
-    });
-  }, [completeStartup, failStartup, releaseRenderUnlock, runStartupE2ECheck]);
+  const { armRenderUnlock, handleMindMapRenderReady } = useStartup({
+    currentDoc,
+    activeTab,
+    lockedProgress,
+    progress,
+    lastUiActionRef,
+    startupOpenRequestedRef,
+    setNotice,
+    setProgress,
+    setOperationLock,
+    setDocs,
+    setDocFolders,
+    setLibraryTree,
+    setVectorSettings,
+    setLlmSummarySettings,
+    setNodeLayoutSettings,
+    setAgentSettings,
+    setAgentDiffs,
+    refreshAgentSessions,
+    openDoc,
+    promptStartupEditBranchChoice,
+    editBranchBaseDocId
+  });
   const activeSourceSpans = currentDoc?.sourceWindow?.sourceSpans || currentDoc?.sourceSpans || null;
   const sentenceLabelByNodeId = useMemo(() => {
     if (!(activeSourceSpans?.length > 0)) return new Map();
@@ -616,24 +344,6 @@ export function App() {
     debugPerfEnd('buildParagraphLabelMap', perfToken, { nodes: map?.size ?? 0 });
     return map;
   }, [currentDoc?.tree]);
-  const currentDocHasSummaryNotes = useMemo(() => (
-    flattenTree(currentDoc?.tree).some((node) => plainNodeNote(node?.note || '').trim())
-  ), [currentDoc?.tree]);
-
-  useEffect(() => {
-    setSummaryNotesVisible(readPersistedSummaryNotesVisible(currentDoc?.doc?.id));
-  }, [currentDoc?.doc?.id]);
-
-  function toggleSummaryNotesVisible() {
-    if (!currentDocHasSummaryNotes) {
-      setNotice('请先生成摘要');
-      return;
-    }
-    const next = !summaryNotesVisible;
-    setSummaryNotesVisible(next);
-    persistSummaryNotesVisible(currentDoc?.doc?.id, next);
-  }
-
   function addAxiomFromReadableView() {
     if (!treeEditMode) {
       setNotice('请先进入编辑模式');
@@ -700,71 +410,6 @@ export function App() {
       branch
     }];
   }, [currentDoc?.editBranch]);
-
-  function nodesForIdMapping(doc) {
-    return Array.isArray(doc?.flatTree) && doc.flatTree.length > 0
-      ? doc.flatTree
-      : flattenTree(doc?.tree);
-  }
-
-  function nodeAddressByIdMap(doc) {
-    const map = new Map();
-    for (const node of nodesForIdMapping(doc)) {
-      const id = normalizeDocId(node?.id);
-      if (id && node?.address) map.set(String(id), String(node.address));
-    }
-    return map;
-  }
-
-  function nodeIdByAddressMap(doc) {
-    const map = new Map();
-    if (doc?.idByAddress && typeof doc.idByAddress === 'object') {
-      for (const [address, id] of Object.entries(doc.idByAddress)) {
-        const normalizedId = normalizeDocId(id);
-        if (address && normalizedId) map.set(String(address), normalizedId);
-      }
-    }
-    for (const node of nodesForIdMapping(doc)) {
-      const id = normalizeDocId(node?.id);
-      if (id && node?.address) map.set(String(node.address), id);
-    }
-    return map;
-  }
-
-  function axiomLabelByIdMap(doc) {
-    return new Map((doc?.axioms || [])
-      .map((axiom) => [String(normalizeDocId(axiom?.id)), String(axiom?.label || '')])
-      .filter(([, label]) => label));
-  }
-
-  function axiomIdByLabelMap(doc) {
-    return new Map((doc?.axioms || [])
-      .map((axiom) => [String(axiom?.label || ''), normalizeDocId(axiom?.id)])
-      .filter(([label, id]) => label && id));
-  }
-
-  function remapNodeIdByAddress(sourceDoc, targetDoc, value) {
-    if (!value) return value;
-    const raw = String(value);
-    if (raw.startsWith('axiom:')) {
-      const label = axiomLabelByIdMap(sourceDoc).get(raw.slice('axiom:'.length));
-      const mappedAxiomId = label ? axiomIdByLabelMap(targetDoc).get(label) : null;
-      return mappedAxiomId ? `axiom:${mappedAxiomId}` : value;
-    }
-    const sourceAddress = nodeAddressByIdMap(sourceDoc).get(String(normalizeDocId(value)));
-    if (!sourceAddress) return value;
-    return nodeIdByAddressMap(targetDoc).get(sourceAddress) || value;
-  }
-
-  function remapNodeIdSetByAddress(sourceDoc, targetDoc, ids) {
-    const next = new Set();
-    for (const id of ids || []) {
-      const mapped = remapNodeIdByAddress(sourceDoc, targetDoc, id);
-      const normalized = normalizeDocId(mapped);
-      if (normalized) next.add(normalized);
-    }
-    return next;
-  }
 
   async function loadDocForCurrentView(docId, sourceDoc = currentDoc) {
     const depth = Math.max(loadedDepthForDoc(sourceDoc), depthLimit, 1);
@@ -1138,248 +783,10 @@ export function App() {
   }
 
   useEffect(() => {
-    let alive = true;
-    startupHeartbeat({ stage: 'renderer-mounted' });
-    const heartbeatTimer = window.setInterval(() => {
-      startupHeartbeat({ stage: 'renderer-alive' });
-    }, 1000);
-    const rendererErrorPayload = (error, extra = {}) => ({
-      message: String(error?.message || error || '').slice(0, 240),
-      stack: String(error?.stack || '').slice(0, 800),
-      lastUiAction: lastUiActionRef.current,
-      ...extra
-    });
-    const reportWindowError = (event) => {
-      const error = event?.error || event?.message || 'renderer-error';
-      debugLog('renderer.window.error', rendererErrorPayload(error, {
-        sourceId: String(event?.filename || '').slice(0, 200),
-        lineNumber: event?.lineno ?? null,
-        columnNumber: event?.colno ?? null
-      }));
-      failStartup(error, { stage: 'renderer-error' });
-    };
-    const reportUnhandledRejection = (event) => {
-      const reason = event?.reason || 'renderer-unhandled-rejection';
-      debugLog('renderer.window.unhandledrejection', rendererErrorPayload(reason));
-      failStartup(reason, { stage: 'renderer-unhandled-rejection' });
-    };
-    window.addEventListener('error', reportWindowError);
-    window.addEventListener('unhandledrejection', reportUnhandledRejection);
-    startupHeartbeat({ stage: 'startup-list-db-docs' });
-    documentRepository.listDocFolders()
-      .then((folders) => { if (alive) setDocFolders(Array.isArray(folders) ? folders : []); })
-      .catch((error) => { if (alive) setNotice(error.message); });
-    documentRepository.readLibraryTree()
-      .then((tree) => { if (alive && tree) setLibraryTree(tree); })
-      .catch((error) => { if (alive) setNotice(error.message); });
-    Promise.all([
-      documentRepository.listDocs(),
-      getStartupOptions().catch(() => ({ startupDocId: null, renderMode: 'hardware', e2eChm: false, debugLogging: false })),
-      // 审核通道统一：不限 owner——llm 待审分支同样在启动时被发现、提示恢复审阅。
-      documentRepository.getPendingEditBranches({}).catch(() => ({ branches: [] }))
-    ]).then(async ([list = [], startupOptions = {}, pendingEdit = {}]) => {
-      const docsList = Array.isArray(list) ? list : [];
-      setDocs(docsList);
-      startupOptionsRef.current = {
-        startupDocId: startupOptions.startupDocId || null,
-        renderMode: startupOptions.renderMode === 'compatible' ? 'compatible' : 'hardware',
-        e2eChm: startupOptions.e2eChm === true,
-        forceHardwareAcceleration: startupOptions.forceHardwareAcceleration === true,
-        debugLogging: startupOptions.debugLogging === true
-      };
-      setDebugLoggingEnabled(startupOptionsRef.current.debugLogging);
-      const requestedDocId = startupOptionsRef.current.startupDocId || readPersistedActiveDocId();
-      startupHeartbeat({
-        stage: 'startup-db-docs-ready',
-        docId: requestedDocId || null,
-        progress: {
-          label: '数据库文档列表读取完成',
-          step: docsList.length,
-          total: docsList.length
-        }
-      });
-      const persistedDoc = requestedDocId
-        ? docsList.find((doc) => normalizeDocId(doc.id) === normalizeDocId(requestedDocId))
-        : null;
-      const pendingBranches = Array.isArray(pendingEdit?.branches) ? pendingEdit.branches : [];
-      debugLog('frontend.startup.options', {
-        ...startupOptionsRef.current,
-        requestedDocId,
-        docCount: docsList.length,
-        pendingBranchCount: pendingBranches.length
-      });
-      const pendingBranch = pendingBranches.find((branch) => (
-        !requestedDocId ||
-        sameDocId(branch.base_doc_id, requestedDocId) ||
-        sameDocId(branch.shadow_doc_id, requestedDocId)
-      )) || null;
-      const pendingBranchChoice = pendingBranch
-        ? await promptStartupEditBranchChoice(pendingBranch)
-        : null;
-      if (!alive) return;
-      const pendingBaseDoc = pendingBranch
-        ? (docsList.find((doc) => sameDocId(doc.id, pendingBranch.base_doc_id)) || {
-            id: pendingBranch.base_doc_id,
-            node_count: pendingBranch.node_count
-          })
-        : null;
-      if (pendingBranch && pendingBranchChoice === 'discard') {
-        try {
-          await documentRepository.discardEditBranch({
-            branchId: pendingBranch.id,
-            owner: pendingBranch.owner || 'human',
-            includeDoc: false
-          });
-        } catch (error) {
-          setNotice(error.message);
-          failStartup(error, { stage: 'startup-discard-edit-branch-failed' });
-          return;
-        }
-      }
-      const openTargetDocId = pendingBranchChoice === 'restore'
-        ? pendingBranch.shadow_doc_id
-        : (pendingBranch ? pendingBranch.base_doc_id : persistedDoc?.id);
-      const openBaseDoc = pendingBranchChoice === 'restore'
-        ? pendingBaseDoc
-        : (pendingBranch ? pendingBaseDoc : persistedDoc);
-      if (!openTargetDocId && requestedDocId && pendingBranchChoice !== 'restore') {
-        if (startupOptionsRef.current.startupDocId) {
-          failStartup(new Error(`启动指定文档不存在：${requestedDocId}`), {
-            stage: 'startup-doc-not-found',
-            docId: requestedDocId
-          });
-          return;
-        }
-        persistActiveDocId(null);
-      }
-      if (!alive || startupOpenRequestedRef.current) return;
-      if (!openTargetDocId) {
-        debugLog('frontend.startup.open.skip', {
-          reason: 'no-open-target',
-          requestedDocId,
-          docCount: docsList.length
-        });
-        completeStartup({ stage: 'empty-main-ui' });
-        return;
-      }
-      e2eDragRequestedRef.current = false;
-      startupOpenRequestedRef.current = true;
-      window.setTimeout(() => {
-        if (!alive) return;
-        const openStartupDoc = (targetDocId, baseDoc, choice) => {
-          const pendingNodeCount = baseDoc?.node_count ?? baseDoc?.nodeCount ?? pendingBranch?.node_count ?? 0;
-          startupPendingDocRef.current = {
-            docId: targetDocId,
-            nodeCount: pendingNodeCount
-          };
-          debugLog('frontend.startup.open.start', {
-            docId: targetDocId,
-            nodeCount: pendingNodeCount,
-            pendingBranchChoice: choice
-          });
-          startupHeartbeat({
-            stage: 'startup-open-active-doc',
-            docId: targetDocId,
-            nodeCount: pendingNodeCount
-          });
-          openDoc(targetDocId, {
-            includeEditBranch: pendingBranch ? choice === 'restore' : undefined,
-            onComplete(doc) {
-              const renderDocId = doc?.doc?.id || targetDocId;
-              const docId = editBranchBaseDocId(doc?.editBranch) || renderDocId;
-              const nodeCount = doc?.doc?.node_count ?? baseDoc?.node_count ?? baseDoc?.nodeCount ?? 0;
-              debugLog('frontend.startup.open.complete', {
-                docId,
-                renderDocId,
-                nodeCount,
-                hasTree: Boolean(doc?.tree),
-                flatTree: Boolean(doc?.flatTree)
-              });
-              persistActiveDocId(docId);
-              if (!startupSuccessReportedRef.current) {
-                startupPendingDocRef.current = { docId: renderDocId, reportDocId: docId, nodeCount };
-                if (!e2eDragRequestedRef.current) {
-                  startupHeartbeat({
-                    stage: 'startup-waiting-first-render',
-                    docId,
-                    nodeCount
-                  });
-                }
-              }
-            }
-          }).catch((error) => {
-            if (!alive) return;
-            if (choice === 'restore' && pendingBranch?.base_doc_id && !sameDocId(targetDocId, pendingBranch.base_doc_id)) {
-              setNotice(`恢复编辑状态失败，已暂存：${error.message}`);
-              debugLog('frontend.startup.restore.fallback-stash', {
-                shadowDocId: targetDocId,
-                baseDocId: pendingBranch.base_doc_id,
-                error: error?.message || String(error || 'open-doc-failed')
-              });
-              openStartupDoc(pendingBranch.base_doc_id, pendingBaseDoc, 'stash');
-              return;
-            }
-            setNotice(error.message);
-            debugLog('frontend.startup.open.failure', {
-              docId: targetDocId,
-              nodeCount: baseDoc?.node_count ?? baseDoc?.nodeCount ?? null,
-              error: error?.message || String(error || 'open-doc-failed')
-            });
-            failStartup(error, {
-              stage: 'startup-open-active-doc-failed',
-              docId: targetDocId,
-              nodeCount: baseDoc?.node_count ?? baseDoc?.nodeCount ?? null
-            });
-          });
-        };
-        openStartupDoc(openTargetDocId, openBaseDoc, pendingBranchChoice || 'open');
-      }, 0);
-    }).catch((error) => {
-      if (alive) {
-        setNotice(error.message);
-        failStartup(error, { stage: 'startup-list-docs-failed' });
-      }
-    });
-    settingsRepository.readVectorSettings()
-      .then((settings) => setVectorSettings(settings || { enabled: true, disabledReason: '' }))
-      .catch((error) => {
-        if (alive) setNotice(error.message);
-      });
-    settingsRepository.readLlmSummarySettings()
-      .then((settings) => setLlmSummarySettings(settings || null))
-      .catch((error) => setNotice(error.message));
-    settingsRepository.readAgentSettings()
-      .then((settings) => setAgentSettings(settings || null))
-      .catch((error) => setNotice(error.message));
-    const agentTimer = window.setTimeout(() => {
-      agentRepository.listDiffs()
-        .then((diffs) => setAgentDiffs(Array.isArray(diffs) ? diffs : []))
-        .catch((error) => setNotice(error.message));
-      refreshAgentSessions().catch((error) => setNotice(error.message));
-    }, 300);
-    settingsRepository.readNodeLayoutSettings()
-      .then((settings) => setNodeLayoutSettings(normalizeNodeLayoutSettingsByView(settings)))
-      .catch((error) => setNotice(error.message));
-    return () => {
-      alive = false;
-      window.clearInterval(heartbeatTimer);
-      window.clearTimeout(agentTimer);
-      window.removeEventListener('error', reportWindowError);
-      window.removeEventListener('unhandledrejection', reportUnhandledRejection);
-    };
-  }, []);
-
-  useEffect(() => {
     return onProgress((data) => {
       setProgress(data.done ? null : data);
     });
   }, []);
-
-  useEffect(() => {
-    const data = lockedProgress || progress;
-    if (!data) return;
-    sendStartupHeartbeat(String(data.label || 'startup-progress'), { progress: data });
-  }, [lockedProgress, progress, sendStartupHeartbeat]);
 
   useEffect(() => {
     return onLibraryChanged(() => {
@@ -1423,76 +830,6 @@ export function App() {
   }, [activeTab, currentDoc?.doc?.id, currentDoc?.sourceDocument?.doc_id, currentDoc?.sourceWindow?.anchorNodeId, selectedNodeId]);
 
   useEffect(() => {
-    setDepthLimit((value) => clampDepthLimit(value, actualMaxDepth));
-  }, [actualMaxDepth, currentDoc?.tree]);
-
-  async function resolveVisibleDepth(nextValue) {
-    const requestedDepth = Math.max(1, Math.floor(Number(nextValue) || 1));
-    return clampDepthLimit(requestedDepth, actualMaxDepth);
-  }
-
-  async function setVisibleDepth(nextValue, { clearAll = false, restoreLocalFirst = false, action = 'setDepth' } = {}) {
-    try {
-      const hasLocalTreeState = !clearAll && (collapsed.size > 0 || expanded.size > 0);
-      if (restoreLocalFirst && hasLocalTreeState) {
-        setPersistedTreeView(depthLimit, new Set(), new Set());
-        return;
-      }
-      const nextDepth = await resolveVisibleDepth(nextValue);
-      if (!nextDepth) {
-        if (hasLocalTreeState) setPersistedTreeView(depthLimit, new Set(), new Set());
-        return;
-      }
-      const nextExpanded = new Set();
-      const nextCollapsed = new Set();
-      applyVisibleTreeDepth(nextDepth, nextCollapsed, nextExpanded, action).catch((error) => {
-        setNotice(error.message);
-        setProgress(null);
-        setOperationLock(null);
-      });
-    } catch (error) {
-      setNotice(error.message);
-      setProgress(null);
-      setOperationLock(null);
-    }
-  }
-
-  async function applyVisibleTreeDepth(nextDepth, nextCollapsed, nextExpanded, action = 'setDepth') {
-    const unlockOnDone = () => {
-      setProgress(null);
-      setOperationLock(null);
-    };
-    try {
-      const doc = await loadDocTreeDepth(nextDepth);
-      const resolvedDoc = sameDocId(doc?.doc?.id, currentDoc?.doc?.id)
-        ? {
-            ...currentDoc,
-            ...doc,
-            tree: loadedDepthForDoc(doc) >= loadedDepthForDoc(currentDoc) ? doc?.tree : currentDoc?.tree,
-            nodes: doc?.nodes?.length ? doc.nodes : currentDoc?.nodes
-          }
-        : (doc || currentDoc);
-      if (resolvedDoc) setCurrentDoc(resolvedDoc);
-      setPersistedTreeView(nextDepth, nextCollapsed, nextExpanded);
-      setC2dDepthControlAction(action || 'setDepth');
-      setC2dDepthControlSeq((seq) => seq + 1);
-      unlockOnDone();
-    } catch (error) {
-      unlockOnDone();
-      throw error;
-    }
-  }
-
-  function collapseVisibleDepthOne() {
-    setVisibleDepth(depthLimit - 1, { clearAll: true, action: 'collapseOne' });
-  }
-
-  const syncC2dVisibleDepth = useCallback((nextDepth) => {
-    const resolvedDepth = clampDepthLimit(nextDepth, actualMaxDepth);
-    setDepthLimit((current) => (current === resolvedDepth ? current : resolvedDepth));
-  }, [actualMaxDepth, setDepthLimit]);
-
-  useEffect(() => {
     if (vectorSettings?.enabled !== true) return undefined;
     if (!embeddingBridge.canHandleBatchRequests()) return undefined;
     const embeddingService = createGpuEmbeddingService();
@@ -1522,34 +859,6 @@ export function App() {
       embeddingService.dispose();
     };
   }, [vectorSettings?.enabled]);
-
-  function patchNodeInTree(root, row) {
-    if (!root || !row?.id) return root;
-    // Use string comparison so tmp ids ("tmp-node-…") in lazy edit branches
-    // patch correctly alongside numeric base ids.
-    if (String(root.id) === String(row.id)) {
-      return { ...root, ...row, children: root.children || row.children || [] };
-    }
-    if (!Array.isArray(root.children) || root.children.length === 0) return root;
-    let changed = false;
-    const children = root.children.map((child) => {
-      const next = patchNodeInTree(child, row);
-      if (next !== child) changed = true;
-      return next;
-    });
-    return changed ? { ...root, children } : root;
-  }
-
-  function patchNodeInDoc(doc, row) {
-    if (!doc || !row?.id) return doc;
-    return {
-      ...doc,
-      tree: patchNodeInTree(doc.tree, row),
-      nodes: Array.isArray(doc.nodes)
-        ? doc.nodes.map((node) => (String(node.id) === String(row.id) ? { ...node, ...row } : node))
-        : doc.nodes
-    };
-  }
 
   function editorHistoryViewState(targetDocId = currentDoc?.doc?.id) {
     const docId = normalizeDocId(targetDocId);
@@ -2445,7 +1754,7 @@ export function App() {
       const ready = await ensureAgentApprovalEditMode();
       if (!ready) return false;
     }
-    const target = agentDiffTraceTarget(pendingDiff);
+    const target = { docId: pendingDiff.base_doc_id };
     let undoToken = null;
     try {
       if (target.docId && !treeEditMode) {
@@ -2607,152 +1916,6 @@ export function App() {
     }
   }
 
-  function changeEntityNodeMatchMode(mode) {
-    const nextMode = mode === 'or' ? 'or' : 'and';
-    setEntityNodeMatchMode(nextMode);
-    setEntityNodeResults([]);
-    setEntityNodeGroups([]);
-    setEntityNodePage(EMPTY_ENTITY_NODE_PAGE);
-  }
-
-  function changeEntityNodeQuery(value) {
-    setEntityNodeQuery(value);
-    setEntityNodeResults([]);
-    setEntityNodeGroups([]);
-    setEntityNodePage(EMPTY_ENTITY_NODE_PAGE);
-  }
-
-  async function runEntitySearch() {
-    const docId = currentDoc?.doc?.id;
-    if (!docId) {
-      setEntityRows([]);
-      setSelectedEntity(null);
-      setEntityDetail(null);
-      return;
-    }
-    setBusy(true);
-    try {
-      const result = await fetchEntityList({
-        readDatabase,
-        docId,
-        query: entityQuery,
-        limit: 100
-      });
-      setEntityRows(result?.rows || []);
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function runEntityNodeSearch(queryOverride = entityNodeQuery, modeOverride = entityNodeMatchMode, options = {}) {
-    const docId = currentDoc?.doc?.id;
-    const manageBusy = options.manageBusy !== false;
-    const offset = Math.max(0, Math.floor(Number(options.offset) || 0));
-    if (!docId || !String(queryOverride || '').trim()) {
-      setEntityNodeResults([]);
-      setEntityNodeGroups([]);
-      setEntityNodePage(EMPTY_ENTITY_NODE_PAGE);
-      return;
-    }
-    if (manageBusy) setBusy(true);
-    try {
-      const result = await fetchEntityNodeSearch({
-        readDatabase,
-        docId,
-        query: queryOverride,
-        matchMode: modeOverride,
-        limit: ENTITY_NODE_SEARCH_PAGE_LIMIT,
-        offset,
-        mapRow: keywordRowToSearchResult
-      });
-      setEntityNodeResults(result.rows);
-      setEntityNodeGroups(result.groups);
-      setEntityNodePage({
-        total: Number(result.total) || 0,
-        returned: Number(result.returned) || 0,
-        offset: Number(result.offset) || 0,
-        limit: Number(result.limit) || ENTITY_NODE_SEARCH_PAGE_LIMIT,
-        hasMore: Boolean(result.hasMore),
-        truncated: Boolean(result.truncated)
-      });
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      if (manageBusy) setBusy(false);
-    }
-  }
-
-  async function selectEntityTraceEntity(entity) {
-    const docId = currentDoc?.doc?.id;
-    if (!docId || !entity?.id) return;
-    setSelectedEntity(entity);
-    setBusy(true);
-    try {
-      const detail = await fetchEntityDetail({
-        readDatabase,
-        docId,
-        entityId: entity.id
-      });
-      setEntityDetail(detail || null);
-      const literal = String(detail?.entity?.literal || entity.literal || '').trim();
-      if (literal) {
-        setEntityNodeQuery(literal);
-        await runEntityNodeSearch(literal, entityNodeMatchMode, { manageBusy: false, offset: 0 });
-      }
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function useEntityTraceKeyword(entity) {
-    const literal = String(entity?.literal || '').trim();
-    if (!literal) return;
-    setEntityNodeQuery(literal);
-    await runEntityNodeSearch(literal, entityNodeMatchMode, { offset: 0 });
-  }
-
-  function pageEntityNodeSearch(direction) {
-    const limit = Number(entityNodePage.limit) || ENTITY_NODE_SEARCH_PAGE_LIMIT;
-    const currentOffset = Number(entityNodePage.offset) || 0;
-    const nextOffset = direction === 'prev'
-      ? Math.max(0, currentOffset - limit)
-      : currentOffset + limit;
-    runEntityNodeSearch(entityNodeQuery, entityNodeMatchMode, { offset: nextOffset }).catch((error) => setNotice(error.message));
-  }
-
-  function dragEntityTraceEntity(event, entity) {
-    if (!entity?.literal) return;
-    event.dataTransfer.setData('application/x-iftree-entity', entityDragPayload(entity));
-    event.dataTransfer.setData('text/plain', entity.literal);
-    event.dataTransfer.effectAllowed = 'copy';
-  }
-
-  function dropEntityIntoNodeSearch(event) {
-    event.preventDefault();
-    const entity = entityFromDragEvent(event);
-    if (!entity?.literal) return;
-    setEntityNodeQuery((current) => appendEntityTerm(current, entity.literal));
-    setEntityNodeResults([]);
-    setEntityNodeGroups([]);
-    setEntityNodePage(EMPTY_ENTITY_NODE_PAGE);
-  }
-
-  async function openEntityMaintenance() {
-    try {
-      await openEntityMaintenanceAction({
-        docId: currentDoc?.doc?.id || null,
-        openWindow: openEntityMaintenanceWindow,
-        setNotice
-      });
-    } catch (error) {
-      setNotice(error.message);
-    }
-  }
-
   async function focusNodeInDoc(doc, node) {
     if (!doc?.tree || !node?.id) return false;
     const nodeAddress = String(node.address || '1');
@@ -2826,23 +1989,16 @@ export function App() {
     return { ok: true };
   }
 
-  async function traceAgentDiff(diff) {
-    const target = agentDiffTraceTarget(diff);
-    if (!target.docId || !target.address) {
-      setNotice('这个待审变更没有可追踪的文档节点。');
+  async function traceAgentDiff(branch) {
+    // 整批：打开该 owner=llm:<会话> 分支的基底文档；明细对照走 changes / 分支 diff 视图。
+    const docId = branch?.base_doc_id;
+    if (!docId) {
+      setNotice('这个待审分支没有可定位的文档。');
       return;
     }
     try {
-      const targetDoc = normalizeDocId(currentDoc?.doc?.id) === normalizeDocId(target.docId)
-        ? currentDoc
-        : await openDoc(target.docId);
-      const nodeId = target.nodeId || targetDoc?.idByAddress?.[target.address];
-      const node = nodeId ? findNode(targetDoc?.tree, nodeId) : null;
-      if (!node) {
-        setNotice(`文档 #${target.docId} 中没有节点 ${target.address}。`);
-        return;
-      }
-      focusNodeInDoc(targetDoc, node);
+      if (normalizeDocId(currentDoc?.doc?.id) !== normalizeDocId(docId)) await openDoc(docId);
+      setNotice('已打开文档；在 changes / 分支 diff 视图查看该会话的待审改动。');
     } catch (error) {
       setNotice(error.message);
     }
@@ -2974,265 +2130,6 @@ export function App() {
     setPersistedTreeViewAfterExpansion(nextDepthLimit, nextCollapsed, nextExpanded);
   }
 
-  function summaryNodeLabel(node) {
-    if (!node) return '未选中节点';
-    const title = String(node.title || node.text || '').replace(/\s+/g, ' ').trim();
-    return `${node.address}${title ? ` ${title.slice(0, 32)}` : ''}`;
-  }
-
-  function summaryTargetsForMode(mode) {
-    const selectedNodeIds = (mode === 'selected' || mode === 'subtree') && multiSelectedNodeIds.size > 0
-      ? [...multiSelectedNodeIds]
-      : selectedNodeId
-        ? [selectedNodeId]
-        : [];
-    return buildSummaryTargetsForMode({
-      tree: currentDoc?.tree,
-      selectedNodeId,
-      selectedNodeIds,
-      mode
-    });
-  }
-
-  function summaryStrategyModeForScope(mode) {
-    return mode === 'article' ? 'node' : mode;
-  }
-
-  async function generateSummary(mode) {
-    if (!treeEditMode) {
-      setNotice('请先进入编辑模式');
-      return;
-    }
-    if (!summaryService.canGenerateNodeSummary()) {
-      setNotice('当前版本缺少摘要生成接口，请重启应用后再试。');
-      return;
-    }
-    if (!currentDoc?.tree) {
-      setNotice('没有打开文档。');
-      return;
-    }
-    const selectedSummaryCount = multiSelectedNodeIds.size || (selectedNodeId ? 1 : 0);
-    if ((mode === 'selected' || mode === 'subtree') && selectedSummaryCount === 0) {
-      setNotice('没有选中任何节点，不能生成节点摘要。');
-      return;
-    }
-
-    const targets = summaryTargetsForMode(mode);
-    if (targets.length === 0) {
-      const selectedDepth = selectedNode ? depthOf(selectedNode.address || '1') : 1;
-      setNotice(mode === 'depth' ? `当前第 ${selectedDepth} 层没有节点。` : '没有可生成摘要的目标节点。');
-      return;
-    }
-
-    const strategySettings = normalizeSummaryStrategySettings(llmSummarySettings || {});
-    const strategyMode = summaryStrategyModeForScope(mode);
-    const strategyIndex = strategyMode === 'article' ? 0 : 1;
-    const strategy = summaryStrategyForMode(llmSummarySettings, strategyMode);
-    const summaryItems = [];
-    let skippedGenerated = 0;
-    for (const target of targets) {
-      const text = String(target.text || '').trim();
-      if (hasGeneratedNote(target.node.note || '')) {
-        skippedGenerated += 1;
-        summaryItems.push({ target, text, skip: 'generated' });
-        continue;
-      }
-      summaryItems.push({ target, text, skip: null });
-    }
-    const writableItems = summaryItems.filter((item) => item.skip !== 'generated');
-
-    if (writableItems.length === 0) {
-      setNotice(`没有需要生成摘要的节点：已有 AI 摘要跳过 ${skippedGenerated} 个。`);
-      return;
-    }
-
-    const scopeLabel = {
-      selected: '当前选中节点',
-      subtree: '当前选中节点及其子树',
-      depth: `当前第 ${selectedNode ? depthOf(selectedNode.address || '1') : 1} 层节点`,
-      article: '全文'
-    }[mode] || '节点';
-    const targetLabel = writableItems.length === 1
-      ? summaryNodeLabel(writableItems[0].target.node)
-      : `${writableItems.length} 个节点`;
-    return {
-      mode,
-      scopeLabel,
-      selectedLabel: selectedNode ? summaryNodeLabel(selectedNode) : '无',
-      targetLabel,
-      summaryItems,
-      skippedShort: summarySkipBelowCount(summaryItems, strategy, strategyIndex),
-      skippedGenerated,
-      strategy,
-      strategyIndex,
-      strategyOptions: strategySettings.summaryStrategies
-    };
-  }
-
-  function isSummaryAbortError(error) {
-    return error?.name === 'AbortError' || /aborted|abort|cancel|取消/i.test(String(error?.message || error || ''));
-  }
-
-  async function cancelSummaryRunRequests(run) {
-    const requestIds = [...(run?.requestIds || [])];
-    await Promise.allSettled(requestIds.map((requestId) => summaryService.cancelNodeSummary?.({ requestId })));
-  }
-
-  async function cancelSummaryGeneration() {
-    const run = summaryRunRef.current;
-    if (!run || run.canceled) return;
-    run.canceled = true;
-    setProgress((current) => current ? { ...current, label: '正在取消摘要生成...', cancelable: false } : current);
-    await cancelSummaryRunRequests(run);
-  }
-
-  async function runSummaryGeneration(request, summaryStrategy) {
-    // 与 generateSummary 的入口约束保持一致：摘要写入只允许落在编辑分支上。
-    if (!treeEditMode) {
-      setNotice('请先进入编辑模式');
-      return;
-    }
-    const strategyIndex = Number.isInteger(request?.strategyIndex)
-      ? request.strategyIndex
-      : (summaryStrategyModeForScope(request?.mode) === 'article' ? 0 : 1);
-    const normalizedStrategy = normalizeSummaryStrategy(summaryStrategy, strategyIndex);
-    const summaryItems = applySummarySkipStrategy(request?.summaryItems || [], normalizedStrategy, strategyIndex);
-    const skippedShort = summaryItems.filter((item) => item.skip === 'short').length;
-    const skippedGenerated = summaryItems.filter((item) => item.skip === 'generated').length;
-    const eligible = summaryItems.filter((item) => !item.skip);
-    if (eligible.length === 0) {
-      setNotice(`没有需要生成摘要的节点：短文本跳过 ${skippedShort} 个，已有 AI 摘要跳过 ${skippedGenerated} 个。`);
-      return;
-    }
-    const concurrency = normalizeSummaryConcurrency(llmSummarySettings?.summaryConcurrency);
-    const run = {
-      id: `summary-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-      canceled: false,
-      requestIds: new Set()
-    };
-    summaryRunRef.current = run;
-    setBusy(true);
-    let generated = 0;
-    let processed = 0;
-    let firstError = /** @type {{ index: number, error: any } | null} */ (null);
-    try {
-      const total = summaryItems.length;
-      const progressFor = (label) => ({
-        label,
-        step: processed,
-        total,
-        countLabel: `${processed} / ${total}`,
-        cancelable: true
-      });
-      const markProcessed = (label) => {
-        processed += 1;
-        setProgress(progressFor(label));
-      };
-      const workItems = [];
-      for (const [index, item] of summaryItems.entries()) {
-        const nodeLabel = summaryNodeLabel(item.target.node);
-        if (item.skip) {
-          markProcessed(item.skip === 'short' ? `跳过短文本：${nodeLabel}` : `跳过已有摘要：${nodeLabel}`);
-          continue;
-        }
-        workItems.push({ item, index, nodeLabel });
-      }
-
-      let cursor = 0;
-      let writeChain = Promise.resolve();
-      const writeTasks = [];
-      const enqueueSummaryWrite = (work, summary) => {
-        const writeTask = writeChain.then(async () => {
-          if (run.canceled || firstError) return;
-          const nextNote = appendGeneratedNote(work.item.target.node.note || '', summary);
-          const next = await nodeRepository.updateNode({
-            docId: currentDoc.doc.id,
-            nodeId: work.item.target.node.id,
-            patch: { node_note: nextNote },
-            includeDoc: false
-          });
-          if (next?.refresh?.kind === 'node' && next.node) {
-            setCurrentDoc((current) => {
-              const patched = patchNodeInDoc(current, next.node);
-              return next.editBranch ? { ...patched, editBranch: next.editBranch } : patched;
-            });
-            if (treeEditMode) syncEditBranchHistoryStacks(next.editBranch || activeEditBranch());
-          } else {
-            const nextDoc = await resolveWriteDoc(next);
-            if (nextDoc) {
-              setCurrentDoc((current) => mergeDocView(current, nextDoc));
-              if (treeEditMode) syncEditBranchHistoryStacks(nextDoc.editBranch || next.editBranch || activeEditBranch());
-            }
-          }
-          generated += 1;
-        }).catch(async (error) => {
-          if (!firstError) firstError = { error, index: work.index };
-          run.canceled = true;
-          await cancelSummaryRunRequests(run);
-          throw error;
-        });
-        writeTasks.push(writeTask);
-        writeChain = writeTask.catch(() => {});
-      };
-
-      const worker = async () => {
-        for (;;) {
-          if (run.canceled || firstError) return;
-          const work = workItems[cursor];
-          cursor += 1;
-          if (!work) return;
-          const requestId = `${run.id}-${work.index}`;
-          run.requestIds.add(requestId);
-          setProgress(progressFor(`生成摘要：${work.nodeLabel}`));
-          try {
-            const result = await summaryService.generateNodeSummary({
-              requestId,
-              mode: work.item.target.summaryMode,
-              title: currentDoc.doc.title,
-              address: work.item.target.node.address,
-              nodeTitle: work.item.target.node.title || '',
-              text: work.item.text,
-              summaryStrategy: normalizedStrategy
-            });
-            if (run.canceled || firstError) return;
-            const summary = String(result?.summary || '').trim();
-            if (summary) enqueueSummaryWrite(work, summary);
-            markProcessed(`完成摘要：${work.nodeLabel}`);
-          } catch (error) {
-            if (isSummaryAbortError(error) || run.canceled) {
-              run.canceled = true;
-              return;
-            }
-            if (!firstError) firstError = { error, index: work.index };
-            run.canceled = true;
-            await cancelSummaryRunRequests(run);
-            return;
-          } finally {
-            run.requestIds.delete(requestId);
-          }
-        }
-      };
-
-      const workerCount = Math.min(concurrency, workItems.length);
-      await Promise.all(Array.from({ length: workerCount }, () => worker()));
-      await Promise.all(writeTasks);
-      if (firstError) throw firstError.error;
-      if (generated > 0) setDocs(await documentRepository.listDocs());
-      if (run.canceled) {
-        setNotice(`摘要生成已取消，已保存 ${generated} 个；再次选择同一范围会跳过已有摘要继续生成。`);
-      } else {
-        setNotice(`已生成摘要 ${generated} 个；短文本跳过 ${skippedShort} 个，已有 AI 摘要跳过 ${skippedGenerated} 个。`);
-      }
-    } catch (error) {
-      const failedAt = Math.min((firstError?.index ?? processed) + 1, summaryItems.length);
-      setNotice(`摘要生成失败（${failedAt} / ${summaryItems.length}）：${error.message}`);
-    } finally {
-      setBusy(false);
-      setProgress(null);
-      if (summaryRunRef.current?.id === run.id) summaryRunRef.current = null;
-    }
-  }
-
   const undoEditRef = useRef(undoEdit);
   const redoEditRef = useRef(redoEdit);
   useEffect(() => { undoEditRef.current = undoEdit; });
@@ -3307,6 +2204,7 @@ export function App() {
         <WindowTitlebar onClose={handleCloseWindow} />
         <SettingsView
           vectorSettings={vectorSettings}
+          memorySettings={memorySettings}
           llmSummarySettings={llmSummarySettings}
           agentSettings={agentSettings}
           nodeLayoutSettings={nodeLayoutSettings}
@@ -3314,6 +2212,7 @@ export function App() {
           clearNotice={() => setNotice('')}
           onBack={() => setActiveScreen('editor')}
           onChange={saveVectorSettings}
+          onMemoryChange={saveMemorySettings}
           onLlmSummaryChange={saveLlmSummarySettings}
           onAgentChange={saveAgentSettings}
           onNodeLayoutChange={saveNodeLayoutSettings}

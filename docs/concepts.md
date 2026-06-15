@@ -1,6 +1,6 @@
 # 概念与设计
 
-> [上手教程](getting-started.md) · [操作指南](how-to.md) · [参考手册](reference.md) · **概念与设计**
+> [上手教程](getting-started.md) · [操作指南](how-to.md) · [参考手册](reference.md) · [概念与设计](concepts.md) · **记忆库使用**
 
 解释这个工具为什么长这样。不教操作（那是[操作指南](how-to.md)的事），只讲设计与取舍。
 

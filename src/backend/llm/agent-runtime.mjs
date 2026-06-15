@@ -89,24 +89,6 @@ function agentPermissionsForMode(mode) {
   };
 }
 
-function parseJsonObject(value, fallback = {}) {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
-  try {
-    return value ? JSON.parse(value) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function sourceTypeFromPath(filePath = '') {
-  const extension = extname(String(filePath || '')).toLowerCase();
-  if (extension === '.pdf') return 'pdf';
-  if (extension === '.md' || extension === '.txt') return 'md';
-  if (extension === '.ppt' || extension === '.pptx') return 'ppt';
-  if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'].includes(extension)) return 'image';
-  return 'file';
-}
-
 function findNodeByIdOrAddress(doc, scope = {}) {
   if (!doc?.tree) return null;
   const nodes = flattenTree(doc.tree);
@@ -166,19 +148,6 @@ function formatAgentContextMessage(context) {
     parts.push(`\n文档结构：\n${context.treeIndex}`);
   }
   return parts.join('\n');
-}
-
-function nodeBaseForDiff(node) {
-  return {
-    docId: node.doc_id,
-    nodeId: node.id,
-    address: node.address,
-    text: node.text || '',
-    node_title: node.node_title || '',
-    node_note: node.node_note || '',
-    node_type: normalizeNodeType(node.node_type || 'TEXT'),
-    trust_level: node.trust_level || ''
-  };
 }
 
 const AGENT_CHANGE_ACTIONS = new Set([
@@ -1057,7 +1026,8 @@ const MEMORY_SCHEMA_FALLBACK = [
   '本库按时态分三层，结构同构（同一套树地址与检索动词）、语义异质：完整记忆（session 事件卷）答"确曾发生"——一个 session 一卷，只追加、封卷不可变、永不删除；长期核心记忆答"现在如此"——经提炼与人工审批产生的当前事实层，每条事实回指事件出处；知识文档答"未来可用"——导入的资料文档。',
   '你有跨会话记忆：开工先看最近发生过什么（`db memory list` 列卷及状态，按 docId 用 tree/read 下钻卷正文），再看工作区文件。知道库里有什么是检索的产物、不是检索的前提——别等清单，直接检索。',
   '信任语义：节点分受控/不受控两级。受控=经人工审批的结论；不受控=机器产物未经人审——事件卷一律不受控，这是层级的时态属性，不是质量评分。命中未解决的 ERROR 节点必须停下向用户报告，不得绕过续跑。',
-  '时间纪律：召回结果附带时间元数据，采信前先看时间；同主题证据冲突时新者胜，不得以"内容看起来更合理"推翻时间新旧——合理感是模型先验，时间是客观信号；找不到更新的证据时，旧证据就是最佳可用证据，知旧而用。'
+  '时间纪律：召回结果附带时间元数据，采信前先看时间；同主题证据冲突时新者胜，不得以"内容看起来更合理"推翻时间新旧——合理感是模型先验，时间是客观信号；找不到更新的证据时，旧证据就是最佳可用证据，知旧而用。',
+  '更详尽的记忆库使用（召回动线、写入边界与提炼、操作要点）见 docs/memory.md。'
 ].join('\n');
 
 // 内置自动落卷的 session→节点树转换（15-10-2）：消息粒度局部展开——一条消息一个节点，
@@ -1176,35 +1146,32 @@ export function createAgentRuntime(deps = {}) {
     };
   }
 
-  function proposeAgentChanges(args = {}, sessionId, context = {}) {
+  async function proposeAgentChanges(args = {}, sessionId, context = {}) {
     const operations = Array.isArray(args.operations) ? args.operations : [];
     if (operations.length === 0) throw new Error('agent change proposal requires one operation');
+    // A2A 提议进 owner=llm:<会话> 影子分支（A5-5 写入者身份+会话隔离），不再写独立 agent_diffs 存储；
+    // 走与 edit 动词同一条 database.write 路径，外部 agent 用统一 changes/merge/discard 审批（projectneed 18-1）。
+    const owner = `llm:${sessionId}`;
+    const stage = (payload, docId) => database().write(payload, { editBranchOwner: owner, editBranchBaseDocId: docId });
     const created = [];
     for (const operation of operations) {
       const action = agentOperationAction(operation);
       if (!action) throw new Error(`Unsupported agent change action: ${operation.action || operation.type || 'empty'}`);
+      if (action === 'source_bind_path') {
+        // source 路径绑定是文件元数据、不是文档节点编辑，不走 A5-5 待审分支（15-4 待审=节点编辑）；由 full 档直接绑定。
+        return { rejected: true, reason: 'source 路径绑定不走待审分支；请用 full 档直接绑定。' };
+      }
+      const docId = normalizeStableId(operation.docId || context.file?.docId, null);
+      if (!docId) throw new Error('Agent change proposal requires a doc id');
+      const doc = docForAgent(docId);
       if (action === 'node_patch') {
-        const docId = normalizeStableId(operation.docId || context.file?.docId, null);
-        const doc = docForAgent(docId);
         const node = findNodeByIdOrAddress(doc, operation);
         if (!node) throw new Error('Agent node_patch target not found');
         const patch = normalizeNodePatch(operation.patch || operation);
         if (Object.keys(patch).length === 0) throw new Error('node_patch requires patch fields');
-        const base = nodeBaseForDiff(node);
-        const next = { ...base, ...patch };
-        created.push(getAgentStore().upsertDiff({
-          sessionId,
-          targetKind: 'node',
-          targetKey: `doc:${docId}:node:${node.id}`,
-          action: 'patch',
-          summary: operation.summary || `修改节点 ${node.address}`,
-          base,
-          next,
-          meta: { address: node.address, docId }
-        }));
+        const result = await stage({ action: 'node.update', nodeId: node.id, patch }, docId);
+        created.push({ ...result, summary: operation.summary || `修改节点 ${node.address}` });
       } else if (action === 'node_insert') {
-        const docId = normalizeStableId(operation.docId || context.file?.docId, null);
-        const doc = docForAgent(docId);
         const parentAddress = String(operation.parentAddress || operation.parent || context.selectedNode?.address || '1').trim();
         const parentId = doc.idByAddress?.[parentAddress];
         if (!parentId) throw new Error(`node_insert parent not found: ${parentAddress}`);
@@ -1213,45 +1180,23 @@ export function createAgentRuntime(deps = {}) {
         const afterNodeId = requestedAfterNodeId
           ? requestedAfterNodeId
           : (afterAddress ? doc.idByAddress?.[afterAddress] || null : null);
-        const next = {
+        const result = await stage({
+          action: 'node.insert',
           docId,
           parentId,
-          parentAddress,
-          afterAddress,
           afterNodeId,
           text: String(operation.text || ''),
-          node_title: String(operation.node_title || operation.title || ''),
-          node_note: String(operation.node_note || operation.note || ''),
-          node_type: normalizeNodeType(operation.node_type || operation.type || 'TEXT')
-        };
-        created.push(getAgentStore().upsertDiff({
-          sessionId,
-          targetKind: 'node',
-          targetKey: `doc:${docId}:insert:${parentAddress}:${operation.key || created.length + 1}`,
-          action: 'insert',
-          summary: operation.summary || `在 ${parentAddress} 下新增节点`,
-          base: {},
-          next,
-          meta: { docId, parentAddress }
-        }));
+          nodeTitle: String(operation.node_title || operation.title || ''),
+          nodeNote: String(operation.node_note || operation.note || ''),
+          nodeType: normalizeNodeType(operation.node_type || operation.type || 'TEXT')
+        }, docId);
+        created.push({ ...result, summary: operation.summary || `在 ${parentAddress} 下新增节点` });
       } else if (action === 'node_delete') {
-        const docId = normalizeStableId(operation.docId || context.file?.docId, null);
-        const doc = docForAgent(docId);
         const node = findNodeByIdOrAddress(doc, operation);
         if (!node || node.parent_id === null) throw new Error('Agent node_delete target not found or root cannot be deleted');
-        created.push(getAgentStore().upsertDiff({
-          sessionId,
-          targetKind: 'node',
-          targetKey: `doc:${docId}:node:${node.id}`,
-          action: 'delete',
-          summary: operation.summary || `删除节点 ${node.address}`,
-          base: nodeBaseForDiff(node),
-          next: { docId, nodeId: node.id, address: node.address, deleted: true },
-          meta: { address: node.address, docId }
-        }));
+        const result = await stage({ action: 'node.delete', docId, nodeId: node.id }, docId);
+        created.push({ ...result, summary: operation.summary || `删除节点 ${node.address}` });
       } else if (action === 'ref_delete') {
-        const docId = normalizeStableId(operation.docId || context.file?.docId, null);
-        const doc = docForAgent(docId);
         const refId = normalizeStableId(operation.refId, null);
         let ref = refId ? doc.refs.find((item) => sameStableId(item.id, refId)) : null;
         if (!ref) {
@@ -1265,48 +1210,8 @@ export function createAgentRuntime(deps = {}) {
           )) || null;
         }
         if (!ref) throw new Error('Agent ref_delete target not found');
-        created.push(getAgentStore().upsertDiff({
-          sessionId,
-          targetKind: 'ref',
-          targetKey: `doc:${docId}:ref:${ref.id}`,
-          action: 'delete',
-          summary: operation.summary || `删除引用 ${ref.source_address} -> ${ref.target_address}`,
-          base: { ...ref, docId },
-          next: { docId, refId: ref.id, deleted: true },
-          meta: { docId }
-        }));
-      } else if (action === 'source_bind_path') {
-        const docId = normalizeStableId(operation.docId || context.file?.docId, null);
-        const doc = docForAgent(docId);
-        const relativeSourcePath = deps.normalizeAgentLibraryPath(operation.sourcePath || operation.path || '');
-        if (!relativeSourcePath) throw new Error('source_bind_path requires sourcePath');
-        const meta = parseJsonObject(doc.doc?.meta, {});
-        const sourceDocument = doc.sourceDocument || {};
-        const storedSourcePath = deps.libraryPath(relativeSourcePath);
-        const sourceType = String(operation.sourceType || sourceDocument.source_type || sourceTypeFromPath(relativeSourcePath));
-        const basePath = deps.libraryRelativePathForAgent(sourceDocument.original_path || meta.sourcePath || '');
-        created.push(getAgentStore().upsertDiff({
-          sessionId,
-          targetKind: 'source',
-          targetKey: `doc:${docId}:source`,
-          action: 'bind_path',
-          summary: operation.summary || '更新文件绑定路径',
-          base: {
-            docId,
-            sourcePath: basePath,
-            storedSourcePath: sourceDocument.original_path || meta.sourcePath || '',
-            sourceType: sourceDocument.source_type || '',
-            rawMarkdown: sourceDocument.raw_markdown || ''
-          },
-          next: {
-            docId,
-            sourcePath: relativeSourcePath,
-            storedSourcePath,
-            sourceType,
-            rawMarkdown: sourceDocument.raw_markdown || ''
-          },
-          meta: { docId }
-        }));
+        const result = await stage({ action: 'ref.delete', docId, refId: ref.id }, docId);
+        created.push({ ...result, summary: operation.summary || `删除引用 ${ref.source_address} -> ${ref.target_address}` });
       }
     }
     return created;
@@ -1917,8 +1822,10 @@ export function createAgentRuntime(deps = {}) {
     }
     const basePrompt = deps.systemPromptSection('agent.base', baseLines.join('\n'));
     // schema 自述（15-12-5）+ 常驻指令（15-12-2）：只点"你有记忆、先看看最近发生什么"，
-    // 不注入正文或命中指针。
-    const memorySchemaPrompt = deps.systemPromptSection('memory.schema', MEMORY_SCHEMA_FALLBACK);
+    // 不注入正文或命中指针。记忆子系统关闭时整段不挂载（15-10-5：禁用时召回常驻指令不挂载）。
+    const memorySchemaPrompt = deps.isMemoryEnabled?.() === true
+      ? deps.systemPromptSection('memory.schema', MEMORY_SCHEMA_FALLBACK)
+      : '';
     const modePrompt = deps.systemPromptSection(
       `agent.mode.${mode}`,
       mode === 'edit'
@@ -2094,7 +2001,7 @@ export function createAgentRuntime(deps = {}) {
       }
 
       if (!answer) answer = mode === 'edit' ? '已生成待审变更。' : '没有生成可用回答，请追问或换个问法。';
-      const diffs = agentStore.listPendingDiffs();
+      const diffs = await listAgentDiffs();
       const turnMessages = [
         {
           role: 'user',
@@ -2127,7 +2034,7 @@ export function createAgentRuntime(deps = {}) {
     } catch (error) {
       if (isAbortError(error)) {
         const answer = '已取消。';
-        const diffs = agentStore.listPendingDiffs();
+        const diffs = await listAgentDiffs();
         const turnMessages = [
           {
             role: 'user',
@@ -2186,12 +2093,39 @@ export function createAgentRuntime(deps = {}) {
     }
   }
 
-  function listAgentDiffs() {
-    return getAgentStore().listPendingDiffs();
+  async function listAgentDiffs() {
+    // A2A 待审 = 所有 owner=llm:<会话> 活跃编辑分支（整批，一分支 = 一组提议）；退役独立 agent_diffs（projectneed 18-1）。
+    const pending = await database().run({ operation: 'query', payload: { action: 'editBranch.listPending' } }, 'query');
+    return (pending?.branches || []).filter((branch) => String(branch.owner || '').startsWith('llm:'));
   }
 
-  function listAgentSessions(payload = {}) {
-    return getAgentStore().listSessions({ limit: payload.limit });
+  function agentBranchActiveEntryCount(branch) {
+    try {
+      const diff = JSON.parse(branch?.diff || '{}');
+      const entries = Array.isArray(diff.entries) ? diff.entries : [];
+      return entries.filter((entry) => entry && entry.status !== 'undone').length;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function listAgentSessions(payload = {}) {
+    const sessions = getAgentStore().listSessions({ limit: payload.limit });
+    // 待审计数补齐（agent_diffs 已退役）：A2A 待审 = owner=llm:<会话> 活跃编辑分支，跨库归属。
+    // 逐分支按 owner 解析出会话 id（内置 agent 分支 owner 形如 llm:<整数会话id>），累加活跃 entry 数。
+    const branches = await listAgentDiffs();
+    if (branches.length === 0) return sessions;
+    const counts = new Map();
+    for (const branch of branches) {
+      const match = String(branch.owner || '').match(/^llm:(\d+)$/);
+      if (!match) continue;
+      const sid = Number(match[1]);
+      counts.set(sid, (counts.get(sid) || 0) + agentBranchActiveEntryCount(branch));
+    }
+    return sessions.map((session) => ({
+      ...session,
+      pending_diff_count: counts.get(Number(session.id)) || 0
+    }));
   }
 
   function getAgentSession(payload = {}) {
@@ -2200,11 +2134,11 @@ export function createAgentRuntime(deps = {}) {
     return getAgentStore().getSession(sessionId);
   }
 
-  function deleteAgentSession(payload = {}) {
+  async function deleteAgentSession(payload = {}) {
     const sessionId = Number(payload.sessionId ?? payload.id);
-    if (!Number.isInteger(sessionId) || sessionId <= 0) return { ok: false, sessions: listAgentSessions() };
+    if (!Number.isInteger(sessionId) || sessionId <= 0) return { ok: false, sessions: await listAgentSessions() };
     getAgentStore().deleteSession(sessionId);
-    return { ok: true, sessions: listAgentSessions() };
+    return { ok: true, sessions: await listAgentSessions() };
   }
 
   function cancelAgentRequest(payload = {}) {
@@ -2231,66 +2165,24 @@ export function createAgentRuntime(deps = {}) {
   }
 
   async function applyAgentDiff(diffId) {
-    const diff = getAgentStore().getDiff(diffId);
-    if (!diff || diff.status !== 'pending') return { ok: false, diffs: listAgentDiffs() };
-    const baseDocId = normalizeStableId(diff.next?.docId || diff.base?.docId || diff.meta?.docId, null);
-    if (!baseDocId) {
-      throw new Error('Agent diff 缺少 doc id，不能应用。');
-    }
-    const pendingBranches = await database().run({
-      operation: 'query',
-      payload: { action: 'editBranch.listPending', owner: 'human' }
-    }, 'query');
-    const humanBranch = (pendingBranches?.branches || []).find((branch) => sameStableId(branch.base_doc_id, baseDocId)) || null;
-    if (!humanBranch) {
-      throw new Error('当前文档没有 human 编辑分支，不能把 LLM 待审变更直接写入主数据库。');
-    }
-    const writeToHumanBranch = (payload) => database().write(payload, {
-      editBranchOwner: 'human',
-      editBranchBaseDocId: humanBranch.base_doc_id
-    });
-    let result = null;
-    if (diff.target_kind === 'node' && diff.action === 'patch') {
-      result = await writeToHumanBranch({
-        action: 'node.update',
-        nodeId: diff.next.nodeId,
-        patch: normalizeNodePatch(diff.next)
-      });
-    } else if (diff.target_kind === 'node' && diff.action === 'insert') {
-      result = await writeToHumanBranch({
-        action: 'node.insert',
-        docId: diff.next.docId,
-        parentId: diff.next.parentId,
-        afterNodeId: diff.next.afterNodeId || null,
-        text: diff.next.text || '',
-        nodeTitle: diff.next.node_title || '',
-        nodeNote: diff.next.node_note || '',
-        nodeType: diff.next.node_type || 'TEXT'
-      });
-    } else if (diff.target_kind === 'node' && diff.action === 'delete') {
-      result = await writeToHumanBranch({
-        action: 'node.delete',
-        docId: diff.next.docId || diff.base.docId,
-        nodeId: diff.next.nodeId || diff.base.nodeId
-      });
-    } else if (diff.target_kind === 'ref' && diff.action === 'delete') {
-      result = await writeToHumanBranch({
-        action: 'ref.delete',
-        docId: diff.next.docId || diff.base.docId,
-        refId: diff.next.refId || diff.base.id
-      });
-    } else if (diff.target_kind === 'source' && diff.action === 'bind_path') {
-      throw new Error('source binding approval must go through an edit-branch mutation before it can be applied');
-    } else {
-      throw new Error(`Unsupported agent diff: ${diff.target_kind}/${diff.action}`);
-    }
-    getAgentStore().markApplied(diff.id);
-    return { ok: true, diffs: listAgentDiffs(), docId: result?.docId || diff.next.docId || diff.base.docId || null };
+    // 整批批准：把该 owner=llm:<会话> 分支 merge 进主干（A5-10）。落点 owner/trust 由审批者档位定
+    // （human 档可标受控、见 18-3；T4 human 档接入前先按机器产物不受控合入）。
+    const branchId = Number(diffId);
+    if (!Number.isInteger(branchId) || branchId <= 0) return { ok: false, diffs: await listAgentDiffs() };
+    const result = await database().write(
+      { action: 'editBranch.applyMerge', branchId, includeDoc: false },
+      {}
+    );
+    const ok = !result?.blocked && !result?.conflicts;
+    return { ok, result, diffs: await listAgentDiffs() };
   }
 
-  function rejectAgentDiff(diffId) {
-    getAgentStore().rejectDiff(diffId);
-    return { ok: true, diffs: listAgentDiffs() };
+  async function rejectAgentDiff(diffId) {
+    // 整批拒绝：丢弃该 owner=llm:<会话> 分支（A5-7），主干不动。
+    const branchId = Number(diffId);
+    if (!Number.isInteger(branchId) || branchId <= 0) return { ok: false, diffs: await listAgentDiffs() };
+    await database().write({ action: 'editBranch.discard', branchId, includeDoc: false }, {});
+    return { ok: true, diffs: await listAgentDiffs() };
   }
 
   return {

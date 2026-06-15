@@ -12,7 +12,7 @@ import { env as transformersEnv, pipeline } from '@huggingface/transformers';
 import { createDatabaseService } from '../database-service.mjs';
 import { createDerivedIndexReconciler } from '../derived-index-reconciler.mjs';
 import { importFilePathsToStore } from '../import-service.mjs';
-import { runDbShellArgv } from '../db-shell.mjs';
+import { runDbShellArgv, resolveDocRef } from '../db-shell.mjs';
 import { normalizeStableId, sameStableId } from '../db/ids.mjs';
 import { AgentStore } from '../../agent/agent-store.mjs';
 import {
@@ -408,6 +408,12 @@ export function createHeadlessAgentHost(options = {}) {
     return configured !== false;
   }
 
+  // 记忆子系统开关（projectneed 15-10-5）：默认关闭，与向量模块并列。
+  // 关闭时内置 agent 不挂载记忆常驻指令（见 agent-runtime 的 memory.schema gate）。
+  function isMemoryEnabled(settings = readSettingsFile()) {
+    return settings?.memory?.enabled === true;
+  }
+
   function assertVectorModuleEnabled() {
     if (!isVectorModuleEnabled()) throw new Error('向量模块已由用户禁用');
   }
@@ -707,6 +713,7 @@ export function createHeadlessAgentHost(options = {}) {
         readAgentSettings,
         agentApiFromPayload,
         systemPromptSection,
+        isMemoryEnabled,
         sendAgentStream,
         fetchers: () => options.fetchers?.() || [],
         libraryPath,
@@ -733,7 +740,13 @@ export function createHeadlessAgentHost(options = {}) {
     const agentRequestId = String(payload.requestId || requestId || `headless-${Date.now()}`).trim();
     streamRequestIds.set(agentRequestId, requestId);
     try {
-      return await getAgentRuntime().runAgent({ ...payload, requestId: agentRequestId });
+      // ask_agent 的 docId 可传文档标题（与 find 对齐）：标题→docId，唯一即定位、重名抛候选 UUID、未找到报错；
+      // 选填，空则不限定文档；合法 UUID 原样通过。MCP(agent.run) 与 CLI(askAgent) 都汇入此处，一处解析覆盖两路。
+      let nextPayload = payload;
+      if (payload.docId != null && String(payload.docId).trim() !== '') {
+        nextPayload = { ...payload, docId: await resolveDocRef(getDatabase(), payload.docId) };
+      }
+      return await getAgentRuntime().runAgent({ ...nextPayload, requestId: agentRequestId });
     } finally {
       streamRequestIds.delete(agentRequestId);
     }

@@ -40,7 +40,7 @@ export const TREE_MINDMAP_RENDER_CACHE_KEY_NAMESPACE_VERSION = 6;
 export const TREE_MINDMAP_SYNC_NODE_LIMIT = 5000;
 export const TREE_LAYOUT_CACHE_APPLY_CHUNK_SIZE = 8192;
 export const TREE_LAYOUT_CACHE_WRITE_CHUNK_SIZE = 5000;
-export const SOURCE_WINDOW_CHAR_LIMIT = 80000;
+export const SOURCE_WINDOW_CHAR_LIMIT = 50000;
 export const SOURCE_WINDOW_BEFORE_CHARS = 12000;
 export const SOURCE_WINDOW_AUTO_LOAD_GAP = 240;
 export const SUPPORTED_LIBRARY_IMPORT_EXTENSIONS = new Set(['.chm', '.txt', '.md', '.pdf', '.docx']);
@@ -645,5 +645,101 @@ export function expandedMindMapRenderRect(camera, viewport) {
     width: width * (1 + MINDMAP_RENDER_OVERSCAN_SCREENS * 2),
     height: height * (1 + MINDMAP_RENDER_OVERSCAN_SCREENS * 2),
     scale
+  };
+}
+
+// ── 跨文档身份重映射（base ↔ shadow 切换时保持视图状态）────────────
+// 节点 id 在 base 与 shadow 文档间不同，但树地址相同；axiom 靠 label 对齐。
+
+function nodesForIdMapping(doc) {
+  return Array.isArray(doc?.flatTree) && doc.flatTree.length > 0
+    ? doc.flatTree
+    : flattenTree(doc?.tree);
+}
+
+function nodeAddressByIdMap(doc) {
+  const map = new Map();
+  for (const node of nodesForIdMapping(doc)) {
+    const id = normalizeDocId(node?.id);
+    if (id && node?.address) map.set(String(id), String(node.address));
+  }
+  return map;
+}
+
+function nodeIdByAddressMap(doc) {
+  const map = new Map();
+  if (doc?.idByAddress && typeof doc.idByAddress === 'object') {
+    for (const [address, id] of Object.entries(doc.idByAddress)) {
+      const normalizedId = normalizeDocId(id);
+      if (address && normalizedId) map.set(String(address), normalizedId);
+    }
+  }
+  for (const node of nodesForIdMapping(doc)) {
+    const id = normalizeDocId(node?.id);
+    if (id && node?.address) map.set(String(node.address), id);
+  }
+  return map;
+}
+
+function axiomLabelByIdMap(doc) {
+  return new Map((doc?.axioms || [])
+    .map((axiom) => [String(normalizeDocId(axiom?.id)), String(axiom?.label || '')])
+    .filter(([, label]) => label));
+}
+
+function axiomIdByLabelMap(doc) {
+  return new Map((doc?.axioms || [])
+    .map((axiom) => [String(axiom?.label || ''), normalizeDocId(axiom?.id)])
+    .filter(([label, id]) => label && id));
+}
+
+export function remapNodeIdByAddress(sourceDoc, targetDoc, value) {
+  if (!value) return value;
+  const raw = String(value);
+  if (raw.startsWith('axiom:')) {
+    const label = axiomLabelByIdMap(sourceDoc).get(raw.slice('axiom:'.length));
+    const mappedAxiomId = label ? axiomIdByLabelMap(targetDoc).get(label) : null;
+    return mappedAxiomId ? `axiom:${mappedAxiomId}` : value;
+  }
+  const sourceAddress = nodeAddressByIdMap(sourceDoc).get(String(normalizeDocId(value)));
+  if (!sourceAddress) return value;
+  return nodeIdByAddressMap(targetDoc).get(sourceAddress) || value;
+}
+
+export function remapNodeIdSetByAddress(sourceDoc, targetDoc, ids) {
+  const next = new Set();
+  for (const id of ids || []) {
+    const mapped = remapNodeIdByAddress(sourceDoc, targetDoc, id);
+    const normalized = normalizeDocId(mapped);
+    if (normalized) next.add(normalized);
+  }
+  return next;
+}
+
+export function patchNodeInTree(root, row) {
+  if (!root || !row?.id) return root;
+  // Use string comparison so tmp ids ("tmp-node-…") in lazy edit branches
+  // patch correctly alongside numeric base ids.
+  if (String(root.id) === String(row.id)) {
+    return { ...root, ...row, children: root.children || row.children || [] };
+  }
+  if (!Array.isArray(root.children) || root.children.length === 0) return root;
+  let changed = false;
+  const children = root.children.map((child) => {
+    const next = patchNodeInTree(child, row);
+    if (next !== child) changed = true;
+    return next;
+  });
+  return changed ? { ...root, children } : root;
+}
+
+export function patchNodeInDoc(doc, row) {
+  if (!doc || !row?.id) return doc;
+  return {
+    ...doc,
+    tree: patchNodeInTree(doc.tree, row),
+    nodes: Array.isArray(doc.nodes)
+      ? doc.nodes.map((node) => (String(node.id) === String(row.id) ? { ...node, ...row } : node))
+      : doc.nodes
   };
 }

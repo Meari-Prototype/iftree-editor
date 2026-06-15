@@ -122,14 +122,7 @@ CREATE TABLE IF NOT EXISTS source_pdf_chars (
 CREATE INDEX IF NOT EXISTS idx_source_pdf_chars_doc_offset ON source_pdf_chars(doc_id, char_offset);
 CREATE INDEX IF NOT EXISTS idx_source_pdf_chars_doc_page ON source_pdf_chars(doc_id, page_number);
 
-CREATE TABLE IF NOT EXISTS save_history (
-  id INTEGER PRIMARY KEY,
-  doc_id TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
-  commit_id TEXT REFERENCES commits(id) ON DELETE SET NULL,
-  saved_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  summary TEXT,
-  diff TEXT
-);
+-- save_history 已退役：历史以 commits 为事实来源；旧库残留表在 dropLegacySaveHistory 迁移期删除。
 
 CREATE TABLE IF NOT EXISTS commits (
   id TEXT PRIMARY KEY,
@@ -137,6 +130,7 @@ CREATE TABLE IF NOT EXISTS commits (
   parent_commit_id TEXT REFERENCES commits(id) ON DELETE SET NULL,
   committed_at TEXT DEFAULT CURRENT_TIMESTAMP,
   summary TEXT,
+  author TEXT,
   diff TEXT NOT NULL DEFAULT '{}',
   snapshot TEXT NOT NULL DEFAULT '{}'
 );

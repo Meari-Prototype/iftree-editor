@@ -16,6 +16,8 @@
     "check:types": "tsc --noEmit -p tsconfig.check.json",
     "pretest": "npm run rebuild:native:electron",
     "test": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$env:ELECTRON_RUN_AS_NODE='1'; & .\\node_modules\\.bin\\electron.cmd --test tests/*.test.mjs\"",
+    "pretest:verbs": "npm run rebuild:native:electron",
+    "test:verbs": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$env:ELECTRON_RUN_AS_NODE='1'; & .\\node_modules\\.bin\\electron.cmd --test tests/db/*.test.mjs\"",
     "monitor:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/monitor-hardware.ps1",
     "verify:samples": "electron scripts/verify-samples.mjs",
     "verify:chm": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-chm-e2e.ps1",

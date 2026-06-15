@@ -119,7 +119,7 @@ test('保存版本 → diff 格式 → 恢复', () => {
     // first save
     const h1 = store.saveHistorySnapshot({ docId: doc.id, summary: '第一版' });
     assert.ok(h1.id);
-    const payload1 = JSON.parse(store.db.prepare('SELECT diff FROM save_history WHERE id = ?').get(h1.id).diff);
+    const payload1 = JSON.parse(store.db.prepare('SELECT diff FROM commits WHERE id = ?').get(h1.id).diff);
     assert.equal(payload1.kind, 'diff');
     assert.ok(Array.isArray(payload1.entries), 'diff entries 是数组');
     assert.ok(payload1.snapshot?.nodes, '包含完整快照用于恢复');
@@ -127,7 +127,7 @@ test('保存版本 → diff 格式 → 恢复', () => {
     // modify and save again
     store.updateNode(child.id, { text: '第一节（修改后）', node_type: 'IF' });
     const h2 = store.saveHistorySnapshot({ docId: doc.id, summary: '第二版' });
-    const payload2 = JSON.parse(store.db.prepare('SELECT diff FROM save_history WHERE id = ?').get(h2.id).diff);
+    const payload2 = JSON.parse(store.db.prepare('SELECT diff FROM commits WHERE id = ?').get(h2.id).diff);
     // second save should have diff entries (comparing with first save)
     const modEntry = payload2.entries.find(e => e.node_id === child.id && e.field === 'text');
     assert.ok(modEntry, '应有 text 修改的 diff 条目');
@@ -135,7 +135,7 @@ test('保存版本 → diff 格式 → 恢复', () => {
     assert.equal(modEntry.new, '第一节（修改后）');
 
     // restore to first version
-    store.restoreHistory(h1.id);
+    store.restoreCommit(h1.id);
     const restored = store.getDoc(doc.id);
     assert.equal(restored.tree.children[0].text, '第一节', '恢复后文本回到初始值');
     assert.equal(restored.tree.children[0].node_type, 'TEXT', '恢复后类型回到初始值');

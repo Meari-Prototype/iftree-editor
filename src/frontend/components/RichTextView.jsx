@@ -18,7 +18,7 @@ import { useScrollViewport } from '../hooks/useScrollViewport.js';
 import { useResolvedImageSources } from '../hooks/useResolvedImages.js';
 import { SourceMarkdownBlock, renderInlineMarkdownText, sourceSpanKey, sourceSpansForRange } from './SourceBlocks.jsx';
 export const SOURCE_VIRTUAL_OVERSCAN = 1200;
-export const SOURCE_WINDOW_CHAR_LIMIT = 80000;
+export const SOURCE_WINDOW_CHAR_LIMIT = 50000;
 export const SOURCE_WINDOW_AUTO_LOAD_GAP = 240;
 
 export function estimateSourceBlockHeight(block, rawMarkdown) {

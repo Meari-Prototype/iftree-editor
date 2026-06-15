@@ -226,6 +226,15 @@ function isVectorModuleEnabled(settings = readSettingsFile()) {
   return configured !== false;
 }
 
+// 记忆子系统开关（projectneed 15-10-5）：默认关闭，与向量模块并列。
+function isMemoryEnabled(settings = readSettingsFile()) {
+  return settings?.memory?.enabled === true;
+}
+
+function memorySettingsPayload(settings = readSettingsFile()) {
+  return { enabled: isMemoryEnabled(settings) };
+}
+
 let dotEnvCache = null;
 
 function projectEnvPath() {
@@ -779,6 +788,13 @@ async function saveVectorConfig(patch = {}) {
   }
 
   return vectorSettingsPayload(next);
+}
+
+function saveMemoryConfig(patch = {}) {
+  const settings = readSettingsFile();
+  settings.memory = { ...(settings.memory || {}), enabled: patch?.enabled === true };
+  writeSettingsFile(settings);
+  return memorySettingsPayload(settings);
 }
 
 function saveNodeLayoutConfig(patch = {}) {
@@ -1834,6 +1850,8 @@ function registerIpc() {
   });
 
   ipcMain.handle('settings:readVector', () => vectorSettingsPayload());
+  ipcMain.handle('settings:readMemory', () => memorySettingsPayload());
+  ipcMain.handle('settings:saveMemory', (_event, patch) => saveMemoryConfig(patch || {}));
 
   ipcMain.handle('settings:saveVector', async (_event, payload) => saveVectorConfig(payload || {}));
 

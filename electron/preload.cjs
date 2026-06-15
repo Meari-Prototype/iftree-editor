@@ -46,6 +46,8 @@ contextBridge.exposeInMainWorld('iftree', {
   importLibraryDocument: wrap('import:libraryDocument'),
   readVectorSettings: wrap('settings:readVector'),
   saveVectorSettings: wrap('settings:saveVector'),
+  readMemorySettings: wrap('settings:readMemory'),
+  saveMemorySettings: wrap('settings:saveMemory'),
   readLlmSummarySettings: wrap('settings:readLlmSummary'),
   saveLlmSummarySettings: wrap('settings:saveLlmSummary'),
   readAgentSettings: wrap('settings:readAgent'),

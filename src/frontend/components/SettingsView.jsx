@@ -1,4 +1,4 @@
-import { ArrowLeft, Bot, Cpu, Database, ExternalLink, Gauge, HardDrive, Power, Settings, SlidersHorizontal, Upload, Zap } from 'lucide-react';
+import { ArrowLeft, Bot, Brain, Cpu, Database, ExternalLink, Gauge, HardDrive, Power, Settings, SlidersHorizontal, Upload, Zap } from 'lucide-react';
 import { useState } from 'react';
 import { normalizeNodeLayoutSettingsByView } from '../lib/doc-utils.mjs';
 import { progressCountText } from '../lib/ui-utils.mjs';
@@ -8,6 +8,7 @@ import { NodeLayoutSettingsPanel } from './settings/NodeLayoutSettingsPanel.jsx'
 
 export function SettingsView({
   vectorSettings,
+  memorySettings,
   llmSummarySettings,
   agentSettings,
   nodeLayoutSettings,
@@ -15,6 +16,7 @@ export function SettingsView({
   clearNotice,
   onBack,
   onChange,
+  onMemoryChange,
   onLlmSummaryChange,
   onAgentChange,
   onNodeLayoutChange,
@@ -29,6 +31,7 @@ export function SettingsView({
   const [settingsSection, setSettingsSection] = useState('vector');
   const settings = vectorSettings || {};
   const vectorEnabled = settings.enabled !== false;
+  const memoryEnabled = memorySettings?.enabled === true;
   const nodeLayouts = normalizeNodeLayoutSettingsByView(nodeLayoutSettings);
   const modelOptions = Array.isArray(settings.modelOptions) ? settings.modelOptions : [];
   const computeOptions = Array.isArray(settings.computeOptions) ? settings.computeOptions : [];
@@ -100,6 +103,13 @@ export function SettingsView({
             <span>向量模块</span>
           </button>
           <button
+            className={`settings-nav-item ${settingsSection === 'memory' ? 'active' : ''}`}
+            onClick={() => setSettingsSection('memory')}
+          >
+            <Brain size={16} />
+            <span>记忆模块</span>
+          </button>
+          <button
             className={`settings-nav-item ${settingsSection === 'agent' ? 'active' : ''}`}
             onClick={() => setSettingsSection('agent')}
           >
@@ -148,6 +158,46 @@ export function SettingsView({
                 <p>正在读取 API、摘要和个性提示词配置。</p>
               </header>
             )
+          ) : settingsSection === 'memory' ? (
+            <>
+          <header className="settings-header settings-header-row">
+            <div>
+              <h1>记忆模块</h1>
+              <p>开启后内置 agent 获得跨会话记忆常驻指令（开工先看最近发生什么、检索纪律、信任与时间纪律）。默认关闭；关闭时退化为纯知识 / 条件树工具，不落卷、不催提炼。</p>
+            </div>
+            <div className="vector-toggle-stack">
+              <div className={`vector-status ${memoryEnabled ? 'enabled' : ''}`}>
+                <span />
+                {memoryEnabled ? '状态：已启用' : '状态：已禁用'}
+              </div>
+              <button
+                type="button"
+                className={`vector-toggle-button ${memoryEnabled ? 'enabled' : ''}`}
+                onClick={() => onMemoryChange?.({ enabled: !memoryEnabled })}
+                title={memoryEnabled ? '禁用记忆模块' : '启用记忆模块'}
+                aria-pressed={memoryEnabled}
+              >
+                <Power size={16} />
+                <span>{memoryEnabled ? '禁用记忆' : '启用记忆'}</span>
+              </button>
+            </div>
+          </header>
+
+          <section className="settings-group">
+            <header>
+              <h2>说明</h2>
+            </header>
+            <div className="settings-list">
+              <div className="settings-row">
+                <div className="settings-row-icon"><Brain size={17} /></div>
+                <div className="settings-row-text">
+                  <strong>记忆库使用</strong>
+                  <span>三层时态、召回动线、写入边界与提炼、操作要点见 docs/memory.md。</span>
+                </div>
+              </div>
+            </div>
+          </section>
+            </>
           ) : (
             <>
           <header className="settings-header settings-header-row">

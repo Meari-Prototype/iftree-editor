@@ -25,6 +25,7 @@ const ACTIONS = Object.freeze([
   'doc.list',
   'docFolder.list',
   'history.diff',
+  'history.nodeLog',
   'editBranch.listPending',
   'editBranch.diffView',
   'editBranch.threeWayMerge',
@@ -521,8 +522,18 @@ function queryLibraryIndex(store, payload = {}, ctx = {}) {
     .then((docs) => ctx.libraryIndex({ ...payload, format: libraryIndexFormat(payload) }, docs));
 }
 
+function memoryAnchorByDocId(store, docIds = []) {
+  const ids = [...new Set(docIds.filter(Boolean))];
+  if (ids.length === 0) return {};
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = store.db
+    .prepare(`SELECT id, json_extract(meta,'$.memoryVolume.hostAnchor') AS hostAnchor FROM docs WHERE id IN (${placeholders})`)
+    .all(...ids);
+  return Object.fromEntries(rows.filter((row) => row.hostAnchor).map((row) => [row.id, row.hostAnchor]));
+}
+
 function librarySourceDocs(store, ctx = {}) {
-  return contentDocRows(store, { include: ['source'] }, ctx)
+  const docs = contentDocRows(store, { include: ['source'] }, ctx)
     .filter((doc) => doc.source?.path)
     .map((doc) => ({
       docId: doc.docId,
@@ -531,6 +542,8 @@ function librarySourceDocs(store, ctx = {}) {
       sourceType: doc.source.type,
       meta: doc.meta
     }));
+  const anchorById = memoryAnchorByDocId(store, docs.map((doc) => doc.docId));
+  return docs.map((doc) => ({ ...doc, hostAnchor: anchorById[doc.docId] || null }));
 }
 
 function normalizeSemanticStatus(status = {}) {
@@ -830,14 +843,43 @@ async function queryContentIndex(store, payload = {}, ctx = {}) {
     maxDepth: depthLimit,
     detail: 'summary'
   }, ctx);
-  return { ...result, kind: 'content.getIndex', indexDepth: depthLimit };
+  // 文档实际最大层数（供调用方判断默认 index 是否截断了更深的层、需不需要下钻）。
+  const maxDepthRow = store.db.prepare('SELECT MAX(depth) AS d FROM nodes WHERE doc_id = ?').get(docId);
+  const docDepth = Math.max(Number(maxDepthRow?.d) || 0, depthLimit);
+  return { ...result, kind: 'content.getIndex', indexDepth: depthLimit, docDepth };
 }
 
 function queryContentArticle(store, payload = {}) {
-  const result = querySourceWindow(store, payload);
-  if (!result) return { kind: 'content.getArticle', article: null };
+  // 窗口上限 50000（与 store.getSourceWindow 的夹值一致）：调用方显式传超限的 limit/before 直接报错、
+  // 要求传合规参数，而不是静默夹小——避免「要 8 万却只拿到 5 万」却不自知。
+  // 前端走 source.getWindow 不经此处，其超额由 store 层静默夹兜底，不受此报错影响。
+  const MAX_ARTICLE_WINDOW = 50000;
+  const reqLimit = payload.limit;
+  if (reqLimit !== null && reqLimit !== undefined && Number(reqLimit) > MAX_ARTICLE_WINDOW) {
+    throw new Error(`article limit 最大 ${MAX_ARTICLE_WINDOW}（单次原文窗口上限），收到 ${reqLimit}；请传 ≤${MAX_ARTICLE_WINDOW}，要读更多请按 startOffset 分多次读取。`);
+  }
+  const reqBefore = payload.before;
+  if (reqBefore !== null && reqBefore !== undefined && Number(reqBefore) > MAX_ARTICLE_WINDOW) {
+    throw new Error(`article before 最大 ${MAX_ARTICLE_WINDOW}（往前字数上限），收到 ${reqBefore}；请传 ≤${MAX_ARTICLE_WINDOW}。`);
+  }
   const include = contentIncludeSet(payload);
-  return {
+  const wantSpans = include.has('spans');
+  // spansLimit 是 article（agent 面向）的专属语义：默认只回 ARTICLE_SPANS_DEFAULT 条，避免 includeSpans 把整窗
+  // 每句 span 全吐出来撑爆输出；显式 spansLimit 则按它截。注意不把这个小上限下传给 store——store 的 span 默认
+  // 上限(8000) 同时服务前端源文本面板的全量高亮（前端走 source.getWindow 直达 store、不经此处），故这里只在
+  // article 出口截、并按整窗实际 span 数报 spansTotal（窗口共 N），让截断可见；两条路互不影响。
+  const ARTICLE_SPANS_DEFAULT = 30;
+  const spansCap = Number.isFinite(Number(payload.spansLimit)) && Number(payload.spansLimit) > 0
+    ? Math.floor(Number(payload.spansLimit))
+    : ARTICLE_SPANS_DEFAULT;
+  const result = querySourceWindow(store, wantSpans ? { ...payload, spansLimit: undefined } : payload);
+  if (!result) return { kind: 'content.getArticle', article: null };
+  // 窗口触及原文两端时，在展示文本首/尾补可见标记，避免把「读到原文边界」误判成被截断。
+  // 标记只加在 text 上；sourceSpans 的偏移仍相对未加标记的原始窗口。
+  let text = result.raw_markdown;
+  if (!result.hasBefore) text = `[原文开始]\n\n${text}`;
+  if (!result.hasAfter) text = `${text}\n\n[原文结束]`;
+  const response = {
     kind: 'content.getArticle',
     docId: result.docId,
     window: {
@@ -847,9 +889,15 @@ function queryContentArticle(store, payload = {}) {
       hasBefore: result.hasBefore,
       hasAfter: result.hasAfter
     },
-    text: result.raw_markdown,
-    ...(include.has('spans') ? { sourceSpans: result.sourceSpans } : {})
+    text
   };
+  if (wantSpans) {
+    const allSpans = Array.isArray(result.sourceSpans) ? result.sourceSpans : [];
+    response.spansTotal = allSpans.length;
+    // 每条 span 原本带与顶层 docId 相同的 doc_id，逐条重复纯属冗余——出口剥掉、节点级 node_id 保留；再按 spansCap 截。
+    response.sourceSpans = allSpans.slice(0, spansCap).map((span) => { const copy = { ...span }; delete copy.doc_id; return copy; });
+  }
+  return response;
 }
 
 function keywordWhereSql(payload = {}, terms = []) {
@@ -884,8 +932,12 @@ function keywordWhereSql(payload = {}, terms = []) {
 }
 
 function normalizeKeywordMatchMode(payload = {}) {
-  const mode = String(payload.matchMode ?? payload.match_mode ?? payload.operator ?? payload.op ?? 'and').trim().toLowerCase();
-  return mode === 'or' ? 'or' : 'and';
+  const mode = String(payload.matchMode ?? payload.match_mode ?? payload.operator ?? payload.op ?? '').trim().toLowerCase();
+  if (mode === 'or') return 'or';
+  // 节点级 AND（旧行为，要求所有词在同一节点共现，精确但长文档易漏）：显式 node/strict 才走。
+  if (mode === 'node' || mode === 'nodeand' || mode === 'strict') return 'node';
+  // 默认文档级 AND（高命中）：词可分散在同一文档的不同节点。
+  return 'doc';
 }
 
 function keywordHaystack(row = {}) {
@@ -923,14 +975,125 @@ function keywordRowMatches(row = {}, terms = [], mode = 'and') {
   return needles.every((term) => haystack.includes(term));
 }
 
-function keywordRowInScope(row = {}, payload = {}) {
+function parseListFilter(value) {
+  if (value === null || value === undefined) return null;
+  const list = (Array.isArray(value) ? value : String(value).split(','))
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+  return list.length > 0 ? new Set(list) : null;
+}
+
+// 文件夹范围归一化：统一 / 分隔、去首尾斜杠；空 → null。
+function normalizeFolderFilter(value) {
+  const text = String(value ?? '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  return text || null;
+}
+
+function parseFolderFilterList(value) {
+  if (value == null) return [];
+  const list = Array.isArray(value) ? value : String(value).split(',');
+  const out = [];
+  for (const item of list) {
+    const folder = normalizeFolderFilter(item);
+    if (folder) out.push(folder);
+  }
+  return out;
+}
+
+// 文档源文件相对路径 rel 是否落在文件夹 folder 子树内（含 folder 本身）。
+function isUnderFolder(rel, folder) {
+  if (!rel || !folder) return false;
+  const path = String(rel).replace(/\\/g, '/').replace(/^\/+/, '');
+  return path === folder || path.startsWith(`${folder}/`);
+}
+
+function memoryWorkspaceFromAnchor(anchor = '') {
+  const matched = String(anchor || '').match(/[\\/]\.claude[\\/]projects[\\/]([^\\/#]+)/);
+  return matched ? matched[1] : '';
+}
+
+// 文档级过滤：综合「元数据过滤（工作区/agent/类型）」与「文件夹范围（folder/excludeFolder）」，
+// 返回预算允许的 docId 集合；两者都无 → null（不限制）；都有 → 取交集。
+function resolveKeywordDocFilter(store, payload = {}, ctx = {}) {
+  const metaSet = resolveMetaDocFilter(store, payload);
+  const folderSet = resolveFolderDocFilter(store, payload, ctx);
+  if (!metaSet) return folderSet;
+  if (!folderSet) return metaSet;
+  const allowed = new Set();
+  for (const id of metaSet) if (folderSet.has(id)) allowed.add(id);
+  return allowed;
+}
+
+// 元数据过滤（工作区 / agent / 文档类型）：无此类过滤时返回 null（不限制）。
+// 类型 kind：event=事件卷、memory=含受控节点的核心记忆、knowledge=其余知识文档。
+function resolveMetaDocFilter(store, payload = {}) {
+  const workspace = parseListFilter(payload.workspace ?? payload.workspaces);
+  const agent = parseListFilter(payload.agent ?? payload.agents);
+  const kind = parseListFilter(payload.kind ?? payload.kinds ?? payload.docKind);
+  if (!workspace && !agent && !kind) return null;
+  const rows = store.db.prepare(`
+    SELECT d.id AS id,
+      json_extract(d.meta,'$.memoryVolume.agent') AS agent,
+      json_extract(d.meta,'$.memoryVolume.hostAnchor') AS host_anchor,
+      CASE
+        WHEN json_extract(d.meta,'$.memoryVolume') IS NOT NULL THEN 'event'
+        WHEN EXISTS (SELECT 1 FROM nodes n WHERE n.doc_id = d.id AND n.trust_level = '受控') THEN 'memory'
+        ELSE 'knowledge'
+      END AS kind
+    FROM docs d
+  `).all();
+  const allowed = new Set();
+  for (const row of rows) {
+    if (workspace && !workspace.has(memoryWorkspaceFromAnchor(row.host_anchor))) continue;
+    if (agent && !agent.has(String(row.agent || ''))) continue;
+    if (kind && !kind.has(String(row.kind || ''))) continue;
+    allowed.add(String(row.id));
+  }
+  return allowed;
+}
+
+// 文件夹范围过滤（folder=只在某 library 文件夹子树内；excludeFolder=排除某些子树）：
+// 「在某文件夹下开 allDocs」即检索该文件夹这篇大型虚拟文档。无 folder/excludeFolder 时返回 null。
+// 文档归属按其源文件的 library 相对路径前缀判定（ctx.libraryRelativePath 把绝对 sourcePath 还原成相对路径）。
+// 无源文件的虚拟/流式文档相对路径为空：folder 限定时被排除、纯 excludeFolder 时保留。
+function resolveFolderDocFilter(store, payload = {}, ctx = {}) {
+  const folder = normalizeFolderFilter(payload.folder ?? payload.inFolder ?? payload.in_folder);
+  const excludeFolders = parseFolderFilterList(payload.excludeFolder ?? payload.excludeFolders ?? payload.exclude_folder);
+  if (!folder && excludeFolders.length === 0) return null;
+  const relativePathFor = typeof ctx.libraryRelativePath === 'function' ? ctx.libraryRelativePath : null;
+  const rows = store.db.prepare(`
+    SELECT d.id AS id, sd.original_path AS original_path
+    FROM docs d
+    LEFT JOIN source_documents sd ON sd.doc_id = d.id
+  `).all();
+  const allowed = new Set();
+  for (const row of rows) {
+    const rel = (row.original_path && relativePathFor) ? relativePathFor(row.original_path) : '';
+    if (folder && !isUnderFolder(rel, folder)) continue;
+    if (excludeFolders.some((ex) => isUnderFolder(rel, ex))) continue;
+    allowed.add(String(row.id));
+  }
+  return allowed;
+}
+
+function keywordRowInScope(row = {}, payload = {}, docFilter = null) {
   const allDocs = payload.allDocs === true || payload.all_docs === true || payload.scope === 'all';
   const docId = normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
   if (!allDocs && docId && String(row.doc_id) !== String(docId)) return false;
   const scopeAddress = String(payload.scopeAddress ?? payload.scope_address ?? payload.address ?? '').trim();
-  if (!scopeAddress) return true;
-  const address = String(row.address || '');
-  return address === scopeAddress || address.startsWith(`${scopeAddress}-`);
+  if (scopeAddress) {
+    const address = String(row.address || '');
+    if (address !== scopeAddress && !address.startsWith(`${scopeAddress}-`)) return false;
+  }
+  if (docFilter && !docFilter.has(String(row.doc_id))) return false;
+  const trust = parseListFilter(payload.trust ?? payload.trustLevel ?? payload.trust_level);
+  if (trust && !trust.has(String(row.trust_level || ''))) return false;
+  const since = String(payload.since ?? payload.after ?? '').trim();
+  const until = String(payload.until ?? payload.before ?? '').trim();
+  const updated = String(row.updated_at || '');
+  if (since && updated && updated < since) return false;
+  if (until && updated && updated > until) return false;
+  return true;
 }
 
 function keywordRowsByIds(store, ids = []) {
@@ -940,7 +1103,12 @@ function keywordRowsByIds(store, ids = []) {
   const rows = store.db.prepare(`
     WITH matched AS (
       SELECT n.*,
-        d.title AS doc_title
+        d.title AS doc_title,
+        CASE
+          WHEN json_extract(d.meta,'$.memoryVolume') IS NOT NULL THEN 'event'
+          WHEN EXISTS (SELECT 1 FROM nodes nn WHERE nn.doc_id = d.id AND nn.trust_level = '受控') THEN 'memory'
+          ELSE 'knowledge'
+        END AS doc_kind
       FROM nodes n
       JOIN docs d ON d.id = n.doc_id
       WHERE n.id IN (${placeholders})
@@ -969,17 +1137,25 @@ function includeWithTimestamps(include = new Set()) {
 }
 
 function formatKeywordResultRows(rows = [], terms = [], payload = {}, include = new Set()) {
-  return rows.map((row) => ({
-    doc: {
-      docId: row.doc_id,
-      title: row.doc_title || ''
-    },
-    node: formatContentNode({ ...row, score: keywordHitCount(row, terms) }, {
+  // includeLabels（find --labels，opt-in）：命中行附 doc 层级(event/memory/knowledge)与节点 trust，
+  // 供调用方一眼分层/分信任；不开则不带这些字段，保持输出精简。
+  const labels = payload?.includeLabels === true;
+  return rows.map((row) => {
+    const node = formatContentNode({ ...row, score: keywordHitCount(row, terms) }, {
       detail: 'summary',
       include: includeWithTimestamps(include),
       previewChars: payload.previewChars ?? payload.preview_chars
-    })
-  }));
+    });
+    if (labels) node.trustLevel = row.trust_level || null;
+    return {
+      doc: {
+        docId: row.doc_id,
+        title: row.doc_title || '',
+        ...(labels ? { kind: row.doc_kind || null } : {})
+      },
+      node
+    };
+  });
 }
 
 function queryContentKeywordSql(store, payload = {}, terms = null) {
@@ -998,7 +1174,12 @@ function queryContentKeywordSql(store, payload = {}, terms = null) {
   const rows = store.db.prepare(`
     WITH matched AS (
       SELECT n.*,
-        d.title AS doc_title
+        d.title AS doc_title,
+        CASE
+          WHEN json_extract(d.meta,'$.memoryVolume') IS NOT NULL THEN 'event'
+          WHEN EXISTS (SELECT 1 FROM nodes nn WHERE nn.doc_id = d.id AND nn.trust_level = '受控') THEN 'memory'
+          ELSE 'knowledge'
+        END AS doc_kind
       FROM nodes n
       JOIN docs d ON d.id = n.doc_id
       WHERE ${sql}
@@ -1038,6 +1219,7 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
   const offset = normalizeNonNegativeInteger(payload.offset ?? payload.start ?? payload.startOffset ?? payload.start_offset, 0);
   const include = contentIncludeSet(payload);
   const matchMode = normalizeKeywordMatchMode(payload);
+  const docFilter = resolveKeywordDocFilter(store, payload, ctx);
   if (typeof ctx.ensureKeywordIndexReady !== 'function' || typeof ctx.keywordSearch !== 'function') {
     return queryContentKeywordSql(store, payload, terms);
   }
@@ -1048,6 +1230,11 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
   const docId = payload.allDocs === true || payload.all_docs === true || payload.scope === 'all'
     ? null
     : normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
+  // 统计用：当前范围可检索的文档数（doc 级过滤后允许集 / 单篇=1 / 全库总数）。
+  // 让 find 返回统计行能把"0 命中"区分成"范围本身就空"还是"范围内没命中"。
+  const scopeDocs = docFilter
+    ? docFilter.size
+    : (docId ? 1 : (Number(store.db.prepare('SELECT COUNT(*) AS c FROM docs').get()?.c) || 0));
 
   if (matchMode === 'or') {
     const groups = [];
@@ -1056,7 +1243,7 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
     for (const term of terms) {
       const candidates = await ctx.keywordSearch({ terms: [term], docId });
       const rows = keywordRowsByIds(store, candidates.map((candidate) => candidate.node_id))
-        .filter((row) => keywordRowInScope(row, payload) && keywordRowMatches(row, [term], 'and'));
+        .filter((row) => keywordRowInScope(row, payload, docFilter) && keywordRowMatches(row, [term], 'and'));
       const page = pageRows(rows, offset, limit);
       const formatted = formatKeywordResultRows(page.rows, [term], payload, include);
       groups.push({
@@ -1080,6 +1267,7 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
       kind: 'content.searchKeyword',
       terms,
       matchMode,
+      scopeDocs,
       returned: flat.length,
       total: groups.reduce((sum, group) => sum + (Number(group.total) || 0), 0),
       offset,
@@ -1091,15 +1279,61 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
     };
   }
 
+  if (matchMode === 'doc') {
+    // 文档级 AND：逐词召回后按 doc 聚合，保留命中「所有词」的文档（词可落在不同节点），
+    // 返回这些文档里命中任一词的节点；同节点共现多词的排前（兼顾高命中与相关性）。
+    const perDocTerms = new Map();
+    const perDocNodes = new Map();
+    for (const term of terms) {
+      const termCandidates = await ctx.keywordSearch({ terms: [term], docId });
+      const termRows = keywordRowsByIds(store, termCandidates.map((candidate) => candidate.node_id))
+        .filter((row) => keywordRowInScope(row, payload, docFilter) && keywordRowMatches(row, [term], 'and'));
+      for (const row of termRows) {
+        const rowDocId = String(row.doc_id);
+        if (!perDocTerms.has(rowDocId)) perDocTerms.set(rowDocId, new Set());
+        perDocTerms.get(rowDocId).add(term);
+        if (!perDocNodes.has(rowDocId)) perDocNodes.set(rowDocId, new Map());
+        const nodeMap = perDocNodes.get(rowDocId);
+        const rowNodeId = String(row.id);
+        if (!nodeMap.has(rowNodeId)) nodeMap.set(rowNodeId, { row, matched: new Set() });
+        nodeMap.get(rowNodeId).matched.add(term);
+      }
+    }
+    const ranked = [];
+    for (const [rowDocId, termSet] of perDocTerms) {
+      if (termSet.size < terms.length) continue;
+      for (const entry of perDocNodes.get(rowDocId).values()) {
+        ranked.push(entry);
+      }
+    }
+    ranked.sort((left, right) => right.matched.size - left.matched.size);
+    const page = pageRows(ranked.map((entry) => entry.row), offset, limit);
+    const formatted = formatKeywordResultRows(page.rows, terms, payload, include);
+    return {
+      kind: 'content.searchKeyword',
+      terms,
+      matchMode,
+      scopeDocs,
+      returned: formatted.length,
+      total: page.total,
+      offset: page.offset,
+      limit: page.limit,
+      hasMore: page.hasMore,
+      truncated: page.truncated,
+      rows: formatted
+    };
+  }
+
   const candidates = await ctx.keywordSearch({ terms, docId });
   const rows = keywordRowsByIds(store, candidates.map((candidate) => candidate.node_id))
-    .filter((row) => keywordRowInScope(row, payload) && keywordRowMatches(row, terms, 'and'));
+    .filter((row) => keywordRowInScope(row, payload, docFilter) && keywordRowMatches(row, terms, 'and'));
   const page = pageRows(rows, offset, limit);
   const formatted = formatKeywordResultRows(page.rows, terms, payload, include);
   return {
     kind: 'content.searchKeyword',
     terms,
     matchMode,
+    scopeDocs,
     returned: formatted.length,
     total: page.total,
     offset: page.offset,
@@ -1400,23 +1634,26 @@ function requireDocId(payload = {}) {
 }
 
 function historySnapshot(row = {}) {
+  const snapshot = parseJsonObject(row.snapshot, null);
+  if (snapshot?.nodes) return snapshot;
   const diff = parseJsonObject(row.diff, {});
   return diff.snapshot || (diff.kind === 'snapshot' ? diff : null);
 }
 
 function historyEntryRow(store, ref, docId = null) {
   const id = normalizeQueryId(ref, null);
-  if (!id) throw new Error('history.diff requires history id');
+  if (!id) throw new Error('history.diff requires commit id');
   const row = docId
-    ? store.db.prepare('SELECT * FROM save_history WHERE id = ? AND doc_id = ?').get(id, docId)
-    : store.db.prepare('SELECT * FROM save_history WHERE id = ?').get(id);
-  if (!row) throw new Error(`History entry not found: ${id}`);
+    ? store.db.prepare('SELECT * FROM commits WHERE id = ? AND doc_id = ?').get(id, docId)
+    : store.db.prepare('SELECT * FROM commits WHERE id = ?').get(id);
+  if (!row) throw new Error(`Commit not found: ${id}`);
   return row;
 }
 
 function historyMetaRow(row = {}) {
   const rest = /** @type {Record<string, any>} */ ({ ...(row || {}) });
   delete rest.diff;
+  delete rest.snapshot;
   return rest;
 }
 
@@ -1445,12 +1682,39 @@ function queryHistoryDiff(store, payload = {}) {
   if (!fromSnapshot?.nodes || !toSnapshot?.nodes) {
     throw new Error('history.diff requires restorable snapshots on both history entries');
   }
+  const entries = store.computeDiff(fromSnapshot, toSnapshot);
+  // computeDiff 的 field-diff entry 只带 node_id；补 address（库的定位语言）供展示层用。
+  // 删除的节点在 to 侧已不存在，故 to 优先、from 兜底；这些是实时算出的临时对象，不入库。
+  const addressByNode = new Map();
+  for (const node of toSnapshot.nodes) addressByNode.set(node.id, node.address);
+  for (const node of fromSnapshot.nodes) if (!addressByNode.has(node.id)) addressByNode.set(node.id, node.address);
+  for (const entry of entries) {
+    if (entry && entry.node_id != null && entry.address == null) {
+      entry.address = addressByNode.get(entry.node_id) ?? null;
+    }
+  }
   return {
     kind: 'history.diff',
     docId: toRow.doc_id,
     from: historyMetaRow(fromRow),
     to: historyMetaRow(toRow),
-    entries: store.computeDiff(fromSnapshot, toSnapshot)
+    entries
+  };
+}
+
+function queryNodeHistory(store, payload = {}) {
+  const docId = normalizeQueryId(payload.docId ?? payload.doc_id, null);
+  const address = payload.address;
+  if (!docId || address == null || address === '') {
+    throw new Error('history.nodeLog requires docId and address');
+  }
+  const scope = payload.scope === 'node' ? 'node' : 'subtree';
+  return {
+    kind: 'history.nodeLog',
+    docId,
+    address: String(address),
+    scope,
+    history: store.nodeHistory(docId, String(address), { scope })
   };
 }
 
@@ -1540,7 +1804,8 @@ function queryEditBranchDiffView(store, payload = {}) {
     branchId: payload.branchId ?? payload.branch_id ?? null,
     shadowDocId: payload.shadowDocId ?? payload.shadow_doc_id ?? null,
     baseDocId: payload.baseDocId ?? payload.base_doc_id ?? null,
-    owner: payload.owner ?? 'human'
+    owner: payload.owner ?? 'human',
+    changedOnly: payload.changedOnly ?? payload.changed_only ?? false
   });
 }
 
@@ -1789,6 +2054,7 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   if (action === 'doc.list') return store.listDocs().map(normalizeDocRow);
   if (action === 'docFolder.list') return store.listDocFolders().map(plainRow);
   if (action === 'history.diff') return queryHistoryDiff(store, payload);
+  if (action === 'history.nodeLog') return queryNodeHistory(store, payload);
   if (action === 'editBranch.listPending') return queryPendingEditBranches(store, payload);
   if (action === 'editBranch.diffView') return queryEditBranchDiffView(store, payload);
   if (action === 'editBranch.threeWayMerge') return queryThreeWayMerge(store, payload);

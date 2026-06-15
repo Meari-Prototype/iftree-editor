@@ -8,7 +8,7 @@ import { buildTree, splitSentences } from '../core/tree.mjs';
 import { classifyTreeDiff } from '../core/merkle-diff.mjs';
 import { classifyThreeWayMerge } from '../core/merkle-merge.mjs';
 import { computeSubtreeHashes, contentHash } from '../core/merkle.mjs';
-import { compareNodeAddress, parseJsonObject } from './shared.mjs';
+import { compareNodeAddress, editModeMismatchMessage, parseJsonObject } from './shared.mjs';
 import { memoryVolumeMetaOf } from './memory-volumes.mjs';
 import { AXIOM_ORDER_SQL, TABLES_SQL } from './db/schema.mjs';
 import {
@@ -574,6 +574,7 @@ export class IftreeStore {
     // Merkle 缓存列（A5-2）：可空持久缓存；失效靠 nodes 触发器把所属 doc 标脏，diff 读时惰性补算。
     this.ensureColumn('nodes','content_hash', 'TEXT');
     this.ensureColumn('nodes','subtree_hash', 'TEXT');
+    this.ensureColumn('commits','author', 'TEXT');
     this.ensureColumn('docs','nodes_hash_dirty', 'INTEGER NOT NULL DEFAULT 1');
     this.ensureColumn('docs','edit_mode', "TEXT NOT NULL DEFAULT 'full'");
     this.ensureColumn('save_history', 'commit_id', 'TEXT');
@@ -1174,6 +1175,7 @@ export class IftreeStore {
     }
     this.db.exec(TABLES_SQL);
     this.seedCommitHeadsFromSaveHistory();
+    this.dropLegacySaveHistory();
   }
 
   seedCommitHeadsFromSaveHistory() {
@@ -1225,6 +1227,12 @@ export class IftreeStore {
         upsertHead.run(doc.id, headByDoc.get(String(doc.id)) || null);
       }
     });
+  }
+
+  // save_history 已退役（历史事实来源是 commits）；seed 回填 commits 后删除残留旧表。
+  dropLegacySaveHistory() {
+    if (!this.hasTable('save_history')) return;
+    this.db.exec('DROP TABLE IF EXISTS save_history');
   }
 
   normalizeExistingDocFolderNames() {
@@ -1827,7 +1835,7 @@ export class IftreeStore {
         const mode = this.getDocEditMode(targetDocId);
         if (mode === null) throw new Error(`Doc not found: ${targetDocId}`);
         if (mode !== 'incremental') {
-          throw new Error('流式写入要求文档处于增量编辑模式；请先 doc.setEditMode 切到 incremental');
+          throw new Error(editModeMismatchMessage({ docId: targetDocId, current: mode, required: 'incremental', intent: '流式写入 push' }));
         }
         // 事件卷一律不受控（projectneed 15-10-3）：拒绝而非静默改写，让调用方知道契约被违反。
         const metaRow = this.db.prepare('SELECT meta FROM docs WHERE id = ?').get(targetDocId);
@@ -2086,7 +2094,7 @@ export class IftreeStore {
     };
   }
 
-  getEditBranchDiffView({ branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' } = {}) {
+  getEditBranchDiffView({ branchId = null, shadowDocId = null, baseDocId = null, owner = 'human', changedOnly = false } = {}) {
     const branch = this.findEditBranch({ branchId, shadowDocId, baseDocId, owner });
     if (!branch) throw new Error('Edit branch not found');
     const docId = normalizePositiveId(branch.base_doc_id);
@@ -2121,6 +2129,15 @@ export class IftreeStore {
     stats.visibleRows += axiomDiff.rows.length;
     const historyState = this.editBranchHistoryState(branch);
 
+    // 公理改动行排最前（树视图里它们画在正文树之外），再接正文 diff 行。
+    let outRows = [...axiomDiff.rows, ...rows];
+    if (changedOnly) {
+      // 只返改动行（agent/MCP/db 外壳消费路径，projectneed 18-1）：丢掉未改动上下文行与
+      // 折叠占位行（含其 hiddenRows 全文），只留 added/deleted/modified。GUI 对比弹窗不传
+      // changedOnly，仍拿完整折叠/展开结构。
+      outRows = outRows.filter((row) => row.status !== 'unchanged' && row.status !== 'collapsed');
+    }
+
     return {
       kind: 'editBranch.diffView',
       branch: { ...branch },
@@ -2141,9 +2158,10 @@ export class IftreeStore {
         activeEntryCount: activeEntries.length,
         undoneEntryCount: undoneEditBranchEntries(entries).length,
         undoDepth: historyState.undoDepth,
-        redoDepth: historyState.redoDepth
+        redoDepth: historyState.redoDepth,
+        changedOnly
       },
-      rows: [...axiomDiff.rows, ...rows]
+      rows: outRows
     };
   }
 
@@ -2821,6 +2839,40 @@ export class IftreeStore {
     return { branch: freshBranch, changed: true, docId };
   }
 
+  stageEditBranchNodeMergePrevious(branch, payload = {}) {
+    const docId = normalizePositiveId(branch.base_doc_id);
+    const sourceRef = payload.nodeId ?? payload.node_id;
+    if (sourceRef === null || sourceRef === undefined) throw new Error('node.mergePrevious requires nodeId');
+    // "前一兄弟"在 stage 时就着投影态物化成 target_ref：op-log 动词记录意图的对象
+    // 而不是位置谓词，否则 undo/redo 翻动前序 entry 后"前一个"会漂移——投影端
+    // （applyNodeMergeInto）与重放端都按定死的 target_ref 应用，所见即所得。
+    const projected = this._projectedDocForBranch(branch);
+    const node = this._findProjectedNode(projected, sourceRef);
+    if (!node) throw new Error(`Node not found in edit branch: ${sourceRef}`);
+    if (node.parent_id === null || node.parent_id === undefined) {
+      return { branch, changed: false, docId };
+    }
+    const previous = projected.nodes
+      .filter((other) => other.parent_id !== null && other.parent_id !== undefined
+        && String(other.parent_id) === String(node.parent_id)
+        && Number(other.sort_order) < Number(node.sort_order))
+      .sort((left, right) => Number(right.sort_order) - Number(left.sort_order))[0] || null;
+    if (!previous) {
+      return { branch, changed: false, docId };
+    }
+    const trunkSource = this._trunkNodeRow(docId, sourceRef);
+    const trunkTarget = this._trunkNodeRow(docId, previous.id);
+    const freshBranch = this._appendEditBranchEntry(branch, {
+      kind: 'node.mergePrevious',
+      source_ref: sourceRef,
+      target_ref: previous.id,
+      // 乐观并发前置：与 mergeInto 同律，两侧内容漂移则拒绝（tmp 侧无前置）。
+      source_before_content_hash: trunkSource ? contentHash(trunkSource) : null,
+      target_before_content_hash: trunkTarget ? contentHash(trunkTarget) : null
+    });
+    return { branch: freshBranch, changed: true, docId };
+  }
+
   stageEditBranchNodeReparent(branch, payload = {}) {
     const docId = normalizePositiveId(branch.base_doc_id);
     const ref = payload.nodeId ?? payload.node_id;
@@ -2834,6 +2886,22 @@ export class IftreeStore {
       new_parent_ref: newParentRef,
       // 乐观并发前置：记录移动时主干上的父节点；保存时父已被主干改走 → 两侧移动相撞。
       // 仅主干行存在时记录（缺省=无前置），避免把「未知」误记成「根(null)」。
+      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
+    });
+    return { branch: freshBranch, changed: true, docId };
+  }
+
+  stageEditBranchNodeMoveBefore(branch, payload = {}) {
+    const docId = normalizePositiveId(branch.base_doc_id);
+    const ref = payload.nodeId ?? payload.node_id;
+    const targetRef = payload.targetNodeId ?? payload.target_node_id;
+    if (ref === null || ref === undefined) throw new Error('node.moveBefore requires nodeId');
+    if (targetRef === null || targetRef === undefined) throw new Error('node.moveBefore requires targetNodeId');
+    const trunkRow = this._trunkNodeRow(docId, ref);
+    const freshBranch = this._appendEditBranchEntry(branch, {
+      kind: 'node.moveBefore',
+      node_ref: ref,
+      target_ref: targetRef,
       ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
     });
     return { branch: freshBranch, changed: true, docId };
@@ -3125,7 +3193,16 @@ export class IftreeStore {
           break;
         }
         case 'node.mergePrevious': {
-          this.mergeNodeIntoPreviousSibling(resolveNodeId(entry.source_ref ?? entry.target_ref));
+          // stage 端已把"前一兄弟"物化为 target_ref；按定死目标重放，与投影所见一致。
+          // 无 target_ref 的旧 entry 退回重放时现查（防御兜底；现行 stage 必写 target_ref）。
+          if (entry.target_ref !== null && entry.target_ref !== undefined) {
+            this.mergeNodeIntoTarget({
+              nodeId: resolveNodeId(entry.source_ref),
+              targetNodeId: resolveNodeId(entry.target_ref)
+            });
+          } else {
+            this.mergeNodeIntoPreviousSibling(resolveNodeId(entry.source_ref));
+          }
           break;
         }
         case 'node.reparent': {
@@ -3428,17 +3505,17 @@ export class IftreeStore {
       };
     }
     if (sourceHistoryId) {
-      const history = this.db.prepare('SELECT * FROM save_history WHERE id = ?').get(sourceHistoryId);
-      if (!history) throw new Error(`History entry not found: ${sourceHistoryId}`);
-      const diff = JSON.parse(history.diff || '{}');
+      const commit = this.db.prepare('SELECT id, doc_id, diff FROM commits WHERE id = ?').get(sourceHistoryId);
+      if (!commit) throw new Error(`Commit not found: ${sourceHistoryId}`);
+      const diff = JSON.parse(commit.diff || '{}');
       const entries = activeEditBranchEntries(diff.entries);
       if (entries.length === 0 && Array.isArray(diff.entries) && diff.entries.length > 0) {
-        throw new Error('cherry-pick history entry does not contain edit-branch entries');
+        throw new Error('cherry-pick commit does not contain edit-branch entries');
       }
       return {
         kind: 'history',
-        id: history.id,
-        docId: history.doc_id,
+        id: commit.id,
+        docId: commit.doc_id,
         entries
       };
     }
@@ -3530,16 +3607,13 @@ export class IftreeStore {
           savedFromEditBranch: true,
           snapshot: currentSnapshot
         };
-        const commit = this.createCommit({
+        this.createCommit({
           docId: branch.base_doc_id,
           summary,
           diff: commitPayload,
-          snapshot: currentSnapshot
+          snapshot: currentSnapshot,
+          author: branch.owner || null
         });
-        this.db.prepare(`
-          INSERT INTO save_history (doc_id, commit_id, summary, diff)
-          VALUES (?, ?, ?, ?)
-        `).run(branch.base_doc_id, commit.id, summary, JSON.stringify(commitPayload));
       }
 
       this.db.prepare('DELETE FROM edit_branches WHERE id = ?').run(branch.id);
@@ -3555,10 +3629,10 @@ export class IftreeStore {
         vectorStaleNodeIds,
         history: hasEffectiveDiff
           ? this.db.prepare(`
-            SELECT id, doc_id, commit_id, saved_at, summary
-            FROM save_history
+            SELECT id, doc_id, id AS commit_id, committed_at AS saved_at, summary
+            FROM commits
             WHERE doc_id = ?
-            ORDER BY id DESC
+            ORDER BY committed_at DESC, id DESC
             LIMIT 1
           `).get(branch.base_doc_id)
           : null
@@ -3723,8 +3797,9 @@ export class IftreeStore {
     // If the doc has an active edit branch, we need the full node list so the
     // lazy-diff projection can recompute addresses and depths consistently;
     // depth slicing kicks back in after projection.
-    const activeBranch = this.activeEditBranchForBaseDoc(docId, 'human')
-      || this.activeEditBranchForBaseDoc(docId, 'llm');
+    // 主文档视图只投影人类自己的编辑分支（owner=human）；外部/内置 agent 的分支
+    // （owner=llm:<会话>）是 A5-5 待审/并行分支，经 diff 视图单独看，不混入主视图（沿用 15-4 待审语义）。
+    const activeBranch = this.activeEditBranchForBaseDoc(docId, 'human');
     const sliceDepthForQuery = activeBranch ? null : treeDepthLimit;
 
     let nodes = sliceDepthForQuery
@@ -4343,7 +4418,7 @@ export class IftreeStore {
   }
 
   /** @param {{ docId?: any, nodeId?: any, startOffset?: number | null, limit?: number, before?: number, spansLimit?: number }} [payload] */
-  getSourceWindow({ docId, nodeId = null, startOffset = null, limit = 80000, before = 12000, spansLimit = 8000 } = {}) {
+  getSourceWindow({ docId, nodeId = null, startOffset = null, limit = 5000, before = null, spansLimit = 8000 } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     if (!normalizedDocId) return null;
 
@@ -4355,8 +4430,14 @@ export class IftreeStore {
     if (!source) return null;
 
     const totalLength = Math.max(0, Number(source.raw_length) || 0);
-    const safeLimit = Math.min(160000, Math.max(4000, Math.floor(Number(limit) || 80000)));
-    const safeBefore = Math.min(safeLimit - 1, Math.max(0, Math.floor(Number(before) || 0)));
+    // limit 是总上下文窗口（默认 5000、上限 50000）。往前量未显式给 before 时自动分配：
+    // min(⌊limit/5⌋, 1000)——limit≤5000 时前后 1:4，limit>5000 时往前封顶 1000、其余全归往后。
+    // 显式给 before 则覆盖自动值（夹到 [0, limit]，用于需要多看上文的场景）。
+    const safeLimit = Math.min(50000, Math.max(1, Math.floor(Number(limit) || 5000)));
+    const hasExplicitBefore = before !== null && before !== undefined && Number.isFinite(Number(before));
+    const safeBefore = hasExplicitBefore
+      ? Math.max(0, Math.min(safeLimit, Math.floor(Number(before))))
+      : Math.min(1000, Math.floor(safeLimit / 5));
     const safeSpansLimit = Math.min(20000, Math.max(100, Math.floor(Number(spansLimit) || 8000)));
     let anchor = Number(startOffset);
     const hasExplicitStartOffset = Number.isFinite(anchor);
@@ -4391,8 +4472,11 @@ export class IftreeStore {
 
     if (!Number.isFinite(anchor)) anchor = 0;
     anchor = Math.min(totalLength, Math.max(0, Math.floor(anchor)));
-    const windowStart = Math.max(0, Math.min(anchor - safeBefore, Math.max(0, totalLength - safeLimit)));
-    const windowEnd = Math.min(totalLength, windowStart + safeLimit);
+    // 往前最多 safeBefore；撞文档头时往前用不满的额度并入往后、凑满 limit；
+    // 撞文档尾时往后到底为止、往前不补（总窗口可能不足 limit）。
+    const windowStart = Math.max(0, anchor - safeBefore);
+    const actualBefore = anchor - windowStart;
+    const windowEnd = Math.min(totalLength, anchor + (safeLimit - actualBefore));
     const rawMarkdown = windowEnd > windowStart
       ? this.db.prepare('SELECT substr(raw_markdown, ?, ?) AS text FROM source_documents WHERE doc_id = ?')
         .get(windowStart + 1, windowEnd - windowStart, normalizedDocId)?.text || ''
@@ -4654,8 +4738,6 @@ export class IftreeStore {
     assertNoHumanTagField(patch, 'updateNode patch');
     const current = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
     if (!current) throw new Error(`Node not found: ${nodeId}`);
-    const hasContentSizePatch = ['text', 'node_title', 'nodeTitle', 'node_note', 'nodeNote', 'node_type', 'nodeType']
-      .some((key) => Object.prototype.hasOwnProperty.call(patch || {}, key));
 
     const next = {
       text: patch.text ?? current.text,
@@ -4682,8 +4764,6 @@ export class IftreeStore {
     );
 
     this.touchDoc(current.doc_id);
-    if (hasContentSizePatch) {
-    }
     return this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
   }
 
@@ -5164,14 +5244,22 @@ export class IftreeStore {
     const firstLine = (value = '') => String(value || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean) || '';
     const headingText = (node = {}) => firstLine(node.node_title) || firstLine(node.text) || String(node.address || node.id || '').trim();
     const lines = [`# ${firstLine(doc.title) || `doc ${normalizedDocId}`}`];
+    // 库内节点类型统一是 TEXT，没有「标题/正文」标记位。markdown 导入时标题会成为带子节点的
+    // 父节点，段落/列表/代码块/表格则是叶子。据此区分：有子节点的渲染为对应层级标题，叶子原样
+    // 输出正文——避免旧实现把正文、代码块、表格行都按树深度套成标题（深层正文变 #####、代码块
+    // 围栏行被当标题再重复输出一遍）的失真。
     const emitNode = (node) => {
       const children = byParent.get(String(node.id)) || [];
-      const heading = headingText(node);
-      const level = Math.max(2, Math.min(6, Number(node.depth) || 2));
-      if (heading) lines.push('', `${'#'.repeat(level)} ${heading}`);
       const body = String(node.text || '').trim();
-      if (body && body !== heading) lines.push('', body);
       const note = String(node.node_note || '').trim();
+      if (children.length > 0) {
+        const heading = headingText(node);
+        const level = Math.max(2, Math.min(6, Number(node.depth) || 2));
+        if (heading) lines.push('', `${'#'.repeat(level)} ${heading}`);
+        if (body && body !== heading) lines.push('', body);
+      } else if (body) {
+        lines.push('', body);
+      }
       if (note) lines.push('', note);
       for (const child of children) emitNode(child);
     };
@@ -5188,27 +5276,101 @@ export class IftreeStore {
   }
 
   listHistory(docId) {
+    // 历史列表以 commits 为事实来源；id 即 commit UUID，commit_id/saved_at 为兼容旧字段名的别名。
     return this.db.prepare(`
-      SELECT id, doc_id, commit_id, saved_at, summary
-      FROM save_history
+      SELECT id, doc_id, id AS commit_id, committed_at AS saved_at, summary, author
+      FROM commits
       WHERE doc_id = ?
-      ORDER BY saved_at DESC, id DESC
+      ORDER BY committed_at DESC, id DESC
     `).all(docId);
   }
 
-  createCommit({ docId, summary = null, diff = {}, snapshot = {}, committedAt = null }) {
+  // 节点级历史（git log <path> 语义）：某地址的节点（scope='node'）或整棵子树（默认）
+  // 在哪些 commit 被改动。按稳定 id 追——先把 address 解析成当前 node_id，再遍历 commit 链，
+  // 对相邻快照跑 computeSnapshotDiff 并过滤目标成员；节点历史上换过地址也连得上（git log --follow）。
+  // 子树成员从相邻两快照并集取，覆盖被删的子节点。
+  nodeHistory(docId, address, { scope = 'subtree' } = {}) {
+    const normalizedDocId = requireStableId(docId, 'nodeHistory docId');
+    const target = this.db
+      .prepare('SELECT id FROM nodes WHERE doc_id = ? AND address = ?')
+      .get(normalizedDocId, String(address));
+    if (!target) throw new Error(`nodeHistory target not found: doc ${normalizedDocId} ${address}`);
+    const targetId = target.id;
+    const commits = this.db.prepare(`
+      SELECT id, committed_at, summary, author, snapshot
+      FROM commits WHERE doc_id = ?
+      ORDER BY committed_at ASC, id ASC
+    `).all(normalizedDocId);
+
+    const entries = [];
+    let prevSnapshot = null;
+    for (const commit of commits) {
+      let snapshot;
+      try { snapshot = JSON.parse(commit.snapshot || '{}'); } catch { snapshot = {}; }
+      const members = scope === 'node'
+        ? new Set([targetId])
+        : new Set([
+          ...this._subtreeMemberIds(prevSnapshot, targetId),
+          ...this._subtreeMemberIds(snapshot, targetId)
+        ]);
+      let changes = [];
+      let changed = false;
+      if (!prevSnapshot) {
+        changed = (snapshot.nodes || []).some((node) => members.has(node.id));
+      } else {
+        changes = computeSnapshotDiff(prevSnapshot, snapshot).filter((entry) => members.has(entry.node_id));
+        changed = changes.length > 0;
+      }
+      if (changed) {
+        entries.push({
+          id: commit.id,
+          commit_id: commit.id,
+          committed_at: commit.committed_at,
+          saved_at: commit.committed_at,
+          summary: commit.summary,
+          author: commit.author,
+          changeCount: changes.length
+        });
+      }
+      prevSnapshot = snapshot;
+    }
+    entries.reverse();
+    return entries;
+  }
+
+  _subtreeMemberIds(snapshot, rootId) {
+    const members = new Set();
+    if (!snapshot || !Array.isArray(snapshot.nodes)) return members;
+    const childrenByParent = new Map();
+    for (const node of snapshot.nodes) {
+      const parent = node.parent_id ?? node.parentId ?? null;
+      if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+      childrenByParent.get(parent).push(node.id);
+    }
+    const stack = [rootId];
+    while (stack.length) {
+      const id = stack.pop();
+      if (members.has(id)) continue;
+      members.add(id);
+      for (const child of childrenByParent.get(id) || []) stack.push(child);
+    }
+    return members;
+  }
+
+  createCommit({ docId, summary = null, diff = {}, snapshot = {}, committedAt = null, author = null }) {
     const normalizedDocId = requireStableId(docId, 'commit docId');
     const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(normalizedDocId);
     const commitId = newStableId();
     this.db.prepare(`
-      INSERT INTO commits (id, doc_id, parent_commit_id, committed_at, summary, diff, snapshot)
-      VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?)
+      INSERT INTO commits (id, doc_id, parent_commit_id, committed_at, summary, author, diff, snapshot)
+      VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)
     `).run(
       commitId,
       normalizedDocId,
       head?.head_commit_id || null,
       committedAt,
       summary,
+      author || null,
       typeof diff === 'string' ? diff : JSON.stringify(diff || {}),
       typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot || {})
     );
@@ -5222,21 +5384,17 @@ export class IftreeStore {
     return this.db.prepare('SELECT * FROM commits WHERE id = ?').get(commitId);
   }
 
-  saveHistorySnapshot({ docId, summary = '保存版本' }) {
+  saveHistorySnapshot({ docId, summary = '保存版本', owner = 'human' }) {
     return this.withTransaction(() => {
       const currentSnapshot = this.createSnapshot(docId);
 
-      const lastSave = this.db.prepare(`
-        SELECT diff FROM save_history
-        WHERE doc_id = ?
-        ORDER BY id DESC LIMIT 1
-      `).get(docId);
-
+      // 上一版快照取自当前 HEAD commit（commits 是历史事实来源，save_history 已退役）。
+      const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(docId);
       const entries = [];
-      if (lastSave) {
+      if (head?.head_commit_id) {
         try {
-          const prev = JSON.parse(lastSave.diff || '{}');
-          const prevSnapshot = prev.snapshot || (prev.kind === 'snapshot' ? prev : null);
+          const prevRow = this.db.prepare('SELECT snapshot FROM commits WHERE id = ?').get(head.head_commit_id);
+          const prevSnapshot = JSON.parse(prevRow?.snapshot || 'null');
           if (prevSnapshot?.nodes) {
             entries.push(...this.computeDiff(prevSnapshot, currentSnapshot));
           }
@@ -5252,15 +5410,16 @@ export class IftreeStore {
         docId,
         summary,
         diff: payload,
-        snapshot: currentSnapshot
+        snapshot: currentSnapshot,
+        author: owner
       });
-      const result = this.db.prepare(`
-        INSERT INTO save_history (doc_id, summary, diff)
-        VALUES (?, ?, ?)
-      `).run(docId, summary, JSON.stringify(payload));
-      this.db.prepare('UPDATE save_history SET commit_id = ? WHERE id = ?').run(commit.id, Number(result.lastInsertRowid));
-      return this.db.prepare('SELECT id, doc_id, commit_id, saved_at, summary FROM save_history WHERE id = ?')
-        .get(Number(result.lastInsertRowid));
+      return {
+        id: commit.id,
+        doc_id: commit.doc_id,
+        commit_id: commit.id,
+        saved_at: commit.committed_at,
+        summary: commit.summary
+      };
     });
   }
 
@@ -5268,17 +5427,15 @@ export class IftreeStore {
     return computeSnapshotDiff(prevSnapshot, currentSnapshot);
   }
 
-  restoreHistory(historyId) {
-    const history = this.db.prepare('SELECT * FROM save_history WHERE id = ?').get(historyId);
-    if (!history) throw new Error(`History entry not found: ${historyId}`);
-
-    const payload = JSON.parse(history.diff || '{}');
-    const snapshot = payload.snapshot || (payload.kind === 'snapshot' ? payload : null);
+  // 按 commit_id（UUID）从 commits.snapshot 恢复——commits 是历史的事实来源（projectneed 189-191）。
+  restoreCommit(commitId) {
+    const commit = this.db.prepare('SELECT doc_id, snapshot FROM commits WHERE id = ?').get(commitId);
+    if (!commit) throw new Error(`Commit not found: ${commitId}`);
+    const snapshot = JSON.parse(commit.snapshot || '{}');
     if (!snapshot?.nodes) {
-      throw new Error(`History entry is not restorable: ${historyId}`);
+      throw new Error(`Commit is not restorable: ${commitId}`);
     }
-
-    this.restoreSnapshot(history.doc_id, snapshot);
+    this.restoreSnapshot(commit.doc_id, snapshot);
     return true;
   }
 

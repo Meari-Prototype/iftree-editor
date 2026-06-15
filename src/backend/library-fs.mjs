@@ -36,6 +36,17 @@ export function sortLibraryEntries(left, right) {
   return String(left.name || '').localeCompare(String(right.name || ''), 'zh-Hans-CN', { numeric: true });
 }
 
+// library 枚举的统一忽略策略（唯一权威，避免各处 filter 漂移）：
+// 系统垃圾文件始终忽略；. 开头隐藏项默认忽略，includeHidden=true 时保留。
+const ALWAYS_IGNORED_ENTRIES = new Set(['.DS_Store', 'Thumbs.db']);
+
+export function shouldIgnoreLibraryEntry(name, { includeHidden = false } = {}) {
+  const entryName = String(name || '');
+  if (ALWAYS_IGNORED_ENTRIES.has(entryName)) return true;
+  if (!includeHidden && entryName.startsWith('.')) return true;
+  return false;
+}
+
 export function measureWorkspaceEntry(entryPath) {
   const stat = statSync(entryPath);
   let sizeBytes = stat.size;
@@ -78,10 +89,10 @@ export function createLibraryFs({ ensureRoot }) {
     return entry;
   }
 
-  function listLibraryChildren(relativePath = '') {
+  function listLibraryChildren(relativePath = '', { includeHidden = false } = {}) {
     const folder = libraryPath(relativePath);
     return readdirSync(folder, { withFileTypes: true })
-      .filter((entry) => entry.name !== '.DS_Store' && entry.name !== 'Thumbs.db' && !entry.isSymbolicLink())
+      .filter((entry) => !shouldIgnoreLibraryEntry(entry.name, { includeHidden }) && !entry.isSymbolicLink())
       .map((entry) => libraryEntry(normalizeLibraryRelativePath(join(relativePath, entry.name)), entry))
       .sort(sortLibraryEntries);
   }

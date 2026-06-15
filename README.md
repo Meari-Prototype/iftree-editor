@@ -213,7 +213,7 @@ Excel `.xlsx` 与 CSV `.csv` 是数据库导出的中继格式，不作为普通
 
 ## MCP 与外部 agent
 
-MCP server 把文档库开放给 Claude Code、Codex 等外部 agent 框架，stdio 传输，权限档在启动时由环境变量 `IFTREE_MCP_TIER` 锁定：`read`（检索与读取，默认）、`edit`（+ 编辑分支写入、流式写入、记忆投递）、`full`（+ 合并回滚等管理动作）。
+MCP server 把文档库开放给 Claude Code、Codex 等外部 agent 框架，stdio 传输，权限档在启动时由环境变量 `IFTREE_MCP_TIER` 锁定：`read`（检索与读取，默认）、`edit`（+ 编辑分支写入、流式写入、记忆投递）、`full`（+ 合并回滚等管理动作，身份仍 llm）、`human`（别名 `yolo`，写入者身份为 human：批准 llm 待审、标受控）。
 
 客户端配置示例（以项目根为工作目录）：
 

@@ -374,7 +374,7 @@ test('deletes a document and its document-scoped records', async () => {
     assert.equal(remainingIds.includes(second.id), true);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM nodes WHERE doc_id = ?').get(first.id).count, 0);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM axioms WHERE doc_id = ?').get(first.id).count, 0);
-    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM save_history WHERE doc_id = ?').get(first.id).count, 0);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM commits WHERE doc_id = ?').get(first.id).count, 0);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM refs').get().count, 0);
     assert.equal(store.deleteDoc(first.id), false);
   });
@@ -481,7 +481,7 @@ test('saves document snapshots and restores an earlier history entry', async () 
     store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'Second.' });
     assert.equal(store.listHistory(doc.id).length, 1);
 
-    store.restoreHistory(history.id);
+    store.restoreCommit(history.id);
     const restored = store.getDoc(doc.id);
 
     assert.equal(restored.tree.children.length, 1);

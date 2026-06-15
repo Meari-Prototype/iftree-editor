@@ -147,9 +147,10 @@ export function createDerivedIndexReconciler(options = {}) {
     await keywords.deleteDoc(docId);
   }
 
-  async function keywordSearch({ terms = [], docId = null } = {}) {
+  /** @param {{ terms?: any[], docId?: any, limit?: number }} [opts] */
+  async function keywordSearch({ terms = [], docId = null, limit } = {}) {
     const keywords = await getKeywordStore();
-    return keywords.search({ terms, docId });
+    return keywords.search({ terms, docId, limit });
   }
 
   async function getVectorStore() {

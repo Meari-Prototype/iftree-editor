@@ -42,16 +42,6 @@ function rowToSessionSummary(row) {
   };
 }
 
-function rowToDiff(row) {
-  if (!row) return null;
-  return {
-    ...row,
-    base: parseJson(row.base_json, {}),
-    next: parseJson(row.next_json, {}),
-    meta: parseJson(row.meta_json, {})
-  };
-}
-
 function legacyMessagesFromSession(session) {
   if (!session) return [];
   const result = session.result || {};
@@ -105,25 +95,11 @@ export class AgentStore {
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       );
-
-      CREATE TABLE IF NOT EXISTS agent_diffs (
-        id INTEGER PRIMARY KEY,
-        session_id INTEGER REFERENCES agent_sessions(id) ON DELETE SET NULL,
-        target_kind TEXT NOT NULL,
-        target_key TEXT NOT NULL,
-        action TEXT NOT NULL,
-        summary TEXT NOT NULL DEFAULT '',
-        base_json TEXT NOT NULL DEFAULT '{}',
-        next_json TEXT NOT NULL DEFAULT '{}',
-        meta_json TEXT NOT NULL DEFAULT '{}',
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_agent_diffs_status ON agent_diffs(status, updated_at);
-      CREATE INDEX IF NOT EXISTS idx_agent_diffs_target ON agent_diffs(target_kind, target_key, action, status);
     `);
+    // agent_diffs 物理退役（projectneed 18-1）：A2A 待审已统一为 owner=llm:<会话> 编辑分支，
+    // 独立待审 diff 表与 commits/edit_branches 不再有等价用途；旧库残留表在此删除（零数据迁移，
+    // 索引随表删除），等价于主库的 dropLegacySaveHistory。
+    this.db.exec('DROP TABLE IF EXISTS agent_diffs');
   }
 
   close() {
@@ -179,6 +155,9 @@ export class AgentStore {
 
   listSessions({ limit = 40 } = {}) {
     const safeLimit = Math.max(1, Math.min(200, Number(limit) || 40));
+    // 待审计数（pending_diff_count）不再由本库子查询提供（agent_diffs 已退役）：
+    // 待审已是 owner=llm:<会话> 编辑分支，跨库归属，由 agent-runtime.listAgentSessions
+    // 合并主库分支后补齐该字段。
     return this.db.prepare(`
       SELECT
         s.id,
@@ -187,12 +166,7 @@ export class AgentStore {
         s.doc_id,
         s.selected_node_id,
         s.created_at,
-        s.updated_at,
-        (
-          SELECT COUNT(*)
-          FROM agent_diffs d
-          WHERE d.session_id = s.id AND d.status = 'pending'
-        ) AS pending_diff_count
+        s.updated_at
       FROM agent_sessions s
       ORDER BY s.updated_at DESC, s.id DESC
       LIMIT ?
@@ -202,63 +176,7 @@ export class AgentStore {
   deleteSession(sessionId) {
     const id = Number(sessionId);
     if (!Number.isInteger(id) || id <= 0) return false;
-    this.db.prepare('UPDATE agent_diffs SET session_id = NULL WHERE session_id = ?').run(id);
     const result = this.db.prepare('DELETE FROM agent_sessions WHERE id = ?').run(id);
     return result.changes > 0;
-  }
-
-  upsertDiff({ sessionId, targetKind, targetKey, action, summary = '', base = {}, next = {}, meta = {} }) {
-    const existing = this.db.prepare(`
-      SELECT * FROM agent_diffs
-      WHERE status = 'pending' AND target_kind = ? AND target_key = ? AND action = ?
-      ORDER BY id DESC LIMIT 1
-    `).get(targetKind, targetKey, action);
-
-    if (existing) {
-      this.db.prepare(`
-        UPDATE agent_diffs
-        SET session_id = ?, summary = ?, next_json = ?, meta_json = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(sessionId, summary, json(next, {}), json(meta, {}), existing.id);
-      return this.getDiff(existing.id);
-    }
-
-    const result = this.db.prepare(`
-      INSERT INTO agent_diffs (
-        session_id, target_kind, target_key, action, summary, base_json, next_json, meta_json
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(sessionId, targetKind, targetKey, action, summary, json(base, {}), json(next, {}), json(meta, {}));
-    return this.getDiff(Number(result.lastInsertRowid));
-  }
-
-  getDiff(diffId) {
-    return rowToDiff(this.db.prepare('SELECT * FROM agent_diffs WHERE id = ?').get(diffId));
-  }
-
-  listPendingDiffs() {
-    return this.db.prepare(`
-      SELECT * FROM agent_diffs
-      WHERE status = 'pending'
-      ORDER BY updated_at DESC, id DESC
-    `).all().map(rowToDiff);
-  }
-
-  markApplied(diffId) {
-    this.db.prepare(`
-      UPDATE agent_diffs
-      SET status = 'applied', updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(diffId);
-    return this.getDiff(diffId);
-  }
-
-  rejectDiff(diffId) {
-    this.db.prepare(`
-      UPDATE agent_diffs
-      SET status = 'rejected', updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(diffId);
-    return this.getDiff(diffId);
   }
 }

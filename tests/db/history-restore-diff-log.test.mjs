@@ -21,16 +21,16 @@ test('db log, diff, read --at, and restore address committed history', { timeout
       'dbt-history',
       'DBT_HISTORY_APPLY'
     );
-    const historyId = String(commit.history.id);
+    const commitRef = String(commit.history.commit_id);
 
     const logText = stdoutOf(await runBashDb(dbPath, ['log', docId, '--limit', '5']));
-    assert.match(logText, new RegExp(`history:${historyId} commit:.* DBT_HISTORY_APPLY`));
+    assert.match(logText, new RegExp(`commit:${commitRef}.*DBT_HISTORY_APPLY`));
 
-    const diffText = stdoutOf(await runBashDb(dbPath, ['diff', docId, historyId]));
+    const diffText = stdoutOf(await runBashDb(dbPath, ['diff', docId, commitRef]));
     assert.match(diffText, /node.update/);
     assert.match(diffText, /"old":"DBT_DIFF_MODIFY 的原始正文是 old-diff-text/);
 
-    assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1', '--at', historyId])), modifyChangedText);
+    assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1', '--at', commitRef])), modifyChangedText);
 
     await commitSingleTextChange(
       dbPath,
@@ -42,7 +42,7 @@ test('db log, diff, read --at, and restore address committed history', { timeout
     );
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1'])), modifyOriginalText);
 
-    const restored = parseJsonStdout(await runBashDb(dbPath, ['restore', historyId]));
+    const restored = parseJsonStdout(await runBashDb(dbPath, ['restore', commitRef]));
     assert.equal(restored.ok, true);
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1'])), modifyChangedText);
 
@@ -51,9 +51,6 @@ test('db log, diff, read --at, and restore address committed history', { timeout
 
     const missingDiffHistory = await runBashDb(dbPath, ['diff', docId], { expectFailure: true });
     assert.match(missingDiffHistory.stderr || missingDiffHistory.stdout, /db diff requires history id/);
-
-    const readAtWithSource = await runBashDb(dbPath, ['read', docId, '1-1-6-1-1', '--at', historyId, '--source'], { expectFailure: true });
-    assert.match(readAtWithSource.stderr || readAtWithSource.stdout, /db read --at does not support --source\/--blame/);
 
     const missingRestoreRef = await runBashDb(dbPath, ['restore'], { expectFailure: true });
     assert.match(missingRestoreRef.stderr || missingRestoreRef.stdout, /history ref requires history id, saved_at, or tag/);

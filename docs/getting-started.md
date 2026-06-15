@@ -1,6 +1,6 @@
 # 上手教程
 
-> **上手教程** · [操作指南](how-to.md) · [参考手册](reference.md) · [概念与设计](concepts.md)
+> **上手教程** · [操作指南](how-to.md) · [参考手册](reference.md) · [概念与设计](concepts.md) · [记忆库使用](memory.md)
 
 这篇带你从零走通一遍核心流程：装好应用、导入第一个文档、看懂两种阅读密度、完成第一次检索，最后（可选）让一个外部 agent 连上你的库。预计 15 分钟。
 
@@ -82,7 +82,7 @@ npm run app
 }
 ```
 
-`IFTREE_MCP_TIER=read` 是只读档：agent 能检索、读正文、查历史，不能写。让它试一句「用 find 检索 ××，然后 read 出命中节点的正文」——回答会带着节点地址，可以核对。三个权限档与全部工具见[参考手册](reference.md#mcp-server)。
+`IFTREE_MCP_TIER=read` 是只读档：agent 能检索、读正文、查历史，不能写。让它试一句「用 find 检索 ××，然后 read 出命中节点的正文」——回答会带着节点地址，可以核对。四个权限档与全部工具见[参考手册](reference.md#mcp-server)。
 
 ## 下一步
 

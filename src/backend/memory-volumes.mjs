@@ -103,12 +103,13 @@ function selectVolumeDocRows(store) {
   `).all();
 }
 
-export function listMemoryVolumes(store, { state = null, agent = null, sessionId = null, limit = 50, nowMs = Date.now() } = {}) {
+// limit 默认 5：日常"开工先看最近发生过什么"只需最近几卷（最新优先）；全量列表是管理动作，显式调大 limit 才给。
+export function listMemoryVolumes(store, { state = null, agent = null, sessionId = null, limit = 5, nowMs = Date.now() } = {}) {
   const wantState = state ? String(state).trim() : null;
   if (wantState && !VOLUME_STATES.includes(wantState)) {
     throw new Error(`未知卷状态：${wantState}；只能是 ${VOLUME_STATES.join(' / ')}`);
   }
-  const max = Number.isInteger(Number(limit)) && Number(limit) > 0 ? Math.min(500, Number(limit)) : 50;
+  const max = Number.isInteger(Number(limit)) && Number(limit) > 0 ? Math.min(500, Number(limit)) : 5;
   const rows = [];
   for (const docRow of selectVolumeDocRows(store)) {
     const row = volumeRow(store, docRow, nowMs);

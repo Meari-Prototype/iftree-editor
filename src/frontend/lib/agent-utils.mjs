@@ -1,5 +1,3 @@
-import { normalizeDocId } from './doc-utils.mjs';
-
 export const AGENT_REASONING_OPTIONS = [
   { value: 'auto', label: '自动' },
   { value: 'low', label: '低' },
@@ -25,28 +23,6 @@ export function normalizeAgentReasoningEfforts(value) {
     }
   }
   return result;
-}
-
-export function agentDiffTraceTarget(diff, docs = []) {
-  const docId = normalizeDocId(diff?.next?.docId || diff?.base?.docId || diff?.meta?.docId);
-  const address = String(
-    diff?.next?.address
-    || diff?.base?.address
-    || diff?.meta?.address
-    || diff?.next?.parentAddress
-    || diff?.next?.sourceAddress
-    || diff?.base?.source_address
-    || ''
-  ).trim();
-  const nodeId = normalizeDocId(diff?.next?.nodeId || diff?.base?.nodeId);
-  const doc = Array.isArray(docs) ? docs.find((item) => normalizeDocId(item.id) === normalizeDocId(docId)) : null;
-  const title = doc?.title ? ` ${doc.title}` : '';
-  return {
-    docId,
-    address,
-    nodeId,
-    docLabel: docId ? `#${docId}${title}` : ''
-  };
 }
 
 export function formatAgentElapsed(value) {
@@ -291,73 +267,56 @@ export function clipText(value, limit = 180) {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }
 
-export function diffTitle(diff) {
-  if (diff.target_kind === 'node' && diff.action === 'insert') return `新增节点到 ${diff.next?.parentAddress || ''}`;
-  if (diff.target_kind === 'node' && diff.action === 'delete') return `删除节点 ${diff.base?.address || diff.meta?.address || ''}`;
-  if (diff.target_kind === 'node') return `节点 ${diff.meta?.address || diff.base?.address || ''}`;
-  if (diff.target_kind === 'ref' && diff.action === 'delete') return '删除引用关系';
-  if (diff.target_kind === 'ref') return '引用关系';
-  if (diff.target_kind === 'source') return '文件绑定路径';
-  if (diff.target_kind === 'library') return diff.next?.path || diff.base?.path || 'library 文件';
-  return diff.summary || '待审变更';
+// A2A 收敛后（projectneed 18-1）agentDiffs = owner=llm:<会话> 编辑分支列表（整批，一分支 = 一组提议）。
+// 下面把分支的 diff.entries 解析成卡片摘要；明细对照走统一 diff 视图。
+const AGENT_ENTRY_LABELS = {
+  'node.update': '改节点', 'node.insert': '增节点', 'node.delete': '删节点',
+  'node.move': '移动节点', 'node.promote': '提升节点', 'node.split': '拆分节点',
+  'node.mergeInto': '并入节点', 'node.mergePrevious': '并入上一条', 'node.reparent': '改父节点',
+  'node.moveBefore': '前移节点', 'node.moveAfter': '后移节点',
+  'axiom.add': '增前提', 'axiom.update': '改前提', 'axiom.delete': '删前提', 'axiom.move': '移前提',
+  'ref.addNodeToNode': '加引用', 'ref.addAxiomToNode': '加前提引用', 'ref.delete': '删引用'
+};
+
+export function agentBranchEntries(branch) {
+  let diff = {};
+  try {
+    diff = typeof branch?.diff === 'string' ? JSON.parse(branch.diff || '{}') : (branch?.diff || {});
+  } catch {
+    diff = {};
+  }
+  const entries = Array.isArray(diff.entries) ? diff.entries : [];
+  return entries
+    .filter((entry) => entry && entry.status !== 'undone')
+    .map((entry, index) => ({
+      key: entry.createdAt || `${branch?.id ?? 'b'}:${index}`,
+      label: AGENT_ENTRY_LABELS[entry.kind] || entry.kind || '改动',
+      address: entry.address || entry.parent_ref || entry.target_ref || entry.node_ref || ''
+    }));
 }
 
-export function diffFields(diff) {
-  if (diff.target_kind === 'node') {
-    return ['node_title', 'text', 'node_note', 'node_type', 'trust_level']
-      .filter((key) => String(diff.base?.[key] ?? '') !== String(diff.next?.[key] ?? ''))
-      .map((key) => ({
-        key,
-        label: {
-          node_title: '标题',
-          text: '正文',
-          node_note: '摘要备注',
-          node_type: '类型',
-          trust_level: '信任级别'
-        }[key] || key,
-        before: diff.base?.[key] || '',
-        after: diff.next?.[key] || ''
-      }));
+export function agentBranchDocLabel(branch, docs = []) {
+  if (branch?.base_title) return branch.base_title;
+  const match = Array.isArray(docs)
+    ? docs.find((doc) => String(doc?.id) === String(branch?.base_doc_id))
+    : null;
+  return match?.title || branch?.base_doc_id || '未知文档';
+}
+
+// owner 标签：A2A 待审分支 owner 形如 llm:<会话id>（A5-5 写入者身份+会话隔离，每会话一条分支）。
+// 优先映射成该会话的可读标题，找不到会话时回落「会话 <id>」；llm/human/其他原样转友好名。
+export function agentBranchOwnerLabel(branch, sessions = []) {
+  const owner = String(branch?.owner || '').trim();
+  if (!owner) return '未知来源';
+  const match = owner.match(/^llm:(.+)$/);
+  if (match) {
+    const sessionId = match[1];
+    const session = Array.isArray(sessions)
+      ? sessions.find((item) => String(item?.id) === String(sessionId))
+      : null;
+    return session ? agentSessionTitle(session) : `会话 ${sessionId}`;
   }
-  if (diff.target_kind === 'ref') {
-    if (diff.action === 'delete') {
-      return [{
-        key: 'ref',
-        label: '删除引用',
-        before: `${diff.base?.source_address || ''} → ${diff.base?.target_address || ''} ${diff.base?.ref_kind || ''}`.trim(),
-        after: '删除'
-      }];
-    }
-    return [{
-      key: 'ref',
-      label: diff.action === 'add' ? '新增引用' : '引用',
-      before: '',
-      after: `${diff.next?.sourceAddress || ''} → ${diff.next?.targetAddress || ''} ${diff.next?.refKind || ''}`.trim()
-    }];
-  }
-  if (diff.target_kind === 'library') {
-    return [{
-      key: 'text',
-      label: '文件内容',
-      before: diff.base?.text || '',
-      after: diff.next?.text || ''
-    }];
-  }
-  if (diff.target_kind === 'source') {
-    return [
-      {
-        key: 'sourcePath',
-        label: '绑定路径',
-        before: diff.base?.sourcePath || '',
-        after: diff.next?.sourcePath || ''
-      },
-      {
-        key: 'sourceType',
-        label: '文件类型',
-        before: diff.base?.sourceType || '',
-        after: diff.next?.sourceType || ''
-      }
-    ].filter((field) => String(field.before || '') !== String(field.after || ''));
-  }
-  return [];
+  if (owner === 'llm') return '智能体';
+  if (owner === 'human') return '人类';
+  return owner;
 }

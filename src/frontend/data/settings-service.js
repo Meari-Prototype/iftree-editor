@@ -9,6 +9,14 @@ export const settingsRepository = {
     return callIftree('saveVectorSettings', patch);
   },
 
+  readMemorySettings() {
+    return callIftree('readMemorySettings');
+  },
+
+  saveMemorySettings(patch) {
+    return callIftree('saveMemorySettings', patch);
+  },
+
   readLlmSummarySettings() {
     return callIftree('readLlmSummarySettings');
   },

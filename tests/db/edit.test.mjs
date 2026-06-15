@@ -30,7 +30,7 @@ test('db edit records set, insert, and delete entries on a real edit branch and 
     assert.equal(deleteResult.changed, true);
 
     const changes = stdoutOf(await runBashDb(dbPath, ['changes', docId, '--owner', owner]));
-    assert.match(changes, new RegExp(`doc:${docId}\\s+owner:${owner}\\s+active:4\\s+undone:0`));
+    assert.match(changes, new RegExp(`doc:${docId}\\s+owner:${owner}\\s+改:1\\s+增:2\\s+删:1`));
 
     const badField = await runBashDb(dbPath, [
       'edit',

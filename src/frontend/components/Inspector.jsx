@@ -377,7 +377,7 @@ export function Inspector({
                 disabled={!canEdit}
                 onClick={() => runInspectorAction('restoreHistory', {
                   docId: currentDoc.doc.id,
-                  historyId: entry.id
+                  commitId: entry.id
                 })}
               >
                 <RotateCcw size={14} />

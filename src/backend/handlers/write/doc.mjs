@@ -317,6 +317,19 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
     };
   }
 
+  // doc.relink：把已导入 doc 重绑到新源文件路径（锚改名/迁移后用，full 档运维动词，
+  // projectneed 15-10-4）。只改绑定（meta.sourcePath + source_documents.original_path），
+  // 不动正文；source_type 缺省保留原值。
+  if (action === 'doc.relink') {
+    const docId = requireDocId(payload);
+    const sourcePath = String(payload.sourcePath ?? payload.source_path ?? payload.path ?? '').trim();
+    if (!sourcePath) throw new Error('doc.relink requires sourcePath');
+    const current = store.db.prepare('SELECT source_type FROM source_documents WHERE doc_id = ?').get(docId);
+    const sourceType = payload.sourceType ?? payload.source_type ?? current?.source_type ?? 'md';
+    const source = store.updateSourceBinding({ docId, sourcePath, sourceType });
+    return docsRefresh(action, { docId, source: plain(source), docs: listDocs(store), sideEffects: effects });
+  }
+
   throw new Error(`Unhandled database_write action: ${action}`);
 }
 

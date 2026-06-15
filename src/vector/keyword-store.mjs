@@ -227,7 +227,7 @@ export class KeywordStore {
     return this.table.countRows(stringPredicate('doc_id', normalized));
   }
 
-  async search({ terms = [], docId = null } = {}) {
+  async search({ terms = [], docId = null, limit = 200 } = {}) {
     if (!this.table) return [];
     const query = (Array.isArray(terms) ? terms : [terms])
       .map((term) => String(term || '').trim())
@@ -239,6 +239,8 @@ export class KeywordStore {
     if (normalizedDocId) {
       request = request.where(stringPredicate('doc_id', normalizedDocId));
     }
+    // 不显式给 limit 时 LanceDB FTS 默认只返回 top 10，会把召回静默截断；放大上限。
+    request = request.limit(Math.max(1, Number(limit) || 200));
     const rows = await request.toArray();
     return rows.map((row) => ({
       node_id: String(row.id),

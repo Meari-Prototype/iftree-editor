@@ -3,11 +3,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import {
-  AGENT_REASONING_OPTIONS, agentContextUsageView, agentDiffTraceTarget, agentModeLabel, agentReasoningLabel, agentReasoningShortLabel,
-  agentSessionTime, agentSessionTitle, agentToolArgsSummary, agentToolNameText, agentToolStatusText, buildAgentModelOptions, clipText, compactAgentModelLabel,
-  defaultAgentModelKey, diffFields, diffTitle, formatAgentElapsed
+  AGENT_REASONING_OPTIONS, agentBranchDocLabel, agentBranchEntries, agentBranchOwnerLabel, agentContextUsageView, agentModeLabel, agentReasoningLabel, agentReasoningShortLabel,
+  agentSessionTime, agentSessionTitle, agentToolArgsSummary, agentToolNameText, agentToolStatusText, buildAgentModelOptions, compactAgentModelLabel,
+  defaultAgentModelKey, formatAgentElapsed
 } from '../lib/agent-utils.mjs';
-import { LocateNodeButton } from './common.jsx';
 
 
 
@@ -123,39 +122,26 @@ export function AgentPanel({
       </div>
       {expanded && (
         <div className="agent-diff-list">
-          {diffs.map((diff) => {
-            const trace = agentDiffTraceTarget(diff, docs);
+          {diffs.map((branch) => {
+            const entries = agentBranchEntries(branch);
             return (
-              <div key={diff.id} className="agent-diff-card">
+              <div key={branch.id} className="agent-diff-card">
                 <header>
                   <div className="agent-diff-title">
-                    <strong>{diffTitle(diff)}</strong>
-                    <span>{diff.summary}</span>
-                    <div className="agent-diff-addresses">
-                      <span>文档 <code>{trace.docLabel || '未知文档'}</code></span>
-                      <span>文内 <code>{trace.address || '未定位'}</code></span>
-                    </div>
+                    <strong>{agentBranchDocLabel(branch, docs)}</strong>
+                    <span>{entries.length} 处待审改动 · {agentBranchOwnerLabel(branch, sessions)}</span>
                   </div>
-                  <LocateNodeButton
-                    title="追踪待审节点"
-                    label="追踪"
-                    className="agent-diff-trace"
-                    disabled={!trace.docId || !trace.address}
-                    onClick={() => onTraceDiff?.(diff)}
-                  />
                 </header>
-                {diffFields(diff).map((field) => (
-                  <div key={field.key} className="agent-field-diff">
-                    <span>{field.label}</span>
-                    <div>
-                      <p className="before">{clipText(field.before, 180) || '空'}</p>
-                      <p className="after">{clipText(field.after, 180) || '空'}</p>
-                    </div>
+                {entries.map((entry) => (
+                  <div key={entry.key} className="agent-field-diff">
+                    <span>{entry.label}</span>
+                    <div><code>{entry.address || '—'}</code></div>
                   </div>
                 ))}
                 <footer>
-                  <button type="button" onClick={() => onReject?.(diff.id)}>拒绝</button>
-                  <button type="button" onClick={() => onApply?.(diff.id)}><Check size={13} /> 接受</button>
+                  <button type="button" onClick={() => onTraceDiff?.(branch)}>看 diff</button>
+                  <button type="button" onClick={() => onReject?.(branch.id)}>拒绝整批</button>
+                  <button type="button" onClick={() => onApply?.(branch.id)}><Check size={13} /> 接受整批</button>
                 </footer>
               </div>
             );

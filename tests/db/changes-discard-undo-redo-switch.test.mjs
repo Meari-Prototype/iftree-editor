@@ -18,7 +18,7 @@ test('db changes, undo, redo, discard, and switch expose edit-branch state and e
     await editSetText(dbPath, docId, '1-1-6-1-1', modifyChangedText, owner);
 
     const changes = stdoutOf(await runBashDb(dbPath, ['changes', docId, '--owner', owner]));
-    assert.match(changes, new RegExp(`doc:${docId}\\s+owner:${owner}\\s+active:1\\s+undone:0`));
+    assert.match(changes, new RegExp(`doc:${docId}\\s+owner:${owner}\\s+改:1\\s+增:0\\s+删:0`));
 
     const detail = parseJsonStdout(await runBashDb(dbPath, ['changes', docId, '--owner', owner, '--detail']));
     assert.equal(detail.stats.activeEntryCount, 1);
@@ -26,11 +26,11 @@ test('db changes, undo, redo, discard, and switch expose edit-branch state and e
 
     const undoResult = parseJsonStdout(await runBashDb(dbPath, ['undo', '--base', docId, '--owner', owner]));
     assert.equal(undoResult.changed, true);
-    assert.match(stdoutOf(await runBashDb(dbPath, ['changes', docId, '--owner', owner])), /active:0\s+undone:1/);
+    assert.match(stdoutOf(await runBashDb(dbPath, ['changes', docId, '--owner', owner])), /改:0\s+增:0\s+删:0\s+撤销:1/);
 
     const redoResult = parseJsonStdout(await runBashDb(dbPath, ['redo', '--base', docId, '--owner', owner]));
     assert.equal(redoResult.changed, true);
-    assert.match(stdoutOf(await runBashDb(dbPath, ['changes', docId, '--owner', owner])), /active:1\s+undone:0/);
+    assert.match(stdoutOf(await runBashDb(dbPath, ['changes', docId, '--owner', owner])), /改:1\s+增:0\s+删:0/);
 
     const dryDiscard = stdoutOf(await runBashDb(dbPath, ['discard', '--base', docId, '--owner', owner]));
     assert.match(dryDiscard, new RegExp(`would discard doc:${docId} owner:${owner}; rerun with --yes to apply`));

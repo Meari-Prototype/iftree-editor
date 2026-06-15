@@ -125,7 +125,7 @@ test('封卷：到期才封、sealedAt=末次活动+24h、封后拒绝追加', a
 
     assert.throws(
       () => store.pushStreamNodes({ docId, nodes: [{ text: 'late', trust_level: '不受控' }] }),
-      /增量编辑模式/
+      /增量编辑/
     );
 
     // 幂等：再扫不重复封。
@@ -288,5 +288,19 @@ test('memory.listVolumes 经读 API 路由可达并带时间元数据', async ()
     for (const key of ['startedAt', 'lastActivityAt', 'sealAt', 'distillableAt', 'createdAt']) {
       assert.ok(row[key], `missing ${key}`);
     }
+  });
+});
+
+test('listVolumes 默认只返回最新 5 卷，显式 limit 可取全量', async () => {
+  await withStore(async (store) => {
+    for (let i = 1; i <= 7; i += 1) {
+      await runDatabaseWrite(store, deliverPayload({ sessionId: `s${i}` }), {});
+    }
+    const def = listMemoryVolumes(store);
+    assert.equal(def.volumes.length, 5);
+    // 建卷顺序 s1..s7，docs.id（UUIDv7）递增；默认按 id DESC 取最新 5 卷。
+    assert.deepEqual(def.volumes.map((v) => v.sessionId), ['s7', 's6', 's5', 's4', 's3']);
+    // 显式调大能拿回全量。
+    assert.equal(listMemoryVolumes(store, { limit: 50 }).volumes.length, 7);
   });
 });

@@ -1,10 +1,11 @@
-import { mkdirSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, statSync } from 'node:fs';
 import { extname, join, relative, resolve, sep } from 'node:path';
 
 import {
   LIBRARY_NAVIGATION_DOC_ID,
   LIBRARY_NAVIGATION_DOC_TITLE
 } from './virtual-docs.mjs';
+import { shouldIgnoreLibraryEntry } from './library-fs.mjs';
 
 function cleanPathPart(value = '') {
   return String(value || '').replace(/[\\/:*?"<>|]/g, '_').trim();
@@ -81,6 +82,25 @@ function docSummary(doc = {}) {
 const NAVIGATION_DOC_ID = LIBRARY_NAVIGATION_DOC_ID;
 const NAVIGATION_TITLE = LIBRARY_NAVIGATION_DOC_TITLE;
 
+function normalizeAnchorPath(value = '') {
+  return String(value || '').replace(/\\/g, '/').toLowerCase();
+}
+
+// 事件卷锚（symlink）校验标签：权威是 DB 里的 hostAnchor，与 symlink 实际 readlink 目标比对。
+// 错位 / 悬空 / 无锚一律显式标出——忽略和没报错是两回事，绝不静默吞掉（projectneed 15-10）。
+function symlinkAnchorLabel(entry = {}) {
+  if (!entry.isSymlink) return '';
+  const target = entry.symlinkTarget || '';
+  const anchor = entry.hostAnchor || '';
+  if (!anchor) return ' [!锚无 hostAnchor 可核对]';
+  const anchorTarget = String(anchor).split('#')[0];
+  if (normalizeAnchorPath(target) !== normalizeAnchorPath(anchorTarget)) {
+    return ` [!锚错位 →${target || '?'}]`;
+  }
+  if (entry.symlinkDangling) return ` [!锚目标不可达 →${target}]`;
+  return ' →锚';
+}
+
 function indexEntryLabel(node, options = {}) {
   const entry = node.libraryEntry || {};
   if (entry.type !== 'file') return node.address === '1' ? 'library/' : `${entry.name || node.text}/`;
@@ -92,7 +112,7 @@ function indexEntryLabel(node, options = {}) {
     : '';
   const summarySuffix = options.includeSummary && node.note ? ` summary=${clipText(node.note)}` : '';
   const idSuffix = options.uuid && entry.docId ? ` #${entry.docId}` : '';
-  return `${entry.name || node.text}${idSuffix}${textCharsSuffix}${semanticLabel}${summarySuffix}`;
+  return `${entry.name || node.text}${idSuffix}${textCharsSuffix}${semanticLabel}${symlinkAnchorLabel(entry)}${summarySuffix}`;
 }
 
 function importedDocsByPath(docs = []) {
@@ -135,7 +155,11 @@ function navigationNode(entry, doc, address, parentId, id, options = {}) {
       imported: Boolean(docId),
       docId,
       textChars: Math.max(0, Number(doc?.meta?.textChars) || 0),
-      semantic: doc?.meta?.semantic || null
+      semantic: doc?.meta?.semantic || null,
+      isSymlink: entry?.isSymlink === true,
+      symlinkTarget: entry?.symlinkTarget || null,
+      symlinkDangling: entry?.symlinkDangling === true,
+      hostAnchor: doc?.hostAnchor || null
     },
     children: []
   };
@@ -203,20 +227,35 @@ export function createLibraryService(rootPath) {
 
   function entry(relativePath = '', depth = 0, options = {}) {
     const target = fullPath(relativePath);
-    const stat = statSync(target);
+    const linkStat = lstatSync(target);
+    const isSymlink = linkStat.isSymbolicLink();
+    // 事件卷锚是 symlink：不跟随目标 stat，避免目标悬空时 statSync 抛错把整树枚举带崩。
+    const stat = isSymlink ? linkStat : statSync(target);
     const name = relativePath ? relativePath.split('/').pop() : 'library';
+    const isFolder = !isSymlink && stat.isDirectory();
     const item = {
-      type: stat.isDirectory() ? 'folder' : 'file',
+      type: isFolder ? 'folder' : 'file',
       name,
       relativePath,
-      extension: stat.isDirectory() ? '' : extname(name).toLowerCase(),
-      size: stat.isDirectory() ? null : stat.size
+      extension: isFolder ? '' : extname(name).toLowerCase(),
+      size: isFolder || isSymlink ? null : stat.size
     };
+    if (isSymlink) {
+      item.isSymlink = true;
+      try {
+        item.symlinkTarget = readlinkSync(target);
+        item.symlinkDangling = !existsSync(target);
+      } catch {
+        item.symlinkTarget = null;
+        item.symlinkDangling = true;
+      }
+    }
     const maxDepth = options.maxDepth === Number.POSITIVE_INFINITY
       ? Number.POSITIVE_INFINITY
       : (Number.isInteger(options.maxDepth) ? options.maxDepth : 2);
     if (item.type === 'folder' && depth < maxDepth) {
       const children = readdirSync(target, { withFileTypes: true })
+        .filter((dirent) => !shouldIgnoreLibraryEntry(dirent.name, { includeHidden: options.includeHidden === true }))
         .map((dirent) => entry(normalizeRelativePath(join(relativePath, dirent.name)), depth + 1, options))
         .sort(compareEntries);
       const limit = Object.prototype.hasOwnProperty.call(options, 'limit') ? Math.floor(Number(options.limit) || 0) : 500;
@@ -275,7 +314,7 @@ export function createLibraryService(rootPath) {
       }
       return { kind: 'library.getTree', query: queryText, results };
     }
-    const rootEntry = entry(normalizeRelativePath(payload.path || ''), 0, { maxDepth, limit });
+    const rootEntry = entry(normalizeRelativePath(payload.path || ''), 0, { maxDepth, limit, includeHidden: true });
     if (payload.format === 'ascii_tree' || payload.output === 'ascii_tree') {
       return {
         kind: 'library.getTree',
@@ -290,7 +329,8 @@ export function createLibraryService(rootPath) {
   function index(payload = {}, docs = []) {
     const rootEntry = entry(normalizeRelativePath(payload.path || ''), 0, {
       maxDepth: Number.POSITIVE_INFINITY,
-      limit: 0
+      limit: 0,
+      includeHidden: payload.includeHidden === true || payload.include_hidden === true
     });
     const withSummary = includeSummary(payload);
     const withUuid = payload.uuid === true || payload.showUuid === true || payload.show_uuid === true;
@@ -311,7 +351,8 @@ export function createLibraryService(rootPath) {
   function navigation(payload = {}, docs = []) {
     const rootEntry = entry(normalizeRelativePath(payload.path || ''), 0, {
       maxDepth: Number.POSITIVE_INFINITY,
-      limit: 0
+      limit: 0,
+      includeHidden: true
     });
     const tree = buildNavigationTree(rootEntry, docs, {
       includeSummary: includeSummary(payload),

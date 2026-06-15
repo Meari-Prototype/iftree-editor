@@ -4,6 +4,7 @@ import { handleMemoryMutation } from './handlers/write/memory.mjs';
 import { handleEditorHistoryMutation, handleHistoryMutation } from './handlers/write/history.mjs';
 import { handleNodeMutation } from './handlers/write/node.mjs';
 import { plain } from './handlers/write/shared.mjs';
+import { editModeMismatchMessage } from './shared.mjs';
 import { ENTITY_WRITE_ACTIONS, runEntityWrite, stageEntityWrite } from './entities/write.mjs';
 import { NODE_TYPES, NODE_TYPE_LABELS } from '../core/node-model.mjs';
 
@@ -17,6 +18,7 @@ const ACTIONS = Object.freeze([
   'doc.delete',
   'doc.updateAxiomsCollapsed',
   'doc.setEditMode',
+  'doc.relink',
   'stream.push',
   'stream.bulkBegin',
   'stream.bulkEnd',
@@ -186,11 +188,8 @@ function guardEditMode(store, action, payload) {
   const docId = store.docIdForMutationPayload(payload);
   if (!docId) return;
   const mode = store.getDocEditMode(docId);
-  if (mode === 'incremental') {
-    throw new Error('文档处于增量编辑（流式写入）模式，不能分支编辑/合并；如需修订请先 doc.setEditMode 切回 full');
-  }
-  if (mode === 'readonly') {
-    throw new Error('文档为只读模式，拒绝编辑');
+  if (mode === 'incremental' || mode === 'readonly') {
+    throw new Error(editModeMismatchMessage({ docId, current: mode, required: 'full', intent: '编辑分支/合并' }));
   }
 }
 
@@ -208,9 +207,9 @@ function requestedEditBranchBaseDocId(payload = {}, ctx = {}) {
 function activeEditBranchForMutation(store, payload = {}) {
   const docId = store.docIdForMutationPayload(payload);
   if (!docId) return null;
-  return store.activeEditBranchForBaseDoc(docId, 'human')
-    || store.activeEditBranchForBaseDoc(docId, 'llm')
-    || null;
+  // 无显式 owner 的 mutation = 人类在 GUI 直接编辑，路由到其 owner=human 分支；
+  // llm 类写入必带 editBranchOwner（owner=llm:<会话>），不走此无主路径（A5-5 多分支）。
+  return store.activeEditBranchForBaseDoc(docId, 'human') || null;
 }
 
 function stagedNodeUpdateResult(action, staged) {
@@ -261,8 +260,12 @@ function dispatchEditBranchStage(store, branch, action, payload) {
       return stagedDocResult(action, store.stageEditBranchNodeSplit(branch, payload));
     case 'node.mergeInto':
       return stagedDocResult(action, store.stageEditBranchNodeMergeInto(branch, payload));
+    case 'node.mergePrevious':
+      return stagedDocResult(action, store.stageEditBranchNodeMergePrevious(branch, payload));
     case 'node.reparent':
       return stagedDocResult(action, store.stageEditBranchNodeReparent(branch, payload));
+    case 'node.moveBefore':
+      return stagedDocResult(action, store.stageEditBranchNodeMoveBefore(branch, payload));
     case 'node.moveAfter':
       return stagedDocResult(action, store.stageEditBranchNodeMoveAfter(branch, payload));
     case 'axiom.add': {

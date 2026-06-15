@@ -1,6 +1,6 @@
 # 参考手册
 
-> [上手教程](getting-started.md) · [操作指南](how-to.md) · **参考手册** · [概念与设计](concepts.md)
+> [上手教程](getting-started.md) · [操作指南](how-to.md) · **参考手册** · [概念与设计](concepts.md) · [记忆库使用](memory.md)
 
 命令、工具、字段的查表式清单。工具与命令自带的 description / help 是最权威的版本，本文是它们的索引。
 
@@ -13,7 +13,8 @@
 | --- | --- | --- |
 | `read`（默认） | 问答 | 只读工具 |
 | `edit` | 协作 | 只读 + 编辑分支写入 / 流式写入 / 导入 / 记忆投递 |
-| `full` | 完全 | 协作 + 合并、回滚、删除等管理动作 |
+| `full` | 完全 | 协作 + 合并、回滚、删除等管理动作（身份仍 llm、产出标不受控） |
+| `human`（别名 `yolo`） | 人类 | 完全档全部，写入者身份为 human：批准（merge）llm 待审分支、写入可标受控——受控内容与人审批准的唯一合法来源 |
 
 后端为共享进程：同一数据库的应用、MCP、CLI 汇到同一个 headless 后端，先到者拉起，后来者按数据库路径派生的命名管道接入。
 
@@ -23,8 +24,9 @@
 | --- | --- |
 | `library_index` | 按 library 文件夹层级列出已导入文档（ASCII 树，可附 docId、摘要） |
 | `tree` | 查看文档结构：缩进 ASCII 树（地址、类型、标题、子树字数），可限子树与层深 |
-| `read` | 读取某地址正文，默认整棵子树；`node` / `meta` / `source`（原文窗口）/ `blame`（原文出处溯源）可选 |
-| `find` | 统一检索：默认多词 AND 字面检索；`semantic=true` 语义检索附 score；`tags=true` 实体同义 / 相关列表 |
+| `read` | 读取某地址正文，默认整棵子树；`scope=node` 只本节点 / `scope=siblings` 同父前中后三条（首末缺位标〈无〉）；`at` 读历史快照（默认按节点身份穿透） |
+| `inspect` | 读某地址的元信息 / 出处 / 引用 / 公理 / 批注（`sections` 选 meta·source·links·axioms·note）；正文用 `read` |
+| `find` | 统一检索：默认多词 AND 字面检索；`semantic=true` 语义检索附 score；`tags=true` 实体同义 / 相关列表；`minScore` 高级过滤（语义按相似度下限默认 0.51、字面按命中次数下限） |
 | `article` | 读取导入文档的原文窗口（按 docId 从头读，或按 nodeId 读附近） |
 | `log` | 列出文档保存 / commit 历史 |
 | `diff` | 比较两条保存历史，或查看一个编辑分支的投影 diff |
@@ -33,7 +35,7 @@
 | `ask_agent` | 问内置文档智能体（A2A）：自己检索、读证据、附地址回答；`sessionId` 多轮续接 |
 | `restart_backend` | 重启 MCP 持有的后端子进程（更新代码 / 原生模块后用） |
 
-### 写入工具（`edit` 与 `full` 档）
+### 写入工具（`edit` / `full` / `human` 档）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -44,8 +46,7 @@
 | `undo` / `redo` | 分支内撤销 / 重做 |
 | `commit` | 保存分支：生效 diff 写入主文档历史并删除分支；非快进时逐条前置验证，结构性失配返回 blocked、字段级冲突返回 conflicts 等人裁 |
 | `merge` | 三方合并：默认只返回预览（fastForward / hasConflicts / 逐节点 resolution）；`yes=true` 执行，冲突与受阻时主干与分支均不动 |
-| `discard` | 丢弃一条待审 diff，或丢弃整个分支（默认预览，`yes=true` 执行） |
-| `list_diffs` / `reject_diff` | 列出 / 拒绝内置 agent 提议的待审改动 |
+| `discard` | 丢弃整个编辑分支（默认预览，`yes=true` 执行） |
 | `import` | 导入 library 内真实文件，mode 为 simple / complete / direct / smart / vector |
 | `vectors` | 为已导入文档补建语义向量 |
 | `set_mode` | 切换文档编辑模式：readonly / incremental（流式写入）/ full（分支与合并），增量与完整互斥 |
@@ -54,11 +55,10 @@
 | `memory_deliver` | 投递事件记忆卷（外部 agent 唯一合法的记忆侧写入；节点一律不受控） |
 | `memory_admin` | 记忆卷维护：seal_due 物理封卷到期卷；mark_distilled 标记已提炼 |
 
-### 管理工具（仅 `full` 档）
+### 管理工具（`full` / `human` 档）
 
 | 工具 | 作用 |
 | --- | --- |
-| `apply_diff` | 接受一条待审改动并保存到分支 |
 | `restore` | 按 history id、saved_at 时间戳或 summary tag 精确回滚文档历史 |
 | `rebase` | 把当前分支的 lazy base 刷新到主干 HEAD（不是完整冲突裁决器） |
 | `cherry-pick` | 从同一文档的保存历史或编辑分支摘取 edit entries 写入目标分支 |
@@ -69,7 +69,7 @@
 
 `db` 是给 LLM 用的统一命令面：内置 agent 的 bash 会话直接可用（由产品注入 LLM 工作区），MCP 工具底层走同一实现。动词分组：
 
-- **检索与读取**：`find`、`keyword`、`query`、`index`、`tree`、`read`、`log`、`diff`、`sql`、`memory list`
+- **检索与读取**：`find`、`keyword`、`query`、`index`、`tree`、`read`、`inspect`、`article`、`log`、`diff`、`sql`、`memory list`
 - **写入**：`edit`、`push`、`import-json`、`set-mode`、`bulk`、`import`、`vectors`、`memory deliver`
 - **分支**：`branch`、`changes`、`commit`、`merge`、`switch`、`undo`、`discard`、`rebase`、`cherry-pick`
 - **管理**：`export`、`restore`、`forget`
@@ -157,7 +157,7 @@ JSON 结构与 `db push` 同构：
 | --- | --- |
 | `IFTREE_DB` | 主数据库路径，缺省 `<项目根>/database/store.sqlite` |
 | `IFTREE_HOME` | 派生数据目录（向量 / 附件），缺省 `%USERPROFILE%\.iftree` |
-| `IFTREE_MCP_TIER` | MCP 权限档：`read` / `edit` / `full` |
+| `IFTREE_MCP_TIER` | MCP 权限档：`read` / `edit` / `full` / `human`（别名 `yolo`） |
 | `IFTREE_DEBUG_LOGGING` | `1` 强制开 debug 日志（等价于配置文件 `debugLogging: true`） |
 | `ELECTRON_START_URL` | 开发模式让 Electron 加载 Vite dev server |
 | `ELECTRON_RUN_AS_NODE` | 以 node 方式运行 Electron（MCP / CLI 脚本需要） |
