@@ -100,7 +100,7 @@ function SourceMarkdownBlockImpl({
 
   let body;
   if (block.type === 'heading') {
-    const Tag = /** @type {any} */ (`h${Math.min(block.level, 6)}`);
+    const Tag = (`h${Math.min(block.level, 6)}`) as any;
     body = <Tag>{textRange(block.contentStart, block.contentEnd, 'heading')}</Tag>;
   } else if (block.type === 'paragraph') {
     body = (

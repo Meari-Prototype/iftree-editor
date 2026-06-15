@@ -34,15 +34,15 @@ function initialDocIdFromLocation() {
   return docId || null;
 }
 
-function docDisplayTitle(doc = {}) {
+function docDisplayTitle(doc: any = {}) {
   return String(doc?.title || '').trim() || '未命名文档';
 }
 
-function entityDocTitle(entity = {}) {
+function entityDocTitle(entity: any = {}) {
   return String(entity.docTitle || '').trim();
 }
 
-function entityLabel(entity = {}, options = {}) {
+function entityLabel(entity: any = {}, options: any = {}) {
   const literal = entity.literal || '未命名实体';
   const docTitle = options.showDocTitle ? entityDocTitle(entity) : '';
   return docTitle ? `${literal} · ${docTitle}` : literal;
@@ -185,7 +185,7 @@ export function EntityMaintenanceWindow() {
     }
   }
 
-  async function refreshEntities(options = {}) {
+  async function refreshEntities(options: any = {}) {
     const result = await fetchEntityList({
       readDatabase,
       ...scopePayload(),

@@ -19,8 +19,7 @@ import { buildTreeWithIndex, nextFrame } from '../lib/mindmap-utils.mjs';
 import { debugPerfBegin, debugPerfEnd } from '../lib/debug-log.mjs';
 import { documentRepository } from '../data/document-repository.js';
 
-/** @param {{ setNotice?: any, setProgress?: any, lock?: any, unlock?: any }} [options] */
-export function useDocumentState({ setNotice, setProgress, lock, unlock } = {}) {
+export function useDocumentState({ setNotice, setProgress, lock, unlock }: any = {}) {
   const [docs, setDocs] = useState([]);
   const [docFolders, setDocFolders] = useState([]);
   const [libraryTree, setLibraryTree] = useState(null);
@@ -53,7 +52,7 @@ export function useDocumentState({ setNotice, setProgress, lock, unlock } = {}) 
     }
   }
 
-  async function loadComplete(docId, label = '正在打开文档……', options = {}) {
+  async function loadComplete(docId, label = '正在打开文档……', options: any = {}) {
     lock?.({ label, step: 0, total: 0 });
     // debug 模式下记录文档加载总耗时（网络 + 分页拉节点 + 构建树索引）
     const perfToken = debugPerfBegin('loadComplete');
@@ -146,7 +145,7 @@ export function useDocumentState({ setNotice, setProgress, lock, unlock } = {}) 
     return next;
   }
 
-  async function loadSourceWindow(request = {}) {
+  async function loadSourceWindow(request: any = {}) {
     const docId = normalizeDocId(request.docId ?? currentDoc?.doc?.id);
     if (!docId || !documentRepository.canRead()) return null;
     setSourceWindowLoading(true);

@@ -24,14 +24,14 @@ export function debugElementTarget(target) {
     control.getAttribute('name') ||
     control.id ||
     '';
-  const descriptor = {
+  const descriptor: any = {
     tag: control.tagName.toLowerCase(),
     id: safeDebugLabel(control.id),
     role: safeDebugLabel(control.getAttribute('role') || ''),
     type: safeDebugLabel(control.getAttribute('type') || ''),
     label: safeDebugLabel(label)
   };
-  const value = /** @type {any} */ (control).value;
+  const value = (control as any).value;
   if (typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,40}$/.test(value)) descriptor.value = value;
   return descriptor;
 }

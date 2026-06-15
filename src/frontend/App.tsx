@@ -416,8 +416,7 @@ export function App() {
     return documentRepository.getDoc(treeDocRequest(docId, depth));
   }
 
-  /** @type {(nextDoc: any, sourceDoc: any, options?: { editMode?: boolean, persistedDocId?: any, noticeText?: string }) => void} */
-  function switchDocPreservingView(nextDoc, sourceDoc, { editMode, persistedDocId, noticeText } = {}) {
+  function switchDocPreservingView(nextDoc, sourceDoc, { editMode, persistedDocId, noticeText }: any = {}) {
     if (!nextDoc?.doc?.id) return;
     const nextMaxDepth = fullDepthForDoc(nextDoc);
     const nextDepthLimit = clampDepthLimit(depthLimit, nextMaxDepth);
@@ -665,7 +664,7 @@ export function App() {
     });
   }
 
-  async function refreshDocs(nextDocId = currentVisualDocId, options = {}) {
+  async function refreshDocs(nextDocId = currentVisualDocId, options: any = {}) {
     const list = await refreshDocList();
     const branch = activeEditBranch();
     if (branch && (sameDocId(nextDocId, editBranchBaseDocId(branch)) || sameDocId(nextDocId, editBranchShadowDocId(branch)))) {
@@ -709,7 +708,7 @@ export function App() {
     return list;
   }
 
-  async function openDoc(docId, options = {}) {
+  async function openDoc(docId, options: any = {}) {
     const branch = activeEditBranch();
     if (branch && (sameDocId(docId, editBranchBaseDocId(branch)) || sameDocId(docId, editBranchShadowDocId(branch)))) {
       return currentDoc;
@@ -934,7 +933,7 @@ export function App() {
     }
   }
 
-  async function resolveWriteDoc(result, options = {}) {
+  async function resolveWriteDoc(result, options: any = {}) {
     if (!result) return null;
     const refreshDocId = normalizeDocId(result.refresh?.docId || result.docId);
     if (refreshDocId && ['doc', 'doc_state'].includes(result.refresh?.kind)) {
@@ -1007,7 +1006,7 @@ export function App() {
     return result !== undefined && result !== null && result !== false && result?.ok !== false;
   }
 
-  async function runWrite(action, options = {}) {
+  async function runWrite(action, options: any = {}) {
     if (!currentDoc) return;
     let undoToken = null;
     const historyEffect = normalizeEditorHistoryEffect(options.historyEffect || options.redoEffect || options.effect);
@@ -1161,7 +1160,7 @@ export function App() {
     return null;
   }
 
-  async function applyEditorHistoryEffect(effect, doc, options = {}) {
+  async function applyEditorHistoryEffect(effect, doc, options: any = {}) {
     const normalized = normalizeEditorHistoryEffect(effect);
     if (!normalized || !sameDocId(normalized.docId, doc?.doc?.id || currentDoc?.doc?.id)) return false;
     if (normalized.kind === 'expandNodeOne') {
@@ -1747,7 +1746,7 @@ export function App() {
     }
   }
 
-  async function applyAgentDiff(diffId, options = {}) {
+  async function applyAgentDiff(diffId, options: any = {}) {
     const pendingDiff = agentDiffs.find((diff) => Number(diff.id) === Number(diffId));
     if (!pendingDiff) return false;
     if (!options.skipEditModeCheck) {
@@ -1951,7 +1950,7 @@ export function App() {
     return true;
   }
 
-  async function selectNodeAndOpenTree(nodeId, result = {}) {
+  async function selectNodeAndOpenTree(nodeId, result: any = {}) {
     if (!nodeId) return;
     const address = String(result?.address || '').trim();
     // 先确保目标深度的数据已加载，再走统一就地定位（从搜索/实体这类非节点视图会切到树视图）。
@@ -2004,7 +2003,7 @@ export function App() {
     }
   }
 
-  async function loadNodeChildren(nodeId, options = {}) {
+  async function loadNodeChildren(nodeId, options: any = {}) {
     const docId = normalizeDocId(currentDoc?.doc?.id);
     const target = findNode(currentDoc?.tree, nodeId);
     if (!docId || !target) return null;
@@ -2046,7 +2045,7 @@ export function App() {
     return [node];
   }
 
-  async function toggleCollapsed(nodeId, options = {}) {
+  async function toggleCollapsed(nodeId, options: any = {}) {
     const node = treeActionNode(nodeId) || (
       options.nodeAddress
         ? {
@@ -2094,7 +2093,7 @@ export function App() {
     }
   }
 
-  async function expandNodeOneLevel(nodeId, options = {}) {
+  async function expandNodeOneLevel(nodeId, options: any = {}) {
     const node = treeActionNode(nodeId) || (
       options.nodeAddress
         ? {

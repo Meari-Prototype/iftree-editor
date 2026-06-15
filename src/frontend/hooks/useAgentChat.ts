@@ -3,8 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { agentMessagesFromSession, upsertAgentToolEvent } from '../lib/agent-utils.mjs';
 import { agentRepository } from '../data/repositories.js';
 
-/** @param {{ setNotice?: any }} [options] */
-export function useAgentChat({ setNotice } = {}) {
+export function useAgentChat({ setNotice }: any = {}) {
   const [agentSettings, setAgentSettings] = useState(null);
   const [agentMessages, setAgentMessages] = useState([]);
   const [agentDiffs, setAgentDiffs] = useState([]);

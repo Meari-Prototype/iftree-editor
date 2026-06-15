@@ -11,7 +11,7 @@ export function MarkdownBlock({ markdown, docId }) {
     <div className="markdown-block">
       {blocks.map((block, index) => {
         if (block.type === 'heading') {
-          const Tag = /** @type {any} */ (`h${Math.min(block.level, 4)}`);
+          const Tag = (`h${Math.min(block.level, 4)}`) as any;
           return <Tag key={index}>{block.text}</Tag>;
         }
         if (block.type === 'image') {

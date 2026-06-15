@@ -164,7 +164,7 @@ export function useStartup({
   openDoc,
   promptStartupEditBranchChoice,
   editBranchBaseDocId
-} = {}) {
+}: any = {}) {
   const startupSuccessReportedRef = useRef(false);
   const startupPendingDocRef = useRef(null);
   const startupOptionsRef = useRef({ startupDocId: null, renderMode: 'hardware', e2eChm: false, forceHardwareAcceleration: false, debugLogging: false });
@@ -172,7 +172,7 @@ export function useStartup({
   const renderUnlockPendingRef = useRef(null);
   const e2eDragRequestedRef = useRef(false);
 
-  const sendStartupHeartbeat = useCallback((stage, extra = {}) => {
+  const sendStartupHeartbeat = useCallback((stage, extra: any = {}) => {
     startupHeartbeat({
       ...extra,
       stage,
@@ -189,7 +189,7 @@ export function useStartup({
     debugLog('frontend.startup.complete', payload);
     reportStartupSuccess(payload).catch(() => {});
   }, []);
-  const failStartup = useCallback((error, payload = {}) => {
+  const failStartup = useCallback((error, payload: any = {}) => {
     if (startupSuccessReportedRef.current) return;
     startupSuccessReportedRef.current = true;
     startupPendingDocRef.current = null;
@@ -220,7 +220,7 @@ export function useStartup({
     setOperationLock(null);
     return true;
   }, [setOperationLock, setProgress]);
-  const runStartupE2ECheck = useCallback(async (info = {}, pending = {}) => {
+  const runStartupE2ECheck = useCallback(async (info: any = {}, pending: any = {}) => {
     if (e2eDragRequestedRef.current) return;
     e2eDragRequestedRef.current = true;
     const reportDocId = pending.reportDocId || pending.docId;
@@ -258,7 +258,7 @@ export function useStartup({
       }
     });
   }, [completeStartup, sendStartupHeartbeat]);
-  const handleMindMapRenderReady = useCallback((info = {}) => {
+  const handleMindMapRenderReady = useCallback((info: any = {}) => {
     const pending = startupPendingDocRef.current;
     const visual = info.visual || {};
     const signature = [

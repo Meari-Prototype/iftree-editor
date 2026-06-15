@@ -35,7 +35,7 @@ function OutlineNode({
           ...(sticky ? { top: (depth - 1) * OUTLINE_STICKY_ROW_HEIGHT, zIndex: 15 - depth } : null)
         }}
         onClick={(event) => {
-          if (/** @type {HTMLElement} */ (event.target).closest('[data-outline-toggle]')) {
+          if ((event.target as HTMLElement).closest('[data-outline-toggle]')) {
             event.preventDefault();
             onToggle(node.id);
             return;

@@ -35,8 +35,7 @@ function keywordRowToSearchResult(row) {
 
 // 实体检索/追踪面板（EntityTraceView）的全部状态与动作。
 // 对 App 的依赖收口为 docId/activeTab 两个输入 + busy/notice 两个回写。
-/** @param {{ docId?: any, activeTab?: string, setBusy?: any, setNotice?: any }} [options] */
-export function useEntityTrace({ docId = null, activeTab = '', setBusy, setNotice } = {}) {
+export function useEntityTrace({ docId = null, activeTab = '', setBusy, setNotice }: any = {}) {
   const [entityQuery, setEntityQuery] = useState('');
   const [entityRows, setEntityRows] = useState([]);
   const [selectedEntity, setSelectedEntity] = useState(null);
@@ -45,7 +44,7 @@ export function useEntityTrace({ docId = null, activeTab = '', setBusy, setNotic
   const [entityNodeMatchMode, setEntityNodeMatchMode] = useState('and');
   const [entityNodeResults, setEntityNodeResults] = useState([]);
   const [entityNodeGroups, setEntityNodeGroups] = useState([]);
-  const [entityNodePage, setEntityNodePage] = useState(EMPTY_ENTITY_NODE_PAGE);
+  const [entityNodePage, setEntityNodePage] = useState<any>(EMPTY_ENTITY_NODE_PAGE);
 
   useEffect(() => {
     setEntityQuery('');
@@ -111,7 +110,7 @@ export function useEntityTrace({ docId = null, activeTab = '', setBusy, setNotic
     }
   }
 
-  async function runEntityNodeSearch(queryOverride = entityNodeQuery, modeOverride = entityNodeMatchMode, options = {}) {
+  async function runEntityNodeSearch(queryOverride = entityNodeQuery, modeOverride = entityNodeMatchMode, options: any = {}) {
     const manageBusy = options.manageBusy !== false;
     const offset = Math.max(0, Math.floor(Number(options.offset) || 0));
     if (!docId || !String(queryOverride || '').trim()) {

@@ -7,7 +7,7 @@ import { LLM_PROVIDER_PRESETS, newLlmApi, newLlmProvider,
 
 const ANTHROPIC_MAX_OUTPUT_MESSAGE = 'Anthropic compatible 需要填写最大输出 token。';
 
-function needsAnthropicMaxOutput(api = {}) {
+function needsAnthropicMaxOutput(api: any = {}) {
   return String(api.protocol || 'openai-compatible') === 'anthropic-compatible'
     && Number(api.maxOutputTokens) <= 0;
 }

@@ -60,7 +60,7 @@ export function MergeConflictDialog({ view, applying = false, error = '', onAppl
   }, [onClose]);
 
   const keyOf = (id, field) => `${id}::${field}`;
-  const setPick = (id, field, pick, fillSeed) => {
+  const setPick = (id, field, pick, fillSeed?: any) => {
     setPicks((cur) => ({
       ...cur,
       [keyOf(id, field)]: { pick, value: pick === 'fill' ? (cur[keyOf(id, field)]?.value ?? fillSeed ?? '') : (cur[keyOf(id, field)]?.value ?? '') }
@@ -87,7 +87,7 @@ export function MergeConflictDialog({ view, applying = false, error = '', onAppl
       if (!conflictSupport(conflict).resolvable) continue;
       const p = picks[keyOf(node.id, conflict.field)];
       if (!p?.pick) continue;
-      const res = { id: String(node.id), field: conflict.field, pick: p.pick };
+      const res: any = { id: String(node.id), field: conflict.field, pick: p.pick };
       if (p.pick === 'fill') res.value = String(p.value ?? '');
       out.push(res);
     }

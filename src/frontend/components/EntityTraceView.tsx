@@ -26,7 +26,7 @@ function rangeText({ total = 0, offset = 0, limit = 100, returned = 0 } = {}) {
   return `${start}-${end} / ${safeTotal} · 每页 ${safeLimit}`;
 }
 
-function docText(entity = {}) {
+function docText(entity: any = {}) {
   return entity.docTitle ? `doc ${entity.docId} · ${entity.docTitle}` : `doc ${entity.docId ?? '-'}`;
 }
 

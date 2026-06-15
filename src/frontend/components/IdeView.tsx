@@ -33,7 +33,7 @@ function nodeIdSetHas(set, id) {
   return Number.isInteger(number) && number > 0 && set.has(number);
 }
 
-export function ideRowHeight(parsed, extras = {}) {
+export function ideRowHeight(parsed, extras: any = {}) {
   const codeLines = parsed?.codeLines?.length || 1;
   const titleLines = extras.title ? 1 : 0;
   const noteLines = extras.note ? Math.max(1, String(extras.note).split('\n').length) : 0;

@@ -9,7 +9,7 @@ export function appendEntityTerm(query = '', literal = '') {
   return current ? `${current} ${term}` : term;
 }
 
-export function entityDragPayload(entity = {}) {
+export function entityDragPayload(entity: any = {}) {
   return JSON.stringify({
     id: entity.id ?? null,
     docId: entity.docId ?? null,
@@ -30,8 +30,7 @@ export function entityFromDragEvent(event) {
   }
 }
 
-/** @param {{ docId?: any, docIds?: any[], allDocs?: boolean }} [scope] */
-function scopedEntityPayload({ docId, docIds, allDocs } = {}) {
+function scopedEntityPayload({ docId, docIds, allDocs }: any = {}) {
   if (allDocs) return { allDocs: true };
   const ids = Array.isArray(docIds) ? docIds.filter(Boolean) : [];
   if (ids.length > 1) return { docIds: ids };
@@ -40,7 +39,7 @@ function scopedEntityPayload({ docId, docIds, allDocs } = {}) {
 }
 
 /** @param {{ readDatabase: any, docId?: any, docIds?: any[], allDocs?: boolean, query?: string, limit?: number }} options */
-export async function fetchEntityList({ readDatabase, docId, docIds, allDocs = false, query, limit = 100 }) {
+export async function fetchEntityList({ readDatabase, docId, docIds, allDocs = false, query, limit = 100 }: any) {
   const scope = scopedEntityPayload({ docId, docIds, allDocs });
   if (!scope.docId && !scope.docIds && !scope.allDocs) return { rows: [] };
   return readDatabase({
@@ -169,8 +168,7 @@ export async function fetchEntityNodeSearch({
   };
 }
 
-/** @param {{ docId?: any, openWindow?: any, setNotice?: any }} [options] */
-export async function openEntityMaintenanceAction({ docId, openWindow, setNotice } = {}) {
+export async function openEntityMaintenanceAction({ docId, openWindow, setNotice }: any = {}) {
   if (typeof openWindow !== 'function') {
     setNotice?.('实体库维护窗口入口不可用。');
     return { ok: false, kind: 'entity.maintenance.open.unavailable' };

@@ -35,13 +35,6 @@ async function cancelSummaryRunRequests(run) {
 // 摘要生成编排：确认请求构造（generateSummary）→ 并发 worker 生成 + writeChain 串行写入
 // （runSummaryGeneration）→ 取消传播。摘要备注显隐也归这里。
 // 写入路径经注入的 resolveWriteDoc/syncEditBranchHistoryStacks 走 App 统一管道。
-/** @param {{
- *   currentDoc?: any, treeEditMode?: boolean,
- *   selectedNode?: any, selectedNodeId?: any, multiSelectedNodeIds?: any,
- *   llmSummarySettings?: any,
- *   setBusy?: any, setNotice?: any, setProgress?: any, setDocs?: any, setCurrentDoc?: any,
- *   resolveWriteDoc?: any, syncEditBranchHistoryStacks?: any, activeEditBranch?: any
- * }} [options] */
 export function useSummaryRun({
   currentDoc = null,
   treeEditMode = false,
@@ -57,7 +50,7 @@ export function useSummaryRun({
   resolveWriteDoc,
   syncEditBranchHistoryStacks,
   activeEditBranch
-} = {}) {
+}: any = {}) {
   const [summaryNotesVisible, setSummaryNotesVisible] = useState(true);
   const summaryRunRef = useRef(null);
 

@@ -13,8 +13,7 @@ import {
 } from '../lib/doc-utils.mjs';
 import { treeViewRepository } from '../data/repositories.js';
 
-/** @param {{ currentDoc?: any, setCurrentDoc?: any, setNotice?: any, setProgress?: any, setOperationLock?: any, loadTreeDepth?: any }} [options] */
-export function useTreeViewState({ currentDoc = null, setCurrentDoc, setNotice, setProgress, setOperationLock, loadTreeDepth } = {}) {
+export function useTreeViewState({ currentDoc = null, setCurrentDoc, setNotice, setProgress, setOperationLock, loadTreeDepth }: any = {}) {
   const [depthLimit, setDepthLimit] = useState(1);
   const [axiomsCollapsed, setAxiomsCollapsed] = useState(false);
   const [collapsed, setCollapsed] = useState(() => new Set());
@@ -33,7 +32,7 @@ export function useTreeViewState({ currentDoc = null, setCurrentDoc, setNotice, 
       : Array.from({ length: actualMaxDepth }, (_, index) => index + 1))
       .map((depth) => Math.floor(Number(depth) || 0))
       .filter((depth) => depth > 0 && depth <= actualMaxDepth))]
-      .sort((left, right) => left - right)
+      .sort((left, right) => Number(left) - Number(right))
   ), [actualMaxDepth, treeDepthStats]);
 
   useEffect(() => {
