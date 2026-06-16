@@ -62,7 +62,7 @@
 
 核心记忆是普通条件树文档，用标准编辑模型改（见[编辑模型：分支与三方合并](concepts.md#编辑模型分支与三方合并)）：
 
-- 开 `branch begin`（owner=llm 影子分支，主干不动）→ `edit`（`node.insert`/`node.reparent`/…）逐条 stage → `commit`（快进直接写回）或人在前端 merge 审。
+- 开 `draft new`（owner=llm 草稿，正文不动）→ `edit`（`node.insert`/`node.reparent`/…）逐条 stage → `commit`（快进直接写回）或人在前端 merge 审。
 - `full` 档的 llm 可自己提 diff 并 `commit`（产出仍不受控）；标受控、批准他人待审是 `human` 档专属。大批结构改就**一条分支多动作 stage、一次 commit**，落成一个 diff。
 
 ## 存储与定位
@@ -74,7 +74,7 @@
 | 长期核心记忆 | `library/memory/<身份>.md`（每身份一篇，跨工作区） | 可见——人要查阅、审批 |
 | 事件卷 | `.memory/<工作区>/<会话>.快捷方式` | 隐藏系统目录 |
 
-锚改名或迁移后，用 `relink` 重绑 doc 的源路径（`full` 档；只改绑定不动正文），别 `forget` 重导（会丢库内已提炼内容）。
+锚改名或迁移后，用 `relink` 重绑 doc 的源路径（`full` 档；只改绑定不动正文），别 `delete` 重导（会丢库内已提炼内容）。
 
 ## 操作要点（踩过的坑）
 
@@ -84,8 +84,8 @@
 - **改动生效边界**：改后端代码（store/handlers/db-shell…）后端是 headless 子进程、惰性启动 → `restart_backend` 放掉旧子进程、下次调用才加载新代码；改 `scripts/mcp-server.mjs`（工具注册/schema）→ 须**重连 MCP**，`restart_backend` 不够；`db.mjs`/CLI 每次 spawn 新进程，改完即时生效。
 - **`edit` 的两类 id 别混**：`baseDocId` 要 **doc id**，`parentId` / `nodeId` 要 **节点 id**。同篇文档这俩前缀常相同、尾号不同，混用直接 `FOREIGN KEY constraint failed`。
 - **reparent / move 按 uuid，不按地址**：地址会随每次结构改动重投影漂移；用稳定节点 id 作 `nodeId` / `newParentId`，叠多少次都不错位。
-- **编辑分支幂等复用**：同 owner 在同文档已有活跃分支时，`begin` / 后续 `edit` 复用它而非新建——连续动作自动叠在一条分支上。
-- **owner 缺省取档位默认**（不再是 human）：`branch` / `diff` / `drop` / `commit` / `edit` 等不传 owner 时落到档位默认（edit/full 档=llm、human 档=human），自动命中自己开的分支；只有在 human 档去操作 llm 分支时才需显式 `owner=llm`。非 human 档不接受 `owner=human`（运行中不升档）。
+- **草稿幂等复用**：同 owner 在同文档已有活跃草稿时，`draft new` / 后续 `edit` 复用它而非新建——连续动作自动叠在一份草稿上。
+- **owner 缺省取档位默认**（不再是 human）：`draft` / `diff` / `discard` / `commit` / `edit` 等不传 owner 时落到档位默认（edit/full 档=llm、human 档=human），自动命中自己开的草稿；只有在 human 档去操作 llm 草稿时才需显式 `owner=llm`。非 human 档不接受 `owner=human`（运行中不升档）。
 
 ## 开关
 

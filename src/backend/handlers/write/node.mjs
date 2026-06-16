@@ -65,7 +65,9 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
   if (action === 'node.delete') changed = store.deleteNodeSubtree(nodeId);
   else if (action === 'node.move') changed = store.moveNode(nodeId, payload.direction);
   else if (action === 'node.promote') changed = store.promoteNode(nodeId);
-  else if (action === 'node.split') changed = store.splitNodeIntoChildren(nodeId);
+  else if (action === 'node.split') changed = store.splitNodeIntoChildren(nodeId, {
+    splitAsciiPunctuation: payload.splitAsciiPunctuation === true || payload.split_ascii_punctuation === true
+  });
   else if (action === 'node.mergePrevious') changed = store.mergeNodeIntoPreviousSibling(nodeId);
   else if (action === 'node.mergeInto') changed = store.mergeNodeIntoTarget({
     nodeId,

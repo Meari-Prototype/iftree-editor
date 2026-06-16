@@ -1,3 +1,4 @@
+import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -42,7 +43,7 @@ test('read：只回正文，scope=node/subtree/siblings 与 at 坐标，不带�
 
     // 错误路径：缺地址、地址不存在
     const missingArgs = await runBashDb(dbPath, ['read', docId], { expectFailure: true });
-    assert.match(missingArgs.stderr || missingArgs.stdout, /db read requires <doc_id> <address>/);
+    assert.match(missingArgs.stderr || missingArgs.stdout, /db read requires <address> 或 --node-id <uuid>/);
     const missingTarget = await runBashDb(dbPath, ['read', docId, '9-9-9'], { expectFailure: true });
     assert.match(missingTarget.stderr || missingTarget.stdout, new RegExp(`db read target not found: doc ${docId} 9-9-9`));
   });
@@ -67,7 +68,7 @@ test('inspect：身份段 + meta/source/links/axioms 选段（吸收旧 read 镜
     assert.match(stdoutOf(await runBashDb(dbPath, ['inspect', docId, '1', '--sections', 'axioms'])), /\[axioms\]/);
 
     const missingArgs = await runBashDb(dbPath, ['inspect', docId], { expectFailure: true });
-    assert.match(missingArgs.stderr || missingArgs.stdout, /db inspect requires <doc_id> <address>/);
+    assert.match(missingArgs.stderr || missingArgs.stdout, /db inspect requires <address> 或 --node-id <uuid>/);
   });
 });
 
@@ -113,7 +114,7 @@ test('read 档全动词批量冒烟', { timeout: 240000 }, async () => {
       [['find', 'DBT_SEARCH_ONLY_ONCE', '--scope', docId, '1-1-7'], /1-1-7-1/],
       [['find', 'DBT_DIFF_MODIFY', '--scope', docId, '1', '--at', commitRef], /历史命中/],
       [['log', docId], /commit:/],
-      [['diff', docId, commitRef], /node\.update/],
+      [['diff', docId, commitRef], /改/],
       [['sql', 'SELECT COUNT(*) AS n FROM nodes'], /"n"/]
     ];
     for (const [argv, must] of calls) {

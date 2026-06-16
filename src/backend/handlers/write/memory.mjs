@@ -2,8 +2,7 @@ import { handleStreamMutation } from './doc.mjs';
 import {
   createMemoryVolume,
   findActiveSessionVolume,
-  markMemoryVolumeDistilled,
-  sealDueMemoryVolumes
+  markMemoryVolumeDistilled
 } from '../../memory-volumes.mjs';
 
 // 建卷与节点写入不在同一事务（push 的事务在 store 内自管），先把最常见的违约拦在建卷前，
@@ -99,9 +98,6 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
       refresh: { kind: 'doc', docId },
       sideEffects: effects
     };
-  }
-  if (action === 'memory.sealDue') {
-    return { ok: true, action, ...sealDueMemoryVolumes(store), sideEffects: effects };
   }
   if (action === 'memory.markDistilled') {
     const result = markMemoryVolumeDistilled(store, {

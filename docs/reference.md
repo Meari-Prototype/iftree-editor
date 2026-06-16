@@ -29,7 +29,7 @@
 | `find` | 统一检索：默认多词 AND 字面检索；`semantic=true` 语义检索附 score；`tags=true` 实体同义 / 相关列表；`minScore` 高级过滤（语义按相似度下限默认 0.51、字面按命中次数下限） |
 | `article` | 读取导入文档的原文窗口（按 docId 从头读，或按 nodeId 读附近） |
 | `log` | 列出文档保存 / commit 历史 |
-| `diff` | 比较两条保存历史，或查看一个编辑分支的投影 diff |
+| `diff` | 对比草稿↔正文 / 两版历史 / 任意两 ref（`from`/`to`：head·`<commitId>`·draft[:branchId]，refA↔refB）。两正交参数：`detail` 切 summary（节点+改增删移计数）/ full（逐行 old→new，默认）；`json` 切结构化输出。原 changes / changes --detail 并入此态 |
 | `sql` | 只读 SQL 调试查询（仅 SELECT / WITH，readonly 连接校验） |
 | `memory_volumes` | 列记忆卷及状态（active → sealed → distillable → distilled，附时间元数据） |
 | `ask_agent` | 问内置文档智能体（A2A）：自己检索、读证据、附地址回答；`sessionId` 多轮续接 |
@@ -39,21 +39,16 @@
 
 | 工具 | 作用 |
 | --- | --- |
-| `edit` | 写一条数据库编辑动作进编辑分支（默认 owner=llm，不直接改主库） |
-| `branch` | 管理编辑分支：list / begin / diff / drop |
-| `changes` | 列当前分支暂存变更；`detail=true` 返回 diffView |
-| `switch` | 切换当前 MCP 的分支选择（后续分支动词的默认目标） |
-| `undo` / `redo` | 分支内撤销 / 重做 |
-| `commit` | 保存分支：生效 diff 写入主文档历史并删除分支；非快进时逐条前置验证，结构性失配返回 blocked、字段级冲突返回 conflicts 等人裁 |
-| `merge` | 三方合并：默认只返回预览（fastForward / hasConflicts / 逐节点 resolution）；`yes=true` 执行，冲突与受阻时主干与分支均不动 |
-| `discard` | 丢弃整个编辑分支（默认预览，`yes=true` 执行） |
+| `edit` | 写一条编辑动作进当前草稿（默认 owner=llm，不直接改主库；高频 node 操作用具名字段，不裸 json） |
+| `draft` | 草稿管理：new 起草 / list 列当前草稿及署名 |
+| `switch` | 切换当前草稿选择（后续草稿动词的默认目标） |
+| `undo` / `redo` | 草稿内撤销 / 重做 |
+| `commit` | 定稿：当前草稿生效 diff 写入正文历史并销稿；快进直落，非快进逐条前置验证——结构失配返回 blocked、字段冲突返回 conflicts 待裁清单、不落 |
+| `merge` | 调和定稿：默认只返回预览（fastForward / hasConflicts / 逐节点 resolution）；`yes=true` 执行，`strategy=ours/theirs` 整批或 `resolutions` 逐条裁决字段冲突，冲突与受阻时正文与草稿均不动 |
+| `discard` | 弃稿：丢弃一份草稿（默认预览，`yes=true` 执行；原 branch drop 并入） |
 | `import` | 导入 library 内真实文件，mode 为 simple / complete / direct / smart / vector |
-| `vectors` | 为已导入文档补建语义向量 |
-| `set_mode` | 切换文档编辑模式：readonly / incremental（流式写入）/ full（分支与合并），增量与完整互斥 |
-| `push` | 流式写入：把消息节点追加进增量编辑文档（首次 `title` 建档，之后 `docId` + `parentId`；每节点必填 `trust_level`） |
-| `bulk` | 海量导入加速会话：begin 异步写 → 多次 push → end 恢复安全设置；共享后端上需独占 |
+| `delete` | 删除已导入文档的 doc 数据（不删 library 真实文件；与 `import` 成对，`18-3-1`；`forget` 一词留给记忆系统） |
 | `memory_deliver` | 投递事件记忆卷（外部 agent 唯一合法的记忆侧写入；节点一律不受控） |
-| `memory_admin` | 记忆卷维护：seal_due 物理封卷到期卷；mark_distilled 标记已提炼 |
 
 ### 管理工具（`full` / `human` 档）
 
@@ -63,16 +58,20 @@
 | `rebase` | 把当前分支的 lazy base 刷新到主干 HEAD（不是完整冲突裁决器） |
 | `cherry-pick` | 从同一文档的保存历史或编辑分支摘取 edit entries 写入目标分支 |
 | `export` | 导出已导入文档为 Markdown 文本（返回文本，不写文件） |
-| `forget` | 删除已导入文档的 doc 数据（不删 library 真实文件） |
+| `vectors` | 为已导入文档补建语义向量（重算力，归 full） |
+| `set_mode` | 切换文档编辑模式：readonly / incremental（流式写入）/ full（分支与合并），增量与草稿编辑互斥 |
+| `push` | 流式写入：把消息节点追加进增量编辑文档（每节点必填 `trust_level`） |
+| `bulk` | 海量导入加速会话：begin 异步写 → 多次 push → end；全库降 durability + 独占锁 |
+| `memory_distill` | 标记记忆卷已提炼（提炼=人审地界；原 memory_admin 的 mark_distilled；seal 已自动化、不再设动词） |
 
 ## db 命令契约
 
 `db` 是给 LLM 用的统一命令面：内置 agent 的 bash 会话直接可用（由产品注入 LLM 工作区），MCP 工具底层走同一实现。动词分组：
 
-- **检索与读取**：`find`、`keyword`、`query`、`index`、`tree`、`read`、`inspect`、`article`、`log`、`diff`、`sql`、`memory list`
+- **检索与读取**：`find`、`keyword`、`index`、`tree`、`read`、`inspect`、`article`、`log`、`diff`、`sql`、`memory list`（`query` 是 `db find --semantic` 的兼容别名）
 - **写入**：`edit`、`push`、`import-json`、`set-mode`、`bulk`、`import`、`vectors`、`memory deliver`
-- **分支**：`branch`、`changes`、`commit`、`merge`、`switch`、`undo`、`discard`、`rebase`、`cherry-pick`
-- **管理**：`export`、`restore`、`forget`
+- **草稿**：`draft`、`commit`、`merge`、`switch`、`undo`、`discard`、`rebase`、`cherry-pick`
+- **管理**：`export`、`restore`、`delete`、`vectors`、`set-mode`、`push`、`bulk`
 
 `db help` 输出当前版本的权威用法。语义与上面的 MCP 工具一一对应。
 

@@ -1,3 +1,5 @@
+import './_assert-electron.mjs';
+
 import assert from 'node:assert/strict';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';

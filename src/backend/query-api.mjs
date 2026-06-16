@@ -1,5 +1,5 @@
 import { parseJsonObject, compareNodeAddress } from './shared.mjs';
-import { listMemoryVolumes } from './memory-volumes.mjs';
+import { listMemoryVolumes, sealDueMemoryVolumes } from './memory-volumes.mjs';
 import { handleDebugOverviewQuery, handleDebugSqlQuery } from './handlers/read/debug.mjs';
 import { ENTITY_READ_ACTIONS, runEntityRead } from './entities/read.mjs';
 import { normalizeStableId } from './db/ids.mjs';
@@ -25,6 +25,7 @@ const ACTIONS = Object.freeze([
   'doc.list',
   'docFolder.list',
   'history.diff',
+  'diff.refs',
   'history.nodeLog',
   'editBranch.listPending',
   'editBranch.diffView',
@@ -171,29 +172,33 @@ function attachVisibleSubtreeTextChars(rows = []) {
 function fullSubtreeTextCharsByNodeId(store, docId, nodeIds = []) {
   const ids = [...new Set(nodeIds.map((value) => normalizeQueryId(value)).filter(Boolean))];
   if (ids.length === 0) return new Map();
-  const placeholders = ids.map(() => '?').join(', ');
+  // 子树字数本质是一次后序聚合：取该文档全部节点的「自身字数」（只取长度、不取正文），
+  // 按 depth 降序（自底向上）单遍 DP，每个节点把「自身 + 已累计子和」上交给父亲。
+  // O(N) 一趟，避免旧实现「对每个种子各自递归展开整棵子树」——那会让深层节点被多个
+  // 祖先种子重复累加，descendants 膨胀到 N×祖先深度，大库退化到分钟级。
   const rows = store.db.prepare(`
-    WITH RECURSIVE descendants(ancestor_id, node_id) AS (
-      SELECT id, id
-      FROM nodes
-      WHERE doc_id = ? AND id IN (${placeholders})
-      UNION ALL
-      SELECT descendants.ancestor_id, child.id
-      FROM descendants
-      JOIN nodes child ON child.parent_id = descendants.node_id
-      WHERE child.doc_id = ?
-    )
-    SELECT descendants.ancestor_id,
-      COALESCE(SUM(
-        LENGTH(COALESCE(nodes.node_title, ''))
-        + LENGTH(COALESCE(nodes.text, ''))
-        + LENGTH(COALESCE(nodes.node_note, ''))
-      ), 0) AS subtree_text_chars
-    FROM descendants
-    JOIN nodes ON nodes.id = descendants.node_id
-    GROUP BY descendants.ancestor_id
-  `).all(docId, ...ids, docId);
-  return new Map(rows.map((row) => [String(row.ancestor_id), Number(row.subtree_text_chars) || 0]));
+    SELECT id, parent_id,
+      LENGTH(COALESCE(node_title, ''))
+      + LENGTH(COALESCE(text, ''))
+      + LENGTH(COALESCE(node_note, '')) AS own
+    FROM nodes
+    WHERE doc_id = ?
+    ORDER BY depth DESC
+  `).all(docId);
+  const childSum = new Map();
+  const total = new Map();
+  for (const row of rows) {
+    const id = String(row.id);
+    const subtree = (Number(row.own) || 0) + (childSum.get(id) || 0);
+    total.set(id, subtree);
+    if (row.parent_id != null) {
+      const parentId = String(row.parent_id);
+      childSum.set(parentId, (childSum.get(parentId) || 0) + subtree);
+    }
+  }
+  const result = new Map();
+  for (const id of ids) result.set(id, total.get(id) ?? 0);
+  return result;
 }
 
 function attachFullSubtreeTextChars(store, docId, rows = []) {
@@ -667,34 +672,6 @@ function subtreeTextScope(root = {}, relativeDepth = null) {
   return { where: clauses.join(' AND '), params };
 }
 
-function subtreeBodyTextSummary(store, root = {}, relativeDepth = null) {
-  const storedChars = relativeDepth
-    ? null
-    : Number(root.meta_subtree_text_chars);
-  if (root.meta_subtree_text_chars !== null
-    && root.meta_subtree_text_chars !== undefined
-    && Number.isFinite(storedChars)
-    && storedChars >= 0) {
-    return {
-      node_count: null,
-      body_text_chars: storedChars
-    };
-  }
-  const scope = subtreeTextScope(root, relativeDepth);
-  return store.db.prepare(`
-    SELECT COUNT(*) AS node_count,
-      COALESCE(SUM(
-        CASE
-          WHEN nodes.parent_id IS NOT NULL
-          THEN LENGTH(COALESCE(text, ''))
-          ELSE 0
-        END
-      ), 0) AS body_text_chars
-    FROM nodes
-    WHERE doc_id = ? AND ${scope.where}
-  `).get(root.doc_id, ...scope.params);
-}
-
 function subtreeBodyTextRows(store, root = {}, relativeDepth = null) {
   const scope = subtreeTextScope(root, relativeDepth);
   return store.db.prepare(`
@@ -703,6 +680,21 @@ function subtreeBodyTextRows(store, root = {}, relativeDepth = null) {
     FROM nodes
     WHERE doc_id = ? AND ${scope.where}
   `).all(root.doc_id, ...scope.params).sort(compareNodeAddress);
+}
+
+// 各相对深度的 body 字数与节点数（read 口径），按 depth 升序。供 read 分层早停：从根逐层累加、取放得进 limit
+// 的最深一层；各层求和即整子树总字数/总节点数，故 text 路径只发这一次扫，不再单独 SUM 一遍整子树。
+function subtreeBodyTextLayers(store, root = {}, relativeDepth = null) {
+  const scope = subtreeTextScope(root, relativeDepth);
+  return store.db.prepare(`
+    SELECT depth,
+      COUNT(*) AS node_count,
+      COALESCE(SUM(CASE WHEN nodes.parent_id IS NOT NULL THEN text_chars ELSE 0 END), 0) AS chars
+    FROM nodes
+    WHERE doc_id = ? AND ${scope.where}
+    GROUP BY depth
+    ORDER BY depth
+  `).all(root.doc_id, ...scope.params);
 }
 
 async function queryContentSubtree(store, payload = {}, ctx = {}) {
@@ -714,24 +706,46 @@ async function queryContentSubtree(store, payload = {}, ctx = {}) {
   const limit = contentLimit(payload.limit, 1000, 10000);
   if (contentFormat(payload) === 'text') {
     const textLimit = normalizePositiveInteger(payload.textLimit ?? payload.text_limit, null);
-    const summary = subtreeBodyTextSummary(store, root, relativeDepth);
-    const bodyTextChars = Math.max(0, Number(summary?.body_text_chars) || 0);
-    const total = Math.max(0, Number(summary?.node_count) || 0);
+    // 分层 body 字数（按 depth 升序）：一次扫同时拿到逐层明细与整子树总字数/总节点数（各层之和），
+    // 既供下面的分层早停，也省掉原先再 SUM 一遍整子树的那次重复全扫（两者扫的是同一批行）。
+    const layers = subtreeBodyTextLayers(store, root, relativeDepth);
+    let bodyTextChars = 0;
+    let total = 0;
+    for (const layer of layers) {
+      bodyTextChars += Math.max(0, Number(layer.chars) || 0);
+      total += Math.max(0, Number(layer.node_count) || 0);
+    }
     const meta = { nodeCount: total, bodyTextChars };
     if (textLimit && bodyTextChars > textLimit) {
+      // 分层早停：从根逐层累加 body 字数，取累计不超过 limit 的最深一层，返回该深度内的正文，
+      // 而不是一刀拒绝——让 read 撞上大子树时仍拿到前几层（看章节小节常用，子树合计答不了"前 N 层多大"）。
+      const rootDepth = Number(root.depth) || 0;
+      let cumChars = 0;
+      let keepRelativeDepth = 0;
+      for (const layer of layers) {
+        const layerChars = Math.max(0, Number(layer.chars) || 0);
+        const layerRelativeDepth = Number(layer.depth) - rootDepth + 1;
+        // 至少保留到第一个有正文的层（cumChars===0 时不因超限退出——文档根那层 body=0，否则会返回空）；之后放不下即停。
+        if (cumChars > 0 && cumChars + layerChars > textLimit) break;
+        cumChars += layerChars;
+        keepRelativeDepth = layerRelativeDepth;
+      }
+      const rows = subtreeBodyTextRows(store, root, keepRelativeDepth);
       return {
         kind: 'content.getSubtree',
         format: 'text',
         docId: root.doc_id,
         rootAddress: root.address,
-        returned: 0,
+        returned: rows.length,
         total,
         truncated: true,
-        meta,
+        // returnedChars 是返回到第 keepRelativeDepth 层、这些层的 body 字数（SQL LENGTH 口径，与 textLimit/bodyTextChars
+        // 同口径，刻意不改用 JS 串长）；渲染时 subtreeBodyText 不显示纯空白节点，肉眼字数可能略少——此处计的是“层预算”。
+        meta: { ...meta, returnedDepth: keepRelativeDepth, returnedChars: cumChars },
         text: [
-          `该子树正文 ${bodyTextChars} 字，超过 ${textLimit} 字。`,
-          `请先用 tree 查看 doc ${root.doc_id} ${root.address || ''} 的下级地址，再分批 read 更小子树。`
-        ].join('\n')
+          subtreeBodyText(rows),
+          `— 整棵子树 ${bodyTextChars} 字，超过 ${textLimit} 字门禁，已返回前 ${keepRelativeDepth} 层（${cumChars} 字）。要继续：下钻到具体子地址分段读，或显式把 limit 加大到所需字数、二次突破门禁（确认你真要一次拉这么多）。`
+        ].filter(Boolean).join('\n\n')
       };
     }
     const rows = subtreeBodyTextRows(store, root, relativeDepth);
@@ -1629,7 +1643,7 @@ function resolveAddress(store, docId, address) {
 
 function requireDocId(payload = {}) {
   const docId = normalizeQueryId(payload.docId ?? payload.doc_id);
-  if (!docId) throw new Error('database_read requires docId for this action');
+  if (!docId) throw new Error('read query requires docId for this action');
   return docId;
 }
 
@@ -1700,6 +1714,46 @@ function queryHistoryDiff(store, payload = {}) {
     to: historyMetaRow(toRow),
     entries
   };
+}
+
+// diff.refs（15-5-2 refA↔refB）：把任意两 ref（head 正文 / 历史 commit / 草稿）各解析成快照，按稳定 node id 配对比对。
+// head/草稿走 projectEditBranchDoc（统一地址口径），history 走存档快照；computeDiff 与 history.diff 同形（field/old/new）。
+function resolveRefSnapshot(store, ref = {}, fallbackDocId = null) {
+  if (ref.head) {
+    const docId = ref.docId ?? fallbackDocId;
+    if (!docId) throw new Error('diff ref=head 需要 docId');
+    return store.liveDocSnapshot(docId);
+  }
+  if (ref.historyId != null) {
+    const row = historyEntryRow(store, ref.historyId, ref.docId ?? fallbackDocId);
+    const snap = historySnapshot(row);
+    if (!snap?.nodes) throw new Error('diff ref 历史快照不可用（该 commit 无可恢复快照）');
+    return snap;
+  }
+  const branch = store.findEditBranch({
+    branchId: ref.branchId ?? null,
+    baseDocId: ref.baseDocId ?? null,
+    owner: ref.owner ?? 'human'
+  });
+  if (!branch) throw new Error('diff ref 草稿未找到（给 branchId 或 baseDocId+owner）');
+  return store._projectedDocForBranch(branch);
+}
+
+function queryRefDiff(store, payload = {}) {
+  const fallbackDocId = normalizeQueryId(payload.docId ?? payload.doc_id, null);
+  const fromSnap = resolveRefSnapshot(store, payload.from ?? {}, fallbackDocId);
+  const toSnap = resolveRefSnapshot(store, payload.to ?? {}, fallbackDocId);
+  const entries = store.computeDiff(fromSnap, toSnap);
+  // 补 address（to 侧优先、from 兜底），与 history.diff 展示口径一致。
+  const addressByNode = new Map();
+  for (const node of toSnap.nodes || []) addressByNode.set(node.id, node.address);
+  for (const node of fromSnap.nodes || []) if (!addressByNode.has(node.id)) addressByNode.set(node.id, node.address);
+  for (const entry of entries) {
+    if (entry && entry.node_id != null && entry.address == null) {
+      entry.address = addressByNode.get(entry.node_id) ?? null;
+    }
+  }
+  return { kind: 'diff.refs', entries };
 }
 
 function queryNodeHistory(store, payload = {}) {
@@ -1983,8 +2037,8 @@ export function databaseReadToolSchema() {
       depth: { type: 'number', description: 'Tree/index depth limit. In ASCII tree output, (xxx) is each node subtree total, not node own text length.' },
       minDepth: { type: 'number' },
       maxDepth: { type: 'number' },
-      from: { type: 'number' },
-      to: { type: 'number' },
+      from: { oneOf: [{ type: 'number' }, { type: 'object' }], description: 'diff.refs 的左端 ref 对象 {head:true}|{historyId}|{branchId}；其它 action（深度/历史范围）作数字。' },
+      to: { oneOf: [{ type: 'number' }, { type: 'object' }], description: 'diff.refs 的右端 ref 对象；其它 action 作数字。' },
       depthLimit: { type: 'number', description: 'Subtree depth limit. Character counts in tree/index output remain subtree totals.' },
       levels: { type: 'number', description: 'Alias for subtree depth limit. Character counts in tree/index output remain subtree totals.' },
       detail: { type: 'string', enum: ['summary', 'full'] },
@@ -2021,14 +2075,14 @@ export function databaseReadToolSchema() {
 
 export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   const action = normalizeQueryAction(payload.action || payload.type);
-  if (!action) throw new Error(`Unknown database_read action: ${payload.action || payload.type || ''}`);
+  if (!action) throw new Error(`Unknown read query action: ${payload.action || payload.type || ''}`);
 
   if (action === 'query.actions') return { actions: databaseReadActions() };
   if (action === 'library.getTree') {
     if (typeof ctx.libraryTree !== 'function') throw new Error('library.getTree is not available');
     return ctx.libraryTree(payload);
   }
-  if (!store?.db) throw new Error('database_read store is not available');
+  if (!store?.db) throw new Error('read query store is not available');
   if (action === 'debug.sql') return handleDebugSqlQuery(store, payload);
   if (action === 'library.index') return queryLibraryIndex(store, payload, ctx);
   if (action === 'library.getNavigation') return queryLibraryNavigation(store, payload, ctx);
@@ -2043,6 +2097,9 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   if (action === 'content.searchAll') return queryContentSearchAll(store, payload, ctx);
   if (ENTITY_READ_ACTIONS.includes(action)) return runEntityRead(store, payload, action, ctx);
   if (action === 'memory.listVolumes') {
+    // 封卷自动化（15-10-1/15-11-5）：列卷时顺手物理封到期卷（末次活动+24h），不再设 seal 动词。
+    // 纯时间戳判断、零 LLM；只在可写连接上做（query-db 的只读路径跳过）。
+    if (!store.readonly) sealDueMemoryVolumes(store);
     return listMemoryVolumes(store, {
       state: payload.state ?? null,
       agent: payload.agent ?? null,
@@ -2054,6 +2111,7 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   if (action === 'doc.list') return store.listDocs().map(normalizeDocRow);
   if (action === 'docFolder.list') return store.listDocFolders().map(plainRow);
   if (action === 'history.diff') return queryHistoryDiff(store, payload);
+  if (action === 'diff.refs') return queryRefDiff(store, payload);
   if (action === 'history.nodeLog') return queryNodeHistory(store, payload);
   if (action === 'editBranch.listPending') return queryPendingEditBranches(store, payload);
   if (action === 'editBranch.diffView') return queryEditBranchDiffView(store, payload);
@@ -2076,5 +2134,5 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   if (action === 'node.getAncestorChain') return queryAncestorChain(store, payload);
   if (action === 'source.getWindow') return querySourceWindow(store, payload);
 
-  throw new Error(`Unhandled database_read action: ${action}`);
+  throw new Error(`Unhandled read query action: ${action}`);
 }

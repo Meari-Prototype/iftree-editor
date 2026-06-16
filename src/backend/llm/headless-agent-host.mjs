@@ -36,7 +36,8 @@ import {
   LLM_PROVIDERS_ENV_KEY,
   LLM_SUMMARY_PROVIDERS_ENV_KEY,
   activeLlmApiFromSettings,
-  createLlmSettingsReader
+  createLlmSettingsReader,
+  readDotEnv
 } from './settings.mjs';
 import {
   createLibraryFs,
@@ -94,6 +95,13 @@ export function createHeadlessAgentHost(options = {}) {
   const databaseRoot = join(projectRoot, 'database');
   const configPath = join(projectRoot, 'iftree.config.json');
   const envPath = join(projectRoot, '.env');
+  // .env 作为统一配置入口：headless 子进程继承 MCP server 的 process.env，而 MCP
+  // server 不加载 .env 文件，导致读 process.env 的项（如嵌入后端 IFTREE_EMBED_*）
+  // 拿不到 .env 配置。这里在子进程内把 .env 灌进 process.env，只填未显式设置的键
+  // （不覆盖外部注入），restart_backend 即可让 .env 生效，无需重连 MCP。
+  for (const [dotEnvKey, dotEnvValue] of Object.entries(readDotEnv(envPath))) {
+    if (process.env[dotEnvKey] === undefined) process.env[dotEnvKey] = dotEnvValue;
+  }
   const systemPromptPath = join(projectRoot, 'system_prompt.md');
   let database = null;
   let agentStore = null;
@@ -120,8 +128,32 @@ export function createHeadlessAgentHost(options = {}) {
   const llmSettings = createLlmSettingsReader({ envPath, configPath, readProjectConfig });
   const { readEnv, readLlmSummarySettings, readAgentSettings } = llmSettings;
 
+  // .env 直连覆盖（最高优先级）：设了 IFTREE_AGENT_BASE_URL + IFTREE_AGENT_MODEL
+  // 即直接用该端点/模型，绕过 iftree.config.json 的 provider 选择，便于本地 ollama
+  // 等通过 .env 一键介入。API_KEY 可省（ollama 不校验，默认占位 'ollama'）。
+  function agentEnvOverride(env) {
+    const baseUrl = String(process.env.IFTREE_AGENT_BASE_URL || env.IFTREE_AGENT_BASE_URL || '').trim();
+    const model = String(process.env.IFTREE_AGENT_MODEL || env.IFTREE_AGENT_MODEL || '').trim();
+    if (!baseUrl || !model) return null;
+    const apiKey = String(process.env.IFTREE_AGENT_API_KEY || env.IFTREE_AGENT_API_KEY || 'ollama').trim();
+    return {
+      providerName: 'EnvDirect',
+      name: model,
+      apiKey,
+      baseUrl,
+      model,
+      fullUrl: false,
+      protocol: 'openai-compatible',
+      reasoningEfforts: [],
+      reasoningEffortMap: {},
+      enabled: true
+    };
+  }
+
   function activeAgentApi() {
     const env = readEnv();
+    const override = agentEnvOverride(env);
+    if (override) return override;
     const stored = Boolean(readProjectConfig().llm?.shared?.providers || env[LLM_PROVIDERS_ENV_KEY]);
     const active = activeLlmApiFromSettings(readAgentSettings());
     if (active?.apiKey && active.enabled !== false) return active;

@@ -1,3 +1,4 @@
+import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -117,7 +118,7 @@ export async function withImportedFixture(callback, options = {}) {
 }
 
 export async function beginBranch(dbPath, docId, owner) {
-  const result = parseJsonStdout(await runBashDb(dbPath, ['branch', 'begin', docId, '--owner', owner]));
+  const result = parseJsonStdout(await runBashDb(dbPath, ['draft', 'new', docId, '--owner', owner]));
   assert.equal(result.changed, true);
   result.branchId = result.branchId ?? result.branch?.id;
   assert.ok(result.branchId);

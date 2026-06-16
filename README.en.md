@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.3.0%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.4.0%20alpha-orange)
 
-> **Project status: 0.3.0, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.4.0, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -75,7 +75,7 @@ In-depth documentation lives in `docs/` (currently in Chinese):
 - **Structural editing**: read-only / edit lock; add empty nodes, drag a single node or `Ctrl`-multi-select to re-parent, drop onto a node to merge / juxtapose / attach; built-in undo / redo (`Ctrl+Z`, `Ctrl+Y`, `Ctrl+Shift+Z`).
 - **Edit branches & three-way merge**: structural changes from agents go into a shadow branch awaiting review; merging into the mainline reconciles three ways by stable node id using merkle hashing — fast-forwards write through, structural mismatches block as a whole, and field-level conflicts are decided by a human one by one.
 - **Streaming writes**: append-only data streams (chat logs, event logs) go straight into an "incremental edit" document without a branch, with keyword and semantic indexes maintained incrementally; bulk import has a dedicated acceleration session.
-- **Event memory volumes**: an external agent can deliver a structured self-report log as a memory volume at the end of a session; volumes seal automatically on a 24-hour rhythm and become distillable. The distill-and-approve pipeline lands in a later release.
+- **Event memory volumes**: an external agent can deliver a structured self-report log as a memory volume at the end of a session; volumes seal automatically on a 24-hour rhythm and become distillable; the `memory-distill` skill turns a volume into a diff proposal for long-term core memory, approved into place under the `human` tier.
 - **Shared backend**: one backend process per database — the app, MCP, and CLI share it over a named pipe and can stay online at the same time without conflict.
 - **Multi-format import & export**: import CHM, TXT, Markdown, PDF, DOCX; irregular sources go through smart import (an LLM produces JSON that is validated byte-for-byte before ingestion); Excel / CSV are explicitly relay formats for database export, not ordinary document import; export to Markdown and JSON.
 - **AI summary notes**: call an OpenAI- or Anthropic-compatible API to generate summary notes for a single node, a subtree, the current level, or the whole document.
@@ -243,9 +243,9 @@ The app, MCP, and CLI share one backend process per database and can stay online
 ├── index.html            # Renderer entry HTML
 ├── src/
 │   ├── renderer/
-│   │   └── main.jsx      # React mount entry
+│   │   └── main.tsx      # React mount entry
 │   ├── frontend/         # UI layer
-│   │   ├── App.jsx
+│   │   ├── App.tsx
 │   │   ├── components/   # Views and panels (tree view, relationship graph, rich text, settings, etc.)
 │   │   ├── hooks/        # React hooks: document state, layout, selection, settings, etc.
 │   │   ├── data/         # Repository / service wrappers calling window.iftree

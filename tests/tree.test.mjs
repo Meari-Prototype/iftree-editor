@@ -1,3 +1,5 @@
+import './_assert-electron.mjs';
+
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -8,13 +10,23 @@ import {
   splitSentences
 } from '../src/core/tree.mjs';
 
-test('splitSentences preserves sentence punctuation and drops blank fragments', () => {
-  const result = splitSentences('如果用户导入文本，那么切分。否则等待输入！OK?  末尾无标点');
+test('splitSentences defaults to Chinese punctuation for mixed technical text', () => {
+  const result = splitSentences('如果用户导入文本，那么切分。否则等待输入！OK? node.split。末尾无标点');
 
   assert.deepEqual(result, [
     '如果用户导入文本，那么切分。',
     '否则等待输入！',
+    'OK? node.split。',
+    '末尾无标点'
+  ]);
+});
+
+test('splitSentences can opt in to ASCII punctuation splitting', () => {
+  const result = splitSentences('OK? Next. 末尾无标点', { splitAsciiPunctuation: true });
+
+  assert.deepEqual(result, [
     'OK?',
+    'Next.',
     '末尾无标点'
   ]);
 });

@@ -2,6 +2,30 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.4.0 — 2026-06-17
+
+### 新增
+
+- **草稿模型动词与两轴 diff**：编辑动词重组为草稿模型——`draft new/list` 起草并列出草稿、`delete` 与 import 成对删档、`merge` 带 `strategy` / `resolutions` 直接落库或逐条裁冲突。`diff` 拆成两轴：详略轴 `--detail summary/full`（summary 只出改/增/删/移计数，full 出逐行 old→new 正文），版本轴 `--from` / `--to` 在正文（head）、历史 commit、草稿三种快照间任意比对。
+- **检索入口统一到 db 契约**：内置 agent 的检索读取统一走 bash 的 `db` 命令——`db find --semantic` 语义检索（命中行自带证据节点地址）、`db read` 回正文、附证据节点；`system_prompt` 据此重写，清掉旧的 `content.*` 裸 action。进阶 / 底层入口工具 `database_read` 改名 `admin_override`，描述精简指向 `db help`。
+- **本地 LLM 经 `.env` 直连**：对话模型可经 `.env` 直配（`IFTREE_AGENT_BASE_URL` / `IFTREE_AGENT_MODEL` / `IFTREE_AGENT_API_KEY` 直连覆盖云端 provider），嵌入后端可切 `IFTREE_EMBED_BACKEND=ollama`，请求超时 `IFTREE_AGENT_TIMEOUT_MS` 可调（小模型冷启动用）。缺 key 不崩（占位 `ollama`），key 不进日志。
+- **diff 识别移动 + merge 预览折叠**：跨快照 diff 现在识别节点移动——换父、或同父调序记 `移`，兄弟增删带来的连带重排不误报。三方合并预览把未改节点折叠进计数行、只列有裁决 / 冲突的节点，避免大文档刷屏。
+- **read 按节点身份定位 + 子树字数持久化**：`read` / `inspect` 可用 `--node-id <uuid>` 按稳定身份定位（认人不认位置）；子树字数持久化并支持分层早停，大库取数更省。
+- 新增 `backfill-corpus-vectors` 离线补向量脚本：给已导入文档补建语义向量（嵌入后端由 `.env` 决定）。
+
+### 修复
+
+- **commit / merge 冲突诊断不再被返回收口裁掉**：MCP 写动词的精简收口此前把非快进 commit、`merge yes=true` 落库失败时的 `blocked` / `message` / `conflicts` / `resolutionErrors` 一并删掉，agent 只见 `applied:false`，既不知受阻原因也拿不到待裁清单；现在失败结果透传这些字段，冲突裁决工作流恢复可用。
+- **检索指引与记忆 skill 跟上改名**：`system_prompt` 把「看结构」从 `db index` 纠正为 `db tree`（`db index` 只列库目录、给 doc_id 直接报错）；`memory-distill` skill 改用现行 `memory_distill` / `draft` / `diff`，不再指向已删的 `memory_admin` / `branch` / `changes`。
+- **diff ref 边界**：`db diff` / MCP `diff` 只给一端（如 `--from <commit>`）时，另一端默认落正文 head，不再因默认指向草稿而在未选草稿时误报「草稿未找到」；`draft:<id>` 传非法 id 直接报错，不再 `Number('')→0` / `NaN` 静默退化。
+
+### 工程
+
+- 前端渲染进程 `.js` / `.jsx` → `.ts` / `.tsx` 迁移收尾（`src/frontend` + `src/renderer` 共 59 文件），import 后缀零改写，构建 / 类型检查 / 套件全绿。
+- db 动词契约测试扩充：补 diff 移动识别（换父 / 调序 / 连带重排不误报）与 merge 预览折叠的单元测试；`read` / `inspect` 缺参报错文案更新跟上实现。
+- **测试运行时守卫**：每个测试文件加载即检测运行时，用纯 node 直接跑（原生模块按 Electron ABI 编译、必然 `NODE_MODULE_VERSION` 不匹配）会立即报错退出，强制走 `npm test` / `npm run test:verbs`。
+- **取数优化**：子树字数聚合从递归 CTE 改为 O(N) 后序 DP（大库取数不再随深度退化）；`read` 分层早停去掉对同一子树的重复全表扫描。
+
 ## 0.3.0 — 2026-06-16
 
 ### 新增

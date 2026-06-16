@@ -1,3 +1,4 @@
+import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -8,7 +9,7 @@ test('db help lists the bash db command surface and unknown commands fail', { ti
     const helpText = stdoutOf(await runBashDb(dbPath, ['help']));
     assert.match(helpText, /db index \[--folder/);
     assert.match(helpText, /db read <doc_id> <address>/);
-    assert.match(helpText, /db branch merge/);
+    assert.match(helpText, /db draft new <doc_id>/);
     assert.match(helpText, /db cherry-pick --history/);
     assert.match(helpText, /db web search <query>/);
     assert.match(helpText, /db web open <url>/);

@@ -516,6 +516,7 @@ export class IftreeStore {
     this.db.exec(TABLES_SQL);
     this.migrateData();
     this.ensureNodeHashTriggers();
+    this.ensureNodeTextCharsTriggers();
   }
 
   ensureNodeHashTriggers() {
@@ -534,6 +535,32 @@ export class IftreeStore {
       CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_delete
       AFTER DELETE ON nodes BEGIN
         UPDATE docs SET nodes_hash_dirty = 1 WHERE id = OLD.doc_id AND nodes_hash_dirty = 0;
+      END;
+    `);
+  }
+
+  // title/text/note 三列自有字数的统一口径：LENGTH(COALESCE(列,''))。触发器用 NEW. 前缀、回填用裸列名，
+  // 故按前缀生成同一套 SET 子句，三处（两触发器 + 回填）共用，免得口径要变（如改按 grapheme 计）时漏改某处。
+  nodeTextCharsSetClause(prefix = '') {
+    return `title_chars = LENGTH(COALESCE(${prefix}node_title, '')), `
+      + `text_chars = LENGTH(COALESCE(${prefix}text, '')), `
+      + `note_chars = LENGTH(COALESCE(${prefix}node_note, ''))`;
+  }
+
+  ensureNodeTextCharsTriggers() {
+    // DB 层维护节点自有字数三列（title_chars/text_chars/note_chars）：写 text/title/note 即同步本行 *_chars，
+    // 按主键单行 update。只更新 *_chars（不在任何 AFTER UPDATE OF 触发器的列清单里），既不触发 hash 失效
+    // 触发器、也不自我递归（recursive_triggers 默认 OFF）。覆盖一切写路径，写代码零改动、漏不掉；
+    // 存量行在 migrateData 加列时一次性回填。读端按请求选列聚合（read 只 SUM text_chars，tree 全口径 SUM 三列）。
+    const setClause = this.nodeTextCharsSetClause('NEW.');
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_nodes_text_chars_insert
+      AFTER INSERT ON nodes BEGIN
+        UPDATE nodes SET ${setClause} WHERE id = NEW.id;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_nodes_text_chars_update
+      AFTER UPDATE OF text, node_title, node_note ON nodes BEGIN
+        UPDATE nodes SET ${setClause} WHERE id = NEW.id;
       END;
     `);
   }
@@ -574,6 +601,15 @@ export class IftreeStore {
     // Merkle 缓存列（A5-2）：可空持久缓存；失效靠 nodes 触发器把所属 doc 标脏，diff 读时惰性补算。
     this.ensureColumn('nodes','content_hash', 'TEXT');
     this.ensureColumn('nodes','subtree_hash', 'TEXT');
+    // 节点自有字数三列（title/text/note 各一列）：持久缓存，按请求选列聚合，避免 SUM 时实时 LENGTH 扫大字段。
+    // 维护靠 ensureNodeTextCharsTriggers，写代码零改动；存量行在加列后一次性回填（以 text_chars 是否已存在为准，只跑一次）。
+    const needTextCharsBackfill = !this.hasColumn('nodes', 'text_chars');
+    this.ensureColumn('nodes', 'title_chars', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('nodes', 'text_chars', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('nodes', 'note_chars', 'INTEGER NOT NULL DEFAULT 0');
+    if (needTextCharsBackfill) {
+      this.db.exec(`UPDATE nodes SET ${this.nodeTextCharsSetClause('')}`);
+    }
     this.ensureColumn('commits','author', 'TEXT');
     this.ensureColumn('docs','nodes_hash_dirty', 'INTEGER NOT NULL DEFAULT 1');
     this.ensureColumn('docs','edit_mode', "TEXT NOT NULL DEFAULT 'full'");
@@ -2101,12 +2137,7 @@ export class IftreeStore {
     if (!docId) throw new Error('Edit branch base doc not found');
     const baseDoc = this.db.prepare('SELECT id, title FROM docs WHERE id = ?').get(docId);
     if (!baseDoc) throw new Error('Edit branch base doc not found');
-    const baseNodes = this.db.prepare(`
-      SELECT * FROM nodes WHERE doc_id = ?
-      ORDER BY parent_id IS NOT NULL, parent_id, sort_order, id
-    `).all(docId);
-    const baseAxioms = this.listAxioms(docId);
-    const baseRefs = this._fetchBaseRefsForDoc(docId);
+    const { nodes: baseNodes, axioms: baseAxioms, refs: baseRefs } = this._baseDocInputsForDoc(docId);
     const diff = JSON.parse(branch.diff || '{}');
     const baseSnapshot = JSON.parse(branch.base_snapshot || '{}');
     const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(docId);
@@ -2138,8 +2169,19 @@ export class IftreeStore {
       outRows = outRows.filter((row) => row.status !== 'unchanged' && row.status !== 'collapsed');
     }
 
+    // entries：草稿↔正文的 field-diff（与 rows 富视图并存），供 formatDiffText 详略轴渲染、与 diff.refs/history.diff 同形。
+    const diffEntries = this.computeDiff(
+      { nodes: baseNodes, axioms: baseAxioms, refs: baseRefs },
+      { nodes: projected.nodes, axioms: projected.axioms, refs: projected.refs }
+    );
+    const addrByNode = new Map();
+    for (const n of projected.nodes) addrByNode.set(n.id, n.address);
+    for (const n of baseNodes) if (!addrByNode.has(n.id)) addrByNode.set(n.id, n.address);
+    for (const e of diffEntries) if (e && e.node_id != null && e.address == null) e.address = addrByNode.get(e.node_id) ?? null;
+
     return {
       kind: 'editBranch.diffView',
+      entries: diffEntries,
       branch: { ...branch },
       baseDoc: { ...baseDoc },
       mergeBase: {
@@ -2474,7 +2516,7 @@ export class IftreeStore {
   //     前端取消可保留分支（自行留存 diff 后再放弃），确认则丢弃分支退出。
   //   - conflicts（字段级/删改级）→ 无人裁拒绝并返回冲突；带 resolutions 折进账目后提交。
   //   - 干净/收敛 → 直接重放写回。
-  applyThreeWayMerge({ branchId = null, shadowDocId = null, baseDocId = null, owner = 'human', summary = '三方合并', resolutions = null } = {}) {
+  applyThreeWayMerge({ branchId = null, shadowDocId = null, baseDocId = null, owner = 'human', summary = '三方合并', resolutions = null, strategy = null } = {}) {
     const branch = this.findEditBranch({ branchId, shadowDocId, baseDocId, owner });
     if (!branch) throw new Error('Edit branch not found');
     const docId = branch.base_doc_id;
@@ -2509,7 +2551,13 @@ export class IftreeStore {
       };
     }
     if (validation.conflicts.length > 0) {
-      const picks = Array.isArray(resolutions) ? resolutions : [];
+      // 整批策略（strategy=ours/theirs，对应 git -X）是逐条裁决的语法糖：把冲突清单映射成统一 pick，
+      // 一处合成、MCP/CLI 都不必各做一遍 dry-run；结构性冲突（parent_id/__parent__）仍由 resolveConflictEntries 拒绝。
+      const picks = Array.isArray(resolutions) && resolutions.length > 0
+        ? resolutions
+        : (strategy === 'ours' || strategy === 'theirs')
+          ? validation.conflicts.map((c) => ({ id: c.id, field: c.field, pick: strategy }))
+          : [];
       if (picks.length === 0) {
         return { ...meta, applied: false, conflicts: validation.conflicts, nodes: validation.nodes };
       }
@@ -2603,21 +2651,31 @@ export class IftreeStore {
     `).all(docId, docId, docId, docId);
   }
 
+  // 某文档当前正文（base）的投影输入：节点（父→排序→id 稳定序）、公理、引用。diffView / 投影 / liveDocSnapshot
+  // 共用这一份取数，省得三处各写一遍、nodes 排序或 base 取法要改时追三处。
+  _baseDocInputsForDoc(docId) {
+    const id = normalizePositiveId(docId);
+    const nodes = this.db.prepare(`
+      SELECT * FROM nodes WHERE doc_id = ?
+      ORDER BY parent_id IS NOT NULL, parent_id, sort_order, id
+    `).all(id);
+    return { docId: id, nodes, axioms: this.listAxioms(id), refs: this._fetchBaseRefsForDoc(id) };
+  }
+
   // Read the doc with all entries from `branch` already projected on top of the
   // base tables. Returns the projection state (nodes/axioms/refs maps) — the
   // caller can use it to derive `node`, `axiom`, or `ref` views to hand back
   // to the front-end after a stage operation.
   _projectedDocForBranch(branch) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const baseNodes = this.db.prepare(`
-      SELECT * FROM nodes WHERE doc_id = ?
-      ORDER BY parent_id IS NOT NULL, parent_id, sort_order, id
-    `).all(docId);
-    const baseAxioms = this.listAxioms(docId);
-    const baseRefs = this._fetchBaseRefsForDoc(docId);
     const diff = JSON.parse(branch.diff || '{}');
     const entries = Array.isArray(diff.entries) ? diff.entries : [];
-    return projectEditBranchDoc({ docId, nodes: baseNodes, axioms: baseAxioms, refs: baseRefs }, entries);
+    return projectEditBranchDoc(this._baseDocInputsForDoc(branch.base_doc_id), entries);
+  }
+
+  // 把某文档当前正文（HEAD）投影成快照 {nodes(含 address),axioms,refs}，供 diff.refs 与历史/草稿快照同形比对。
+  // 空 entries 投影 = 正文本身，但复用投影器算地址，地址口径与草稿/历史快照一致（computeDiff 按稳定 id 配对）。
+  liveDocSnapshot(docId) {
+    return projectEditBranchDoc(this._baseDocInputsForDoc(docId), []);
   }
 
   _findProjectedNode(state, ref) {
@@ -2638,7 +2696,12 @@ export class IftreeStore {
     const before = this._projectedDocForBranch(branch);
     const currentNode = this._findProjectedNode(before, nodeRef);
     if (!currentNode) throw new Error(`Node not found in edit branch: ${nodeRef}`);
-    const requestedPatch = this.nodePatchForEditBranch(currentNode, payload.patch || {});
+    // 接受顶层字段或 patch 包：不强制调用方手写嵌套 { patch: {...} }（不裸 json，见 15-5-2）。
+    // nodePatchForEditBranch 按白名单取字段，顶层混入的 nodeId/action/owner 等非字段会被忽略。
+    const requestedPatch = this.nodePatchForEditBranch(currentNode, payload.patch ?? payload);
+    if (Object.keys(requestedPatch).length === 0) {
+      throw new Error('node.update 需要至少一个可改字段（text / nodeType / nodeTitle / nodeNote / trustLevel / sourcePosition），放在顶层或 patch 内均可');
+    }
     const patch = {};
     const fields = [];
     for (const [field, value] of Object.entries(requestedPatch)) {
@@ -2649,6 +2712,7 @@ export class IftreeStore {
       fields.push({ field, old: oldValue, new: nextValue });
     }
     if (fields.length === 0) {
+      // 提供了字段但值与现状相同——合法 no-op，非错误
       return { branch, changed: false, node: nodeRowWithClientAliases(currentNode) };
     }
     const freshBranch = this._appendEditBranchEntry(branch, {
@@ -2802,7 +2866,9 @@ export class IftreeStore {
       }
     }
 
-    const sentences = splitSentences(target.text || '');
+    const sentences = splitSentences(target.text || '', {
+      splitAsciiPunctuation: payload.splitAsciiPunctuation === true || payload.split_ascii_punctuation === true
+    });
     if (sentences.length < 2) {
       return { branch, changed: false, docId };
     }
@@ -3418,7 +3484,9 @@ export class IftreeStore {
       branch && (!normalizedOwner || branch.owner === normalizedOwner) ? branch : null
     );
     if (branchId) {
-      return acceptOwner(this.db.prepare("SELECT * FROM edit_branches WHERE id = ? AND status = 'active'").get(Number(branchId))) || null;
+      // branchId 是主键、全局唯一，唯一锁定一条草稿；owner 是写入身份/消歧维度、不是定位键。
+      // 给了唯一句柄就不再按 owner 过滤——否则不传/传错 owner 会找不到本已锁定的草稿（见 A5-5、15-5-2）。
+      return this.db.prepare("SELECT * FROM edit_branches WHERE id = ? AND status = 'active'").get(Number(branchId)) || null;
     }
     if (shadowDocId) return acceptOwner(this.activeEditBranchForShadowDoc(shadowDocId));
     if (baseDocId) return this.activeEditBranchForBaseDoc(baseDocId, normalizedOwner || 'human');
@@ -4816,13 +4884,15 @@ export class IftreeStore {
     return true;
   }
 
-  splitNodeIntoChildren(nodeId) {
+  splitNodeIntoChildren(nodeId, options = {}) {
     const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
     if (!node) throw new Error(`Node not found: ${nodeId}`);
 
     if (this.splitSourceParagraphsIntoSentenceChildren(node)) return true;
 
-    const sentences = splitSentences(node.text);
+    const sentences = splitSentences(node.text, {
+      splitAsciiPunctuation: options.splitAsciiPunctuation === true || options.split_ascii_punctuation === true
+    });
     if (sentences.length < 2) return false;
 
     this.withTransaction(() => {

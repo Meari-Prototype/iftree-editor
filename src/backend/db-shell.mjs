@@ -3,6 +3,8 @@ import { normalizeStableId, isStableId } from './db/ids.mjs';
 import { runImportJson } from './import-json.mjs';
 import { normalizeNodeType, nodeTypeDisplayLabel } from '../core/node-model.mjs';
 import { formatBranchLine } from './branch-status.mjs';
+import { formatDiffText } from './diff-text.mjs';
+import { parseDiffRef } from './diff-refs.mjs';
 
 function cleanLine(value = '') {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -97,7 +99,7 @@ function parseFlags(argv = []) {
       index += 1;
       continue;
     }
-    if (['branch', 'base', 'owner', 'history', 'source-branch', 'target-branch', 'target-base', 'entry-id', 'entry-index', 'mode', 'doc-id', 'session-id', 'set', 'insert', 'cwd', 'at', 'state', 'agent', 'workspace', 'kind', 'trust', 'since', 'until', 'match-mode', 'exclude-folder', 'sections', 'range', 'start', 'before', 'spans-limit', 'node-id', 'min-score'].includes(name)) {
+    if (['branch', 'base', 'owner', 'history', 'source-branch', 'target-branch', 'target-base', 'entry-id', 'entry-index', 'mode', 'doc-id', 'session-id', 'set', 'insert', 'cwd', 'at', 'state', 'agent', 'workspace', 'kind', 'trust', 'since', 'until', 'match-mode', 'exclude-folder', 'sections', 'range', 'start', 'before', 'spans-limit', 'node-id', 'min-score', 'detail'].includes(name)) {
       const value = argv[index + 1];
       if (!value || value.startsWith('--')) throw new Error(`db --${name} requires a value`);
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = parseValue(value);
@@ -118,7 +120,7 @@ function parseFlags(argv = []) {
       index += 1;
       continue;
     }
-    if (['tags', 'all-docs', 'all', 'or', 'semantic', 'yes', 'detail', 'delete', 'uuid', 'dry-run', 'allow-gaps', 'vectors', 'force', 'labels', 'spans', 'json', 'node', 'at-address'].includes(name)) {
+    if (['tags', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'allow-gaps', 'vectors', 'force', 'labels', 'spans', 'json', 'node', 'at-address'].includes(name)) {
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
@@ -491,15 +493,6 @@ function formatSourceSpanLine(row = {}) {
   return parts.join(' ') || cleanLine(JSON.stringify(row));
 }
 
-function formatDiffEntry(entry = {}) {
-  const node = entry.node_id ?? entry.nodeId ?? entry.id ?? '';
-  const field = entry.field || entry.kind || entry.action || '';
-  const oldValue = clip(entry.old ?? entry.before ?? '', 80);
-  const newValue = clip(entry.new ?? entry.after ?? '', 80);
-  if (oldValue || newValue) return [`node:${node}`, field, `${oldValue} -> ${newValue}`].filter(Boolean).join(' ');
-  return cleanLine(JSON.stringify(entry));
-}
-
 function selectedBranch(context = {}) {
   return context.shellState?.selectedBranch || {};
 }
@@ -530,6 +523,15 @@ function branchTargetLabel(target = {}) {
     target.baseDocId ? `doc:${target.baseDocId}` : '',
     target.owner ? `owner:${target.owner}` : ''
   ].filter(Boolean).join(' ');
+}
+
+// 把草稿定位（branchId/baseDocId/owner）按真值铺进 payload，返回 payload。各写动词（diff/discard/undo/redo/commit/merge/rebase）
+// 共用，省得逐处抄这三行；缺一报错信息各动词不同，仍留在各处。
+function applyBranchTarget(payload, target = {}) {
+  if (target.branchId) payload.branchId = target.branchId;
+  if (target.baseDocId) payload.baseDocId = target.baseDocId;
+  if (target.owner) payload.owner = String(target.owner);
+  return payload;
 }
 
 function contextFunction(context = {}, name) {
@@ -757,6 +759,28 @@ async function requireDbReadTargetNode(database, docId, address) {
   const node = result?.node || null;
   if (!node?.id) throw dbReadTargetNotFoundError(docId, address);
   return node;
+}
+
+// 只读动词（read/inspect/tree/log）的统一定位入口：address 是主定位方式；给了 --node-id 时
+// 按节点稳定 UUID 兼容定位，解析成当前版本的 address 后复用 address 流程（address 仍是主路径，
+// nodeId 只是兼容入口；两者都给时以 nodeId 为准）。节点在当前版本不存在（已删 / UUID 有误）
+// 即报错——查历史里某版本的位置仍用 address + --at-address。
+async function resolveNodeAddress(database, docId, address, nodeId) {
+  const raw = nodeId === undefined || nodeId === null ? '' : String(nodeId).trim();
+  if (!raw) return String(address || '').trim();
+  const result = await database.run({
+    operation: 'read',
+    payload: { action: 'content.getNode', docId, nodeId: raw, detail: 'summary' }
+  }, 'read');
+  const node = result?.node || null;
+  if (!node?.id) {
+    throw new Error(`db: --node-id 未命中当前版本（doc ${docId} node ${raw}）：节点可能已删除或 UUID 有误；查历史位置请用 address + --at-address。`);
+  }
+  const resolvedAddress = String(node.address || '').trim();
+  if (!resolvedAddress) {
+    throw new Error(`db: --node-id 命中了节点（doc ${docId} node ${raw}）但它没有有效地址（疑似文档根/异常节点）；改用 address 定位。`);
+  }
+  return resolvedAddress;
 }
 
 async function readSourceBlame(database, docId, address, options = {}) {
@@ -1085,7 +1109,10 @@ export function dbShellHelp() {
     '  db inspect <doc_id> <address> [--sections meta,source,links,axioms,note] [--limit N] [--uuid]  (节点/文档档案：身份+元信息/出处/引用/事实)',
     '  db article <doc_id> [address] [--node-id <uuid>] [--start <offset>] [--before N] [--limit N] [--spans] [--spans-limit N] [--json]  (导入原件原文窗口，按字符偏移)',
     '  db log <doc_id> [--limit N]',
-    '  db diff <doc_id> <history_id> | <doc_id> <from_history_id> <to_history_id>',
+    '  db diff <doc_id> <history_id> | <doc_id> <from_history_id> <to_history_id>  (两版历史)',
+    '  db diff --branch <id> | --base <doc_id>  (草稿↔正文；无参时用 switch 选中草稿；原 db changes --detail 已并入)',
+    '  db diff [doc_id] --from <ref> --to <ref>  (refA↔refB；ref ∈ head · <commitId> · draft[:branchId])',
+    '    diff 通用：[--detail summary|full]（默认 full 逐行，summary 出节点+计数）[--json]（结构化输出）',
     '  db sql <SELECT_or_WITH_sql> [--limit N]',
     '  db ask_agent <prompt> [--doc-id <doc_id>] [--session-id <id>]',
     '  db edit <database_write_action> [json_payload] [--owner <owner>] [--base <doc_id>]',
@@ -1101,30 +1128,30 @@ export function dbShellHelp() {
     '  db import <library_relative_path> [--mode simple|complete|direct|smart|vector]',
     '  db import-json <json_file> <source_file> [--dry-run] [--allow-gaps] [--vectors]  (智能导入 4-3-3：校验节点树 JSON 并入库；JSON 与 db push 同契约)',
     '  db vectors <doc_id>',
-    '  db forget <doc_id>',
+    '  db delete <doc_id>',
     '  db relink <doc_id> <source_path>  (重绑 doc 的源文件路径；锚改名/迁移后用，只改绑定不动正文)',
     '  db memory list [--state active|sealed|distillable|distilled] [--agent <name>] [--session-id <id>] [--limit N]',
     '  db memory deliver <json_payload|json_file>  (事件卷投递 18-8-4；payload: {agent,sessionId,hostAnchor?,title?,startedAt?,endedAt?,nodes:[...]}，节点一律 trust_level=不受控)',
-    '  db memory seal-due  (物理封卷到期卷：末次活动+24h，15-10-1)',
-    '  db memory mark-distilled <doc_id> [--force]  (提炼状态标记 15-11-5；force=用户明确指示跳过冷却期)',
-    '  db changes [doc_id] [--detail] [--branch <id> | --base <doc_id>] [--owner <owner>]',
-    '  db discard --branch <id> | --base <doc_id> [--owner <owner>] [--yes]',
+    '  db memory distill <doc_id> [--force]  (提炼状态标记 15-11-5；封卷已自动化、列卷顺手封；force=用户明确指示跳过冷却期)',
+    '  db draft new <doc_id> [--owner <owner>]  (起草)',
+    '  db draft list [doc_id] [--owner <owner>]  (列草稿及署名；原 db branch list / db changes 已并入)',
+    '  db discard --branch <id> | --base <doc_id> [--owner <owner>] [--yes]  (弃稿；原 db branch drop 已并入)',
     '  db undo --branch <id> | --base <doc_id> [--owner <owner>]',
     '  db redo --branch <id> | --base <doc_id> [--owner <owner>]',
-    '  db branch list [doc_id] [--owner <owner>]',
-    '  db branch begin <doc_id> [--owner <owner>]',
-    '  db branch diff [doc_id] | --branch <id> | --base <doc_id> [--owner <owner>]',
-    '  db branch merge [doc_id] | --branch <id> | --base <doc_id> [--owner <owner>] --all [--yes]',
-    '  db branch drop [doc_id] | --branch <id> | --base <doc_id> [--owner <owner>] [--yes]',
     '  db switch --branch <id> | --base <doc_id> [--owner <owner>]',
     '  db commit --branch <id> | --base <doc_id> [--owner <owner>] [--summary text] [--tag text]',
-    '  db merge --branch <id> | --base <doc_id> [--owner <owner>] [--yes]',
+    '  db merge --branch <id> | --base <doc_id> [--owner <owner>] [--strategy ours|theirs] [--resolutions <json>] [--yes]  (调和落正文；原 db branch merge --all 已并入)',
     '  db rebase --branch <id> | --base <doc_id> [--owner <owner>]',
     '  db cherry-pick --history <id> | --source-branch <id> [--target-branch <id> | --target-base <doc_id>] [--entry-index N]',
     '  db shell [--cwd workspace|library|path] [--timeout-ms N] [--] <command>',
     '  db web search <query> [--limit N]',
     '  db web open <url> [--char-limit N]',
-    '  db keyword/query ... (compat aliases for db find)'
+    '  db keyword/query ... (compat aliases for db find)',
+    '',
+    '# 进阶：admin_override 工具（绕过 db，直接调底层只读查询 API）',
+    '  常规检索/读取一律用上面的 db 命令；仅当 db 满足不了时，才用 admin_override 工具传 {action, 参数}。',
+    '  常用 action：content.search（searchMode=vector 语义 / keyword 子串）、content.searchKeyword（terms 多词 AND）、content.searchAll（跨文档）、content.getNode/getSubtree/getIndex（读正文/结构）、history.*/node.*/debug.sql。',
+    '  db 命令本质就是这些 action 的封装（已替你注入 docId、设默认、格式化输出），所以优先用 db。'
   ].join('\n');
 }
 
@@ -1293,7 +1320,9 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     if (positionalAddress && flags.from && positionalAddress !== String(flags.from).trim()) {
       throw new Error('db tree address and --from must match when both are provided');
     }
-    const address = String(flags.from || positionalAddress || '').trim();
+    let address = String(flags.from || positionalAddress || '').trim();
+    // --node-id（兼容入口，优先于 address/--from）：按节点稳定 UUID 解析成当前 address 再展开。
+    if (flags.nodeId !== undefined) address = await resolveNodeAddress(database, docId, address, flags.nodeId);
     if (flags.at) {
       return { kind: 'db_tree', text: await treeHistorySnapshot(database, docId, address, flags) };
     }
@@ -1313,9 +1342,10 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
 
   if (command === 'read') {
     const { flags, positional } = parseFlags(args.slice(1));
-    const address = String(positional[1] || '').trim();
-    if (!positional[0] || !address) throw new Error('db read requires <doc_id> <address>');
+    if (!positional[0]) throw new Error('db read requires <doc_id>');
     const docId = await resolveDocRef(database, positional[0]);
+    const address = await resolveNodeAddress(database, docId, positional[1], flags.nodeId);
+    if (!address) throw new Error('db read requires <address> 或 --node-id <uuid>');
     if (flags.at) {
       return {
         kind: 'db_read_at',
@@ -1350,9 +1380,10 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
 
   if (command === 'inspect') {
     const { flags, positional } = parseFlags(args.slice(1));
-    const address = String(positional[1] || '').trim();
-    if (!positional[0] || !address) throw new Error('db inspect requires <doc_id> <address>');
+    if (!positional[0]) throw new Error('db inspect requires <doc_id>');
     const docId = await resolveDocRef(database, positional[0]);
+    const address = await resolveNodeAddress(database, docId, positional[1], flags.nodeId);
+    if (!address) throw new Error('db inspect requires <address> 或 --node-id <uuid>');
     const sections = [];
     const rawSections = typeof flags.sections === 'string' ? flags.sections : '';
     for (const name of rawSections.split(',').map((part) => part.trim()).filter(Boolean)) {
@@ -1385,7 +1416,9 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const { flags, positional } = parseFlags(args.slice(1));
     if (!positional[0]) throw new Error('db log requires doc_id');
     const docId = await resolveDocRef(database, positional[0]);
-    const address = positional[1] ? String(positional[1]) : null;
+    let address = positional[1] ? String(positional[1]) : null;
+    // --node-id（兼容入口）：按节点稳定 UUID 解析成当前 address，走节点级 log。
+    if (flags.nodeId !== undefined) address = await resolveNodeAddress(database, docId, address || '', flags.nodeId);
     if (address) {
       // 节点级 log（git log <path>）：某地址的节点（--node）或整棵子树（默认）在哪些 commit 被改。
       const scope = flags.node ? 'node' : 'subtree';
@@ -1412,18 +1445,50 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
 
   if (command === 'diff') {
     const { flags, positional } = parseFlags(args.slice(1));
-    if (!positional[0]) throw new Error('db diff requires doc_id');
+    const detail = flags.detail === 'summary' ? 'summary' : 'full';
+    const renderDiff = (result) => (flags.json ? JSON.stringify(result, null, 2) : formatDiffText(result, { detail }));
+    // refA↔refB（15-5-2）：给了 --from/--to 即走通用 diff.refs（ref ∈ head 正文 / <commitId> 历史 / draft[:branchId] 草稿）。
+    if (flags.from !== undefined || flags.to !== undefined) {
+      const docId = positional[0] ? await resolveDocRef(database, positional[0]) : null;
+      const selectedRef = selectedBranch(context);
+      const draftRef = () => ({
+        branchId: flags.branch ?? selectedRef.branchId ?? undefined,
+        baseDocId: flags.base ?? selectedRef.baseDocId ?? undefined,
+        owner: flags.owner ? String(flags.owner) : (selectedRef.owner || 'human')
+      });
+      const headRef = { head: true, docId };
+      const fromGiven = flags.from !== undefined;
+      const toGiven = flags.to !== undefined;
+      const payload = {
+        action: 'diff.refs',
+        from: fromGiven ? parseDiffRef(flags.from, { docId, draftRef }) : headRef,
+        // 只给 --from（如某历史↔当前正文）时，对端默认落正文 head 而非草稿——否则未选草稿会误报“草稿未找到”。
+        to: toGiven ? parseDiffRef(flags.to, { docId, draftRef }) : (fromGiven ? headRef : draftRef())
+      };
+      if (docId) payload.docId = docId;
+      const result = await database.run({ operation: 'read', payload }, 'read');
+      return { kind: 'db_diff', text: renderDiff(result) };
+    }
+    // 草稿↔正文：显式 --branch/--base，或无 doc 位置参时回退 switch 选中草稿（原 db changes --detail / db branch diff 已并入）。
+    const selected = selectedBranch(context);
+    if (flags.branch || flags.base || (!positional[0] && (selected.branchId || selected.baseDocId))) {
+      const target = branchTarget(flags, context);
+      if (!target.branchId && !target.baseDocId) throw new Error('db diff 需要 doc_id + history（两版历史），或 --branch/--base（草稿↔正文），或 --from/--to（任意 ref），或先 switch 到一个草稿');
+      const payload = { action: 'editBranch.diffView', changedOnly: true };
+      applyBranchTarget(payload, target);
+      const result = await database.run({ operation: 'read', payload }, 'read');
+      return { kind: 'db_diff', text: renderDiff(result) };
+    }
+    // 两版历史（位置参：doc_id [from_history] to_history）
+    if (!positional[0]) throw new Error('db diff 需要 doc_id + history（两版历史），或 --branch/--base（草稿↔正文），或 --from/--to（任意 ref），或先 switch 到一个草稿');
     const docId = await resolveDocRef(database, positional[0]);
-    const fromHistoryId = flags.from || positional[1] || '';
-    const toHistoryId = flags.to || positional[2] || positional[1] || '';
+    const fromHistoryId = positional[1] && positional[2] ? positional[1] : '';
+    const toHistoryId = positional[2] || positional[1] || '';
     if (!toHistoryId) throw new Error('db diff requires history id');
     const payload = { action: 'history.diff', docId, toHistoryId };
     if (fromHistoryId && fromHistoryId !== toHistoryId) payload.fromHistoryId = fromHistoryId;
     const result = await database.run({ operation: 'read', payload }, 'read');
-    return {
-      kind: 'db_diff',
-      text: (result.entries || []).map(formatDiffEntry).join('\n')
-    };
+    return { kind: 'db_diff', text: renderDiff(result) };
   }
 
   if (command === 'sql') {
@@ -1552,19 +1617,19 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     return { kind: 'db_vectors', text: JSON.stringify(result, null, 2) };
   }
 
-  if (command === 'forget') {
+  if (command === 'delete') {
     const { positional } = parseFlags(args.slice(1));
     const docId = normalizeShellDocId(positional[0], null);
-    if (!docId) throw new Error('db forget requires doc_id');
+    if (!docId) throw new Error('db delete requires doc_id');
     if (typeof context.deleteImportedDocument === 'function') {
       const result = await context.deleteImportedDocument({ docId });
-      return { kind: 'db_forget', text: JSON.stringify(result, null, 2) };
+      return { kind: 'db_delete', text: JSON.stringify(result, null, 2) };
     }
     const result = await database.run({
       operation: 'write',
       payload: { action: 'doc.delete', docId }
     }, 'write');
-    return { kind: 'db_forget', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_delete', text: JSON.stringify(result, null, 2) };
   }
 
   if (command === 'relink') {
@@ -1606,24 +1671,20 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       const result = await database.run({ operation: 'write', payload: { ...payload, action: 'memory.deliverVolume' } }, 'write');
       return { kind: 'db_memory_deliver', text: JSON.stringify(result, null, 2) };
     }
-    if (sub === 'seal-due') {
-      const result = await database.run({ operation: 'write', payload: { action: 'memory.sealDue' } }, 'write');
-      return { kind: 'db_memory_seal', text: JSON.stringify(result, null, 2) };
-    }
-    if (sub === 'mark-distilled') {
+    if (sub === 'distill') {
       const { flags, positional } = parseFlags(args.slice(2));
       const docId = normalizeShellDocId(positional[0], null);
-      if (!docId) throw new Error('db memory mark-distilled requires <doc_id>');
+      if (!docId) throw new Error('db memory distill requires <doc_id>');
       const result = await database.run({
         operation: 'write',
         payload: { action: 'memory.markDistilled', docId, force: flags.force === true }
       }, 'write');
       return { kind: 'db_memory_distilled', text: JSON.stringify(result, null, 2) };
     }
-    throw new Error('db memory list|deliver|seal-due|mark-distilled');
+    throw new Error('db memory list|deliver|distill（封卷已自动化、列卷顺手封，无 seal-due 命令）');
   }
 
-  if (command === 'branch') {
+  if (command === 'draft') {
     const { flags, positional } = parseFlags(args.slice(1));
     const subcommand = String(positional[0] || 'list').trim();
     if (subcommand === 'list') {
@@ -1634,81 +1695,17 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       const branches = (result.branches || []).filter((branch) => (
         docId ? String(branch.base_doc_id) === String(docId) : true
       ));
-      return { kind: 'db_branch_list', text: branches.map(formatBranchLine).join('\n') };
+      return { kind: 'db_draft_list', text: branches.map(formatBranchLine).join('\n') || '(无草稿)' };
     }
-    if (subcommand === 'begin') {
+    if (subcommand === 'new') {
       const docId = normalizeShellDocId(positional[1], null);
-      if (!docId) throw new Error('db branch begin requires doc_id');
+      if (!docId) throw new Error('db draft new requires doc_id');
       const payload = { action: 'editBranch.begin', docId, includeDoc: false };
       if (flags.owner) payload.owner = String(flags.owner);
       const result = await database.run({ operation: 'write', payload }, 'write');
-      return { kind: 'db_branch_begin', text: JSON.stringify(result, null, 2) };
+      return { kind: 'db_draft_new', text: JSON.stringify(result, null, 2) };
     }
-    if (subcommand === 'diff') {
-      const target = branchTarget(flags, context, positional[1]);
-      const payload = { action: 'editBranch.diffView', changedOnly: true };
-      if (target.branchId) payload.branchId = target.branchId;
-      if (target.baseDocId) payload.baseDocId = target.baseDocId;
-      if (target.owner) payload.owner = String(target.owner);
-      const result = await database.run({ operation: 'read', payload }, 'read');
-      return { kind: 'db_branch_diff', text: JSON.stringify(result, null, 2) };
-    }
-    if (subcommand === 'merge') {
-      if (!flags.all) return { kind: 'db_branch_merge', text: 'db branch merge requires --all; --entry is not implemented' };
-      const target = branchTarget(flags, context, positional[1]);
-      if (!target.branchId && !target.baseDocId) throw new Error('db branch merge requires --branch or --base');
-      if (!flags.yes) {
-        return {
-          kind: 'db_branch_merge',
-          text: `would merge ${branchTargetLabel(target)}; rerun with --yes to apply`
-        };
-      }
-      const payload = { action: 'editBranch.save', includeDoc: false };
-      if (target.branchId) payload.branchId = target.branchId;
-      if (target.baseDocId) payload.baseDocId = target.baseDocId;
-      if (target.owner) payload.owner = String(target.owner);
-      const result = await database.run({ operation: 'write', payload }, 'write');
-      return { kind: 'db_branch_merge', text: JSON.stringify(result, null, 2) };
-    }
-    if (subcommand === 'drop') {
-      const target = branchTarget(flags, context, positional[1]);
-      if (!target.branchId && !target.baseDocId) throw new Error('db branch drop requires --branch or --base');
-      if (!flags.yes) {
-        return {
-          kind: 'db_branch_drop',
-          text: `would drop ${branchTargetLabel(target)}; rerun with --yes to apply`
-        };
-      }
-      const payload = { action: 'editBranch.discard', includeDoc: false };
-      if (target.branchId) payload.branchId = target.branchId;
-      if (target.baseDocId) payload.baseDocId = target.baseDocId;
-      if (target.owner) payload.owner = String(target.owner);
-      const result = await database.run({ operation: 'write', payload }, 'write');
-      return { kind: 'db_branch_drop', text: JSON.stringify(result, null, 2) };
-    }
-    throw new Error(`Unknown db branch command: ${subcommand}`);
-  }
-
-  if (command === 'changes') {
-    const { flags, positional } = parseFlags(args.slice(1));
-    if (flags.detail) {
-      const target = branchTarget(flags, context, positional[0]);
-      const payload = { action: 'editBranch.diffView', changedOnly: true };
-      if (target.branchId) payload.branchId = target.branchId;
-      if (target.baseDocId) payload.baseDocId = target.baseDocId;
-      if (target.owner) payload.owner = String(target.owner);
-      if (!payload.branchId && !payload.baseDocId) throw new Error('db changes --detail requires --branch or --base');
-      const result = await database.run({ operation: 'read', payload }, 'read');
-      return { kind: 'db_changes', text: JSON.stringify(result, null, 2) };
-    }
-    const docId = normalizeShellDocId(positional[0], null);
-    const payload = { action: 'editBranch.listPending' };
-    if (flags.owner) payload.owner = String(flags.owner);
-    const result = await database.run({ operation: 'read', payload }, 'read');
-    const branches = (result.branches || []).filter((branch) => (
-      docId ? String(branch.base_doc_id) === String(docId) : true
-    ));
-    return { kind: 'db_changes', text: branches.map(formatBranchLine).join('\n') };
+    throw new Error(`Unknown db draft command: ${subcommand}（对比走 db diff、弃稿走 db discard、落正文走 db commit/merge）`);
   }
 
   if (command === 'discard') {
@@ -1722,9 +1719,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       };
     }
     const payload = { action: 'editBranch.discard', includeDoc: false };
-    if (target.branchId) payload.branchId = target.branchId;
-    if (target.baseDocId) payload.baseDocId = target.baseDocId;
-    if (target.owner) payload.owner = String(target.owner);
+    applyBranchTarget(payload, target);
     const result = await database.run({ operation: 'write', payload }, 'write');
     return { kind: 'db_discard', text: JSON.stringify(result, null, 2) };
   }
@@ -1736,9 +1731,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       action: command === 'undo' ? 'editBranch.undo' : 'editBranch.redo',
       includeDoc: false
     };
-    if (target.branchId) payload.branchId = target.branchId;
-    if (target.baseDocId) payload.baseDocId = target.baseDocId;
-    if (target.owner) payload.owner = String(target.owner);
+    applyBranchTarget(payload, target);
     if (!payload.branchId && !payload.baseDocId) throw new Error(`db ${command} requires --branch or --base`);
     const result = await database.run({ operation: 'write', payload }, 'write');
     return { kind: command === 'undo' ? 'db_undo' : 'db_redo', text: JSON.stringify(result, null, 2) };
@@ -1748,7 +1741,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const { flags } = parseFlags(args.slice(1));
     if (!flags.branch && !flags.base) {
       const current = selectedBranch(context);
-      return { kind: 'db_switch', text: current.branchId || current.baseDocId ? JSON.stringify(current, null, 2) : '(未选择分支)' };
+      return { kind: 'db_switch', text: current.branchId || current.baseDocId ? JSON.stringify(current, null, 2) : '(未选择草稿)' };
     }
     const next = updateSelectedBranch(context, {
       branchId: flags.branch ?? null,
@@ -1768,12 +1761,20 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         text: `would merge ${branchTargetLabel(target)}; rerun with --yes to apply`
       };
     }
-    const payload = { action: 'editBranch.save', includeDoc: false };
-    if (target.branchId) payload.branchId = target.branchId;
-    if (target.baseDocId) payload.baseDocId = target.baseDocId;
-    if (target.owner) payload.owner = String(target.owner);
+    // commit 不带裁决走 editBranch.save（冲突→待裁清单、不落）；merge 走 applyMerge，可带 strategy/resolutions 折叠字段冲突。
+    const payload = command === 'merge'
+      ? { action: 'editBranch.applyMerge', includeDoc: false }
+      : { action: 'editBranch.save', includeDoc: false };
+    applyBranchTarget(payload, target);
     if (flags.summary && flags.summary !== true) payload.summary = String(flags.summary);
     else if (flags.tag && flags.tag !== true) payload.summary = String(flags.tag);
+    if (command === 'merge') {
+      if (flags.strategy && flags.strategy !== true) payload.strategy = String(flags.strategy);
+      if (flags.resolutions && flags.resolutions !== true) {
+        try { payload.resolutions = JSON.parse(String(flags.resolutions)); }
+        catch { throw new Error('db merge --resolutions 需要合法 JSON 数组，如 [{"id":"<nodeId>","field":"text","pick":"theirs"}]'); }
+      }
+    }
     if (!payload.branchId && !payload.baseDocId) throw new Error(`db ${command} requires --branch or --base`);
     const result = await database.run({ operation: 'write', payload }, 'write');
     return { kind: command === 'commit' ? 'db_commit' : 'db_merge', text: JSON.stringify(result, null, 2) };
@@ -1783,9 +1784,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const { flags } = parseFlags(args.slice(1));
     const target = branchTarget(flags, context);
     const payload = { action: 'editBranch.rebase', includeDoc: false };
-    if (target.branchId) payload.branchId = target.branchId;
-    if (target.baseDocId) payload.baseDocId = target.baseDocId;
-    if (target.owner) payload.owner = String(target.owner);
+    applyBranchTarget(payload, target);
     if (!payload.branchId && !payload.baseDocId) throw new Error('db rebase requires --branch or --base');
     const result = await database.run({ operation: 'write', payload }, 'write');
     return { kind: 'db_rebase', text: JSON.stringify(result, null, 2) };

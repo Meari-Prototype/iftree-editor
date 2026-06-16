@@ -1,9 +1,10 @@
+import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { formatDiffText, diffShortRef, diffOneLine } from '../../src/backend/diff-text.mjs';
 
-// formatDiffText 渲染纯函数，不碰 DB，可直接 node --test（不受 better-sqlite3 ABI 限制）。
+// formatDiffText 渲染纯函数，不碰 DB；但本项目统一用 electron 跑测试、禁用 node（见 ../_assert-electron.mjs）。
 // 它此前内嵌在 scripts/mcp-server.mjs 里无法单测，导致下面这个回归长期无人发现：
 // 跨 commit diff 走 computeSnapshotDiff 产出 field-diff 形态（无 kind，靠 node_id/field/old/new），
 // 而旧渲染器只认 op-log 形态（kind/address/fields），整组 field-diff 被打成「· ? ?」。

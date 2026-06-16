@@ -1,9 +1,10 @@
+import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { computeSnapshotDiff } from '../../src/backend/db/snapshot-history.mjs';
 
-// computeSnapshotDiff 是纯函数，可直接 node --test。覆盖三类比对：节点、公理、引用。
+// computeSnapshotDiff 是纯函数；但本项目统一用 electron 跑测试、禁用 node（见 ../_assert-electron.mjs）。覆盖三类比对：节点、公理、引用。
 // 历史回归：曾只比 nodes，快照里现成的 axioms/refs 没比，跨 commit 看不到公理/引用变更。
 
 const node = (id, over = {}) => ({
@@ -25,6 +26,27 @@ test('节点：新增 / 删除 / 改字段', () => {
   assert.ok(e.some((x) => x.node_id === 'a' && x.field === 'text' && x.old === 't-a' && x.new === 't-a2'));
   assert.ok(e.some((x) => x.node_id === 'c' && x.field === '*' && x.old === null));
   assert.ok(e.some((x) => x.node_id === 'b' && x.field === '*' && x.new === null));
+});
+
+test('节点：换父 / 同父调序记 __moved__，兄弟增删的连带重排不误报', () => {
+  // 换父（reparent）：a 从 p1 移到 p2，意图明确无歧义 → __moved__
+  const reA = { nodes: [node('p1', { sort_order: 1 }), node('p2', { sort_order: 2 }), node('a', { parent_id: 'p1', sort_order: 1 })] };
+  const reB = { nodes: [node('p1', { sort_order: 1 }), node('p2', { sort_order: 2 }), node('a', { parent_id: 'p2', sort_order: 1 })] };
+  const reparent = computeSnapshotDiff(reA, reB);
+  assert.ok(reparent.some((x) => x.node_id === 'a' && x.field === '__moved__'));
+
+  // 同父调序 + 子集不变：x/y 交换 sort_order → 两条 __moved__
+  const soA = { nodes: [node('p', { sort_order: 1 }), node('x', { parent_id: 'p', sort_order: 1 }), node('y', { parent_id: 'p', sort_order: 2 })] };
+  const soB = { nodes: [node('p', { sort_order: 1 }), node('x', { parent_id: 'p', sort_order: 2 }), node('y', { parent_id: 'p', sort_order: 1 })] };
+  const reorder = computeSnapshotDiff(soA, soB);
+  assert.ok(reorder.some((x) => x.node_id === 'x' && x.field === '__moved__'));
+  assert.ok(reorder.some((x) => x.node_id === 'y' && x.field === '__moved__'));
+
+  // 同父调序但兄弟新增（子集变了）：连带重排，不报 __moved__（避免头插一个就把后面全刷成移）
+  const coA = { nodes: [node('p', { sort_order: 1 }), node('x', { parent_id: 'p', sort_order: 1 })] };
+  const coB = { nodes: [node('p', { sort_order: 1 }), node('z', { parent_id: 'p', sort_order: 1 }), node('x', { parent_id: 'p', sort_order: 2 })] };
+  const collateral = computeSnapshotDiff(coA, coB);
+  assert.ok(!collateral.some((x) => x.field === '__moved__'), '兄弟增删连带重排不应误报为移动');
 });
 
 test('公理：新增 / 删除 / 改内容（对齐编辑分支比对字段）', () => {

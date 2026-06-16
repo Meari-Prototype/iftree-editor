@@ -1,3 +1,4 @@
+import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -29,7 +30,7 @@ test('db edit records set, insert, and delete entries on a real edit branch and 
     const deleteResult = await editDelete(dbPath, docId, '1-1-6-3-1', owner);
     assert.equal(deleteResult.changed, true);
 
-    const changes = stdoutOf(await runBashDb(dbPath, ['changes', docId, '--owner', owner]));
+    const changes = stdoutOf(await runBashDb(dbPath, ['draft', 'list', docId, '--owner', owner]));
     assert.match(changes, new RegExp(`doc:${docId}\\s+owner:${owner}\\s+改:1\\s+增:2\\s+删:1`));
 
     const badField = await runBashDb(dbPath, [

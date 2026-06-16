@@ -1,3 +1,5 @@
+import './_assert-electron.mjs';
+
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';

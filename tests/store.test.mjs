@@ -1,3 +1,5 @@
+import './_assert-electron.mjs';
+
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -380,7 +382,32 @@ test('deletes a document and its document-scoped records', async () => {
   });
 });
 
-test('splits a node into parent text plus child sentence nodes', async () => {
+test('splits a node by Chinese punctuation into parent text plus child sentence nodes', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'Demo', rootText: 'Root' });
+    const node = store.insertNode({
+      docId: doc.id,
+      parentId: doc.rootNodeId,
+      text: '第一句。第二句！第三句？'
+    });
+    const existingChild = store.insertNode({ docId: doc.id, parentId: node.id, text: '已有孩子。' });
+
+    const ok = store.splitNodeIntoChildren(node.id);
+    const loaded = store.getDoc(doc.id);
+    const split = loaded.tree.children[0];
+
+    assert.equal(ok, true);
+    assert.equal(split.text, '第一句。');
+    assert.equal(split.children.length, 3);
+    assert.equal(split.children[0].text, '第二句！');
+    assert.equal(split.children[0].address, '1-1-1');
+    assert.equal(split.children[1].text, '第三句？');
+    assert.equal(split.children[2].id, existingChild.id);
+    assert.equal(split.children[2].address, '1-1-3');
+  });
+});
+
+test('splitNodeIntoChildren can opt in to ASCII punctuation splitting', async () => {
   await withStore(async (store) => {
     const doc = store.createDoc({ title: 'Demo', rootText: 'Root' });
     const node = store.insertNode({
@@ -388,20 +415,16 @@ test('splits a node into parent text plus child sentence nodes', async () => {
       parentId: doc.rootNodeId,
       text: 'First sentence. Second sentence! Third sentence?'
     });
-    const existingChild = store.insertNode({ docId: doc.id, parentId: node.id, text: 'Existing child.' });
 
-    const ok = store.splitNodeIntoChildren(node.id);
+    const ok = store.splitNodeIntoChildren(node.id, { splitAsciiPunctuation: true });
     const loaded = store.getDoc(doc.id);
     const split = loaded.tree.children[0];
 
     assert.equal(ok, true);
     assert.equal(split.text, 'First sentence.');
-    assert.equal(split.children.length, 3);
+    assert.equal(split.children.length, 2);
     assert.equal(split.children[0].text, 'Second sentence!');
-    assert.equal(split.children[0].address, '1-1-1');
     assert.equal(split.children[1].text, 'Third sentence?');
-    assert.equal(split.children[2].id, existingChild.id);
-    assert.equal(split.children[2].address, '1-1-3');
   });
 });
 

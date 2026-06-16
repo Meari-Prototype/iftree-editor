@@ -256,7 +256,7 @@ export function agentToolNameText(name) {
   if (name === 'propose_ref_delete') return '删除引用待审';
   if (name === 'propose_source_bind_path') return '绑定路径待审';
   if (name === 'workspace_file') return '工作区文件';
-  if (name === 'database_read') return '数据库读取';
+  if (name === 'admin_override') return '管理员直查';
   if (name === 'database_write') return '数据库写入';
   if (name === 'web_search') return '联网搜索';
   return name || '工具调用';

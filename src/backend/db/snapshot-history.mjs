@@ -17,7 +17,7 @@ function describeSnapshotRef(ref, addressById) {
 // 两个快照的字段级差异。快照存了 nodes/axioms/refs（store.createSnapshot），三者都比：
 // 节点逐字段、公理逐字段、引用纯增删。实体（术语库）不在快照、也不归文档 diff 管——
 // 它有自己的变更通道，不从文档 diff 查。entry 统一为 field-diff 形态（无 kind，
-// 靠 node_id/axiom_id/ref_id + field/old/new），由 formatDiffText / formatDiffEntry 渲染。
+// 靠 node_id/axiom_id/ref_id + field/old/new），由 formatDiffText 渲染。
 export function computeSnapshotDiff(prevSnapshot, currentSnapshot) {
   const entries = [];
   const prevById = new Map((prevSnapshot.nodes || []).map((node) => [node.id, node]));
@@ -31,7 +31,30 @@ export function computeSnapshotDiff(prevSnapshot, currentSnapshot) {
     'trust_level'
   ];
 
-  // 节点：按稳定 id 配对，新增 old=null、删除 new=null、改字段逐项。
+  // 同父子集（按稳定 id）：把「主动调序」和「兄弟增删的连带重排」分开。纯快照对比拿不到
+  // 操作意图，但有个判据——insert/delete 必然改变父下子集，主动调序不会。故同父 sort_order
+  // 变化只有在「该父子集前后不变」时才认作移动，否则是连带、不报，避免在列表头插一个节点
+  // 就把后面所有兄弟刷成「移」的噪声。
+  const childSetByParent = (nodes) => {
+    const map = new Map();
+    for (const node of nodes || []) {
+      const key = node.parent_id == null ? 'root' : String(node.parent_id);
+      if (!map.has(key)) map.set(key, new Set());
+      map.get(key).add(String(node.id));
+    }
+    return map;
+  };
+  const prevKids = childSetByParent(prevSnapshot.nodes);
+  const currKids = childSetByParent(currentSnapshot.nodes);
+  const sameSiblingSet = (parentKey) => {
+    const a = prevKids.get(parentKey);
+    const b = currKids.get(parentKey);
+    if (!a || !b || a.size !== b.size) return false;
+    for (const x of a) if (!b.has(x)) return false;
+    return true;
+  };
+
+  // 节点：按稳定 id 配对，新增 old=null、删除 new=null、改字段逐项、位置（父/序）变化记一条 __moved__。
   for (const [id, curr] of currById) {
     const prev = prevById.get(id);
     if (!prev) {
@@ -42,6 +65,14 @@ export function computeSnapshotDiff(prevSnapshot, currentSnapshot) {
       if (curr[field] !== prev[field]) {
         entries.push({ node_id: id, field, old: prev[field], new: curr[field] });
       }
+    }
+    const prevParent = prev.parent_id == null ? 'root' : String(prev.parent_id);
+    const currParent = curr.parent_id == null ? 'root' : String(curr.parent_id);
+    const moved = prevParent !== currParent
+      ? true // 换父（reparent/promote）：意图明确，无连带歧义。
+      : Number(prev.sort_order) !== Number(curr.sort_order) && sameSiblingSet(currParent);
+    if (moved) {
+      entries.push({ node_id: id, field: '__moved__', address: curr.address ?? null, old: prev.address ?? null, new: curr.address ?? null });
     }
   }
   for (const [id, prev] of prevById) {

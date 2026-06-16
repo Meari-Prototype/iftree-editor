@@ -1,4 +1,4 @@
-// edit branch 暂存变更的紧凑状态行（git status 语义）。MCP（changes/branch list）与
+// edit branch 暂存变更的紧凑状态行（git status 语义）。MCP（draft list / diff）与
 // CLI（db-shell）共用——此前两处逐字重复、只数笼统的 active/undone，不分改/增/删。
 // diff.entries 是 op-log 形态（kind: node.insert/delete/update/move...），按 kind 归类计数。
 

@@ -1480,8 +1480,8 @@ export function createAgentRuntime(deps = {}) {
       {
         type: 'function',
         function: {
-          name: 'database_read',
-          description: '统一只读查询 API。找文档先用 library.index 按 library 文件夹层级定位 docId；单文档读内容用 content.getNode/content.getSubtree/content.getDepth/content.getArticle/content.search；跨文档查正文用 content.searchAll；查结构用 content.getIndex。tree/index 字数说明：meta.textChars 是节点自有正文长度；meta.subtreeTextChars 和 ASCII (xxx) 是整棵子树合计。',
+          name: 'admin_override',
+          description: '进阶只读查询（高级/底层入口，绕过 db 直接调原始 action）。常规检索与读取请优先用 bash 的 db 命令（db find --semantic / db read / db index 等，已替你组装参数、注入当前文档、格式化输出）；仅当 db 命令满足不了时，才用本工具按 action 直调底层只读 API。可用 action 与参数用法见 `db help`。',
           parameters: databaseReadToolSchema()
         }
       }
@@ -1623,9 +1623,9 @@ export function createAgentRuntime(deps = {}) {
     assertNotAborted(signal);
     const permissions = agentPermissionsForMode(mode);
     if (name === 'search_manifest' || name === 'fetch_content') {
-      return { rejected: true, reason: '内容查询已统一到 database_read；请使用 content.* actions。' };
+      return { rejected: true, reason: '内容查询请用 bash 的 db 命令（db find/read/index…）；进阶可用 admin_override 工具。' };
     }
-    if (name === 'database_read') return database().run({ operation: 'read', payload: args }, 'read');
+    if (name === 'admin_override') return database().run({ operation: 'read', payload: args }, 'read');
     if (name === 'bash') return agentBash(args, permissions, context, signal);
     if (name === 'workspace_file') return agentWorkspaceFile(args, permissions);
     if (name === 'web_search') return agentWebSearch(args, { signal });
@@ -1718,7 +1718,8 @@ export function createAgentRuntime(deps = {}) {
       }, {
         fetchers: deps.fetchers?.(),
         signal: options.signal,
-        errorPrefix: 'Agent API 请求失败'
+        errorPrefix: 'Agent API 请求失败',
+        timeoutMs: Math.max(1000, Number(process.env.IFTREE_AGENT_TIMEOUT_MS) || 45000)
       });
       if (!response.ok) {
         const detail = await response.text().catch(() => '');
@@ -1749,7 +1750,9 @@ export function createAgentRuntime(deps = {}) {
     }, {
       fetchers: deps.fetchers?.(),
       signal: options.signal,
-      errorPrefix: 'Agent API 请求失败'
+      errorPrefix: 'Agent API 请求失败',
+      // 本地慢模型（如 ollama 小模型）单轮可能远超默认 45s；用 IFTREE_AGENT_TIMEOUT_MS 调大，默认仍 45s。
+      timeoutMs: Math.max(1000, Number(process.env.IFTREE_AGENT_TIMEOUT_MS) || 45000)
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => '');

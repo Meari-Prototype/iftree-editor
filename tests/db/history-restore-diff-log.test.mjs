@@ -1,3 +1,4 @@
+import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -27,8 +28,8 @@ test('db log, diff, read --at, and restore address committed history', { timeout
     assert.match(logText, new RegExp(`commit:${commitRef}.*DBT_HISTORY_APPLY`));
 
     const diffText = stdoutOf(await runBashDb(dbPath, ['diff', docId, commitRef]));
-    assert.match(diffText, /node.update/);
-    assert.match(diffText, /"old":"DBT_DIFF_MODIFY 的原始正文是 old-diff-text/);
+    assert.match(diffText, /改/);
+    assert.match(diffText, /old-diff-text/);
 
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1', '--at', commitRef])), modifyChangedText);
 

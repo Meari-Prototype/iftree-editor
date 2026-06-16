@@ -1,21 +1,30 @@
 import { FlatTree, isFlatTree } from './flat-tree.mjs';
 import { toTreeNode } from './node-model.mjs';
 
-const SENTENCE_PATTERN = /([^。？！.!?\r\n]+[。？！.!?]?)/g;
+// 句末标点字符片段：中文版只认全角 。？！；mixed 版再并入 ASCII 的 .!?。
+// 两个正则由同一片段拼出，避免字符类重复且保证 .source 与手写版逐字节一致。
+const CHINESE_PUNCT = '。？！';
+const MIXED_PUNCT = `${CHINESE_PUNCT}.!?`;
+const sentencePattern = (punct) => new RegExp(`([^${punct}\\r\\n]+[${punct}]?)`, 'g');
+const CHINESE_SENTENCE_PATTERN = sentencePattern(CHINESE_PUNCT);
+const MIXED_SENTENCE_PATTERN = sentencePattern(MIXED_PUNCT);
 
 export { NODE_TYPES } from './node-model.mjs';
 
-export function splitSentences(text) {
+export function splitSentences(text, options = {}) {
   if (!text || !text.trim()) return [];
 
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const sentences = [];
+  const pattern = options.splitAsciiPunctuation === true
+    ? MIXED_SENTENCE_PATTERN
+    : CHINESE_SENTENCE_PATTERN;
 
   for (const line of normalized.split('\n')) {
     const trimmedLine = line.trim();
     if (!trimmedLine) continue;
 
-    const matches = [...trimmedLine.matchAll(SENTENCE_PATTERN)].map((match) => match[1].trim());
+    const matches = [...trimmedLine.matchAll(pattern)].map((match) => match[1].trim());
     if (matches.length === 0) {
       sentences.push(trimmedLine);
       continue;

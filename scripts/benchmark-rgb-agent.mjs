@@ -11,9 +11,9 @@ function printHelp() {
   console.log([
     'Usage:',
     '  $env:ELECTRON_RUN_AS_NODE = \'1\'',
-    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 32 --testcard <path> --ids 5-10',
-    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 32 --testcard <path> --limit 20 --offset 0',
-    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 32 --testcard <path> --all',
+    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --ids 5-10',
+    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --limit 20 --offset 0',
+    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --all',
     '',
     'Options:',
     '  --doc-id <id>          Imported corpus doc id.',
@@ -59,7 +59,7 @@ function parseArgs(argv = []) {
     }
     const next = argv[i + 1];
     if (arg === '--doc-id') {
-      options.docId = Number(next);
+      options.docId = String(next || '').trim();
       i += 1;
       continue;
     }
@@ -90,7 +90,7 @@ function parseArgs(argv = []) {
     }
     throw new Error(`Unknown argument: ${arg}`);
   }
-  if (!Number.isInteger(options.docId) || options.docId <= 0) {
+  if (!options.docId) {
     throw new Error('--doc-id is required');
   }
   if (!options.testcard) {
@@ -204,16 +204,16 @@ function toolActionSummary(toolEvents = []) {
   const actions = [];
   let bodyRead = false;
   for (const tool of toolEvents || []) {
-    if (tool?.name === 'database_read' && tool.argsPreview) {
+    if (tool?.name === 'admin_override' && tool.argsPreview) {
       try {
         const args = JSON.parse(tool.argsPreview);
         const action = String(args.action || '');
-        actions.push(action || 'database_read');
+        actions.push(action || 'admin_override');
         if (['content.getNode', 'content.getSubtree', 'content.getArticle'].includes(action)) {
           bodyRead = true;
         }
       } catch {
-        actions.push('database_read:parse_failed');
+        actions.push('admin_override:parse_failed');
       }
       continue;
     }

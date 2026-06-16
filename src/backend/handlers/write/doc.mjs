@@ -145,7 +145,8 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
       baseDocId: payload.baseDocId ?? payload.base_doc_id ?? null,
       owner: payload.owner,
       summary: payload.summary ?? '三方合并',
-      resolutions: payload.resolutions ?? null
+      resolutions: payload.resolutions ?? null,
+      strategy: payload.strategy ?? null
     });
     if (result.applied && result.changed) {
       // 保存离场只押主数据落库（8-3-2-2）：BM25 按本次受影响节点增量更新（4-6-2），
