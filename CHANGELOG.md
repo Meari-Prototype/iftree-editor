@@ -2,6 +2,27 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.4.1 — 2026-06-18
+
+### 修复
+
+- **关键词检索召回不再被截断**：keyword 命中召回从 FTS top-200 候选改为 Aho-Corasick 全量字面扫描——字面命中全量不漏，截断只发生在展示层；FTS / BM25 退为只对已召回结果排序，不再充当召回器。旧实现下单个常见词就可能命中数千节点、被 top-200 候选窗悄悄截断，多词 AND 因此漏召回。展示条数上限由 100 放宽到 1000，新增 `rankLimit` 调节参与 BM25 排序的候选规模（只影响长尾排序精度、不影响召回完整性）；`searchKeyword` 的 `matchMode` 契约对齐为 `doc` / `node` / `or`。
+- **内置 agent 检索自污染修复**：内置问答 agent 此前把每轮对话自动落成无锚记忆卷、污染跨库检索空间，导致召回掺入自身历史。现内置 agent 不再逐轮自落卷（本地持久化仍在）；跨库 / 全库检索默认排除 `.` 开头隐藏路径（如 `.memory`），`includeHidden` / `kind=event` 显式纳回；内置 agent 默认只检索当前文档，非用户要求不跨库。
+- **信任边界收口**：edit / full 档的分支 stage 与 commit 重放一律拒绝 `trust_level`，标受控只经 human `certify`，堵住 llm 经 MCP 直传受控绕过人审的路径。
+- **`debug.sql` 截断判断去假阳性**：改用 `limit+1` 探针判断结果是否被截断。
+
+### 新增
+
+- **full / yolo 档动词层**：`certify`（human 按节点 / 子树标受控或撤销，作为 owner=human 提交进历史）、`revert`（反向提交撤销目标 commit 对节点的改动、保留其后历史，冲突交人裁）、`web_search`（full/human 联网只读检索）、`agent` 委托等按档位开放；写动词 `trust` 字段下线，流式写入恒落不受控。
+- **记忆卷投递即建锚**：记忆卷落库即在 `library/.memory/<身份>/<工作区>/<会话>` 建实体锚，建不出即回滚删卷、拒绝无锚卷（非导航文档必有库内实体锚）。
+
+### 工程
+
+- 手写 Aho-Corasick 自动机从 `entities/shared.mjs` 提取为 `src/core/aho-corasick.mjs`（`buildAhoCorasickMatcher`），实体绑定与 keyword 召回共用一份实现；大小写归一化改由各调用方自理。
+- `refs` 增建 source / target 索引。
+- 文档跟进：`docs/reference.md` 补 `certify` / `revert` / `web_search` 动词与 `find` 的 `matchMode` / 隐藏路径默认排除说明。
+- 顶层套件 / 类型闸 / lint 跟上已落契约：记忆卷测试 harness 补建锚能力、edit 分支拒 `trust_level` 用例随 18-3 更新、解构形参补 JSDoc（`check:types` 归零）、删 `IS_FULL_TIER` 死常量。
+
 ## 0.4.0 — 2026-06-17
 
 ### 新增

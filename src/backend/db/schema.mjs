@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS refs (
   note TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_type, target_id);
+
 CREATE TABLE IF NOT EXISTS source_documents (
   doc_id TEXT PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
   source_type TEXT NOT NULL DEFAULT 'md',

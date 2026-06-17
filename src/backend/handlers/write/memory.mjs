@@ -18,6 +18,20 @@ function assertDeliverNodes(items) {
   }
 }
 
+// 15-10-4：记忆卷落库即建库内实体锚；建不出就删掉刚建的卷、拒绝创建无锚卷（无锚即拒）。
+function anchorMemoryVolumeOrRollback(store, ctx, { docId, agent, sessionId, hostAnchor }) {
+  if (typeof ctx?.writeMemoryAnchor !== 'function') {
+    store.deleteDoc(docId);
+    throw new Error('当前写入上下文未提供记忆卷建锚能力，拒绝创建无锚卷（projectneed 15-10-4）。');
+  }
+  try {
+    ctx.writeMemoryAnchor({ docId, agent, sessionId, hostAnchor });
+  } catch (error) {
+    store.deleteDoc(docId);
+    throw new Error(`记忆卷建锚失败、已回滚（projectneed 15-10-4 非导航文档必有库内实体锚）：${error?.message || error}`);
+  }
+}
+
 // 完整记忆动词（projectneed 15-10 / 15-11-5 / 18-8-4）。
 // deliverVolume = 建卷 + 流式写入一步完成：投递语义就是新建一个文档（15-10-1），
 // 节点写入复用 stream.push 同一条链（FTS/向量增量随行），不设第二套机制（15-10-2）。
@@ -40,6 +54,12 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
       hostAnchor: payload.hostAnchor ?? payload.host_anchor ?? null,
       startedAt: payload.startedAt ?? payload.started_at ?? null,
       endedAt: payload.endedAt ?? payload.ended_at ?? null
+    });
+    anchorMemoryVolumeOrRollback(store, ctx, {
+      docId: created.docId,
+      agent: payload.agent ?? payload.agentId ?? payload.agent_id ?? null,
+      sessionId: payload.sessionId ?? payload.session_id ?? null,
+      hostAnchor: payload.hostAnchor ?? payload.host_anchor ?? null
     });
     const pushed = await handleStreamMutation(store, {
       docId: created.docId,
@@ -83,6 +103,12 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
       });
       docId = created.docId;
       createdVolume = true;
+      anchorMemoryVolumeOrRollback(store, ctx, {
+        docId: created.docId,
+        agent,
+        sessionId,
+        hostAnchor: payload.hostAnchor ?? payload.host_anchor ?? null
+      });
     }
     const pushed = await handleStreamMutation(store, {
       docId,

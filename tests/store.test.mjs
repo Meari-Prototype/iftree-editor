@@ -707,3 +707,99 @@ test('mergeNodeIntoPreviousSibling 蒸发指向被合并节点的引用，前一
     assert.ok(remaining.has(String(intoPrev.id)), '前一兄弟的引用保留');
   });
 });
+
+test('certifyNodes：human 标受控/撤销，受控只许 human，子树批量，幂等不建空 commit', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'Cert', rootText: '根' });
+    const child = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '子节点' });
+    const trustOf = (id) => store.db.prepare('SELECT trust_level FROM nodes WHERE id = ?').get(id)?.trust_level ?? null;
+
+    // 标受控（owner=human）→ 改 trust + 建一次提交
+    const res = store.certifyNodes({ docId: doc.id, nodeId: child.id, scope: 'node', trust: '受控', owner: 'human' });
+    assert.equal(res.changed, true);
+    assert.equal(res.certified, 1);
+    assert.equal(trustOf(child.id), '受控');
+    assert.ok(res.commitId, '背书建了一次提交');
+
+    // 撤销（trust=不受控）
+    const undo = store.certifyNodes({ docId: doc.id, nodeId: child.id, scope: 'node', trust: '不受控', owner: 'human' });
+    assert.equal(undo.changed, true);
+    assert.equal(trustOf(child.id), '不受控');
+
+    // 受控只许 human：owner=llm 拒绝、状态不动
+    assert.throws(() => store.certifyNodes({ docId: doc.id, nodeId: child.id, trust: '受控', owner: 'llm:s1' }), /owner=human/);
+    assert.equal(trustOf(child.id), '不受控');
+
+    // 子树批量：根 subtree 覆盖 root + child
+    const sub = store.certifyNodes({ docId: doc.id, nodeId: doc.rootNodeId, scope: 'subtree', trust: '受控', owner: 'human' });
+    assert.equal(sub.certified, 2);
+    assert.equal(trustOf(doc.rootNodeId), '受控');
+    assert.equal(trustOf(child.id), '受控');
+
+    // 幂等：已是受控再标受控 → 无变更、不建空 commit
+    const again = store.certifyNodes({ docId: doc.id, nodeId: doc.rootNodeId, scope: 'subtree', trust: '受控', owner: 'human' });
+    assert.equal(again.changed, false);
+  });
+});
+
+test('revertCommit：撤销改动、复活被删节点', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'Rev', rootText: '根' });
+    const a = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'A原文' });
+    store.saveHistorySnapshot({ docId: doc.id, summary: 'c1', owner: 'human' });
+    const textOf = (id) => store.db.prepare('SELECT text FROM nodes WHERE id = ?').get(id)?.text ?? null;
+    const exists = (id) => store.db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE id = ?').get(id).c > 0;
+
+    // c2：改 A 正文
+    store.updateNode(a.id, { text: 'A改后' });
+    const c2 = store.saveHistorySnapshot({ docId: doc.id, summary: 'c2', owner: 'human' });
+    assert.equal(textOf(a.id), 'A改后');
+
+    // revert c2 → A 回到原文，建反向提交（不丢历史）
+    const rev = store.revertCommit({ commitId: c2.commit_id, owner: 'human' });
+    assert.equal(rev.changed, true);
+    assert.ok(rev.revertCommitId);
+    assert.equal(textOf(a.id), 'A原文');
+
+    // c3：删 A
+    store.deleteNodeSubtree(a.id);
+    const c3 = store.saveHistorySnapshot({ docId: doc.id, summary: 'c3 删A', owner: 'human' });
+    assert.equal(exists(a.id), false);
+
+    // revert c3 → A 复活（同 id、原文）
+    const rev3 = store.revertCommit({ commitId: c3.commit_id, owner: 'human' });
+    assert.equal(rev3.changed, true);
+    assert.equal(exists(a.id), true, '被删节点复活');
+    assert.equal(textOf(a.id), 'A原文');
+  });
+});
+
+test('revertCommit：撞字段冲突时 blocked、正文不物化', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'RevConflict', rootText: '根' });
+    const a = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'A1' });
+    store.saveHistorySnapshot({ docId: doc.id, summary: 'c1', owner: 'human' });
+    store.updateNode(a.id, { text: 'A2' });
+    const c2 = store.saveHistorySnapshot({ docId: doc.id, summary: 'c2', owner: 'human' });
+    // 当前又把 A 改成第三个值：revert c2（base=A2 / theirs=A1 / ours=A3）两侧改同字段不同值 → 冲突
+    store.updateNode(a.id, { text: 'A3' });
+
+    const rev = store.revertCommit({ commitId: c2.commit_id, owner: 'human' });
+    assert.equal(rev.blocked, true);
+    assert.ok(Array.isArray(rev.conflicts) && rev.conflicts.length > 0);
+    assert.equal(store.db.prepare('SELECT text FROM nodes WHERE id = ?').get(a.id).text, 'A3', 'blocked 时正文不物化');
+  });
+});
+
+test('pushStreamNodes：写动词 trust 下线，传入的受控被忽略、写入恒不受控', async () => {
+  await withStore(async (store) => {
+    // 普通增量文档（非事件卷）：传 trust_level=受控 不再被采纳，也不报错，一律落不受控（18-3）。
+    const res = store.pushStreamNodes({ title: '流式文档', nodes: [
+      { text: '节点A', trust_level: '受控' },
+      { text: '节点B' }
+    ] });
+    const rows = store.db.prepare('SELECT trust_level FROM nodes WHERE doc_id = ? AND parent_id IS NOT NULL').all(res.docId);
+    assert.ok(rows.length >= 2);
+    assert.ok(rows.every((r) => r.trust_level === '不受控'), '传入的受控被忽略，写入恒不受控');
+  });
+});

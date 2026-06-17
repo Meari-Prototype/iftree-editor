@@ -3,6 +3,7 @@ import {
   normalizeStableId,
   sameStableId
 } from '../db/ids.mjs';
+import { buildAhoCorasickMatcher } from '../../core/aho-corasick.mjs';
 
 export function normalizePositiveInteger(value, fallback = null) {
   return normalizeStableId(value, fallback);
@@ -99,60 +100,12 @@ export function countLiteralOccurrences(haystack = '', needle = '') {
   return count;
 }
 
-function trieNode() {
-  return { next: new Map(), fail: 0, outputs: [] };
-}
-
-export function buildLiteralMatcher(patterns = []) {
-  const nodes = [trieNode()];
-  const normalized = patterns
-    .map((pattern) => ({ ...pattern, key: normalizeEntityKey(pattern.key ?? pattern.literal) }))
-    .filter((pattern) => pattern.key);
-
-  for (const pattern of normalized) {
-    let state = 0;
-    for (const char of pattern.key) {
-      if (!nodes[state].next.has(char)) {
-        nodes[state].next.set(char, nodes.length);
-        nodes.push(trieNode());
-      }
-      state = nodes[state].next.get(char);
-    }
-    nodes[state].outputs.push(pattern);
-  }
-
-  const queue = [];
-  for (const nextState of nodes[0].next.values()) queue.push(nextState);
-  while (queue.length > 0) {
-    const state = queue.shift();
-    for (const [char, nextState] of nodes[state].next.entries()) {
-      let fail = nodes[state].fail;
-      while (fail && !nodes[fail].next.has(char)) fail = nodes[fail].fail;
-      nodes[nextState].fail = nodes[fail].next.get(char) ?? 0;
-      nodes[nextState].outputs.push(...nodes[nodes[nextState].fail].outputs);
-      queue.push(nextState);
-    }
-  }
-
-  return {
-    scan(text = '', visit = /** @type {(output: any) => void} */ (() => {})) {
-      const haystack = String(text || '').toLocaleLowerCase();
-      let state = 0;
-      for (const char of haystack) {
-        while (state && !nodes[state].next.has(char)) state = nodes[state].fail;
-        state = nodes[state].next.get(char) ?? 0;
-        for (const output of nodes[state].outputs) visit(output);
-      }
-    }
-  };
-}
-
 export function scanEntityHits(rows = [], entities = []) {
   const totals = new Map();
   const byNode = new Map();
-  const matcher = buildLiteralMatcher(entities.map((entity) => ({
+  const matcher = buildAhoCorasickMatcher(entities.map((entity) => ({
     id: entity.id,
-    literal: entity.literal
+    key: normalizeEntityKey(entity.literal)
   })));
 
   for (const row of rows) {

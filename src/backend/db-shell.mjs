@@ -120,7 +120,7 @@ function parseFlags(argv = []) {
       index += 1;
       continue;
     }
-    if (['tags', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'allow-gaps', 'vectors', 'force', 'labels', 'spans', 'json', 'node', 'at-address'].includes(name)) {
+    if (['tags', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'allow-gaps', 'vectors', 'force', 'labels', 'spans', 'json', 'node', 'at-address', 'include-hidden'].includes(name)) {
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
@@ -1194,7 +1194,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       if (!query) throw new Error('db find --semantic requires natural language text');
       const scope = docScope(flags, context);
       const payload = scope.allDocs
-        ? { action: 'content.searchAll', query, searchMode: 'vector', allDocs: true, limit: flags.limit }
+        ? { action: 'content.searchAll', query, searchMode: 'vector', allDocs: true, limit: flags.limit, includeHidden: flags.includeHidden }
         : { action: 'content.search', query, searchMode: 'vector', docId: scope.docId, limit: flags.limit };
       const result = await database.run({ operation: 'read', payload }, 'read');
       if (result.error) throw new Error(result.error);
@@ -1250,7 +1250,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       payload: {
         action: 'content.searchKeyword',
         terms: positional,
-        matchMode: flags.matchMode || 'and',
+        matchMode: flags.matchMode || 'doc',
         ...scope,
         limit: flags.limit,
         workspace: flags.workspace,
@@ -1261,7 +1261,8 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         until: flags.until,
         folder: flags.folder,
         excludeFolder: flags.excludeFolder,
-        includeLabels: flags.labels
+        includeLabels: flags.labels,
+        includeHidden: flags.includeHidden
       }
     }, 'read');
     const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId, { uuid: flags.uuid });

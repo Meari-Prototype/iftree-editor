@@ -97,15 +97,16 @@ function handleDebugSqlQuery(store, payload = {}) {
   assertReadOnlySqlStatement(store, sql);
   const params = normalizeSqlParams(payload.params);
   const limit = normalizeLimit(payload.limit, 1000, 10000);
+  const probeLimit = limit + 1;
   if (Array.isArray(params)) {
-    const rows = store.db.prepare(`SELECT * FROM (${sql}) LIMIT ?`).all(...params, limit).map(plainRow);
-    return { limit, rowCount: rows.length, truncated: rows.length >= limit, rows };
+    const rows = store.db.prepare(`SELECT * FROM (${sql}) LIMIT ?`).all(...params, probeLimit).map(plainRow);
+    return { limit, rowCount: Math.min(rows.length, limit), truncated: rows.length > limit, rows: rows.slice(0, limit) };
   }
   const rows = store.db.prepare(`SELECT * FROM (${sql}) LIMIT @__iftreeLimit`).all({
     ...params,
-    __iftreeLimit: limit
+    __iftreeLimit: probeLimit
   }).map(plainRow);
-  return { limit, rowCount: rows.length, truncated: rows.length >= limit, rows };
+  return { limit, rowCount: Math.min(rows.length, limit), truncated: rows.length > limit, rows: rows.slice(0, limit) };
 }
 
 export { handleDebugOverviewQuery, handleDebugSqlQuery };

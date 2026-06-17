@@ -242,9 +242,12 @@ export class KeywordStore {
     // 不显式给 limit 时 LanceDB FTS 默认只返回 top 10，会把召回静默截断；放大上限。
     request = request.limit(Math.max(1, Number(limit) || 200));
     const rows = await request.toArray();
+    // 透出 BM25 相关性分（LanceDB FTS `_score`）：keyword 召回由 Aho-Corasick 负责，
+    // 这里只把分数交给上层给召回结果排序用。
     return rows.map((row) => ({
       node_id: String(row.id),
-      doc_id: String(row.doc_id)
+      doc_id: String(row.doc_id),
+      score: Number(row._score) || 0
     })).filter((row) => row.node_id && row.doc_id);
   }
 }

@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.4.0%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.4.1%20alpha-orange)
 
-> **Project status: 0.4.0, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.4.1, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -215,7 +215,7 @@ Sources too irregular for rule-based parsing go through **smart import**: an LLM
 
 ## MCP & External Agents
 
-The MCP server exposes the library to external agent frameworks such as Claude Code and Codex over stdio. The permission tier is locked at launch by the `IFTREE_MCP_TIER` environment variable: `read` (search and read, default), `edit` (+ edit-branch writes, streaming writes, memory delivery), `full` (+ merge, rollback, and other administrative actions).
+The MCP server exposes the library to external agent frameworks such as Claude Code and Codex over stdio. The permission tier is locked at launch by the `IFTREE_MCP_TIER` environment variable: `read` (search and read, default), `edit` (+ edit-branch writes, streaming writes, memory delivery), `full` (+ merge, rollback, and other administrative actions; the writer identity is still llm), and `human` (alias `yolo`; the writer identity is human — approve llm pending branches via merge and mark content as trusted, the only legitimate source of trusted content).
 
 Client configuration example (with the project root as working directory):
 

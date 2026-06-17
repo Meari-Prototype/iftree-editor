@@ -26,7 +26,7 @@
 | `tree` | 查看文档结构：缩进 ASCII 树（地址、类型、标题、子树字数），可限子树与层深 |
 | `read` | 读取某地址正文，默认整棵子树；`scope=node` 只本节点 / `scope=siblings` 同父前中后三条（首末缺位标〈无〉）；`at` 读历史快照（默认按节点身份穿透） |
 | `inspect` | 读某地址的元信息 / 出处 / 引用 / 公理 / 批注（`sections` 选 meta·source·links·axioms·note）；正文用 `read` |
-| `find` | 统一检索：默认多词 AND 字面检索；`semantic=true` 语义检索附 score；`tags=true` 实体同义 / 相关列表；`minScore` 高级过滤（语义按相似度下限默认 0.51、字面按命中次数下限） |
+| `find` | 统一检索：默认多词 AND 字面检索（`matchMode=doc` 文档级 / `node` 节点级 / `or` 任一词）；`semantic=true` 语义检索附 score；`tags=true` 实体同义 / 相关列表；`minScore` 高级过滤（语义按相似度下限默认 0.51、字面按命中次数下限）。跨库检索默认排除 `.` 开头隐藏路径（如 `.memory`），`includeHidden=true` 纳回 |
 | `article` | 读取导入文档的原文窗口（按 docId 从头读，或按 nodeId 读附近） |
 | `log` | 列出文档保存 / commit 历史 |
 | `diff` | 对比草稿↔正文 / 两版历史 / 任意两 ref（`from`/`to`：head·`<commitId>`·draft[:branchId]，refA↔refB）。两正交参数：`detail` 切 summary（节点+改增删移计数）/ full（逐行 old→new，默认）；`json` 切结构化输出。原 changes / changes --detail 并入此态 |
@@ -63,12 +63,15 @@
 | `push` | 流式写入：把消息节点追加进增量编辑文档（每节点必填 `trust_level`） |
 | `bulk` | 海量导入加速会话：begin 异步写 → 多次 push → end；全库降 durability + 独占锁 |
 | `memory_distill` | 标记记忆卷已提炼（提炼=人审地界；原 memory_admin 的 mark_distilled；seal 已自动化、不再设动词） |
+| `revert` | 反向提交：撤销某次已落 commit 的改动、生成反向变更并保留其后历史（区别于 `restore` 的 reset 回滚）；三方调和，撞冲突 blocked 交人裁 |
+| `web_search` | 联网检索（只读）：对齐通用 web_search，带 URL 校验与内网拦截，给 query 返回搜索结果 |
+| `certify`（仅 `human` 档） | 节点级背书：把节点 / 子树标受控——受控内容的唯一合法来源，owner 恒 human 进历史；`scope=node/subtree`、`trust=不受控` 撤销背书；定位给 `nodeId` 或 `address` |
 
 ## db 命令契约
 
 `db` 是给 LLM 用的统一命令面：内置 agent 的 bash 会话直接可用（由产品注入 LLM 工作区），MCP 工具底层走同一实现。动词分组：
 
-- **检索与读取**：`find`、`keyword`、`index`、`tree`、`read`、`inspect`、`article`、`log`、`diff`、`sql`、`memory list`（`query` 是 `db find --semantic` 的兼容别名）
+- **检索与读取**：`find`、`keyword`、`index`、`tree`、`read`、`inspect`、`article`、`log`、`diff`、`sql`、`web_search`（full/human 联网只读）、`memory list`（`query` 是 `db find --semantic` 的兼容别名）
 - **写入**：`edit`、`push`、`import-json`、`set-mode`、`bulk`、`import`、`vectors`、`memory deliver`
 - **草稿**：`draft`、`commit`、`merge`、`switch`、`undo`、`discard`、`rebase`、`cherry-pick`
 - **管理**：`export`、`restore`、`delete`、`vectors`、`set-mode`、`push`、`bulk`

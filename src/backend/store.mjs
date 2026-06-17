@@ -108,6 +108,29 @@ function assertNoHumanTagField(source, context = 'node patch') {
   }
 }
 
+function assertNoEditTrustField(source, context = 'node patch') {
+  if (hasOwnValue(source, 'trust_level', 'trustLevel', 'trust')) {
+    throw new Error(`${context} no longer supports trust_level; use human certify to set trust_level`);
+  }
+}
+
+/** @param {any} [entry] edit-branch diff entry（kind/patch/fields 形态随动作而异） */
+function editBranchEntryTouchesTrust(entry = {}) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.kind === 'node.update') {
+    if (hasOwnValue(entry.patch, 'trust_level', 'trustLevel', 'trust')) return true;
+    return Array.isArray(entry.fields) && entry.fields.some((field) => (
+      field && ['trust_level', 'trustLevel', 'trust'].includes(String(field.field || ''))
+    ));
+  }
+  if (entry.kind === 'node.insert') {
+    if (!hasOwnValue(entry.fields, 'trust_level', 'trustLevel', 'trust')) return false;
+    const value = entry.fields?.trust_level ?? entry.fields?.trustLevel ?? entry.fields?.trust;
+    return value !== null && value !== undefined && value !== '';
+  }
+  return false;
+}
+
 function mapOldId(map, value) {
   if (value === null || value === undefined || value === '') return value;
   return map.get(String(value)) ?? value;
@@ -629,6 +652,7 @@ export class IftreeStore {
     this.ensureColumn('axioms','node_size_mode', "TEXT NOT NULL DEFAULT 'auto'");
     this.normalizeExistingSizeModes('axioms');
     this.ensureNodeStructureIndexes();
+    this.ensureRefsIndexes();
     if (addressColumnsChanged || this.hasMissingNodeAddresses()) this.refreshAllAddresses();
     this.removeRootAxiomRefs();
     this.normalizeExistingDocFolderNames();
@@ -1341,6 +1365,15 @@ export class IftreeStore {
     } catch { /* table may not exist yet */ }
   }
 
+  ensureRefsIndexes() {
+    try {
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_type, source_id);
+        CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_type, target_id);
+      `);
+    } catch { /* table may not exist yet */ }
+  }
+
   hasMissingNodeAddresses() {
     try {
       const row = this.db.prepare(`
@@ -1726,12 +1759,31 @@ export class IftreeStore {
     });
   }
 
+  // 为记忆卷写库内实体锚的 source 记录（projectneed 15-10-4：非导航文档必有库内实体锚）。
+  // original_path 指向 .memory 下的 symlink/占位文件；raw_markdown 留空（正文在 nodes）。
+  setMemoryAnchorSource(docId, originalPath, sourceType = 'memory-anchor') {
+    if (!docId || !originalPath) throw new Error('setMemoryAnchorSource requires docId and originalPath');
+    return this.withTransaction(() => {
+      this.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
+      this.db.prepare(`
+        INSERT INTO source_documents (doc_id, source_type, original_path, raw_markdown)
+        VALUES (?, ?, ?, ?)
+      `).run(docId, sourceType, originalPath, '');
+      return true;
+    });
+  }
+
   deleteDoc(docId) {
     const doc = this.db.prepare('SELECT id, meta FROM docs WHERE id = ?').get(docId);
     if (!doc) return false;
     // 完整记忆永不删除（projectneed 15-10）：由结构保证而非纪律。
+    // 但「永不删除」保的是有合法实体锚的卷；无实体锚的记忆卷属非法残留
+    // （违反 3-5/15-10-4「非导航文档必有库内实体锚」），允许清除。
     if (memoryVolumeMetaOf(doc.meta)) {
-      throw new Error(`记忆卷不可删除（完整记忆永不删除，projectneed 15-10）：${docId}`);
+      const anchored = this.db.prepare('SELECT 1 FROM source_documents WHERE doc_id = ? LIMIT 1').get(docId);
+      if (anchored) {
+        throw new Error(`记忆卷不可删除（完整记忆永不删除，projectneed 15-10）：${docId}`);
+      }
     }
 
     this.withTransaction(() => {
@@ -1793,12 +1845,10 @@ export class IftreeStore {
   // 流式节点标准字段：trust_level 必给（4-16-4），source_position 可选（配合 stream.attachSource
   // 的源文档层，流式文档同样能做句位对照），其余缺省。
   _streamNodeFields(item = {}) {
-    const trustLevel = normalizeNullableText(item.trust_level ?? item.trustLevel ?? null);
-    if (trustLevel !== '受控' && trustLevel !== '不受控') {
-      throw new Error('流式节点必须显式给 trust_level（受控 / 不受控）');
-    }
+    // 写动词写入信任恒为不受控（projectneed 18-3：trust 字段下线，标受控只走 human 档 certify）；
+    // 不再要求/采纳调用方给的 trust_level。事件卷的不受控约束（15-10-3）与此一致。
     return {
-      trustLevel,
+      trustLevel: '不受控',
       nodeType: normalizeNodeType(item.node_type ?? item.nodeType ?? 'TEXT'),
       text: typeof item.text === 'string' ? item.text : '',
       nodeTitle: item.node_title ?? item.nodeTitle ?? '',
@@ -2073,6 +2123,7 @@ export class IftreeStore {
 
   nodePatchForEditBranch(current, patch = {}) {
     assertNoHumanTagField(patch, 'node.update patch');
+    assertNoEditTrustField(patch, 'node.update patch');
     const next = {};
     if (hasOwnValue(patch, 'text')) next.text = patch.text ?? '';
     if (hasOwnValue(patch, 'node_title', 'nodeTitle')) next.node_title = patch.node_title ?? patch.nodeTitle ?? '';
@@ -2084,9 +2135,6 @@ export class IftreeStore {
     }
     if (hasOwnValue(patch, 'node_type', 'nodeType')) {
       next.node_type = normalizeNodeType(patchValue(patch, 'node_type', 'nodeType', current.node_type));
-    }
-    if (hasOwnValue(patch, 'trust_level', 'trustLevel')) {
-      next.trust_level = normalizeNullableText(patchValue(patch, 'trust_level', 'trustLevel', current.trust_level));
     }
     return next;
   }
@@ -2691,6 +2739,7 @@ export class IftreeStore {
   }
 
   stageEditBranchNodeUpdate(branch, payload = {}) {
+    assertNoEditTrustField(payload, 'node.update payload');
     const nodeRef = payload.nodeId ?? payload.node_id;
     if (nodeRef === null || nodeRef === undefined) throw new Error('node.update requires nodeId');
     const before = this._projectedDocForBranch(branch);
@@ -2700,7 +2749,7 @@ export class IftreeStore {
     // nodePatchForEditBranch 按白名单取字段，顶层混入的 nodeId/action/owner 等非字段会被忽略。
     const requestedPatch = this.nodePatchForEditBranch(currentNode, payload.patch ?? payload);
     if (Object.keys(requestedPatch).length === 0) {
-      throw new Error('node.update 需要至少一个可改字段（text / nodeType / nodeTitle / nodeNote / trustLevel / sourcePosition），放在顶层或 patch 内均可');
+      throw new Error('node.update 需要至少一个可改字段（text / nodeType / nodeTitle / nodeNote / sourcePosition），放在顶层或 patch 内均可');
     }
     const patch = {};
     const fields = [];
@@ -2730,6 +2779,7 @@ export class IftreeStore {
 
   stageEditBranchNodeInsert(branch, payload = {}) {
     assertNoHumanTagField(payload, 'node.insert payload');
+    assertNoEditTrustField(payload, 'node.insert payload');
     const docId = normalizePositiveId(branch.base_doc_id);
     const parentRef = payload.parentId ?? payload.parent_id ?? null;
     if (parentRef === null || parentRef === undefined) throw new Error('node.insert requires parentId');
@@ -2739,8 +2789,7 @@ export class IftreeStore {
       node_type: normalizeNodeType(payload.nodeType ?? payload.node_type ?? 'TEXT'),
       node_title: payload.nodeTitle ?? payload.node_title ?? '',
       node_note: payload.nodeNote ?? payload.node_note ?? '',
-      source_position: normalizeSourcePosition(payload.sourcePosition ?? payload.source_position ?? null),
-      trust_level: normalizeNullableText(payload.trustLevel ?? payload.trust_level ?? null)
+      source_position: normalizeSourcePosition(payload.sourcePosition ?? payload.source_position ?? null)
     };
     const freshBranch = this._appendEditBranchEntry(branch, {
       kind: 'node.insert',
@@ -3188,8 +3237,8 @@ export class IftreeStore {
             nodeTitle: fields.node_title ?? fields.nodeTitle ?? '',
             nodeNote: fields.node_note ?? fields.nodeNote ?? '',
             sourcePosition: fields.source_position ?? null,
-            // stage 侧（stageEditBranchNodeInsert）一直保留 trust_level，重放漏传会让
-            // 分支里声明的信任级别在落主干时静默归 null（实际翻过车：31 条「受控」全丢）。
+            // 兼容旧 diff / 历史摘取里已经存在的 trust_level 字段；新的 edit branch
+            // stage 与 commit 入口不再接受 trust_level，标受控只走 human certify。
             trustLevel: fields.trust_level ?? fields.trustLevel ?? null
           });
           if (entry.tmp_id) nodeIdByTmp.set(entry.tmp_id, inserted.id);
@@ -3648,6 +3697,9 @@ export class IftreeStore {
   // 返回 touchedNodeIds/deletedNodeIds 供派生索引按受影响节点增量同步（4-6-2）。
   _commitEditBranchPayload(branch, rawPayload = {}, summary = '保存编辑分支') {
     const entries = activeEditBranchEntries(rawPayload.entries);
+    if (entries.some(editBranchEntryTouchesTrust)) {
+      throw new Error('edit branch diff no longer supports trust_level; use human certify to set trust_level');
+    }
     const payload = { ...rawPayload, entries };
     const hasEffectiveDiff = entries.length > 0;
 
@@ -5493,6 +5545,56 @@ export class IftreeStore {
     });
   }
 
+  // human 节点级背书（projectneed 18-3）：把节点或整棵子树标受控/撤销，作为一次 owner=human 提交进历史。
+  // trust_level ∈ content_hash（A5-2），改 trust 即改指纹，saveHistorySnapshot 的 computeDiff 据此把变更写进 commit；
+  // 受控只允许 owner=human（后端档位校验，对应 18-3 写动词 trust 下线、堵 llm 绕过 MCP 直传受控）。
+  /** @param {{ docId?: any, nodeId?: any, address?: any, scope?: string, trust?: string, owner?: string }} [args] */
+  certifyNodes({ docId, nodeId = null, address = null, scope = 'subtree', trust = '受控', owner = 'human' } = {}) {
+    const normalizedDocId = requireStableId(docId, 'certify docId');
+    if (trust !== '受控' && trust !== '不受控') throw new Error(`certify trust 只能是 受控/不受控，收到：${trust}`);
+    if (trust === '受控' && owner !== 'human') throw new Error('标受控只允许 owner=human（18-3）');
+    return this.withTransaction(() => {
+      let targetId = null;
+      if (nodeId != null && String(nodeId).length > 0) {
+        targetId = String(requireStableId(nodeId, 'certify nodeId'));
+      } else if (address != null && String(address).length > 0) {
+        const row = this.db.prepare('SELECT id FROM nodes WHERE doc_id = ? AND address = ?').get(normalizedDocId, String(address));
+        if (!row) throw new Error(`certify 找不到地址 ${address} 的节点`);
+        targetId = String(row.id);
+      } else {
+        throw new Error('certify 需要 nodeId 或 address');
+      }
+      const ids = scope === 'node'
+        ? [targetId]
+        : this.db.prepare(`
+            WITH RECURSIVE subtree(id) AS (
+              SELECT id FROM nodes WHERE id = ? AND doc_id = ?
+              UNION ALL
+              SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+            )
+            SELECT id FROM subtree
+          `).all(targetId, normalizedDocId).map((row) => String(row.id));
+      // 只改 trust 与目标不同的节点（NULL 视为不受控），避免无变更的空 commit。
+      const update = this.db.prepare(`
+        UPDATE nodes SET trust_level = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND doc_id = ? AND COALESCE(trust_level, '不受控') <> ?
+      `);
+      const touchedNodeIds = [];
+      for (const id of ids) {
+        if (update.run(trust, id, normalizedDocId, trust).changes > 0) touchedNodeIds.push(id);
+      }
+      if (touchedNodeIds.length === 0) {
+        return { changed: false, docId: normalizedDocId, certified: 0, trust, touchedNodeIds: [] };
+      }
+      const history = this.saveHistorySnapshot({
+        docId: normalizedDocId,
+        summary: trust === '受控' ? '认证·标受控' : '撤销认证·标不受控',
+        owner
+      });
+      return { changed: true, docId: normalizedDocId, certified: touchedNodeIds.length, trust, touchedNodeIds, commitId: history.commit_id };
+    });
+  }
+
   computeDiff(prevSnapshot, currentSnapshot) {
     return computeSnapshotDiff(prevSnapshot, currentSnapshot);
   }
@@ -5507,6 +5609,90 @@ export class IftreeStore {
     }
     this.restoreSnapshot(commit.doc_id, snapshot);
     return true;
+  }
+
+  // 反向提交（projectneed 15-5-3 revert）：撤销目标 commit 对 nodes 的改动、保留其后历史，建一个新 commit
+  // （不丢历史，区别于 restore 的 reset 式回滚）。三方调和 base=目标 commit / ours=当前主干 / theirs=目标的父：
+  // 只 C 改过而当前未再动的取父侧（撤销），当前在 C 之后又改的保留；C 删过的节点经 added-theirs 复活。
+  // 撞冲突（两侧改同字段、或结构性删改）一律 blocked、交人裁、不自动解。v1 聚焦 nodes：axioms 取当前侧不单独反撤，refs 跟随存活节点。
+  /** @param {{ commitId?: any, owner?: string, summary?: any }} [args] */
+  revertCommit({ commitId, owner = 'human', summary = null } = {}) {
+    const normalizedCommitId = requireStableId(commitId, 'revert commitId');
+    return this.withTransaction(() => {
+      const target = this.db.prepare('SELECT id, doc_id, parent_commit_id, snapshot, summary FROM commits WHERE id = ?').get(normalizedCommitId);
+      if (!target) throw new Error(`revert 找不到 commit ${commitId}`);
+      if (!target.parent_commit_id) throw new Error('revert 不能撤销初始提交（无父提交）');
+      const parentRow = this.db.prepare('SELECT snapshot FROM commits WHERE id = ?').get(target.parent_commit_id);
+      if (!parentRow) throw new Error('revert 找不到父提交快照');
+      const docId = target.doc_id;
+      const baseSnap = JSON.parse(target.snapshot || '{}');
+      const parentSnap = JSON.parse(parentRow.snapshot || '{}');
+      const currentSnap = this.createSnapshot(docId);
+
+      const merge = classifyThreeWayMerge(baseSnap.nodes || [], currentSnap.nodes || [], parentSnap.nodes || []);
+      if (merge.hasConflicts) {
+        return { changed: false, blocked: true, docId, commitId: normalizedCommitId, conflicts: merge.conflicts };
+      }
+
+      // 按 resolution 构造撤销后的目标 nodes：取当前侧 / 父侧 / 合并值；deleted 跳过。address/depth 由 restoreSnapshot 重算，只需 parent_id + sort_order + 内容正确。
+      const oursById = new Map((currentSnap.nodes || []).map((n) => [String(n.id), n]));
+      const theirsById = new Map((parentSnap.nodes || []).map((n) => [String(n.id), n]));
+      const targetNodes = [];
+      for (const entry of merge.nodes) {
+        const id = String(entry.id);
+        if (entry.resolution === 'deleted') continue;
+        if (entry.resolution === 'theirs' || entry.resolution === 'added-theirs') {
+          const row = theirsById.get(id);
+          if (row) targetNodes.push({ ...row });
+        } else if (entry.resolution === 'merged') {
+          // 合并值覆盖当前侧行（entry.merged 只含 classifyThreeWayMerge 调和过的字段，无冲突——冲突已在上面整体 blocked）。
+          const row = { ...(oursById.get(id) || theirsById.get(id) || {}) };
+          for (const [field, value] of Object.entries(entry.merged || {})) row[field] = value;
+          targetNodes.push(row);
+        } else {
+          // ours / unchanged / added-ours / added-converged / 兜底：取当前侧，保留 C 之后的改动。
+          const row = oursById.get(id) || theirsById.get(id);
+          if (row) targetNodes.push({ ...row });
+        }
+      }
+
+      // refs 跟随存活节点：父 + 当前并集按 id 去重（当前覆盖父），过滤两端 node 已不在目标集的。
+      const targetNodeIds = new Set(targetNodes.map((n) => String(n.id)));
+      const refById = new Map();
+      for (const ref of [...(parentSnap.refs || []), ...(currentSnap.refs || [])]) refById.set(String(ref.id), ref);
+      const targetRefs = [...refById.values()].filter((ref) => (
+        (ref.source_type !== 'node' || targetNodeIds.has(String(ref.source_id)))
+        && (ref.target_type !== 'node' || targetNodeIds.has(String(ref.target_id)))
+      ));
+
+      this.restoreSnapshot(docId, {
+        doc: currentSnap.doc,
+        sourceDocument: currentSnap.sourceDocument,
+        nodes: targetNodes,
+        axioms: currentSnap.axioms || [],
+        refs: targetRefs
+      });
+
+      // 反向提交：parent = 当前 HEAD，保留历史链。
+      const finalSnapshot = this.createSnapshot(docId);
+      const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(docId);
+      const entries = [];
+      if (head?.head_commit_id) {
+        const prevRow = this.db.prepare('SELECT snapshot FROM commits WHERE id = ?').get(head.head_commit_id);
+        const prev = JSON.parse(prevRow?.snapshot || 'null');
+        if (prev?.nodes) entries.push(...this.computeDiff(prev, finalSnapshot));
+      }
+      const shortId = String(normalizedCommitId).slice(0, 8);
+      const commit = this.createCommit({
+        docId,
+        summary: summary || `revert ${shortId}${target.summary ? `（${target.summary}）` : ''}`,
+        diff: { kind: 'diff', entries, snapshot: finalSnapshot, revertedCommitId: normalizedCommitId },
+        snapshot: finalSnapshot,
+        author: owner
+      });
+      const touchedNodeIds = [...new Set(entries.filter((e) => e.node_id).map((e) => String(e.node_id)))];
+      return { changed: true, blocked: false, docId, commitId: normalizedCommitId, revertCommitId: commit.id, touchedNodeIds };
+    });
   }
 
   updateDocAxiomsCollapsed(docId, collapsed) {

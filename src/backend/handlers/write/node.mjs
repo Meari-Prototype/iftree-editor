@@ -10,7 +10,20 @@ import {
   runOptionalEffect
 } from './shared.mjs';
 
+function hasTrustField(source = {}) {
+  return ['trust_level', 'trustLevel', 'trust'].some((key) => (
+    Object.prototype.hasOwnProperty.call(source || {}, key)
+  ));
+}
+
+function assertNoNodeTrustField(source = {}, context = 'node mutation') {
+  if (hasTrustField(source)) {
+    throw new Error(`${context} no longer supports trust_level; use human certify to set trust_level`);
+  }
+}
+
 function nodeInsertPayload(payload = {}) {
+  assertNoNodeTrustField(payload, 'node.insert payload');
   return {
     ...payload,
     docId: payload.docId ?? payload.doc_id,
@@ -39,7 +52,9 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
 
   if (action === 'node.update') {
     const nodeId = requireId(payload, 'nodeId', 'node_id');
+    assertNoNodeTrustField(payload, 'node.update payload');
     const patch = ownPatch(payload);
+    assertNoNodeTrustField(patch, 'node.update patch');
     const node = store.updateNode(nodeId, patch);
     if (Object.prototype.hasOwnProperty.call(patch, 'text')) {
       await runOptionalEffect(effects, 'vector.upsert_node', () => ctx.upsertVectorForNode?.(node));

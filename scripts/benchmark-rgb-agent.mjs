@@ -63,6 +63,11 @@ function parseArgs(argv = []) {
       i += 1;
       continue;
     }
+    if (arg === '--api-id') {
+      options.apiId = String(next || '').trim();
+      i += 1;
+      continue;
+    }
     if (arg === '--ids') {
       options.ids = parseIdList(next);
       i += 1;
@@ -273,7 +278,8 @@ async function runCase(client, item, options) {
       mode: 'qa',
       docId: options.docId,
       contextDepth: options.contextDepth,
-      prompt: item.query
+      prompt: item.query,
+      agentApiId: options.apiId || undefined
     }
   });
   const answer = String(result.answer || '');

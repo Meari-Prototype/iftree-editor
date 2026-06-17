@@ -59,6 +59,8 @@ const ACTIONS = Object.freeze([
   'editorHistory.discard',
   'history.save',
   'history.restore',
+  'history.certify',
+  'history.revert',
   ...ENTITY_WRITE_ACTIONS,
 ]);
 
@@ -100,6 +102,7 @@ export function databaseWriteToolSchema() {
       errorId: STABLE_ID_SCHEMA,
       refId: STABLE_ID_SCHEMA,
       historyId: STABLE_ID_SCHEMA,
+      commitId: STABLE_ID_SCHEMA,
       sourceHistoryId: STABLE_ID_SCHEMA,
       sourceBranchId: { type: 'number' },
       targetBranchId: { type: 'number' },
@@ -119,6 +122,9 @@ export function databaseWriteToolSchema() {
       folderId: { type: 'number' },
       direction: { type: 'string', enum: ['up', 'down'] },
       splitAsciiPunctuation: { type: 'boolean' },
+      trust: { type: 'string', enum: ['受控', '不受控'] },
+      scope: { type: 'string', enum: ['subtree', 'node'] },
+      address: { type: 'string' },
       title: { type: 'string' },
       term: { type: 'string' },
       literal: { type: 'string' },

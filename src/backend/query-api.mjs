@@ -3,6 +3,7 @@ import { listMemoryVolumes, sealDueMemoryVolumes } from './memory-volumes.mjs';
 import { handleDebugOverviewQuery, handleDebugSqlQuery } from './handlers/read/debug.mjs';
 import { ENTITY_READ_ACTIONS, runEntityRead } from './entities/read.mjs';
 import { normalizeStableId } from './db/ids.mjs';
+import { buildAhoCorasickMatcher } from '../core/aho-corasick.mjs';
 
 const ACTIONS = Object.freeze([
   'query.actions',
@@ -75,9 +76,9 @@ function normalizeLimit(value, fallback = 100, max = 1000) {
   return Math.min(max, number);
 }
 
-function pageRows(rows = [], offset = 0, limit = 100) {
+function pageRows(rows = [], offset = 0, limit = 100, maxLimit = 100) {
   const safeOffset = normalizeNonNegativeInteger(offset, 0);
-  const safeLimit = normalizeLimit(limit, 100, 100);
+  const safeLimit = normalizeLimit(limit, Math.min(100, maxLimit), maxLimit);
   const total = rows.length;
   const page = rows.slice(safeOffset, safeOffset + safeLimit);
   return {
@@ -914,7 +915,7 @@ function queryContentArticle(store, payload = {}) {
   return response;
 }
 
-function keywordWhereSql(payload = {}, terms = []) {
+function keywordWhereSql(payload = {}, terms = [], options = {}) {
   const clauses = [];
   const params = [];
   const docId = normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
@@ -929,15 +930,22 @@ function keywordWhereSql(payload = {}, terms = []) {
     clauses.push('(n.address = ? OR n.address LIKE ? ESCAPE \'\\\')');
     params.push(scopeAddress, `${escapeLike(scopeAddress)}-%`);
   }
+  const termClauses = [];
+  const termParams = [];
   for (const term of terms) {
     const like = `%${escapeLike(term)}%`;
-    clauses.push(`(
+    termClauses.push(`(
       n.address LIKE ? ESCAPE '\\'
       OR n.node_title LIKE ? ESCAPE '\\'
       OR n.text LIKE ? ESCAPE '\\'
       OR n.node_note LIKE ? ESCAPE '\\'
     )`);
-    params.push(like, like, like, like);
+    termParams.push(like, like, like, like);
+  }
+  if (termClauses.length > 0) {
+    const joiner = options.termOperator === 'or' ? '\n      OR ' : '\n      AND ';
+    clauses.push(`(${termClauses.join(joiner)})`);
+    params.push(...termParams);
   }
   return {
     sql: clauses.length ? clauses.join('\n      AND ') : '1 = 1',
@@ -979,14 +987,6 @@ function countLiteralOccurrences(haystack = '', needle = '') {
 function keywordHitCount(row = {}, terms = []) {
   const haystack = keywordHaystack(row);
   return terms.reduce((sum, term) => sum + countLiteralOccurrences(haystack, String(term || '').toLocaleLowerCase()), 0);
-}
-
-function keywordRowMatches(row = {}, terms = [], mode = 'and') {
-  const haystack = keywordHaystack(row);
-  const needles = terms.map((term) => String(term || '').toLocaleLowerCase()).filter(Boolean);
-  if (needles.length === 0) return false;
-  if (mode === 'or') return needles.some((term) => haystack.includes(term));
-  return needles.every((term) => haystack.includes(term));
 }
 
 function parseListFilter(value) {
@@ -1090,6 +1090,33 @@ function resolveFolderDocFilter(store, payload = {}, ctx = {}) {
   return allowed;
 }
 
+// 相对路径是否落在 . 开头的隐藏文件夹下（任一路径段以 . 开头，如 .memory）。
+function docIsUnderHiddenPath(rel) {
+  if (!rel) return false;
+  return String(rel).replace(/\\/g, '/').replace(/^\/+/, '').split('/').some((seg) => seg.startsWith('.'));
+}
+
+// 跨文档检索默认排除 . 开头隐藏路径文档（projectneed 15-7-3，如事件卷锚所在的 .memory）。
+// includeHidden=true 或显式 kind=event 时不排除（"显式传参才看得到"）。返回要排除的 docId 集合；无可排除时 null。
+function resolveHiddenDocExclusion(store, payload = {}, ctx = {}) {
+  if (payload.includeHidden === true || payload.include_hidden === true) return null;
+  const kind = parseListFilter(payload.kind ?? payload.kinds ?? payload.docKind);
+  if (kind && kind.has('event')) return null;
+  const relativePathFor = typeof ctx.libraryRelativePath === 'function' ? ctx.libraryRelativePath : null;
+  if (!relativePathFor) return null;
+  const rows = store.db.prepare(`
+    SELECT d.id AS id, sd.original_path AS original_path
+    FROM docs d
+    LEFT JOIN source_documents sd ON sd.doc_id = d.id
+  `).all();
+  const hidden = new Set();
+  for (const row of rows) {
+    const rel = row.original_path ? relativePathFor(row.original_path) : '';
+    if (docIsUnderHiddenPath(rel)) hidden.add(String(row.id));
+  }
+  return hidden.size ? hidden : null;
+}
+
 function keywordRowInScope(row = {}, payload = {}, docFilter = null) {
   const allDocs = payload.allDocs === true || payload.all_docs === true || payload.scope === 'all';
   const docId = normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
@@ -1172,94 +1199,113 @@ function formatKeywordResultRows(rows = [], terms = [], payload = {}, include = 
   });
 }
 
-function queryContentKeywordSql(store, payload = {}, terms = null) {
-  const normalizedTerms = terms || normalizeKeywordTerms(payload);
-  if (normalizedTerms.length === 0) return { kind: 'content.searchKeyword', terms: normalizedTerms, rows: [] };
-  const limit = normalizeLimit(payload.limit, 100, 100);
-  const offset = normalizeNonNegativeInteger(payload.offset ?? payload.start ?? payload.startOffset ?? payload.start_offset, 0);
-  const include = contentIncludeSet(payload);
-  const { sql, params } = keywordWhereSql(payload, normalizedTerms);
-  const total = Number(store.db.prepare(`
-    SELECT COUNT(*) AS count
+// keyword 召回的候选行（轻量字段，供 Aho-Corasick 扫描与 scope 过滤）。
+// scope（docId / scopeAddress）在 SQL 层缩小；docFilter / trust / 时间窗在 keywordRowInScope 兜底。
+// allDocs 且无 docId 时取全库——keyword 字面召回接受全库扫，AC 扫描是线性的。
+function keywordScanRows(store, payload = {}) {
+  const { sql, params } = keywordWhereSql(payload, [], {});
+  return store.db.prepare(`
+    SELECT n.id, n.doc_id, n.address, n.node_title, n.text, n.node_note, n.trust_level, n.updated_at, n.depth
     FROM nodes n
     JOIN docs d ON d.id = n.doc_id
     WHERE ${sql}
-  `).get(...params)?.count) || 0;
-  const rows = store.db.prepare(`
-    WITH matched AS (
-      SELECT n.*,
-        d.title AS doc_title,
-        CASE
-          WHEN json_extract(d.meta,'$.memoryVolume') IS NOT NULL THEN 'event'
-          WHEN EXISTS (SELECT 1 FROM nodes nn WHERE nn.doc_id = d.id AND nn.trust_level = '受控') THEN 'memory'
-          ELSE 'knowledge'
-        END AS doc_kind
-      FROM nodes n
-      JOIN docs d ON d.id = n.doc_id
-      WHERE ${sql}
-      ORDER BY d.title, n.depth, n.address, n.id
-      LIMIT ? OFFSET ?
-    ),
-    child_counts(parent_id, child_count) AS (
-      SELECT parent_id, COUNT(*)
-      FROM nodes
-      WHERE parent_id IN (SELECT id FROM matched)
-      GROUP BY parent_id
-    )
-    SELECT matched.*,
-      COALESCE(child_counts.child_count, 0) AS child_count
-    FROM matched
-    LEFT JOIN child_counts ON child_counts.parent_id = matched.id
-    ORDER BY matched.doc_title, matched.depth, matched.address, matched.id
-  `).all(...params, limit, offset);
-  return {
-    kind: 'content.searchKeyword',
-    terms: normalizedTerms,
-    matchMode: 'and',
-    returned: rows.length,
-    total,
-    offset,
-    limit,
-    hasMore: offset + rows.length < total,
-    truncated: offset + rows.length < total,
-    rows: formatKeywordResultRows(rows, normalizedTerms, payload, include)
-  };
+  `).all(...params);
+}
+
+// 用 Aho-Corasick 一次扫遍候选行，标出每行命中的词键集合。
+// 全量、不漏、不截断——这是 keyword「字面连续命中」的精确召回（projectneed 14-3-3）。
+function scanKeywordHits(rows = [], termKeys = []) {
+  const matcher = buildAhoCorasickMatcher(termKeys.map((key) => ({ key })));
+  const hitRows = [];
+  for (const row of rows) {
+    const hits = new Set();
+    matcher.scan(keywordHaystack(row), (pattern) => hits.add(pattern.key));
+    if (hits.size > 0) hitRows.push({ row, hits });
+  }
+  return hitRows;
+}
+
+// BM25 相关性分（node_id -> score），仅用于给已召回的命中排序、不参与召回。
+// FTS 不可用时返回 null（排序退化为命中量兜底）。rankLimit 决定参与 BM25 打分的候选规模，
+// 可由调用方显式调大；够不到的长尾由命中量兜底，不影响召回完整性。
+async function keywordBm25Scores(ctx = {}, terms = [], docId = null, rankLimit = 1000) {
+  if (typeof ctx.keywordSearch !== 'function') return null;
+  if (typeof ctx.ensureKeywordIndexReady === 'function') {
+    try {
+      await ctx.ensureKeywordIndexReady({ docId, allDocs: docId == null });
+    } catch { /* 排序信号缺失只让排序退化，召回已由 AC 兜全 */ }
+  }
+  const candidates = await ctx.keywordSearch({ terms, docId, limit: rankLimit });
+  const scores = new Map();
+  for (const candidate of candidates) {
+    const id = String(candidate.node_id || '');
+    if (id && !scores.has(id)) scores.set(id, Number(candidate.score) || 0);
+  }
+  return scores;
+}
+
+// 命中节点排序：BM25 分降序 → 命中词数降序 → 字面命中次数降序 → 地址升序。
+// BM25 缺分（FTS 未覆盖的长尾或索引缺失）按命中量兜底，保证次序稳定确定。
+function compareKeywordHits(left, right, scores, terms) {
+  if (scores) {
+    const leftScore = scores.has(String(left.row.id)) ? scores.get(String(left.row.id)) : -Infinity;
+    const rightScore = scores.has(String(right.row.id)) ? scores.get(String(right.row.id)) : -Infinity;
+    if (leftScore !== rightScore) return rightScore - leftScore;
+  }
+  if (left.hits.size !== right.hits.size) return right.hits.size - left.hits.size;
+  const leftHits = keywordHitCount(left.row, terms);
+  const rightHits = keywordHitCount(right.row, terms);
+  if (leftHits !== rightHits) return rightHits - leftHits;
+  return String(left.row.address || '').localeCompare(String(right.row.address || ''));
 }
 
 async function queryContentKeyword(store, payload = {}, ctx = {}) {
   const terms = normalizeKeywordTerms(payload);
   if (terms.length === 0) return { kind: 'content.searchKeyword', terms, rows: [] };
-  const limit = normalizeLimit(payload.limit, 100, 100);
+  const termKeys = [...new Set(terms.map((term) => term.toLocaleLowerCase()).filter(Boolean))];
+  // 展示条数：max 放宽到 1000，调用方可显式调大（旧实现卡死在 100）。
+  const limit = normalizeLimit(payload.limit, 100, 1000);
   const offset = normalizeNonNegativeInteger(payload.offset ?? payload.start ?? payload.startOffset ?? payload.start_offset, 0);
+  // BM25 排序参与的候选规模：可显式调大；只影响长尾排序精度、不影响召回完整性。
+  const rankLimit = normalizeLimit(payload.rankLimit ?? payload.candidateLimit ?? payload.candidate_limit, 1000, 100000);
   const include = contentIncludeSet(payload);
   const matchMode = normalizeKeywordMatchMode(payload);
   const docFilter = resolveKeywordDocFilter(store, payload, ctx);
-  if (typeof ctx.ensureKeywordIndexReady !== 'function' || typeof ctx.keywordSearch !== 'function') {
-    return queryContentKeywordSql(store, payload, terms);
-  }
-
-  // 入库时已增量维护 FTS（流式 push add / 普通导入 rebuild）。查询不再全量重建：
-  // 只在该 doc 于 keyword store 缺失时分批补建（projectneed 4-16）。
-  await ctx.ensureKeywordIndexReady(payload);
   const docId = payload.allDocs === true || payload.all_docs === true || payload.scope === 'all'
     ? null
     : normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
-  // 统计用：当前范围可检索的文档数（doc 级过滤后允许集 / 单篇=1 / 全库总数）。
+  // 跨文档（allDocs）默认排除 . 开头隐藏路径文档（15-7-3）；单篇显式定位（含定位到隐藏文档）不受限。
+  const hiddenExcluded = docId ? null : resolveHiddenDocExclusion(store, payload, ctx);
+  const rowHidden = (row) => hiddenExcluded != null && hiddenExcluded.has(String(row.doc_id));
+  // 统计用：当前范围可检索的文档数（doc 级过滤 + 隐藏排除后的允许集 / 单篇=1 / 全库总数）。
   // 让 find 返回统计行能把"0 命中"区分成"范围本身就空"还是"范围内没命中"。
   const scopeDocs = docFilter
-    ? docFilter.size
-    : (docId ? 1 : (Number(store.db.prepare('SELECT COUNT(*) AS c FROM docs').get()?.c) || 0));
+    ? [...docFilter].filter((id) => !(hiddenExcluded && hiddenExcluded.has(String(id)))).length
+    : (docId
+        ? 1
+        : Math.max(0, (Number(store.db.prepare('SELECT COUNT(*) AS c FROM docs').get()?.c) || 0) - (hiddenExcluded ? hiddenExcluded.size : 0)));
+
+  // 召回：Aho-Corasick 全量扫范围节点的字面命中（不漏、不截断）；scope/过滤在 JS 兜底。
+  const candidateRows = keywordScanRows(store, payload)
+    .filter((row) => keywordRowInScope(row, payload, docFilter))
+    .filter((row) => !rowHidden(row));
+  const hitRows = scanKeywordHits(candidateRows, termKeys);
+  // 排序信号：BM25（仅排序，不影响召回完整性）。
+  const scores = await keywordBm25Scores(ctx, terms, docId, rankLimit);
 
   if (matchMode === 'or') {
+    // 按词分组：每组是命中该词的全部节点，组内按相关性排序、各自分页。
     const groups = [];
     const seen = new Set();
     const flat = [];
     for (const term of terms) {
-      const candidates = await ctx.keywordSearch({ terms: [term], docId });
-      const rows = keywordRowsByIds(store, candidates.map((candidate) => candidate.node_id))
-        .filter((row) => keywordRowInScope(row, payload, docFilter) && keywordRowMatches(row, [term], 'and'));
-      const page = pageRows(rows, offset, limit);
-      const formatted = formatKeywordResultRows(page.rows, [term], payload, include);
+      const key = term.toLocaleLowerCase();
+      const groupHits = hitRows
+        .filter((entry) => entry.hits.has(key))
+        .sort((left, right) => compareKeywordHits(left, right, scores, terms));
+      const page = pageRows(groupHits, offset, limit, 1000);
+      const fullRows = keywordRowsByIds(store, page.rows.map((entry) => entry.row.id));
+      const formatted = formatKeywordResultRows(fullRows, [term], payload, include);
       groups.push({
         term,
         returned: formatted.length,
@@ -1293,56 +1339,25 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
     };
   }
 
+  let ranked;
   if (matchMode === 'doc') {
-    // 文档级 AND：逐词召回后按 doc 聚合，保留命中「所有词」的文档（词可落在不同节点），
-    // 返回这些文档里命中任一词的节点；同节点共现多词的排前（兼顾高命中与相关性）。
-    const perDocTerms = new Map();
-    const perDocNodes = new Map();
-    for (const term of terms) {
-      const termCandidates = await ctx.keywordSearch({ terms: [term], docId });
-      const termRows = keywordRowsByIds(store, termCandidates.map((candidate) => candidate.node_id))
-        .filter((row) => keywordRowInScope(row, payload, docFilter) && keywordRowMatches(row, [term], 'and'));
-      for (const row of termRows) {
-        const rowDocId = String(row.doc_id);
-        if (!perDocTerms.has(rowDocId)) perDocTerms.set(rowDocId, new Set());
-        perDocTerms.get(rowDocId).add(term);
-        if (!perDocNodes.has(rowDocId)) perDocNodes.set(rowDocId, new Map());
-        const nodeMap = perDocNodes.get(rowDocId);
-        const rowNodeId = String(row.id);
-        if (!nodeMap.has(rowNodeId)) nodeMap.set(rowNodeId, { row, matched: new Set() });
-        nodeMap.get(rowNodeId).matched.add(term);
-      }
+    // 文档级 AND：保留命中「全部词」的文档（词可分散在不同节点），返回这些文档里命中任一词的节点。
+    const perDocKeys = new Map();
+    for (const entry of hitRows) {
+      const rowDocId = String(entry.row.doc_id);
+      if (!perDocKeys.has(rowDocId)) perDocKeys.set(rowDocId, new Set());
+      const keySet = perDocKeys.get(rowDocId);
+      for (const key of entry.hits) keySet.add(key);
     }
-    const ranked = [];
-    for (const [rowDocId, termSet] of perDocTerms) {
-      if (termSet.size < terms.length) continue;
-      for (const entry of perDocNodes.get(rowDocId).values()) {
-        ranked.push(entry);
-      }
-    }
-    ranked.sort((left, right) => right.matched.size - left.matched.size);
-    const page = pageRows(ranked.map((entry) => entry.row), offset, limit);
-    const formatted = formatKeywordResultRows(page.rows, terms, payload, include);
-    return {
-      kind: 'content.searchKeyword',
-      terms,
-      matchMode,
-      scopeDocs,
-      returned: formatted.length,
-      total: page.total,
-      offset: page.offset,
-      limit: page.limit,
-      hasMore: page.hasMore,
-      truncated: page.truncated,
-      rows: formatted
-    };
+    ranked = hitRows.filter((entry) => (perDocKeys.get(String(entry.row.doc_id))?.size || 0) === termKeys.length);
+  } else {
+    // 节点级 AND：节点正文同时含全部词。
+    ranked = hitRows.filter((entry) => entry.hits.size === termKeys.length);
   }
-
-  const candidates = await ctx.keywordSearch({ terms, docId });
-  const rows = keywordRowsByIds(store, candidates.map((candidate) => candidate.node_id))
-    .filter((row) => keywordRowInScope(row, payload, docFilter) && keywordRowMatches(row, terms, 'and'));
-  const page = pageRows(rows, offset, limit);
-  const formatted = formatKeywordResultRows(page.rows, terms, payload, include);
+  ranked.sort((left, right) => compareKeywordHits(left, right, scores, terms));
+  const page = pageRows(ranked, offset, limit, 1000);
+  const fullRows = keywordRowsByIds(store, page.rows.map((entry) => entry.row.id));
+  const formatted = formatKeywordResultRows(fullRows, terms, payload, include);
   return {
     kind: 'content.searchKeyword',
     terms,
@@ -1533,6 +1548,8 @@ async function queryContentSearchAll(store, payload = {}, ctx = {}) {
       ? { kind: 'content.searchAll', format: 'ascii_tree', query, text: '' }
       : { kind: 'content.searchAll', mode: 'keyword', query, rows: [] };
   }
+  // searchAll 是跨文档检索：默认排除 . 开头隐藏路径文档（15-7-3），字面/语义同口径。
+  const hiddenExcluded = resolveHiddenDocExclusion(store, payload, ctx);
   if (mode === 'vector') {
     if (typeof ctx.vectorSearch !== 'function') {
       return { kind: 'content.searchAll', mode, query, rows: [], error: '向量检索入口未接入' };
@@ -1543,10 +1560,11 @@ async function queryContentSearchAll(store, payload = {}, ctx = {}) {
     const byId = new Map(rows.map((row) => [String(row.id), row]));
     const formatted = results.map((result) => {
       const row = byId.get(String(result.node_id));
-      return row ? formatCrossDocSearchRow({ ...row, score: result.score }, {
+      if (!row || (hiddenExcluded && hiddenExcluded.has(String(row.doc_id)))) return null;
+      return formatCrossDocSearchRow({ ...row, score: result.score }, {
         ...payload,
         includeSource: true
-      }, ctx) : null;
+      }, ctx);
     }).filter(Boolean);
     if (contentFormat(payload) === 'ascii_tree') {
       return {
@@ -1569,7 +1587,8 @@ async function queryContentSearchAll(store, payload = {}, ctx = {}) {
     };
   }
   const { rows, truncated } = crossDocSearchRows(store, payload);
-  const results = rows.map((row) => formatCrossDocSearchRow(row, {
+  const visibleRows = hiddenExcluded ? rows.filter((row) => !hiddenExcluded.has(String(row.doc_id))) : rows;
+  const results = visibleRows.map((row) => formatCrossDocSearchRow(row, {
     ...payload,
     includeSource: true
   }, ctx));
@@ -2023,8 +2042,8 @@ export function databaseReadToolSchema() {
       query: { type: 'string', description: 'Query text for content.search/content.searchAll. In keyword mode this is a substring, not multi-term AND.' },
       q: { type: 'string', description: 'Alias for query. In keyword mode this is a substring, not multi-term AND.' },
       keyword: { type: 'string', description: 'Single keyword for content.searchKeyword.' },
-      terms: { type: 'array', items: { type: 'string' }, description: 'Multiple terms for content.searchKeyword; all terms must match inside the selected scope.' },
-      matchMode: { type: 'string', enum: ['and', 'or'], description: 'content.searchKeyword only: and returns nodes matching every term; or returns per-term groups.' },
+      terms: { type: 'array', items: { type: 'string' }, description: 'Multiple terms for content.searchKeyword; all terms must match according to matchMode.' },
+      matchMode: { type: 'string', enum: ['doc', 'node', 'or'], description: 'content.searchKeyword only: doc returns documents where every term appears somewhere in the doc, node returns nodes matching every term, or returns per-term groups.' },
       entityId: STABLE_ID_SCHEMA,
       entityIds: { type: 'array', items: STABLE_ID_SCHEMA },
       docIds: { type: 'array', items: STABLE_ID_SCHEMA },

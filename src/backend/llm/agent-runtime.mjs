@@ -1017,9 +1017,6 @@ const REQUIRED_DEPS = [
   'libraryRelativePathForAgent'
 ];
 
-// 内置 agent 在记忆卷元信息里的身份标识（15-10-1 卷必带 agent 身份）。
-const BUILTIN_AGENT_ID = 'iftree-builtin';
-
 // schema 自述（15-12-5）：接入第一读物，数百 token 的约定说明，不是内容清单。
 // 正文维护在 system_prompt.md 的 memory.schema 段；这里是文件缺失时的回退。
 const MEMORY_SCHEMA_FALLBACK = [
@@ -1686,6 +1683,24 @@ export function createAgentRuntime(deps = {}) {
     const stream = Boolean(requestId);
     const reasoningEffort = normalizeReasoningEffort(options.reasoningEffort, api);
     assertNotAborted(options.signal);
+    // LLM 调试（debug 功能，开关见 headless-agent-host：IFTREE_DEBUG_LOGGING / config.debugLogging）：
+    // 记下每次发给模型的完整请求与模型返回，便于排查上下文拼接与实际输出。
+    const debugModel = api.model || 'deepseek-v4-pro';
+    deps.debugLog?.('llm.request', {
+      model: debugModel,
+      stream,
+      reasoningEffort: reasoningEffort || null,
+      tools: Array.isArray(tools) ? tools.map((tool) => tool?.function?.name).filter(Boolean) : [],
+      messages
+    });
+    const logLlmResponse = (msg) => deps.debugLog?.('llm.response', {
+      model: debugModel,
+      content: String(msg?.content || ''),
+      toolCalls: Array.isArray(msg?.tool_calls)
+        ? msg.tool_calls.map((call) => ({ name: call?.function?.name || '', arguments: call?.function?.arguments || '' }))
+        : [],
+      usage: msg?.usage || null
+    });
     if (llmProtocol(api) === 'anthropic-compatible') {
       const maxTokens = configuredMaxOutputTokens(api);
       if (!maxTokens) {
@@ -1726,7 +1741,9 @@ export function createAgentRuntime(deps = {}) {
         throw new Error(`Agent API 请求失败：${response.status} ${response.statusText}${detail ? ` ${detail.slice(0, 300)}` : ''}`);
       }
       const json = await response.json();
-      return agentMessageFromAnthropic(json, api);
+      const anthropicMessage = agentMessageFromAnthropic(json, api);
+      logLlmResponse(anthropicMessage);
+      return anthropicMessage;
     }
     const body = {
       model: api.model || 'deepseek-v4-pro',
@@ -1781,11 +1798,13 @@ export function createAgentRuntime(deps = {}) {
         }
       }, { signal: options.signal });
       message.tool_calls = message.tool_calls.filter((call) => call?.id || call?.function?.name);
+      logLlmResponse(message);
       return message;
     }
     const json = await response.json();
     const message = json?.choices?.[0]?.message || {};
     message.usage = normalizeAgentUsage(json?.usage, api);
+    logLlmResponse(message);
     return message;
   }
 
@@ -1800,9 +1819,10 @@ export function createAgentRuntime(deps = {}) {
       '',
       '# P1 取数顺序',
       '1. 找文档：优先用 library.index 按 library 文件夹层级定位 docId；它只列已导入文件，默认不显示摘要内容；索引里的字数是子树合计，不是节点自有正文。',
-      '2. 跨文档查正文细节（需要知道具体节点而不仅是文档级别）：使用跨文档正文搜索。',
-      '3. 当前文档查结构：先看默认 treeIndex；节点短就读取单节点，子树大就按范围读取，当前文档找关键词再用单文档搜索。',
-      '4. 需要给人或模型看树结构时请求 ASCII tree；程序继续处理时保留 JSON。',
+      '2. 默认作用域是当前文档：上下文已给出当前文档 docId，检索与读取都先锚定它、每次检索都显式带上该 docId；除非用户明确要求跨文档或全库，否则不得用 all-docs／跨库检索，也不得擅自把作用域偏移到别的文档。',
+      '3. 当前文档查结构：先看默认 treeIndex；节点短就读取单节点，子树大就按范围读取；当前文档找关键词用本文档关键词检索并带上当前 docId。',
+      '4. 仅当用户明确要求跨文档、或已确认当前文档确实查不到时，才显式走跨文档正文搜索；跨文档检索默认不含隐藏系统目录（如 .memory），要纳入须显式声明。',
+      '5. 需要给人或模型看树结构时请求 ASCII tree；程序继续处理时保留 JSON。',
       '',
       '# P2 IF-tree 规则',
       '1. IF-tree 使用稳定地址：1 是根节点，1-3 是 1 的第 3 个子节点，1-3-2 是 1-3 的第 2 个子节点。',
@@ -1846,28 +1866,6 @@ export function createAgentRuntime(deps = {}) {
     ].filter(Boolean).join('\n');
   }
 
-  // 内置自动落卷（15-10-2）：每个对话回合收尾把消息追加进该 session 的记忆卷。
-  // fire-and-forget：落卷是机械记账，不挡回合收尾——done 信号与请求返回都不等它，
-  // 调用处不 await，错误全在本函数内消化。失败只告警：agent_sessions 仍是原始全量记录，
-  // 缺卷可人工补投。
-  async function recordVolumeTurn(sessionId, turnMessages) {
-    try {
-      const nodes = volumeNodesFromTurnMessages(turnMessages);
-      if (!nodes.length) return;
-      await database().run({
-        operation: 'write',
-        payload: {
-          action: 'memory.appendSessionTurn',
-          agent: BUILTIN_AGENT_ID,
-          sessionId: String(sessionId),
-          hostAnchor: `${getAgentStore()?.dbPath || 'agent.sqlite'}#session=${sessionId}`,
-          nodes
-        }
-      }, 'write');
-    } catch (error) {
-      console.warn('[memory] 内置自动落卷失败：', error?.message || error);
-    }
-  }
 
   async function runAgent(payload = {}) {
     const mode = normalizeAgentMode(payload.mode);
@@ -2032,7 +2030,6 @@ export function createAgentRuntime(deps = {}) {
         changedDocIds: Array.from(changedDocIds)
       }, turnMessages);
       sendAgentStream(requestId, { type: 'done', answer, diffCount: diffs.length, usage });
-      recordVolumeTurn(session.id, turnMessages);
       return { sessionId: session.id, answer, diffs, usage, toolEvents, changedDocIds: Array.from(changedDocIds) };
     } catch (error) {
       if (isAbortError(error)) {
@@ -2063,7 +2060,6 @@ export function createAgentRuntime(deps = {}) {
           toolEvents
         }, turnMessages);
         sendAgentStream(requestId, { type: 'done', answer, diffCount: diffs.length, canceled: true });
-        recordVolumeTurn(session.id, turnMessages);
         return { sessionId: session.id, answer, diffs, toolEvents, canceled: true, changedDocIds: [] };
       }
       const turnMessages = [
@@ -2087,7 +2083,6 @@ export function createAgentRuntime(deps = {}) {
         error: error.message || String(error),
         toolEvents
       }, turnMessages);
-      recordVolumeTurn(session.id, turnMessages);
       throw error;
     } finally {
       if (requestId && activeAgentRequests.get(requestId) === abortController) {

@@ -1,8 +1,13 @@
 import {
+  appendFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
-  statSync
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -120,6 +125,26 @@ export function createHeadlessAgentHost(options = {}) {
       return JSON.parse(readFileSync(configPath, 'utf8')) || {};
     } catch {
       return {};
+    }
+  }
+
+  // LLM 调试日志（debug 功能）：开关同主进程——IFTREE_DEBUG_LOGGING=1 或项目配置 debugLogging=true；
+  // 开启时把 agent 的每次 LLM 请求/响应原文逐行写入 .iftree-debug/agent-<起始时刻>.jsonl，
+  // 便于排查"上下文拼接 / 模型实际输出"。请求 body 不含 api key（key 在 HTTP header，不入日志）。
+  // 日志层异常一律吞掉，绝不影响 agent 运行。
+  const debugSessionStamp = new Date().toISOString().replace(/[:.]/g, '-');
+  function agentDebugLoggingEnabled() {
+    return process.env.IFTREE_DEBUG_LOGGING === '1' || readProjectConfig().debugLogging === true;
+  }
+  function agentDebugLog(event, payload = {}) {
+    if (!agentDebugLoggingEnabled()) return;
+    try {
+      const dir = join(projectRoot, '.iftree-debug');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const line = `${JSON.stringify({ ts: new Date().toISOString(), event, ...payload })}\n`;
+      appendFileSync(join(dir, `agent-${debugSessionStamp}.jsonl`), line);
+    } catch {
+      // debug 日志绝不影响 agent 运行
     }
   }
 
@@ -591,9 +616,48 @@ export function createHeadlessAgentHost(options = {}) {
     return derivedIndexes.readContext();
   }
 
+  function memoryAnchorTargetWorkspace(anchor) {
+    const raw = String(anchor || '');
+    const targetPath = raw.split('#')[0].trim();
+    const matched = targetPath.match(/[\\/]\.claude[\\/]projects[\\/]([^\\/]+)[\\/]/);
+    return { targetPath, workspace: matched ? matched[1] : '' };
+  }
+
+  function sanitizeAnchorSegment(value, fallback) {
+    const text = String(value || '').replace(/[\\/:*?"<>|]+/g, '_').trim();
+    return text || fallback;
+  }
+
+  // 记忆卷库内实体锚（projectneed 15-10-4）：library/.memory/<身份>/<工作区>/<会话>.jsonl
+  // 作 symlink 指向宿主原始记录（jsonl / agent.sqlite，允许悬空）；无可用目标则落真实占位文件，绝不留无锚。
+  // 建链后写 source_documents；任何失败抛出，由调用方回滚删卷（无锚即拒，15-10-4）。
+  /** @param {{ docId?: any, agent?: any, sessionId?: any, hostAnchor?: any }} [args] */
+  function writeMemoryAnchor({ docId, agent, sessionId, hostAnchor } = {}) {
+    if (!docId) throw new Error('writeMemoryAnchor requires docId');
+    const { targetPath, workspace } = memoryAnchorTargetWorkspace(hostAnchor);
+    const dir = join(
+      libraryRoot,
+      '.memory',
+      sanitizeAnchorSegment(agent, 'unknown-agent'),
+      sanitizeAnchorSegment(workspace, '_local')
+    );
+    mkdirSync(dir, { recursive: true });
+    const linkPath = join(dir, `${sanitizeAnchorSegment(sessionId, 'session')}.jsonl`);
+    try {
+      if (lstatSync(linkPath)) rmSync(linkPath, { force: true });
+    } catch {
+      // 锚位不存在即可，直接建
+    }
+    if (targetPath) symlinkSync(targetPath, linkPath, 'file');
+    else writeFileSync(linkPath, '');
+    getDatabase().getStore().setMemoryAnchorSource(docId, linkPath);
+    return linkPath;
+  }
+
   function databaseWriteContext() {
     return {
       refreshDoc,
+      writeMemoryAnchor,
       ...derivedIndexes.writeContext()
     };
   }
@@ -762,7 +826,8 @@ export function createHeadlessAgentHost(options = {}) {
         llmWorkspaceBinPath: () => workspaceBin,
         llmWorkspaceStatus: () => llmWorkspaceState || refreshLlmWorkspaceState(),
         notifyLibraryChanged,
-        updateImportedSourcePaths
+        updateImportedSourcePaths,
+        debugLog: agentDebugLog
       });
     }
     return agentRuntime;

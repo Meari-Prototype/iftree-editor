@@ -6,6 +6,10 @@
 //   其余         → 历史 commit { historyId, docId }
 // draftRef 与 docId 是各前端的上下文（db 外壳与 MCP 各自的选中草稿/当前文档），故以参数注入；
 // 两个前端共用这一份文法，避免各抄一遍、加 ref 种类（如 tag:）时只改一处不致分叉。
+/**
+ * @param {string} raw
+ * @param {{ docId?: any, draftRef?: () => any }} [ctx]
+ */
 export function parseDiffRef(raw, { docId = null, draftRef } = {}) {
   const s = String(raw ?? '').trim();
   const low = s.toLowerCase();
