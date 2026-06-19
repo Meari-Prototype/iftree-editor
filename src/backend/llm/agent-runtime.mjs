@@ -293,7 +293,11 @@ function importLibraryDocumentToolSchema() {
       mode: {
         type: 'string',
         enum: ['simple', 'complete', 'direct', 'smart', 'vector'],
-        description: '默认 simple。simple=格式识别目录结构并切到段落；complete=simple 后切到句子；smart=simple/complete 后由 LLM 整理目录；vector=simple 后建立向量；direct=全文不切直接塞到节点 1。'
+        description: '切分方式，默认 simple。simple=格式识别目录结构并切到段落；complete=simple 后切到句子；smart=simple/complete 后由 LLM 整理目录；vector=按字数切文本块（区别于按句切）；direct=全文不切直接塞到节点 1。建不建向量与切分方式无关，由 embed 决定。'
+      },
+      embed: {
+        type: 'boolean',
+        description: '导入后是否同步建立向量（吃性能）。默认 false=后补；true=当场 embed。与 mode 切分方式正交。'
       }
     },
     required: ['relativePath']

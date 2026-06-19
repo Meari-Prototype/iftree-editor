@@ -6,7 +6,6 @@ import {
   modifyChangedText,
   modifyOriginalText,
   commitSingleTextChange,
-  parseJsonStdout,
   runBashDb,
   stdoutOf,
   withImportedFixture
@@ -43,8 +42,8 @@ test('db log, diff, read --at, and restore address committed history', { timeout
     );
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1'])), modifyOriginalText);
 
-    const restored = parseJsonStdout(await runBashDb(dbPath, ['restore', commitRef]));
-    assert.equal(restored.ok, true);
+    const restored = stdoutOf(await runBashDb(dbPath, ['restore', commitRef]));
+    assert.match(restored, /restore/);
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1'])), modifyChangedText);
 
     const missingLogDoc = await runBashDb(dbPath, ['log'], { expectFailure: true });

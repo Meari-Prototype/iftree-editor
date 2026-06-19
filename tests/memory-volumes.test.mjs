@@ -11,10 +11,12 @@ import { runDatabaseWrite } from '../src/backend/mutation-api.mjs';
 import { runDatabaseRead } from '../src/backend/query-api.mjs';
 import { runDbShellArgv } from '../src/backend/db-shell.mjs';
 import {
+  listMemoryVolumeAnchors,
   listMemoryVolumes,
   markMemoryVolumeDistilled,
   memoryVolumeMetaOf,
   sealDueMemoryVolumes,
+  selectOrphanedMemoryVolumes,
   VOLUME_SEAL_IDLE_MS,
   VOLUME_DISTILL_COOLDOWN_MS
 } from '../src/backend/memory-volumes.mjs';
@@ -207,6 +209,50 @@ test('完整记忆永不删除：deleteDoc 拒绝记忆卷', async () => {
     assert.throws(() => store.deleteDoc(docId), /15-10/);
     const ordinary = store.createDoc({ title: '普通文档' });
     assert.equal(store.deleteDoc(ordinary.id), true);
+  });
+});
+
+test('listMemoryVolumeAnchors：列出每卷及锚路径；无 source 行的脱锚卷也照样列出（LEFT JOIN，扫除可重入）', async () => {
+  await withStore(async (store) => {
+    const a = await runDatabaseWrite(store, deliverPayload({ sessionId: 'sess-A' }), anchorCtx(store));
+    const b = await runDatabaseWrite(store, deliverPayload({ sessionId: 'sess-B' }), anchorCtx(store));
+
+    const before = listMemoryVolumeAnchors(store);
+    assert.equal(before.length, 2);
+    const rowA = before.find((v) => v.docId === a.docId);
+    assert.equal(rowA.anchorPath, `.memory/test/${a.docId}.jsonl`);
+    assert.equal(rowA.sessionId, 'sess-A');
+
+    // 「解锚后未及删卷」的中间态：source 行没了、卷还在。LEFT JOIN 不能漏它，否则永远清不掉。
+    store.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(b.docId);
+    const after = listMemoryVolumeAnchors(store);
+    assert.equal(after.length, 2);
+    assert.equal(after.find((v) => v.docId === b.docId).anchorPath, null);
+  });
+});
+
+test('selectOrphanedMemoryVolumes：锚被删 / 无 source 行→清；锚还在（含悬空 symlink、占位文件）→留', () => {
+  const volumes = [
+    { docId: 1, anchorPath: '.memory/alive.jsonl' },   // 锚文件路径本身还在（含悬空 symlink、占位文件）
+    { docId: 2, anchorPath: '.memory/deleted.jsonl' }, // 人工删掉了锚文件
+    { docId: 3, anchorPath: null }                     // 无 source 行（解锚中间态）
+  ];
+  const alivePaths = new Set(['.memory/alive.jsonl']);
+  const orphaned = selectOrphanedMemoryVolumes(volumes, (path) => alivePaths.has(path));
+  assert.deepEqual(orphaned.map((volume) => volume.docId), [2, 3]);
+});
+
+test('校验扫除删除序列：解锚（删 source 行）后 deleteDoc 守卫放行、卷连带删除', async () => {
+  await withStore(async (store) => {
+    const { docId } = await runDatabaseWrite(store, deliverPayload(), anchorCtx(store));
+    // 锚还在：守卫拒删（15-10）。
+    assert.throws(() => store.deleteDoc(docId), /15-10/);
+    // 扫除第一步——解锚（对应人工删掉 .memory 锚文件后、扫除清掉 source 行）。
+    store.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
+    // 第二步：此时无 source 行，守卫放行，卷连带 nodes/refs 一并消失。
+    assert.equal(store.deleteDoc(docId), true);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS c FROM docs WHERE meta LIKE '%memoryVolume%'").get().c, 0);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ?').get(docId).c, 0);
   });
 });
 

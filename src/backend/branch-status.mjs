@@ -4,11 +4,16 @@
 
 const KIND_BUCKET = {
   'node.insert': 'insert',
+  'node.split': 'insert',        // 拆分主效果=增出子节点
   'node.delete': 'delete',
+  'node.mergeInto': 'delete',    // 合并=源节点被吸收消失
+  'node.mergePrevious': 'delete',
   'node.update': 'update',
   'node.move': 'move',
   'node.moveAfter': 'move',
-  'node.reparent': 'move'
+  'node.moveBefore': 'move',
+  'node.reparent': 'move',
+  'node.promote': 'move'         // 提升层级=移动
 };
 
 export function parseBranchEntryCounts(branch = {}) {
@@ -23,6 +28,15 @@ export function parseBranchEntryCounts(branch = {}) {
   for (const entry of entries) {
     if (entry?.status === 'undone') { counts.undone += 1; continue; }
     counts.active += 1;
+    if (entry?.kind === 'node.split') {
+      // 拆分一条 entry 拆出多个子节点：按实际拆出数计「增」（否则恒「增1」误导拆分规模），
+      // 原节点正文清空计「改」——与 diff 净效果口径对齐。
+      const splits = Array.isArray(entry.paragraph_splits) ? entry.paragraph_splits : [];
+      const childCount = splits.reduce((sum, p) => sum + (Array.isArray(p?.spans) ? p.spans.length : 0), 0);
+      counts.insert += childCount > 0 ? childCount : 1;
+      counts.update += 1;
+      continue;
+    }
     counts[KIND_BUCKET[entry?.kind] || 'other'] += 1;
   }
   return counts;

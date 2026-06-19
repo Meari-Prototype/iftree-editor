@@ -156,12 +156,8 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
       await runOptionalEffect(effects, 'keyword.update_nodes', () => (
         ctx.updateKeywordForNodes?.(result.baseDocId, result.touchedNodeIds, result.deletedNodeIds)
       ));
-      await runOptionalEffect(effects, 'vector.delete_nodes', () => (
-        ctx.deleteVectorsForNodes?.(result.baseDocId, [
-          ...(result.vectorStaleNodeIds || []),
-          ...(result.deletedNodeIds || [])
-        ])
-      ));
+      // 向量：发 pull 自对账信号（保存路径不 embed，4-6-1）——向量库自查 SQL 删孤儿/标待补，留 completeness 后补。
+      await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(result.baseDocId, { fillNow: false }));
     }
     const doc = payload.includeDoc === false || !result.applied
       ? null
@@ -216,12 +212,8 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
       await runOptionalEffect(effects, 'keyword.update_nodes', () => (
         ctx.updateKeywordForNodes?.(result.baseDocId, result.touchedNodeIds, result.deletedNodeIds)
       ));
-      await runOptionalEffect(effects, 'vector.delete_nodes', () => (
-        ctx.deleteVectorsForNodes?.(result.baseDocId, [
-          ...(result.vectorStaleNodeIds || []),
-          ...(result.deletedNodeIds || [])
-        ])
-      ));
+      // 向量：发 pull 自对账信号（保存路径不 embed，4-6-1）——向量库自查 SQL 删孤儿/标待补，留 completeness 后补。
+      await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(result.baseDocId, { fillNow: false }));
     }
     const doc = payload.includeDoc === false || result.applied === false
       ? null
@@ -366,10 +358,12 @@ export async function handleStreamMutation(store, payload, ctx, action, effects)
     return { ok: true, action, ...store.endBulkImport(), sideEffects: effects };
   }
   if (action === 'stream.push') {
-    const wantVectors = payload.vectors === true || payload.embed === true;
+    // 同步建向量统一用 embed（与 import 一名到底）；vectors 是旧名，传了直接报错、别静默不建。
+    if (payload.vectors !== undefined) throw new Error('stream.push 用 embed 表示同步建向量，不再接受 vectors 参数。');
+    const wantVectors = payload.embed === true;
     if (wantVectors && ctx?.isVectorModuleEnabled?.() !== true) {
       // fail-fast：声明启用向量但配置不可用 → 写 SQL 前抛，SQL 一字不写（4-16）。
-      throw new Error('stream.push 声明 vectors:true，但向量模块不可用；请检查向量配置，或改为不启用向量。');
+      throw new Error('stream.push 声明 embed:true，但向量模块不可用；请检查向量配置，或改为不启用向量。');
     }
     const result = store.pushStreamNodes({
       docId: payload.docId ?? payload.doc_id ?? null,
@@ -391,10 +385,10 @@ export async function handleStreamMutation(store, payload, ctx, action, effects)
       }
       // FTS 增量入库（默认，CPU 轻量）：写一批 add 一批，立刻可被 find 关键字检索（projectneed 4-16）。
       await runOptionalEffect(effects, 'keyword.add_stream', () => ctx.addStreamKeywords?.(result.docId, nodes));
-      // 向量增量（GPU，按 vectors 开关）：推一点算一点，只 embed 这批。
-      // 任一索引运行时失败 → runOptionalEffect 记入 sideEffects 不阻塞；调用方停止后同批幂等重补。
+      // 向量：发 pull 自对账信号（fillNow 即时嵌）——向量库自查 SQL、subtree 剪枝跳已嵌、只嵌本批新增。
+      // 任一索引运行时失败 → runOptionalEffect 记入 sideEffects 不阻塞；调用方停止后重发信号幂等重补。
       if (wantVectors) {
-        await runOptionalEffect(effects, 'vector.embed_stream', () => ctx.embedStreamNodes?.(result.docId, nodes));
+        await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(result.docId, { fillNow: true }));
       }
     }
     return {

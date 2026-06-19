@@ -356,15 +356,24 @@ function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], baseHashes
     added: 0,
     deleted: 0,
     modified: 0,
+    moved: 0,
     unchanged: 0,
     collapsed: 0,
     visibleRows: 0,
     totalRows: 0
   };
+  // 仅位置/父级变更（sort_order/parent_id）从 modified 拆出单列 moved，与 diff summary 的「移」口径对齐
+  // （否则 move/reparent 挤动的邻居 sort_order 变化全算 modified，summary 报 2、stats 报 11 对不上）。
+  const POSITION_ONLY_FIELDS = new Set(['sort_order', 'parent_id', 'address']);
   for (const item of items) {
     item.row.left = editBranchDiffNode(item.row.left);
     item.row.right = editBranchDiffNode(item.row.right);
-    stats[item.row.status] += 1;
+    const fields = Array.isArray(item.row.changedFields) ? item.row.changedFields : [];
+    if (item.row.status === 'modified' && fields.length > 0 && fields.every((f) => POSITION_ONLY_FIELDS.has(f))) {
+      stats.moved += 1;
+    } else {
+      stats[item.row.status] += 1;
+    }
     stats.totalRows += 1;
   }
 
@@ -2781,8 +2790,22 @@ export class IftreeStore {
     assertNoHumanTagField(payload, 'node.insert payload');
     assertNoEditTrustField(payload, 'node.insert payload');
     const docId = normalizePositiveId(branch.base_doc_id);
-    const parentRef = payload.parentId ?? payload.parent_id ?? null;
-    if (parentRef === null || parentRef === undefined) throw new Error('node.insert requires parentId');
+    const afterRef = payload.afterNodeId ?? payload.after_node_id ?? null;
+    let parentRef = payload.parentId ?? payload.parent_id ?? null;
+    if (parentRef === null || parentRef === undefined) {
+      // afterNodeId 自足：锚点一确定，父（=锚点的父）与位次（=锚点之后）在地址体系下唯一确定，
+      // 无需再抄一遍 parentId。只有插为首个子节点 / 插进空父（没有前序兄弟可锚）才必须 parentId。
+      if (afterRef === null || afterRef === undefined) {
+        throw new Error('node.insert 需要 parentId（插为首个子节点或空父下），或 afterNodeId（插在某节点之后，父从锚点推断）');
+      }
+      const projected = this._projectedDocForBranch(branch);
+      const anchor = this._findProjectedNode(projected, afterRef);
+      if (!anchor) throw new Error(`node.insert afterNodeId 锚点不存在: ${afterRef}`);
+      if (anchor.parent_id === null || anchor.parent_id === undefined) {
+        throw new Error('node.insert 不能插在根节点之后（根唯一）；要在根下插入请给 parentId');
+      }
+      parentRef = anchor.parent_id;
+    }
     const tmpId = nextTmpId('node');
     const fields = {
       text: typeof payload.text === 'string' ? payload.text : '',
@@ -2795,7 +2818,7 @@ export class IftreeStore {
       kind: 'node.insert',
       tmp_id: tmpId,
       parent_ref: parentRef,
-      after_ref: payload.afterNodeId ?? payload.after_node_id ?? null,
+      after_ref: afterRef,
       fields
     });
     const after = this._projectedDocForBranch(freshBranch);
@@ -5397,14 +5420,36 @@ export class IftreeStore {
     return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
   }
 
+  // 从 head 沿 parent_commit_id 上溯，返回祖先链 commit id（head 在前、根在后）。git log 只走这条链——
+  // restore/reset 把 head 移到旧 commit 后，被跳过的"未来" commit 不在链上、从 log 消失（仍可凭 id 直接访问，充当 reflog）。
+  commitAncestry(docId) {
+    const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(docId);
+    const chain = [];
+    const seen = new Set();
+    const parentStmt = this.db.prepare('SELECT parent_commit_id FROM commits WHERE id = ?');
+    let cur = head?.head_commit_id || null;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      chain.push(cur);
+      cur = parentStmt.get(cur)?.parent_commit_id || null;
+    }
+    return chain;
+  }
+
   listHistory(docId) {
-    // 历史列表以 commits 为事实来源；id 即 commit UUID，commit_id/saved_at 为兼容旧字段名的别名。
-    return this.db.prepare(`
+    // 历史列表以 commits 为事实来源，但只列 head 祖先链（git log 语义）：restore/reset 把 head 移回后，
+    // 被跳过的"未来" commit 不再出现在 log/历史里（仍可凭 commit id 直接 diff/restore 跳回）。
+    // id 即 commit UUID，commit_id/saved_at 为兼容旧字段名的别名。
+    const chain = this.commitAncestry(docId);
+    if (chain.length === 0) return [];
+    const placeholders = chain.map(() => '?').join(',');
+    const rows = this.db.prepare(`
       SELECT id, doc_id, id AS commit_id, committed_at AS saved_at, summary, author
       FROM commits
-      WHERE doc_id = ?
-      ORDER BY committed_at DESC, id DESC
-    `).all(docId);
+      WHERE doc_id = ? AND id IN (${placeholders})
+    `).all(docId, ...chain);
+    const byId = new Map(rows.map((row) => [String(row.id), row]));
+    return chain.map((id) => byId.get(String(id))).filter(Boolean);
   }
 
   // 节点级历史（git log <path> 语义）：某地址的节点（scope='node'）或整棵子树（默认）
@@ -5418,11 +5463,13 @@ export class IftreeStore {
       .get(normalizedDocId, String(address));
     if (!target) throw new Error(`nodeHistory target not found: doc ${normalizedDocId} ${address}`);
     const targetId = target.id;
+    // 只遍历 head 祖先链上的 commit（git log 语义，与文档级一致）：reset 后"未来" commit 不计入节点历史。
+    const ancestry = new Set(this.commitAncestry(normalizedDocId));
     const commits = this.db.prepare(`
       SELECT id, committed_at, summary, author, snapshot
       FROM commits WHERE doc_id = ?
       ORDER BY committed_at ASC, id ASC
-    `).all(normalizedDocId);
+    `).all(normalizedDocId).filter((commit) => ancestry.has(String(commit.id)));
 
     const entries = [];
     let prevSnapshot = null;
@@ -5601,14 +5648,24 @@ export class IftreeStore {
 
   // 按 commit_id（UUID）从 commits.snapshot 恢复——commits 是历史的事实来源（projectneed 189-191）。
   restoreCommit(commitId) {
-    const commit = this.db.prepare('SELECT doc_id, snapshot FROM commits WHERE id = ?').get(commitId);
-    if (!commit) throw new Error(`Commit not found: ${commitId}`);
-    const snapshot = JSON.parse(commit.snapshot || '{}');
-    if (!snapshot?.nodes) {
-      throw new Error(`Commit is not restorable: ${commitId}`);
-    }
-    this.restoreSnapshot(commit.doc_id, snapshot);
-    return true;
+    return this.withTransaction(() => {
+      const commit = this.db.prepare('SELECT doc_id, snapshot FROM commits WHERE id = ?').get(commitId);
+      if (!commit) throw new Error(`Commit not found: ${commitId}`);
+      const snapshot = JSON.parse(commit.snapshot || '{}');
+      if (!snapshot?.nodes) {
+        throw new Error(`Commit is not restorable: ${commitId}`);
+      }
+      this.restoreSnapshot(commit.doc_id, snapshot);
+      // git reset 语义：把 head 移到目标 commit。之前只重写 nodes、head 不动，会让 head_commit_id
+      // 与正文脱节（后续 diff/commit 的 parent 链挂错）。被跳过的"未来" commit 仍留在 commits 表，
+      // 可凭 commit id 直接 restore 跳回，充当 reflog。
+      this.db.prepare(`
+        INSERT INTO doc_heads (doc_id, head_commit_id, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(doc_id) DO UPDATE SET head_commit_id = excluded.head_commit_id, updated_at = CURRENT_TIMESTAMP
+      `).run(commit.doc_id, commitId);
+      return true;
+    });
   }
 
   // 反向提交（projectneed 15-5-3 revert）：撤销目标 commit 对 nodes 的改动、保留其后历史，建一个新 commit
@@ -5653,6 +5710,30 @@ export class IftreeStore {
           // ours / unchanged / added-ours / added-converged / 兜底：取当前侧，保留 C 之后的改动。
           const row = oursById.get(id) || theirsById.get(id);
           if (row) targetNodes.push({ ...row });
+        }
+      }
+
+      // sort_order 单独逐节点三方调和（revert 撤销移动）：撤销目标 commit 改过的位置、保留其后又改的。
+      // classifyThreeWayMerge 的 MERGE_FIELDS 不含 sort，纯位置移动（node.move/moveAfter）会被判 unchanged
+      // 而漏撤；这里独立补一次，不动那个共享分类器（免得波及 merge 预览对连带重排的判定）。三侧都在该
+      // 节点才调和；新增/复活的节点不在三侧之列，保留所取侧的位置。
+      const baseById = new Map((baseSnap.nodes || []).map((n) => [String(n.id), n]));
+      const resolveSort = (base, ours, theirs) => {
+        const b = base == null ? null : String(base);
+        const o = ours == null ? null : String(ours);
+        const t = theirs == null ? null : String(theirs);
+        if (o === t) return ours;    // 收敛 / 两侧都没动
+        if (o === b) return theirs;  // 当前未再动该位置 → 撤销回父侧
+        if (t === b) return ours;    // 父侧未动 → 保留当前
+        return ours;                 // 三方分歧：保留当前，不破坏目标 commit 之后的移动
+      };
+      for (const node of targetNodes) {
+        const id = String(node.id);
+        const baseSort = baseById.get(id)?.sort_order;
+        const oursSort = oursById.get(id)?.sort_order;
+        const theirsSort = theirsById.get(id)?.sort_order;
+        if (baseSort != null && oursSort != null && theirsSort != null) {
+          node.sort_order = resolveSort(baseSort, oursSort, theirsSort);
         }
       }
 

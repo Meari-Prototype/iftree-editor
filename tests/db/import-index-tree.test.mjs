@@ -11,7 +11,7 @@ test('db import, index, and tree expose the imported fixture and reject bad args
 
     const indexText = stdoutOf(await runBashDb(dbPath, ['index', '--folder', 'generated', '--uuid']));
     assert.match(indexText, new RegExp(`${fixtureTitle}\\.md #${docId}`));
-    assert.match(indexText, /\(2227字\) \[semantic:missing\]/);
+    assert.match(indexText, /\(2227字\) \[semantic:missing 0\/\d+\]/);
 
     const indexMissingFolderValue = await runBashDb(dbPath, ['index', '--folder'], { expectFailure: true });
     assert.match(indexMissingFolderValue.stderr || indexMissingFolderValue.stdout, /db --folder requires a library relative path/);

@@ -94,7 +94,7 @@
 
 ## import-json 契约
 
-`db import-json <tree.json> <源文件> [--dry-run] [--allow-gaps] [--vectors]`
+`db import-json <tree.json> <源文件> [--dry-run] [--allow-gaps] [--embed]`
 
 JSON 结构与 `db push` 同构：
 

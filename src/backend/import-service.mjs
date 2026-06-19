@@ -192,7 +192,7 @@ export async function importFilePathsToStore(options = {}) {
         }
         if (vectorRows.length > 0 && vectorStore) {
           sendProgress({ label: '写入 LanceDB 向量库', step: nodeCount, total: nodeCount });
-          await vectorStore.upsertNodeVectors(vectorRows, { deleteExisting: false });
+          await vectorStore.upsertNodeVectors(vectorRows);
         }
       }
 

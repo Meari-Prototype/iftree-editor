@@ -248,3 +248,39 @@ export function markMemoryVolumeDistilled(store, { docId = null, force = false, 
     };
   });
 }
+
+// 校验扫除支撑（projectneed 15-10-4）：列出每个记忆卷与其实体锚的库内路径，
+// 供运维判定「锚是否已被人工删除」（脱锚即非法残留、可清除）。
+// LEFT JOIN：连「source 行已缺失」的中间态卷（上一轮解锚后未及删卷）也照样列出，
+// anchorPath 取 null——同样按脱锚处理，保证扫除可重入、不漏。
+// 只取定位与锚路径、不拖节点统计：扫除是一次性运维，逐卷核一次文件存在性即可。
+export function listMemoryVolumeAnchors(store) {
+  const rows = store.db.prepare(`
+    SELECT docs.id AS doc_id, docs.title AS title, docs.meta AS meta,
+           source_documents.original_path AS anchor_path
+    FROM docs
+    LEFT JOIN source_documents ON source_documents.doc_id = docs.id
+    WHERE docs.meta LIKE '%"memoryVolume"%'
+    ORDER BY docs.id DESC
+  `).all();
+  const out = [];
+  for (const row of rows) {
+    const volume = memoryVolumeMetaOf(row.meta);
+    if (!volume) continue; // meta LIKE 命中但实际非卷：极端兜底，不当卷处理
+    out.push({
+      docId: row.doc_id,
+      title: row.title,
+      agent: volume.agent ?? null,
+      sessionId: volume.sessionId ?? null,
+      anchorPath: row.anchor_path ?? null
+    });
+  }
+  return out;
+}
+
+// 从「卷+锚路径」列表里挑出脱锚卷（实体锚已被人工删除，projectneed 15-10-4 可清除）。
+// anchorExists 由调用方注入（host 用 lstat 不解引用，判锚路径本身在不在）——隔离文件系统、便于单测。
+// 锚路径缺失（无 source 行）一律算脱锚：覆盖「解锚后未及删卷」的中间态，保证扫除可重入、不漏。
+export function selectOrphanedMemoryVolumes(volumes, anchorExists) {
+  return volumes.filter((volume) => !volume.anchorPath || !anchorExists(volume.anchorPath));
+}

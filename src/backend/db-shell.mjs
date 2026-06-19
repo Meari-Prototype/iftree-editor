@@ -5,6 +5,8 @@ import { normalizeNodeType, nodeTypeDisplayLabel } from '../core/node-model.mjs'
 import { formatBranchLine } from './branch-status.mjs';
 import { formatDiffText } from './diff-text.mjs';
 import { parseDiffRef } from './diff-refs.mjs';
+import { formatWriteResult } from './write-result-text.mjs';
+import { contentHash } from '../core/merkle.mjs';
 
 function cleanLine(value = '') {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -120,7 +122,7 @@ function parseFlags(argv = []) {
       index += 1;
       continue;
     }
-    if (['tags', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'allow-gaps', 'vectors', 'force', 'labels', 'spans', 'json', 'node', 'at-address', 'include-hidden'].includes(name)) {
+    if (['tags', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'allow-gaps', 'embed', 'force', 'labels', 'spans', 'json', 'node', 'at-address', 'include-hidden'].includes(name)) {
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
@@ -474,7 +476,9 @@ function formatRefLine(row = {}, addrById = null) {
   const target = refEnd(row.target_type || row.targetType, row.target_id ?? row.targetId);
   const kind = cleanLine(row.ref_kind || row.refKind || row.kind || '');
   const note = clip(row.note || '', 120);
-  return [`${source} -> ${target}`, kind ? `[${kind}]` : '', note].filter(Boolean).join(' ');
+  // 末尾带 ref:<id>——ref.delete 要 refId，inspect links 是拿到它的正路（端点地址只够人看、删不了引用）。
+  const refId = row.id ?? row.refId ?? row.ref_id;
+  return [`${source} -> ${target}`, kind ? `[${kind}]` : '', refId != null ? `ref:${refId}` : '', note].filter(Boolean).join(' ');
 }
 
 function valueOrNull(value) {
@@ -670,8 +674,11 @@ function formatIndexNode(node = {}, depth = 0, options = {}) {
 
 function semanticLabel(semantic = null) {
   if (!semantic?.status) return '';
-  const vectors = Number(semantic.vectorCount) > 0 ? ` vectors=${Number(semantic.vectorCount)}` : '';
-  return `[semantic:${semantic.status}${vectors}]`;
+  const vc = Number(semantic.vectorCount) || 0;
+  const nc = Number(semantic.nodeCount) || 0;
+  // 向量/节点 覆盖率（如 49/50），分子<分母即缺、不再用裸 vectors=N 让人误判齐了。
+  const cov = (nc > 0 || vc > 0) ? ` ${vc}/${nc}` : '';
+  return `[semantic:${semantic.status}${cov}]`;
 }
 
 // 跨库语义检索覆盖提示（projectneed 14-2）：allDocs 向量检索扫的是整个向量索引，只覆盖已向量化的节点，
@@ -863,13 +870,13 @@ async function dbInspect(database, docId, address, options = {}) {
   if (sections.includes('meta')) {
     const metaRow = (await database.run({
       operation: 'read',
-      payload: { action: 'debug.sql', sql: 'SELECT sort_order, content_hash FROM nodes WHERE doc_id = ? AND id = ?', params: [docId, node.id], limit: 1 }
+      payload: { action: 'debug.sql', sql: 'SELECT sort_order, content_hash, text, node_title, node_note, node_type, trust_level FROM nodes WHERE doc_id = ? AND id = ?', params: [docId, node.id], limit: 1 }
     }, 'read'))?.rows?.[0] || {};
-    lines.push(`[meta] updated:${valueOrNull(node.updatedAt)} created:${valueOrNull(node.createdAt)} sort:${valueOrNull(metaRow.sort_order)} chars:${valueOrNull(node.meta?.textChars)} hash:${valueOrNull(metaRow.content_hash)}`);
+    lines.push(`[meta] updated:${valueOrNull(node.updatedAt)} created:${valueOrNull(node.createdAt)} sort:${valueOrNull(metaRow.sort_order)} chars:${valueOrNull(node.meta?.textChars)} hash:${metaRow.content_hash || (metaRow.text === undefined ? 'null' : contentHash(metaRow))}`);
   }
   if (sections.includes('note')) {
     const note = node.note ?? node.node_note ?? '';
-    if (String(note).trim()) lines.push(`[note] ${cleanLine(note)}`);
+    lines.push(`[note] ${String(note).trim() ? cleanLine(note) : '(无)'}`);
   }
   if (sections.includes('source')) {
     // 复用 blame 的 source/window/spans 渲染，去掉它自带的身份行（本函数已有统一身份段）。
@@ -1125,8 +1132,8 @@ export function dbShellHelp() {
     '  db bulk begin|end  (海量流式导入加速会话：begin 设异步写+延迟索引，end 恢复+重建索引)',
     '  db export <doc_id>',
     '  db restore <history_id|saved_at|tag> [doc_id]',
-    '  db import <library_relative_path> [--mode simple|complete|direct|smart|vector]',
-    '  db import-json <json_file> <source_file> [--dry-run] [--allow-gaps] [--vectors]  (智能导入 4-3-3：校验节点树 JSON 并入库；JSON 与 db push 同契约)',
+    '  db import <library_relative_path> [--mode simple|complete|direct|smart|vector] [--embed]',
+    '  db import-json <json_file> <source_file> [--dry-run] [--allow-gaps] [--embed]  (智能导入 4-3-3：校验节点树 JSON 并入库；JSON 与 db push 同契约)',
     '  db vectors <doc_id>',
     '  db delete <doc_id>',
     '  db relink <doc_id> <source_path>  (重绑 doc 的源文件路径；锚改名/迁移后用，只改绑定不动正文)',
@@ -1205,7 +1212,9 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       // 语义相似度下限：默认 0.51（过滤 sim < 0.51 的弱相关）；--min-score 覆盖（高级搜索可调）。
       // score 取法与 formatNodeLine 对齐：命中行可能包成 {node,doc}（score 在 node.score）或顶层 score。
       const minSim = flags.minScore != null ? Number(flags.minScore) : 0.51;
+      const beforeMinSim = rows.length;
       rows = rows.filter((row) => Number((row.node || row).score ?? row.score ?? 0) >= minSim);
+      const weakFilteredOut = beforeMinSim - rows.length;
       const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId, { uuid: flags.uuid });
       const body = formatGroupedHits(rows, {
         uuid: flags.uuid,
@@ -1220,9 +1229,12 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       const docCount = scope.allDocs
         ? new Set(rows.map((row) => String(row.doc?.docId ?? row.doc?.id ?? row.docId ?? row.doc_id ?? '')).filter(Boolean)).size
         : (rows.length ? 1 : 0);
+      const weakNote = weakFilteredOut > 0 ? `（已滤除 ${weakFilteredOut} 条 sim<${minSim} 弱相关，--min-score 可调）` : '';
       const stats = rows.length === 0
-        ? `— 0 命中（范围：${scopeDesc}）；可换近义词重试 / 调大 limit / 用 library_index 看目录`
-        : `— 语义命中 ${rows.length} 节点 / ${docCount} 文档（范围：${scopeDesc}）；按相似度排序取 top ${rows.length}`;
+        ? (weakFilteredOut > 0
+          ? `— 0 命中（范围：${scopeDesc}）：召回 ${weakFilteredOut} 条但 sim 均 <${minSim} 被判弱相关已滤；--min-score 调低可纳入 / 换近义词 / 用 library_index 看目录`
+          : `— 0 命中（范围：${scopeDesc}）；可换近义词重试 / 调大 limit / 用 library_index 看目录`)
+        : `— 语义命中 ${rows.length} 节点 / ${docCount} 文档（范围：${scopeDesc}）；按相似度排序取 top ${rows.length}${weakNote}`;
       return {
         kind: 'db_find',
         text: [body, stats, notice].filter(Boolean).join('\n\n').replace(/^\n+/, '')
@@ -1556,7 +1568,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       sourcePath,
       dryRun: flags.dryRun === true,
       allowGaps: flags.allowGaps === true,
-      vectors: flags.vectors === true
+      embed: flags.embed === true
     });
     return { kind: 'db_import_json', text: JSON.stringify(result, null, 2) };
   }
@@ -1597,7 +1609,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const history = await resolveHistoryRef(database, historyRefSpec(flags, positional));
     const payload = { action: 'history.restore', commitId: history.id, docId: history.doc_id };
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: 'db_restore', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_restore', text: formatWriteResult(result, { label: 'restore' }) };
   }
 
   if (command === 'import') {
@@ -1606,6 +1618,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     if (!relativePath) throw new Error('db import requires library_relative_path');
     const payload = { relativePath };
     if (flags.mode) payload.mode = String(flags.mode);
+    if (flags.embed) payload.embed = true;
     const result = await contextFunction(context, 'importLibraryDocument')(payload);
     return { kind: 'db_import', text: JSON.stringify(result, null, 2) };
   }
@@ -1642,7 +1655,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       operation: 'write',
       payload: { action: 'doc.relink', docId, sourcePath }
     }, 'write');
-    return { kind: 'db_relink', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_relink', text: formatWriteResult(result, { label: 'relink' }) };
   }
 
   if (command === 'memory') {
@@ -1845,6 +1858,15 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       docId: currentDocIdFrom(context) || undefined,
       args: toolArgs
     });
+    if (mode === 'search' && Array.isArray(result?.results)) {
+      const items = result.results.map((row, i) => [
+        `${i + 1}. ${row.title || '(无标题)'}`,
+        row.url ? `   ${row.url}` : null,
+        row.snippet ? `   ${String(row.snippet).replace(/\s+/g, ' ').trim()}` : null
+      ].filter(Boolean).join('\n'));
+      const header = `web 检索「${result.query ?? value}」${result.results.length} 条结果：`;
+      return { kind: 'db_web', text: items.length ? [header, ...items].join('\n') : `web 检索「${value}」无结果。` };
+    }
     return { kind: 'db_web', text: JSON.stringify(result, null, 2) };
   }
 

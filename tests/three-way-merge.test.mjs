@@ -132,20 +132,13 @@ test('applyMerge 成功写回后只做 BM25 增量同步：向量不随保存生
     const service = createDatabaseService({
       store,
       writeContext: {
-        deleteDocVectors: (docId) => calls.push(['vector.delete_doc', String(docId)]),
-        ensureDocVectors: (docId) => calls.push(['vector.ensure_doc', String(docId)]),
-        rebuildKeywordIndexForDoc: (docId) => calls.push(['keyword.rebuild_doc', String(docId)]),
         updateKeywordForNodes: (docId, upsertIds, deleteIds) => calls.push([
           'keyword.update_nodes',
           String(docId),
           (upsertIds || []).map(String),
           (deleteIds || []).map(String)
         ]),
-        deleteVectorsForNodes: (docId, nodeIds) => calls.push([
-          'vector.delete_nodes',
-          String(docId),
-          (nodeIds || []).map(String)
-        ])
+        reconcile: (docId, opts) => calls.push(['vector.reconcile', String(docId), opts || {}])
       }
     });
 
@@ -153,14 +146,14 @@ test('applyMerge 成功写回后只做 BM25 增量同步：向量不随保存生
     assert.equal(applied.applied, true);
     assert.deepEqual(
       calls.map((c) => c[0]),
-      ['keyword.update_nodes', 'vector.delete_nodes'],
-      'BM25 增量同步 + 向量只清陈旧行，不整篇重建不生成'
+      ['keyword.update_nodes', 'vector.reconcile'],
+      'BM25 增量同步 + 向量发 pull 自对账信号（保存不 embed）'
     );
     const [, docIdArg, upsertIds, deleteIds] = calls[0];
     assert.equal(docIdArg, String(doc.id));
     assert.deepEqual(upsertIds, [String(a.id)], '增量集合 = 本次实际受影响节点（分支改的 a）');
     assert.deepEqual(deleteIds, [], '本次无删除');
-    assert.deepEqual(calls[1][2], [String(a.id)], 'a 正文变更 → 旧向量行清理');
+    assert.deepEqual(calls[1], ['vector.reconcile', String(doc.id), { fillNow: false }], '向量发自对账信号、fillNow=false 不在保存路径 embed');
     assert.ok(
       !('touchedNodeIds' in applied) && !('deletedNodeIds' in applied) && !('vectorStaleNodeIds' in applied),
       '受影响节点集不进响应'

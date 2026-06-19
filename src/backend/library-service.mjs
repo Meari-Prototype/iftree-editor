@@ -107,9 +107,11 @@ function indexEntryLabel(node, options = {}) {
   const textChars = Math.max(0, Number(entry.textChars) || 0);
   const textCharsSuffix = ` (${textChars}字)`;
   const semantic = entry.semantic || {};
-  const semanticLabel = semantic.status
-    ? ` [semantic:${semantic.status}${Number(semantic.vectorCount) > 0 ? ` vectors=${Number(semantic.vectorCount)}` : ''}]`
-    : '';
+  const vectorCount = Number(semantic.vectorCount) || 0;
+  const nodeCount = Number(semantic.nodeCount) || 0;
+  // 向量/节点 覆盖率（如 49/50），分子<分母即缺，比裸 vectors=N 直观、不误导。
+  const coverage = (nodeCount > 0 || vectorCount > 0) ? ` ${vectorCount}/${nodeCount}` : '';
+  const semanticLabel = semantic.status ? ` [semantic:${semantic.status}${coverage}]` : '';
   const summarySuffix = options.includeSummary && node.note ? ` summary=${clipText(node.note)}` : '';
   const idSuffix = options.uuid && entry.docId ? ` #${entry.docId}` : '';
   return `${entry.name || node.text}${idSuffix}${textCharsSuffix}${semanticLabel}${symlinkAnchorLabel(entry)}${summarySuffix}`;

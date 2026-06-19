@@ -4,6 +4,7 @@ import { handleDebugOverviewQuery, handleDebugSqlQuery } from './handlers/read/d
 import { ENTITY_READ_ACTIONS, runEntityRead } from './entities/read.mjs';
 import { normalizeStableId } from './db/ids.mjs';
 import { buildAhoCorasickMatcher } from '../core/aho-corasick.mjs';
+import { normalizeSemanticStatus } from './semantic-status.mjs';
 
 const ACTIONS = Object.freeze([
   'query.actions',
@@ -524,7 +525,7 @@ function queryContentDocs(store, payload = {}, ctx = {}) {
 
 function queryLibraryIndex(store, payload = {}, ctx = {}) {
   if (typeof ctx.libraryIndex !== 'function') throw new Error('library.index is not available');
-  return withLibrarySemanticMeta(librarySourceDocs(store, ctx), ctx)
+  return withLibrarySemanticMeta(store, librarySourceDocs(store, ctx))
     .then((docs) => ctx.libraryIndex({ ...payload, format: libraryIndexFormat(payload) }, docs));
 }
 
@@ -552,36 +553,24 @@ function librarySourceDocs(store, ctx = {}) {
   return docs.map((doc) => ({ ...doc, hostAnchor: anchorById[doc.docId] || null }));
 }
 
-function normalizeSemanticStatus(status = {}) {
-  const vectorCount = Math.max(0, Number(status.vectorCount ?? status.vector_count) || 0);
-  const nodeCount = Math.max(0, Number(status.nodeCount ?? status.node_count) || 0);
-  const enabled = status.enabled !== false;
-  if (!enabled) return { status: 'disabled', available: false, vectorCount, nodeCount, reason: status.reason || 'vector_disabled' };
-  if (status.available === true || (nodeCount > 0 ? vectorCount >= nodeCount : vectorCount > 0)) {
-    return { status: 'ready', available: true, vectorCount, nodeCount };
-  }
-  return {
-    status: 'missing',
-    available: false,
-    vectorCount,
-    nodeCount,
-    reason: vectorCount > 0 ? 'vector_partial' : (status.reason || 'vector_missing')
-  };
-}
-
-async function semanticStatusByDocId(docIds = [], ctx = {}) {
+async function semanticStatusByDocId(store, docIds = []) {
   const ids = [...new Set(docIds.map((value) => normalizeQueryId(value)).filter(Boolean))];
   if (ids.length === 0) return {};
-  let statuses = {};
-  if (typeof ctx.docVectorStatus === 'function') {
-    statuses = await ctx.docVectorStatus(ids);
-  }
-  return Object.fromEntries(ids.map((id) => [id, normalizeSemanticStatus(statuses?.[id] || {})]));
+  // 读 docs.meta.semantic 持久化列（写入侧 refreshDocSemanticMeta 维护），免每次查 lance 的计算税。
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = store.db.prepare(`SELECT id, json_extract(meta, '$.semantic') AS semantic FROM docs WHERE id IN (${placeholders})`).all(...ids);
+  const byId = new Map(rows.map((row) => [String(row.id), row.semantic]));
+  return Object.fromEntries(ids.map((id) => {
+    let parsed = {};
+    const raw = byId.get(String(id));
+    if (raw) { try { parsed = JSON.parse(raw); } catch { parsed = {}; } }
+    return [id, normalizeSemanticStatus(parsed)];
+  }));
 }
 
-async function withLibrarySemanticMeta(docs = [], ctx = {}) {
+async function withLibrarySemanticMeta(store, docs = []) {
   if (docs.length === 0) return docs;
-  const statusByDocId = await semanticStatusByDocId(docs.map((doc) => doc.docId), ctx);
+  const statusByDocId = await semanticStatusByDocId(store, docs.map((doc) => doc.docId));
   return docs.map((doc) => {
     return {
       ...doc,
@@ -595,7 +584,7 @@ async function withLibrarySemanticMeta(docs = [], ctx = {}) {
 
 function queryLibraryNavigation(store, payload = {}, ctx = {}) {
   if (typeof ctx.libraryNavigation !== 'function') throw new Error('library.getNavigation is not available');
-  return withLibrarySemanticMeta(librarySourceDocs(store, ctx), ctx)
+  return withLibrarySemanticMeta(store, librarySourceDocs(store, ctx))
     .then((docs) => ctx.libraryNavigation(payload, docs))
     .then((result) => {
       const docId = result?.doc?.id;
@@ -613,7 +602,7 @@ async function queryContentNode(store, payload = {}, ctx = {}) {
     return queryContentSubtree(store, payload, ctx);
   }
   const row = contentNodeRow(store, payload);
-  const semanticStatus = row ? await semanticStatusByDocId([row.doc_id], ctx) : {};
+  const semanticStatus = row ? await semanticStatusByDocId(store, [row.doc_id]) : {};
   return row ? {
     kind: 'content.getNode',
     docId: row.doc_id,
@@ -766,7 +755,7 @@ async function queryContentSubtree(store, payload = {}, ctx = {}) {
   if (relativeDepth) rows = rows.filter((row) => Number(row.depth) - Number(root.depth) < relativeDepth);
   const total = rows.length;
   const returnedRows = limit ? rows.slice(0, limit) : rows;
-  const semanticStatus = await semanticStatusByDocId([root.doc_id], ctx);
+  const semanticStatus = await semanticStatusByDocId(store, [root.doc_id]);
   const tree = rowsToContentTree(returnedRows, {
     detail,
     include,
@@ -814,7 +803,7 @@ async function queryContentDepth(store, payload = {}, ctx = {}) {
     'selected_nodes.depth, selected_nodes.address, selected_nodes.id'
   ).sort(compareNodeAddress));
   const returnedRows = limit ? rows.slice(0, limit) : rows;
-  const semanticStatus = await semanticStatusByDocId([docId], ctx);
+  const semanticStatus = await semanticStatusByDocId(store, [docId]);
   const nodes = returnedRows.map((row) => formatContentNode(row, {
     detail: contentDetail(payload),
     include: contentIncludeSet(payload),

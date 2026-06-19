@@ -137,6 +137,9 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
           }
           write({ id: origId, type: 'result', result });
         } catch (error) {
+          // bulkBegin 失败回滚：上面同步乐观置位的独占锁要撤掉，否则残留伪锁会把后续写请求
+          // 全部按「批量导入进行中」拒掉。只回滚自己持有的锁，不动别人的会话。
+          if (action === 'stream.bulkBegin' && bulkOwnerConn === connId) bulkOwnerConn = null;
           write({ id: origId, type: 'error', error: errorPayload(error) });
         } finally {
           routes.delete(serverId);

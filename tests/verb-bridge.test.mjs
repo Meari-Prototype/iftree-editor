@@ -50,15 +50,14 @@ test('runDatabaseWrite 路由 history.revert：撤改 + 触发索引重建 effec
     const effects = [];
     const ctx = {
       rebuildKeywordIndexForDoc: (d) => effects.push(['keyword', d]),
-      deleteDocVectors: (d) => effects.push(['vec-del', d]),
-      ensureDocVectors: (d) => effects.push(['vec-ensure', d])
+      reconcile: (d, opts) => effects.push(['vec-reconcile', d, opts])
     };
 
     await runDatabaseWrite(store, { action: 'history.revert', commitId: c2.commit_id, owner: 'human' }, ctx);
 
     assert.equal(store.db.prepare('SELECT text FROM nodes WHERE id = ?').get(a.id).text, 'A原文');
     assert.ok(effects.some((e) => e[0] === 'keyword'), 'keyword 重建');
-    assert.ok(effects.some((e) => e[0] === 'vec-ensure'), '向量重建');
+    assert.ok(effects.some((e) => e[0] === 'vec-reconcile'), '向量发自对账信号');
   });
 });
 

@@ -64,7 +64,7 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
     const pushed = await handleStreamMutation(store, {
       docId: created.docId,
       nodes,
-      vectors: payload.vectors === true || payload.embed === true
+      embed: payload.embed === true
     }, ctx, 'stream.push', effects);
     const result = {
       ok: true,
@@ -113,7 +113,7 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
     const pushed = await handleStreamMutation(store, {
       docId,
       nodes,
-      vectors: payload.vectors === true
+      embed: payload.embed === true
     }, ctx, 'stream.push', effects);
     return {
       ok: true,

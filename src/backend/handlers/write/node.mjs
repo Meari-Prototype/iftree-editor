@@ -41,6 +41,7 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
     const docId = requireDocId(payload);
     const node = store.insertNode(nodeInsertPayload(payload));
     await runOptionalEffect(effects, 'keyword.upsert_node', () => ctx.upsertKeywordForNode?.(node));
+    await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(docId, { fillNow: false }));
     const doc = maybeRefreshDoc(store, ctx, docId, payload.refreshOptions || {});
     return docRefresh(action, docId, {
       doc,
@@ -57,7 +58,7 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
     assertNoNodeTrustField(patch, 'node.update patch');
     const node = store.updateNode(nodeId, patch);
     if (Object.prototype.hasOwnProperty.call(patch, 'text')) {
-      await runOptionalEffect(effects, 'vector.upsert_node', () => ctx.upsertVectorForNode?.(node));
+      await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(node.doc_id, { fillNow: false }));
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, 'text')

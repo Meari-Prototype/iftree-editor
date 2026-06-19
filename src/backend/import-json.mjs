@@ -171,7 +171,7 @@ function zipCreatedIds(payloadNodes, createdNodes, idByAddress = new Map()) {
   return idByAddress;
 }
 
-export async function runImportJson({ database, jsonPath, sourcePath, dryRun = false, allowGaps = false, vectors = false }) {
+export async function runImportJson({ database, jsonPath, sourcePath, dryRun = false, allowGaps = false, embed = false }) {
   if (!database) throw new Error('import-json requires a database service');
   const resolvedJsonPath = resolve(String(jsonPath || ''));
   const resolvedSourcePath = resolve(String(sourcePath || ''));
@@ -182,6 +182,10 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
     throw new Error(`无法读取节点树 JSON（${resolvedJsonPath}）：${error.message || error}`);
   }
   const source = normalizeImportSourceText(readFileSync(resolvedSourcePath, 'utf8'));
+  // 同步建向量统一用 embed；JSON 顶层旧的 vectors 字段不再认，传了直接报错、别静默不建。
+  if (payload && typeof payload === 'object' && payload.vectors !== undefined) {
+    throw new Error('import-json 用 embed 表示同步建向量，不再接受 vectors 参数。');
+  }
 
   const report = validateImportTree(payload, source);
   const blockedByGaps = report.gaps.length > 0 && !allowGaps;
@@ -212,7 +216,7 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
         action: 'stream.push',
         title: String(payload.title).trim(),
         nodes,
-        vectors: vectors === true || payload.vectors === true
+        embed: embed === true || payload.embed === true
       }
     }, 'write');
     const docId = pushResult?.docId;

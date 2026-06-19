@@ -9,13 +9,13 @@ import {
   symlinkSync,
   writeFileSync
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { env as transformersEnv, pipeline } from '@huggingface/transformers';
 
 import { createDatabaseService } from '../database-service.mjs';
 import { createDerivedIndexReconciler } from '../derived-index-reconciler.mjs';
+import { listMemoryVolumeAnchors, selectOrphanedMemoryVolumes } from '../memory-volumes.mjs';
 import { importFilePathsToStore } from '../import-service.mjs';
 import { runDbShellArgv, resolveDocRef } from '../db-shell.mjs';
 import { normalizeStableId, sameStableId } from '../db/ids.mjs';
@@ -445,7 +445,10 @@ export function createHeadlessAgentHost(options = {}) {
   }
 
   function appHome() {
-    return process.env.IFTREE_HOME || join(homedir(), '.iftree');
+    // 默认锚工作区内（与 dbPath/agentDbPath 同根 databaseRoot），不再回落用户主目录 ~/.iftree。
+    // 早期布局曾把向量/settings 放 ~/.iftree，导致 IFTREE_HOME 未设时向量库与 SQLite 分家
+    // （SQLite 在工作区、向量回落 C 盘空库）。显式 IFTREE_HOME 仍可 override（压测等场景）。
+    return process.env.IFTREE_HOME || databaseRoot;
   }
 
   function settingsPath() {
@@ -612,6 +615,10 @@ export function createHeadlessAgentHost(options = {}) {
     embedTexts: headlessEmbeddings
   });
 
+  // 启动后台回填 docs.meta.semantic（读取侧改读这一列后，存量文档需一次性补上、否则显示退化）。
+  // fire-and-forget：延到微任务、不阻塞初始化，单文档失败在内部吞掉。
+  Promise.resolve().then(() => derivedIndexes.backfillDocSemanticMeta()).catch(() => {});
+
   function databaseReadContext() {
     return derivedIndexes.readContext();
   }
@@ -743,6 +750,11 @@ export function createHeadlessAgentHost(options = {}) {
       payload.relativePath ?? payload.relative_path ?? payload.path ?? payload.libraryPath
     );
     if (!relativePath) throw new Error('import_library_document requires relativePath');
+    // vectors 是 stream.push 的内联向量口径、不是 import 的开关——传成 vectors 先于导入报错（fail-fast），
+    // 别让人以为同步建了向量、实则静默不建。导入时同步建向量用 embed:true。
+    if (payload.vectors !== undefined) {
+      throw new Error('import 不接受 vectors 参数；导入时同步建向量请用 embed:true（vectors 是 stream.push 的内联向量口径）。');
+    }
     const filePath = libraryPath(relativePath);
     if (!statSync(filePath).isFile()) throw new Error('import_library_document 只能导入 library 内真实文件');
     const imported = await importFilePathsToStore({
@@ -761,6 +773,22 @@ export function createHeadlessAgentHost(options = {}) {
     });
     notifyLibraryChanged();
     const docs = imported.map((item) => importedDocSummary(item, filePath));
+    // 导入后发 pull 自对账信号 + 刷新 meta.semantic（读取侧读列，新文档需立即有值、不等下次回填）。
+    // embed:true 才 fillNow 当场算 embedding——吃性能，故默认后补：只清孤儿/陈旧、记待补，
+    // 向量留给 completeness 闸或显式 vectors 动词补。这与「向量式导入」（mode:'vector' 按字数切块的
+    // 切分方式）正交：怎么切归 mode，建不建 embedding 归这个开关（vectors 参数在入口已被拒，见上）。
+    const wantVectors = payload.embed === true;
+    let vectorWarning = null;
+    for (const doc of docs) {
+      if (!doc?.docId) continue;
+      try {
+        await derivedIndexes.reconcile(doc.docId, { fillNow: wantVectors });
+      } catch (error) {
+        // 向量是派生索引、可重建，SQL 已落库 → 不让导入失败；显式建向量时把错误冒泡成 warning。
+        if (wantVectors) vectorWarning = error?.message || String(error);
+      }
+      await derivedIndexes.refreshDocSemanticMeta(doc.docId).catch(() => {});
+    }
     return {
       ok: true,
       action: 'import.libraryDocument',
@@ -768,7 +796,8 @@ export function createHeadlessAgentHost(options = {}) {
       imported: docs,
       docId: docs[0]?.docId ?? null,
       title: docs[0]?.title || '',
-      nodeCount: docs[0]?.nodeCount || 0
+      nodeCount: docs[0]?.nodeCount || 0,
+      ...(vectorWarning ? { vectorWarning } : {})
     };
   }
 
@@ -789,6 +818,39 @@ export function createHeadlessAgentHost(options = {}) {
       title: existing?.title || '',
       nodeCount: Number(existing?.node_count) || 0
     };
+  }
+
+  // 记忆卷校验扫除（projectneed 15-10-4）：清除「实体锚已被人工删除」的卷。
+  // 判据 = 锚的库内路径本身是否还在（lstatSync 不解引用 symlink）：
+  //   · 人工删掉 .memory 下的锚文件 → 路径不存在 → 脱锚、清除（这是用户表达「删此卷」的动作）；
+  //   · 合法卷的悬空 symlink（target 没了、链接还在，15-10-2 允许悬空）→ 链接本身在 → 保留；
+  //   · 没带 hostAnchor 的占位文件 → 文件还在 → 保留（同属 15-10-2 允许的悬空锚）。
+  // 删除走正规链路：先删 source 行解锚（deleteDoc 守卫据此放行），再 deleteImportedDocument
+  // 连带清 SQLite（refs/nodes/source 行）；LanceDB 派生索引不在此碰，留给自检/reconcile 对齐。
+  // 解锚与删卷非同一事务，但可重入：中途中断留下的「无 source 行」卷下轮扫描仍按脱锚清除。
+  async function purgeOrphanedMemoryVolumes({ dryRun = false } = {}) {
+    const store = getDatabase().getStore();
+    const volumes = listMemoryVolumeAnchors(store);
+    const orphaned = selectOrphanedMemoryVolumes(volumes, anchorPathExists);
+    const purged = [];
+    for (const volume of orphaned) {
+      if (!dryRun) {
+        store.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(volume.docId);
+        await deleteImportedDocument({ docId: volume.docId });
+      }
+      purged.push(volume);
+    }
+    return { ok: true, action: 'memory.purgeOrphaned', dryRun, scanned: volumes.length, purgedCount: purged.length, purged };
+  }
+
+  // lstatSync 不解引用：路径本身（含悬空 symlink、空占位文件）存在即视为「锚还在」，
+  // 仅当锚文件被真正删除（lstat 抛 ENOENT）才判脱锚。
+  function anchorPathExists(anchorPath) {
+    try {
+      return Boolean(lstatSync(anchorPath));
+    } catch {
+      return false;
+    }
   }
 
   function sendAgentStream(requestId, event) {
@@ -878,6 +940,7 @@ export function createHeadlessAgentHost(options = {}) {
     }
     if (type === 'import.libraryDocument') return importLibraryDocument(request.payload || {});
     if (type === 'import.deleteDocument') return deleteImportedDocument(request.payload || {});
+    if (type === 'memory.purgeOrphaned') return purgeOrphanedMemoryVolumes({ dryRun: request.dryRun === true });
     if (type === 'database.updateSourceBinding') {
       return getDatabase().updateSourceBinding(request.payload || {});
     }

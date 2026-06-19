@@ -468,7 +468,10 @@ function writeAgentSettings(payload = {}) {
 }
 
 function appHome() {
-  return process.env.IFTREE_HOME || join(homedir(), '.iftree');
+  // 默认锚工作区内（与 SQLite 的 DATABASE_ROOT 同根），不再回落用户主目录 ~/.iftree——
+  // 否则 IFTREE_HOME 未设时向量/settings 会与 SQLite 分家（SQLite 在工作区、向量回落 C 盘空库）。
+  // 显式 IFTREE_HOME 仍可 override（压测等场景）。
+  return process.env.IFTREE_HOME || DATABASE_ROOT;
 }
 
 function ensureLibraryRoot() {

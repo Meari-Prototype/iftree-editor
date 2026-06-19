@@ -41,7 +41,7 @@ function toVector(value, dimensions) {
   return vector;
 }
 
-function toRow({ nodeId, docId, text, vector }, dimensions) {
+function toRow({ nodeId, docId, text, contentHash, subtreeHash, vector }, dimensions) {
   const id = String(nodeId ?? '').trim();
   const doc_id = String(docId ?? '').trim();
   if (!id) throw new Error(`Invalid vector node id: ${nodeId}`);
@@ -49,6 +49,9 @@ function toRow({ nodeId, docId, text, vector }, dimensions) {
   return {
     id,
     doc_id,
+    // Merkle 哈希随行落库：content_hash 判自身要不要重嵌，subtree_hash 供 reconcile top-down 剪枝。
+    content_hash: String(contentHash ?? ''),
+    subtree_hash: String(subtreeHash ?? ''),
     text: text || '',
     vector: toVector(vector, dimensions)
   };
@@ -105,36 +108,40 @@ export class VectorStore {
       await this.connection.dropTable(TABLE_NAME);
       return null;
     }
+    // 渐进迁移：旧表缺 Merkle 哈希列就原地补（addColumns，旧行留空、靠 reconcile 回填），
+    // 不重建、不丢向量。
+    const newColumns = [];
+    if (!fieldNames.includes('content_hash')) newColumns.push({ name: 'content_hash', valueSql: "''" });
+    if (!fieldNames.includes('subtree_hash')) newColumns.push({ name: 'subtree_hash', valueSql: "''" });
+    if (newColumns.length) await table.addColumns(newColumns);
     return table;
   }
 
-  async ensureTable(firstRow) {
-    if (this.table) return this.table;
-    this.table = await this.connection.createTable(TABLE_NAME, [firstRow]);
-    return this.table;
-  }
-
   async upsertNodeVector(payload) {
-    const row = toRow(payload, this.dimensions);
-    const table = await this.ensureTable(row);
-    await table.delete(stringPredicate('id', row.id));
-    await table.add([row]);
+    await this.upsertNodeVectors([payload]);
   }
 
-  async upsertNodeVectors(payloads, options = {}) {
-    const rows = (payloads || []).map((payload) => toRow(payload, this.dimensions));
-    if (rows.length === 0) return;
+  // 写入恒按 node_id 原子 upsert：匹配则整行覆盖、不匹配则插入。物理恒「一 id 一行」，
+  // 同 id 重复写入幂等不堆行——从源头消除裸 add 的重复，连带消解计数虚高 /
+  // 陈旧误判 / 补建死循环（不必再靠 deleteExisting 逐行删，也不会产生重复存量）。
+  async upsertNodeVectors(payloads) {
+    // 同批先按 id 去重（留后者）：mergeInsert 的 source 不能自带重复 id（多匹配行为未定义）。
+    const byId = new Map();
+    for (const payload of payloads || []) {
+      const row = toRow(payload, this.dimensions);
+      byId.set(row.id, row);
+    }
+    if (byId.size === 0) return;
+    const rows = [...byId.values()];
     if (!this.table) {
       this.table = await this.connection.createTable(TABLE_NAME, rows);
       return;
     }
-    const table = this.table;
-    if (options.deleteExisting !== false) {
-      for (const row of rows) {
-        await table.delete(stringPredicate('id', row.id));
-      }
-    }
-    await table.add(rows);
+    // 幂等过滤交给 reconcile 外层（按 content_hash diff 只传变化节点）；这里恒覆盖匹配行。
+    await this.table.mergeInsert('id')
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .execute(rows);
   }
 
   async deleteNodeVectors(nodeIds = []) {
@@ -189,6 +196,31 @@ export class VectorStore {
         .limit(chunk.length)
         .toArray();
       for (const row of rows) found.set(String(row.id), String(row.text || ''));
+    }
+    return found;
+  }
+
+  // 批量取这批 id 的 Merkle 哈希 (id → {contentHash, subtreeHash})：reconcile 逐层剪枝对账用，
+  // 只拉哈希、不拉正文/向量。按 id 分块查询，不按 doc 全量拉行。
+  async hashesByNodeIds(nodeIds = []) {
+    if (!this.table) return new Map();
+    const ids = [...new Set((nodeIds || [])
+      .map((id) => String(id ?? '').trim())
+      .filter(Boolean))];
+    const found = new Map();
+    for (let offset = 0; offset < ids.length; offset += DELETE_PREDICATE_CHUNK_SIZE) {
+      const chunk = ids.slice(offset, offset + DELETE_PREDICATE_CHUNK_SIZE);
+      const rows = await this.table.query()
+        .where(`id IN (${chunk.map(quoteValue).join(',')})`)
+        .select(['id', 'content_hash', 'subtree_hash'])
+        .limit(chunk.length)
+        .toArray();
+      for (const row of rows) {
+        found.set(String(row.id), {
+          contentHash: String(row.content_hash ?? ''),
+          subtreeHash: String(row.subtree_hash ?? '')
+        });
+      }
     }
     return found;
   }

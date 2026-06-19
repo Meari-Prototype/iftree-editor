@@ -210,6 +210,10 @@ function requestedEditBranchBaseDocId(payload = {}, ctx = {}) {
     ?? null;
 }
 
+function requestedEditBranchId(payload = {}, ctx = {}) {
+  return ctx?.editBranchId ?? payload.editBranchId ?? payload.edit_branch_id ?? null;
+}
+
 function activeEditBranchForMutation(store, payload = {}) {
   const docId = store.docIdForMutationPayload(payload);
   if (!docId) return null;
@@ -316,10 +320,15 @@ export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
     if (!shouldRouteToEditBranch(action)) {
       throw new Error(`database_write action cannot be routed to an edit branch: ${action}`);
     }
-    const branch = store.beginEditBranch(
-      requestedEditBranchBaseDocId(payload, ctx) ?? store.docIdForMutationPayload(payload),
-      routeOwner
-    );
+    // 显式 branchId 精确定位（多草稿并存时不靠 (baseDocId, owner) 唯一性）；缺省回退 beginEditBranch 的找/建。
+    const routeBranchId = requestedEditBranchId(payload, ctx);
+    const branch = routeBranchId != null
+      ? store.findEditBranch({ branchId: routeBranchId })
+      : store.beginEditBranch(
+        requestedEditBranchBaseDocId(payload, ctx) ?? store.docIdForMutationPayload(payload),
+        routeOwner
+      );
+    if (!branch) throw new Error(`edit branch not found: branchId=${routeBranchId}`);
     return dispatchEditBranchStage(store, branch, action, payload);
   }
 
