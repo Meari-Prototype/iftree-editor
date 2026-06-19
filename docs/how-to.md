@@ -108,7 +108,7 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
 
 - 投的是「发生过什么」的**原料**，不是结论——提炼成当前事实是库内另一条链（提炼 + 人工审批）的事。
 - 自述日志四段骨架：用户原话（唯一逐字段）、任务与结果、失败与教训、可复用结论。
-- 所有节点一律 `trust_level: "不受控"`，写「受控」会被拒绝。
+- 节点一律不受控：写入不接受 `trust_level` 字段（trust 已下线），标受控只能事后经 `human` 档 `certify`。
 - 一次投递成一卷；落库后按 24 小时节律自动封卷、进入可提炼，agent 不管理生命周期。
 
 查看已有卷：MCP `memory_volumes` 或 `db memory list`，按 docId 用 `tree` / `read` 下钻卷正文。
@@ -118,7 +118,7 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
 把外部数据流（聊天记录、日志、抓取结果）持续追加进库，不走「导入一个完整文件」的路径：
 
 1. 目标文档切到增量编辑模式：`set_mode` → `incremental`（增量编辑与完整编辑互斥；要回头修订就切回 `full`）。
-2. 用 `push` 追加：首次给 `title` 新建文档；之后给 `docId` + 挂载点 `parentId`（uuid，可用 `tree` / `read` 查到）。每个节点必须显式给 `trust_level`；更深结构放 `children` 递归。
+2. 用 `push` 追加：首次给 `title` 新建文档；之后给 `docId` + 挂载点 `parentId`（uuid，可用 `tree` / `read` 查到）。写入恒落不受控、不接受 `trust_level`；更深结构放 `children` 递归；`embed=true` 可同步建向量（缺省后补）。
 3. 去重是调用方的责任，系统只按 `idempotencyKey` 做请求级防抖。
 
 **海量导入**（一次灌几十万句）再加一层 `bulk` 加速会话：`begin` 开异步写 → 多次 `push` → `end` 恢复安全设置并 checkpoint。注意：
@@ -133,7 +133,7 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
 | --- | --- | --- |
 | 源文档 | `<项目根>/library/` | 你自己组织的源文件，自行备份 |
 | 主数据库 | `<项目根>/database/store.sqlite` | 文档、节点、历史、记忆卷等全部结构化数据 |
-| 向量 / 附件 | `%USERPROFILE%\.iftree\` | `vectors\nodes.lance`、`assets\doc-<id>\` |
+| 向量 / 附件 | `<项目根>\database\`（默认，与主库同根；`IFTREE_HOME` 可覆盖） | `vectors\nodes.lance`、`assets\doc-<id>\` |
 
 - 备份：`library/` + `database/store.sqlite` 即可恢复全部内容；向量可随时重建。
 - 换库 / 隔离测试：`IFTREE_DB` 指定另一个 SQLite 路径，`IFTREE_HOME` 指定另一个派生数据目录（也可把向量库挪到大盘）。

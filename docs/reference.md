@@ -46,7 +46,7 @@
 | `commit` | 定稿：当前草稿生效 diff 写入正文历史并销稿；快进直落，非快进逐条前置验证——结构失配返回 blocked、字段冲突返回 conflicts 待裁清单、不落 |
 | `merge` | 调和定稿：默认只返回预览（fastForward / hasConflicts / 逐节点 resolution）；`yes=true` 执行，`strategy=ours/theirs` 整批或 `resolutions` 逐条裁决字段冲突，冲突与受阻时正文与草稿均不动 |
 | `discard` | 弃稿：丢弃一份草稿（默认预览，`yes=true` 执行；原 branch drop 并入） |
-| `import` | 导入 library 内真实文件，mode 为 simple / complete / direct / smart / vector |
+| `import` | 导入 library 内真实文件，mode 为 simple / complete / direct / smart / vector（切分方式）；`embed=true` 导入后同步建向量、缺省后补 |
 | `delete` | 删除已导入文档的 doc 数据（不删 library 真实文件；与 `import` 成对，`18-3-1`；`forget` 一词留给记忆系统） |
 | `memory_deliver` | 投递事件记忆卷（外部 agent 唯一合法的记忆侧写入；节点一律不受控） |
 
@@ -60,7 +60,7 @@
 | `export` | 导出已导入文档为 Markdown 文本（返回文本，不写文件） |
 | `vectors` | 为已导入文档补建语义向量（重算力，归 full） |
 | `set_mode` | 切换文档编辑模式：readonly / incremental（流式写入）/ full（分支与合并），增量与草稿编辑互斥 |
-| `push` | 流式写入：把消息节点追加进增量编辑文档（每节点必填 `trust_level`） |
+| `push` | 流式写入：把消息节点追加进增量编辑文档（恒落不受控，不接受 `trust_level`，标受控走 human `certify`）；`embed=true` 同步建向量、缺省后补 |
 | `bulk` | 海量导入加速会话：begin 异步写 → 多次 push → end；全库降 durability + 独占锁 |
 | `memory_distill` | 标记记忆卷已提炼（提炼=人审地界；原 memory_admin 的 mark_distilled；seal 已自动化、不再设动词） |
 | `revert` | 反向提交：撤销某次已落 commit 的改动、生成反向变更并保留其后历史（区别于 `restore` 的 reset 回滚）；三方调和，撞冲突 blocked 交人裁 |
@@ -151,6 +151,8 @@ JSON 结构与 `db push` 同构：
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | OpenAI 兼容接口的默认凭据 |
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | 显式 DeepSeek 命名，与 OPENAI_* 同在时优先 |
 | `OLLAMA_BASE_URL` | Ollama 本地服务地址 |
+| `IFTREE_AGENT_BASE_URL` / `IFTREE_AGENT_MODEL` / `IFTREE_AGENT_API_KEY` | 内置问答 agent 直连模型（覆盖摘要默认，缺省复用 `OPENAI_*`）；`IFTREE_AGENT_TIMEOUT_MS` 单轮超时默认 45s |
+| `IFTREE_EMBED_BACKEND` / `IFTREE_EMBED_*` | 嵌入后端：缺省 `transformers`（本地内置），可切 `ollama` / `openai`（`_BASE_URL` / `_MODEL` / `_API_KEY` / `_BATCH` / `_FALLBACK`） |
 | `IFTREE_LLM_*` | 设置页自动维护的多供应商配置与各 API 的 Key，一般不手编 |
 
 ### 运行时环境变量
@@ -158,7 +160,7 @@ JSON 结构与 `db push` 同构：
 | 变量 | 作用 |
 | --- | --- |
 | `IFTREE_DB` | 主数据库路径，缺省 `<项目根>/database/store.sqlite` |
-| `IFTREE_HOME` | 派生数据目录（向量 / 附件），缺省 `%USERPROFILE%\.iftree` |
+| `IFTREE_HOME` | 派生数据目录（向量 / 附件），缺省 `<项目根>\database`（与主库 `IFTREE_DB` 同根；不再回落 `%USERPROFILE%\.iftree`，避免向量库与 SQLite 分家） |
 | `IFTREE_MCP_TIER` | MCP 权限档：`read` / `edit` / `full` / `human`（别名 `yolo`） |
 | `IFTREE_DEBUG_LOGGING` | `1` 强制开 debug 日志（等价于配置文件 `debugLogging: true`） |
 | `ELECTRON_START_URL` | 开发模式让 Electron 加载 Vite dev server |

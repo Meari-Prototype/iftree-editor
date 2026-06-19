@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.4.1%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.5.0%20alpha-orange)
 
-> **项目状态：0.4.1，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
+> **项目状态：0.5.0，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
 >
 > - **前端**：仍有较多已知 bug 未修复。
 > - **后端写入路径**：缺少长期使用的实测——项目开发时间尚短，客观上还没有积累足够的长时运行数据。
@@ -173,12 +173,12 @@ OPENAI_MODEL=deepseek-v4-pro
 
 导入后解析出的结构化数据——文档、节点、前提、ERROR、引用、历史、记忆卷——存于项目根的 `database/store.sqlite`（已在 `.gitignore`），可用环境变量 `IFTREE_DB` 指定其他路径。
 
-### 派生数据（`%USERPROFILE%\.iftree\`）
+### 派生数据（默认 `database\`，可用 `IFTREE_HOME` 覆盖）
 
-向量与附件写入用户数据目录（可用 `IFTREE_HOME` 覆盖）：
+向量与附件默认写入主库同目录 `database\`（0.5.0 起锚工作区，避免与 SQLite 分家；早期默认为 `%USERPROFILE%\.iftree`，仍可用 `IFTREE_HOME` 覆盖）：
 
 ```text
-%USERPROFILE%\.iftree\
+database\               # 与主库 store.sqlite 同目录（IFTREE_HOME 默认）
   vectors\nodes.lance\  # 节点级语义向量
   assets\doc-<id>\      # 文档附件（图片等）
 ```

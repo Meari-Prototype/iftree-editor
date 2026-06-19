@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.4.1%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.5.0%20alpha-orange)
 
-> **Project status: 0.4.1, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.5.0, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -175,12 +175,12 @@ The app involves three kinds of local data: the **document library** you manage,
 
 The structured data parsed on import — documents, nodes, axioms, ERRORs, references, history, memory volumes — lives in `database/store.sqlite` at the project root (gitignored). Use the `IFTREE_DB` environment variable to point at a different path.
 
-### Derived data (`%USERPROFILE%\.iftree\`)
+### Derived data (defaults to `database\`, overridable with `IFTREE_HOME`)
 
-Vectors and attachments are written to the user data directory (overridable with `IFTREE_HOME`):
+Vectors and attachments default to the main database's directory `database\` (since 0.5.0 anchored to the workspace, avoiding a split from SQLite; earlier releases defaulted to `%USERPROFILE%\.iftree`, still overridable with `IFTREE_HOME`):
 
 ```text
-%USERPROFILE%\.iftree\
+database\               # same directory as store.sqlite (IFTREE_HOME default)
   vectors\nodes.lance\  # node-level semantic vectors
   assets\doc-<id>\      # document attachments (images, etc.)
 ```

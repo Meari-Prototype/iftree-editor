@@ -2,6 +2,33 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.5.0 — 2026-06-19
+
+动词形态完整定型：编辑/流式/管理动词的参数面收口，向量维护改为 pull 自对账架构，新增记忆卷孤儿清理工具。
+
+### 新增
+
+- **记忆卷孤儿清理工具**：`memory.purgeOrphaned` 与运维脚本 `scripts/purge-orphaned-volumes.{mjs,bat}`——在文件管理器删掉某卷在 `.memory` 下的实体锚后跑此工具，把「锚已被删除」的脱锚卷连带清干净（`lstat` 不解引用、只清真删的、不误伤需求允许悬空的真卷、带 `--dry-run` 预览、复用共享后端不抢锁）。
+- **edit 动词定位增强**：补 `node.moveBefore`（移到目标节点之前）与 `node.mergePrevious`；`targetNodeId` 具名字段统一 `moveAfter` / `moveBefore` / `mergeInto` 的目标（`afterNodeId` 兜底映射）；`node.insert` 给 `afterNodeId` 即自足推断父节点；`branchId` 精确路由多草稿并存。
+- **建向量开关统一为 `embed`**：`import` / `push` / `import-json` 同步建向量统一用 `embed`（与切分方式 `mode` 正交）；旧 `vectors` 参数退役，传了直接报错、不静默不建。
+
+### 修复
+
+- **restore 走 git reset 语义**：按 commit 恢复时在事务内把 head 移到目标 commit，不再只重写 nodes 致 head 与正文脱节；`log` / 历史只列 head 祖先链（被跳过的「未来」commit 仍可凭 id 直接访问，充当 reflog）。
+- **向量库与 SQLite 不再分家**：派生数据目录（`IFTREE_HOME`）缺省锚工作区 `database`（与主库同根），不再回落 `%USERPROFILE%\.iftree`——修 `IFTREE_HOME` 未设时向量库连错空库（`find --semantic` 全空的真因）。
+- **检索就绪一致性**：completeness 闸改走对账实时校验；陈旧向量（正文已变的旧 embedding）即使在保存路径也删成「缺失」（安全降级），不再让跨库语义检索按旧正文打分。
+- **分支计数口径**：diff 把纯位置变更（`sort_order` / `parent_id`）从 modified 拆出单列「移」；`node.split` 按实际拆出子节点数计「增」。
+- **revert 撤销节点移动**：反向提交对 `sort_order` 做三方调和，撤掉目标 commit 改过的位置、保留其后又改的。
+- **MCP 稳定性**：`restart_backend` 优雅关停后按 pid 强杀兜底；共享后端被多客户端复用时单个 MCP 退出不再误关全局后端；agent 委托长任务周期发 progress 防客户端超时；`memory_deliver` 复活。
+
+### 工程
+
+- **向量索引重构为 pull 自对账**：主进程写完 SQL 只发 `reconcile(docId, {fillNow})` 信号、不传变更集，向量库自查 SQL 对账；写入恒 `mergeInsert` 按 id upsert（物理一 id 一行，消除重复行 / 计数虚高 / 补建死循环）；`content_hash` + `subtree_hash` 双列随行落库，top-down subtree 剪枝让流式百万节点也只对账变化子树；旧表 `addColumns` 原地迁移。
+- **MCP 写返回渲染收口**：写动词返回从裸 JSON 改为紧凑 ASCII 文本（`write-result-text`），截断预算统一到 `text-budget`，语义状态读 `docs.meta` 持久化列（`semantic-status`，启动后台回填存量）。
+- **运维工具归位**：`purge-orphaned-volumes` 从内部 `scripts/ops/` 移到发布的 `scripts/` 顶层，与 `prune-orphan-index-rows` 等并列。
+- 文档跟进：`reference` / `how-to` 修正流式写入不再接受 `trust_level`、派生数据目录默认路径，`.env` 表补 `IFTREE_AGENT_*` / `IFTREE_EMBED_*`；`.env.example` 补全直连与嵌入后端配置。
+- 顶层套件 / `test:verbs` / `check:types` / `lint` 全绿；新增 reconcile subtree 剪枝、非 fillNow 删陈旧、记忆卷孤儿清理等单测。
+
 ## 0.4.1 — 2026-06-18
 
 ### 修复
