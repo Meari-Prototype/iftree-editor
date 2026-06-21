@@ -385,6 +385,103 @@ export function createLlmSettingsReader({ envPath = null, configPath = null, rea
     };
   }
 
+  // .env 直连覆盖（最高优先级）：设了 IFTREE_AGENT_BASE_URL + IFTREE_AGENT_MODEL
+  // 即直接用该端点/模型，绕过 iftree.config.json 的 provider 选择，便于本地 ollama
+  // 等通过 .env 一键介入。API_KEY 可省（ollama 不校验，默认占位 'ollama'）。
+  function agentEnvOverride(env) {
+    const baseUrl = String(process.env.IFTREE_AGENT_BASE_URL || env.IFTREE_AGENT_BASE_URL || '').trim();
+    const model = String(process.env.IFTREE_AGENT_MODEL || env.IFTREE_AGENT_MODEL || '').trim();
+    if (!baseUrl || !model) return null;
+    const apiKey = String(process.env.IFTREE_AGENT_API_KEY || env.IFTREE_AGENT_API_KEY || 'ollama').trim();
+    return {
+      providerName: 'EnvDirect',
+      name: model,
+      apiKey,
+      baseUrl,
+      model,
+      fullUrl: false,
+      protocol: 'openai-compatible',
+      reasoningEfforts: [],
+      reasoningEffortMap: {},
+      enabled: true
+    };
+  }
+
+  // 当前 agent 该用哪个 provider/api：.env 直连覆盖 > 设置页选中的共享 provider > legacy env。
+  function activeAgentApi() {
+    const env = readEnv();
+    const override = agentEnvOverride(env);
+    if (override) return override;
+    const stored = Boolean(readProjectConfig().llm?.shared?.providers || env[LLM_PROVIDERS_ENV_KEY]);
+    const active = activeLlmApiFromSettings(readAgentSettings());
+    if (active?.apiKey && active.enabled !== false) return active;
+    if (stored) {
+      if (active?.enabled === false) throw new Error('当前共享 API 已禁用，请在设置里启用或切换。');
+      throw new Error('当前共享 API 未配置 API Key，请在设置里填写。');
+    }
+    const apiKey = process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY || env.OPENAI_API_KEY || env.DEEPSEEK_API_KEY || '';
+    if (!apiKey) throw new Error('未配置共享 API Key，请在设置页填写。');
+    return {
+      providerName: 'Legacy',
+      name: 'Legacy',
+      apiKey,
+      baseUrl: process.env.OPENAI_BASE_URL || process.env.DEEPSEEK_BASE_URL || env.OPENAI_BASE_URL || env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
+      model: process.env.OPENAI_MODEL || process.env.DEEPSEEK_MODEL || env.OPENAI_MODEL || env.DEEPSEEK_MODEL || 'deepseek-v4-pro',
+      fullUrl: false,
+      protocol: 'openai-compatible',
+      reasoningEfforts: [],
+      reasoningEffortMap: {},
+      enabled: true
+    };
+  }
+
+  function agentApiFromPayload(payload = {}) {
+    const settings = readAgentSettings();
+    const providerId = String(payload.agentProviderId || payload.providerId || '').trim();
+    const apiId = String(payload.agentApiId || payload.apiId || '').trim();
+    if (providerId || apiId) {
+      const provider = settings.providers.find((item) => item.id === providerId)
+        || settings.providers.find((item) => item.apis.some((api) => api.id === apiId));
+      const api = provider?.apis.find((item) => item.id === apiId);
+      if (provider && api) {
+        if (api.enabled === false) throw new Error('当前选择的 Agent API 已禁用，请切换模型或在设置里启用。');
+        if (!api.apiKey) throw new Error('当前选择的 Agent API 未配置 API Key。');
+        return { ...api, providerName: provider.name };
+      }
+    }
+    const active = activeAgentApi();
+    const model = String(payload.agentModel || payload.model || '').trim();
+    return model ? { ...active, model } : active;
+  }
+
+  // 摘要该用哪个 api：独立摘要配置启用时用其自身 provider，否则复用 agent 的选择。
+  function activeLlmSummaryApi() {
+    const settings = readLlmSummarySettings();
+    if (settings.independent !== true) return activeAgentApi();
+    const env = readEnv();
+    const stored = Boolean(readProjectConfig().llm?.summary?.providers || env[LLM_SUMMARY_PROVIDERS_ENV_KEY]);
+    const active = activeLlmApiFromSettings(settings);
+    if (active?.apiKey && active.enabled !== false) return active;
+    if (stored) {
+      if (active?.enabled === false) throw new Error('当前 LLM 摘要 API 已禁用，请在设置里启用或切换。');
+      throw new Error('当前 LLM 摘要 API 未配置 API Key，请在设置里填写。');
+    }
+    const apiKey = process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY || env.DEEPSEEK_API_KEY || env.OPENAI_API_KEY || '';
+    if (!apiKey) throw new Error('未配置 LLM 摘要 API Key，请检查 .env 或设置页。');
+    return {
+      providerName: 'Legacy',
+      name: 'Legacy',
+      apiKey,
+      baseUrl: process.env.DEEPSEEK_BASE_URL || process.env.OPENAI_BASE_URL || env.DEEPSEEK_BASE_URL || env.OPENAI_BASE_URL || 'https://api.deepseek.com',
+      model: process.env.DEEPSEEK_MODEL || process.env.OPENAI_MODEL || env.DEEPSEEK_MODEL || env.OPENAI_MODEL || 'deepseek-v4-pro',
+      fullUrl: false,
+      protocol: 'openai-compatible',
+      reasoningEfforts: [],
+      reasoningEffortMap: {},
+      enabled: true
+    };
+  }
+
   return {
     readEnv,
     readProjectConfig,
@@ -394,6 +491,9 @@ export function createLlmSettingsReader({ envPath = null, configPath = null, rea
     readStoredIndependentSummarySettings,
     readSharedLlmSettings,
     readLlmSummarySettings,
-    readAgentSettings
+    readAgentSettings,
+    activeAgentApi,
+    agentApiFromPayload,
+    activeLlmSummaryApi
   };
 }

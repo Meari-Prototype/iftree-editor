@@ -25,8 +25,8 @@ import {
   normalizeVectorConfig
 } from '../src/vector/embeddings.mjs';
 import { normalizeDocMeta, resolveMarkdownImageUrl, workspaceSearchRoots } from '../src/core/image-paths.mjs';
-import { IftreeStore } from '../src/backend/store.mjs';
-import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.mjs';
+import { IftreeStore } from '../src/backend/store/index.mjs';
+import { createBackendClient } from '../src/backend/llm/backend-client.mjs';
 import {
   clampNumber,
   normalizeAgentToolSettings
@@ -520,9 +520,7 @@ async function moveLibraryEntry(payload = {}) {
   if (pathKey(source) === pathKey(target)) return listLibraryTree();
   if (existsSync(target)) throw new Error(`Target already exists: ${parse(source).base}`);
   renameSync(source, target);
-  await getHeadlessAgentClient().request('library.updateImportedSourcePaths', {
-    payload: { fromPath: source, toPath: target, isDirectory: sourceStat.isDirectory() }
-  });
+  await getHeadlessAgentClient().updateImportedSourcePaths({ fromPath: source, toPath: target, isDirectory: sourceStat.isDirectory() });
   return listLibraryTree();
 }
 
@@ -563,34 +561,61 @@ function dbPath() {
   return process.env.IFTREE_DB || join(DATABASE_ROOT, 'store.sqlite');
 }
 
+// 数据库三口的请求观测：旧实现在每个 IPC handler 里各抄一套 try/catch + 计时 + start/end；现下沉到
+// 统一 SDK 的 onDebug 回调（SDK 出站点统一触发），这里只决定「记什么」——保持只观测数据库读 / 写 /
+// 跑三口、沿用既有 event 名（run 记作 database.command）与 debugValueSummary 截断，行为不变。
+/** @param {{ type?: string, phase?: string, body?: { payload?: any, commandPayload?: any }, ok?: boolean, ms?: number, result?: any, error?: any }} arg */
+function backendDebugLogger({ type, phase, body = {}, ok, ms, result, error }) {
+  const spec = {
+    'database.read': { event: 'database.read', payload: body.payload },
+    'database.write': { event: 'database.write', payload: body.payload },
+    'database.run': { event: 'database.command', payload: body.commandPayload }
+  }[type];
+  if (!spec) return;
+  if (phase === 'start') {
+    appendDebugLog('backend', { event: `${spec.event}.start`, payload: debugValueSummary(spec.payload || {}) });
+    return;
+  }
+  appendDebugLog('backend', {
+    event: `${spec.event}.end`,
+    ok,
+    ms,
+    payload: debugValueSummary(spec.payload || {}),
+    ...(ok ? { result: debugValueSummary(result || {}) } : { error: debugErrorSummary(error) })
+  });
+}
+
 function getHeadlessAgentClient() {
   if (!headlessAgentClient) {
-    headlessAgentClient = createHeadlessAgentClient({
-      cwd: PROJECT_ROOT,
-      scriptPath: HEADLESS_AGENT_SCRIPT,
-      onStderr: (text) => console.error(`[headless-agent] ${String(text || '').trimEnd()}`)
+    // 解耦第 10 步：主进程经统一 backend-client SDK 连共享管道后端（与 mcp-server 写档同一个 host
+    // 实例）——发现→连接→连不上自拉起→单机离线回退私有 stdio。主进程从此只调 SDK 的语义方法、
+    // 内部不再写连接 / 请求信封 / 日志这些通信处理；退出时 close 在管道模式只断连接、不杀共享后端。
+    headlessAgentClient = createBackendClient({
+      projectRoot: PROJECT_ROOT,
+      hostScriptPath: HEADLESS_AGENT_SCRIPT,
+      mode: 'shared',
+      onStderr: (text) => console.error(`[headless-agent] ${String(text || '').trimEnd()}`),
+      onStatus: (text) => console.error(`[backend] ${String(text || '').trimEnd()}`),
+      onDebug: backendDebugLogger
     });
   }
   return headlessAgentClient;
 }
 
 function headlessDatabaseRead(payload = {}) {
-  return getHeadlessAgentClient().request('database.read', { payload });
+  return getHeadlessAgentClient().databaseRead(payload);
 }
 
 function headlessDatabaseWrite(payload = {}) {
-  return getHeadlessAgentClient().request('database.write', { payload });
+  return getHeadlessAgentClient().databaseWrite(payload);
 }
 
 function headlessDatabaseRun(command = {}, fallbackOperation = 'read') {
-  return getHeadlessAgentClient().request('database.run', {
-    commandPayload: command || {},
-    fallbackOperation
-  });
+  return getHeadlessAgentClient().databaseRun(command, fallbackOperation);
 }
 
 async function ensureHeadlessAgentStarted() {
-  const result = await getHeadlessAgentClient().request('ping', {});
+  const result = await getHeadlessAgentClient().ping();
   console.log(`[headless-agent] started pid=${result?.pid || getHeadlessAgentClient().pid || ''}`);
   return result;
 }
@@ -601,7 +626,7 @@ function stopHeadlessAgent() {
   headlessAgentClient = null;
 }
 
-function vectorDbPath() {
+function lanceDbPath() {
   return join(appHome(), 'vectors', 'nodes.lance');
 }
 
@@ -650,7 +675,7 @@ function vectorSettingsPayload(config = getVectorConfig(), runtime = {}) {
     detectedOllamaBgeM3Path: detectedOllamaBgeM3Path(),
     appHome: appHome(),
     settingsPath: settingsPath(),
-    vectorDbPath: vectorDbPath(),
+    lanceDbPath: lanceDbPath(),
     vectorTable: 'nodes_vec',
     localModelBaseUrl: runtime.localModelBaseUrl || ''
   };
@@ -759,7 +784,7 @@ async function downloadVectorModelToRoot(config, downloadRoot) {
 }
 
 async function resetVectorStoreTable(dimensions) {
-  await getHeadlessAgentClient().request('vector.resetStore', { payload: { dimensions } });
+  await getHeadlessAgentClient().resetVectorStore({ dimensions });
 }
 
 async function saveVectorConfig(patch = {}) {
@@ -1641,9 +1666,7 @@ async function importFilePaths(filePaths = [], options = {}) {
   for (const filePath of paths) {
     const relativePath = libraryRelativePathForAgent(filePath);
     if (!relativePath) throw new Error('请选择 library 文件夹内的文件');
-    const result = await getHeadlessAgentClient().request('import.libraryDocument', {
-      payload: { relativePath, mode: options.mode }
-    });
+    const result = await getHeadlessAgentClient().importLibraryDocument({ relativePath, mode: options.mode });
     const docs = Array.isArray(result?.imported)
       ? result.imported
       : [{ docId: result?.docId, title: result?.title, nodeCount: result?.nodeCount }];
@@ -1902,89 +1925,10 @@ function registerIpc() {
 
   ipcMain.handle('library:move', (_event, payload) => moveLibraryEntry(payload || {}));
 
-  ipcMain.handle('database:read', async (_event, payload) => {
-    const startedAt = Date.now();
-    appendDebugLog('backend', {
-      event: 'database.read.start',
-      payload: debugValueSummary(payload || {})
-    });
-    try {
-      const result = await headlessDatabaseRead(payload || {});
-      appendDebugLog('backend', {
-        event: 'database.read.end',
-        ok: true,
-        ms: Date.now() - startedAt,
-        payload: debugValueSummary(payload || {}),
-        result: debugValueSummary(result || {})
-      });
-      return result;
-    } catch (error) {
-      appendDebugLog('backend', {
-        event: 'database.read.end',
-        ok: false,
-        ms: Date.now() - startedAt,
-        payload: debugValueSummary(payload || {}),
-        error: debugErrorSummary(error)
-      });
-      throw error;
-    }
-  });
-
-  ipcMain.handle('database:run', async (_event, command) => {
-    const startedAt = Date.now();
-    appendDebugLog('backend', {
-      event: 'database.command.start',
-      payload: debugValueSummary(command || {})
-    });
-    try {
-      const result = await headlessDatabaseRun(command || {});
-      appendDebugLog('backend', {
-        event: 'database.command.end',
-        ok: true,
-        ms: Date.now() - startedAt,
-        payload: debugValueSummary(command || {}),
-        result: debugValueSummary(result || {})
-      });
-      return result;
-    } catch (error) {
-      appendDebugLog('backend', {
-        event: 'database.command.end',
-        ok: false,
-        ms: Date.now() - startedAt,
-        payload: debugValueSummary(command || {}),
-        error: debugErrorSummary(error)
-      });
-      throw error;
-    }
-  });
-
-  ipcMain.handle('database:write', async (_event, payload) => {
-    const startedAt = Date.now();
-    appendDebugLog('backend', {
-      event: 'database.write.start',
-      payload: debugValueSummary(payload || {})
-    });
-    try {
-      const result = await headlessDatabaseWrite(payload || {});
-      appendDebugLog('backend', {
-        event: 'database.write.end',
-        ok: true,
-        ms: Date.now() - startedAt,
-        payload: debugValueSummary(payload || {}),
-        result: debugValueSummary(result || {})
-      });
-      return result;
-    } catch (error) {
-      appendDebugLog('backend', {
-        event: 'database.write.end',
-        ok: false,
-        ms: Date.now() - startedAt,
-        payload: debugValueSummary(payload || {}),
-        error: debugErrorSummary(error)
-      });
-      throw error;
-    }
-  });
+  // 数据库三口：观测（计时 + start/end）已下沉统一 SDK 的 onDebug（backendDebugLogger），handler 只转发。
+  ipcMain.handle('database:read', (_event, payload) => headlessDatabaseRead(payload || {}));
+  ipcMain.handle('database:run', (_event, command) => headlessDatabaseRun(command || {}));
+  ipcMain.handle('database:write', (_event, payload) => headlessDatabaseWrite(payload || {}));
 
   ipcMain.handle('source:readPdfData', (_event, docId) => {
     const normalizedDocId = normalizeMainDocId(docId, null);
@@ -2017,9 +1961,7 @@ function registerIpc() {
     const reportProgress = !requestId;
     if (reportProgress) sendProgress({ label: '生成摘要...', step: 0, total: 0 });
     try {
-      return await getHeadlessAgentClient().request('summary.generateNode', {
-        payload: payload || {}
-      });
+      return await getHeadlessAgentClient().generateNodeSummary(payload || {});
     } finally {
       if (reportProgress) sendProgress({ done: true });
     }
@@ -2027,24 +1969,22 @@ function registerIpc() {
   ipcMain.handle('summary:cancelNode', (_event, payload) => {
     const requestId = String(payload?.requestId || '').trim();
     if (!requestId) return { ok: false, canceled: false, reason: 'missing requestId' };
-    return getHeadlessAgentClient().request('summary.cancelNode', {
-      payload: { requestId }
-    });
+    return getHeadlessAgentClient().cancelNodeSummary({ requestId });
   });
 
-  ipcMain.handle('agent:run', async (_event, payload) => getHeadlessAgentClient().request('agent.run', { payload: payload || {} }, {
+  ipcMain.handle('agent:run', async (_event, payload) => getHeadlessAgentClient().runAgent(payload || {}, {
     onEvent: (event) => sendAgentStream(event.requestId, event)
   }));
-  ipcMain.handle('agent:cancel', (_event, payload) => getHeadlessAgentClient().request('agent.cancel', { payload: payload || {} }));
+  ipcMain.handle('agent:cancel', (_event, payload) => getHeadlessAgentClient().cancelAgent(payload || {}));
 
-  ipcMain.handle('agent:diffs', () => getHeadlessAgentClient().request('agent.diffs', {}));
-  ipcMain.handle('agent:sessions', (_event, payload) => getHeadlessAgentClient().request('agent.sessions', { payload: payload || {} }));
-  ipcMain.handle('agent:session', (_event, payload) => getHeadlessAgentClient().request('agent.session', { payload: payload || {} }));
-  ipcMain.handle('agent:deleteSession', (_event, payload) => getHeadlessAgentClient().request('agent.deleteSession', { payload: payload || {} }));
+  ipcMain.handle('agent:diffs', () => getHeadlessAgentClient().listAgentDiffs());
+  ipcMain.handle('agent:sessions', (_event, payload) => getHeadlessAgentClient().listAgentSessions(payload || {}));
+  ipcMain.handle('agent:session', (_event, payload) => getHeadlessAgentClient().getAgentSession(payload || {}));
+  ipcMain.handle('agent:deleteSession', (_event, payload) => getHeadlessAgentClient().deleteAgentSession(payload || {}));
 
-  ipcMain.handle('agent:applyDiff', (_event, payload) => getHeadlessAgentClient().request('agent.applyDiff', { payload: payload || {} }));
+  ipcMain.handle('agent:applyDiff', (_event, payload) => getHeadlessAgentClient().applyAgentDiff(payload || {}));
 
-  ipcMain.handle('agent:rejectDiff', (_event, payload) => getHeadlessAgentClient().request('agent.rejectDiff', { payload: payload || {} }));
+  ipcMain.handle('agent:rejectDiff', (_event, payload) => getHeadlessAgentClient().rejectAgentDiff(payload || {}));
 
   ipcMain.handle('asset:createImage', async (_event, payload) => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -2153,18 +2093,16 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // 关停清理集中一处（原先 before-quit 注册了两次、stopHeadlessAgent 跑两遍）：停文件监听 +
+  // 清启动器轮询 + 断后端连接（共享管道模式只断连、不杀别的客户端在用的后端）+ 关本进程 store。
   stopLibraryWatcher();
+  if (launcherPollTimer) clearInterval(launcherPollTimer);
   stopHeadlessAgent();
+  if (store) store.close();
 });
 
 app.on('activate', async () => {
   if (BrowserWindow.getAllWindows().length > 0) return;
   if (IS_MAIN_APP_PROCESS) await createWindow();
   else await createLauncherWindow();
-});
-
-app.on('before-quit', () => {
-  if (launcherPollTimer) clearInterval(launcherPollTimer);
-  stopHeadlessAgent();
-  if (store) store.close();
 });

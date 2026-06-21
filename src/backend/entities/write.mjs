@@ -1,7 +1,9 @@
 import {
+  compareStableIds,
   newStableId,
   sameStableId
 } from '../db/ids.mjs';
+import { normalizePositiveId } from '../db/normalizers.mjs';
 import {
   ensureEntityNodeSameDoc,
   entityRow,
@@ -264,7 +266,9 @@ function assertExistingEntityInBranchDoc(store, branch, ref) {
 
 export function stageEntityWrite(store, branch, payload = {}, action = '') {
   if (action === 'entity.create') {
-    const docId = requireDocId(payload);
+    // docId 与 axiom/ref 对齐：以已建好的编辑分支为准（顶层 baseDocId 经 beginEditBranch 已进
+    // branch.base_doc_id）；payload 若显式给 docId 仍由 assertBranchDoc 校验与分支一致、防跨档误写。
+    const docId = normalizePositiveInteger(payload.docId ?? payload.doc_id) ?? branch.base_doc_id;
     assertBranchDoc(branch, docId);
     const literal = requireLiteral(payload);
     const tmpId = nextTmpEntityId();
@@ -392,4 +396,119 @@ export function runEntityWrite(store, payload = {}, action = '') {
   if (action === 'entity.ignoreNode') return setNodeBinding(store, payload, 'ignored');
   if (action === 'entity.clearNodeBinding') return clearNodeBinding(store, payload);
   throw new Error(`Unhandled entity write action: ${action}`);
+}
+
+// 提交时把编辑分支 diff 里的 entity 条目实化到主库——从 store.applyEditBranchDiffEntries 下沉
+// （解耦第 4 步：entity 落库 SQL 单点收口到本模块，store 提交循环只调度、不再重写 SQL）。
+// ctx 提供 store 提交循环的横切解析设施：resolveEntityId/resolveNodeId（tmp-id → 真实 id）、
+// entityIdByTmp（新建 entity 的 tmp→真实 映射，回填供后续条目引用）、baseDocId。
+export function applyEntityEntry(store, entry, ctx = {}) {
+  const { resolveEntityId, resolveNodeId, entityIdByTmp, baseDocId } = ctx;
+  const normalizeKey = (value = '') => String(value || '').trim().toLocaleLowerCase();
+  const orderedPair = (left, right) => {
+    const leftId = resolveEntityId(left);
+    const rightId = resolveEntityId(right);
+    if (!leftId || !rightId || sameStableId(leftId, rightId)) throw new Error('apply: entity link requires two different entity ids');
+    return compareStableIds(leftId, rightId) <= 0 ? [leftId, rightId] : [rightId, leftId];
+  };
+  switch (entry.kind) {
+    case 'entity.create': {
+      const fields = entry.fields || {};
+      const docId = normalizePositiveId(fields.doc_id || baseDocId);
+      const literal = String(fields.literal || '').trim();
+      const key = normalizeKey(fields.normalized_literal || literal);
+      if (!literal || !key || !docId) throw new Error('apply: invalid entity.create entry');
+      let row = store.db.prepare('SELECT id FROM entities WHERE doc_id = ? AND normalized_literal = ?').get(docId, key);
+      if (row) {
+        store.db.prepare('UPDATE entities SET literal = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(literal, row.id);
+      } else {
+        store.db.prepare(`
+          INSERT INTO entities (id, doc_id, literal, normalized_literal)
+          VALUES (?, ?, ?, ?)
+        `).run(newStableId(), docId, literal, key);
+        row = store.db.prepare('SELECT id FROM entities WHERE doc_id = ? AND normalized_literal = ?').get(docId, key);
+      }
+      if (entry.tmp_id) entityIdByTmp.set(entry.tmp_id, row.id);
+      break;
+    }
+    case 'entity.update': {
+      const entityId = resolveEntityId(entry.entity_ref);
+      const literal = String(entry.literal || '').trim();
+      const key = normalizeKey(entry.normalized_literal || literal);
+      if (!literal || !key) throw new Error('apply: invalid entity.update entry');
+      store.db.prepare(`
+        UPDATE entities
+        SET literal = ?,
+          normalized_literal = ?,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(literal, key, entityId);
+      break;
+    }
+    case 'entity.delete': {
+      store.db.prepare('DELETE FROM entities WHERE id = ?').run(resolveEntityId(entry.entity_ref));
+      break;
+    }
+    case 'entity.link': {
+      const [leftId, rightId] = orderedPair(entry.source_ref, entry.target_ref);
+      const kind = entry.link_kind === 'synonym' ? 'synonym' : entry.link_kind === 'related' ? 'related' : '';
+      if (!kind) throw new Error('apply: invalid entity.link kind');
+      const existing = store.db.prepare(`
+        SELECT id FROM entity_links
+        WHERE entity_a_id = ? AND entity_b_id = ?
+      `).get(leftId, rightId);
+      if (existing) {
+        store.db.prepare(`
+          UPDATE entity_links
+          SET kind = ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(kind, existing.id);
+      } else {
+        store.db.prepare(`
+          INSERT INTO entity_links (kind, entity_a_id, entity_b_id)
+          VALUES (?, ?, ?)
+        `).run(kind, leftId, rightId);
+      }
+      break;
+    }
+    case 'entity.unlink': {
+      const [leftId, rightId] = orderedPair(entry.source_ref, entry.target_ref);
+      if (entry.link_kind) {
+        store.db.prepare(`
+          DELETE FROM entity_links
+          WHERE entity_a_id = ? AND entity_b_id = ? AND kind = ?
+        `).run(leftId, rightId, entry.link_kind);
+      } else {
+        store.db.prepare(`
+          DELETE FROM entity_links
+          WHERE entity_a_id = ? AND entity_b_id = ?
+        `).run(leftId, rightId);
+      }
+      break;
+    }
+    case 'entity.bindNode':
+    case 'entity.ignoreNode': {
+      const entityId = resolveEntityId(entry.entity_ref);
+      const nodeId = resolveNodeId(entry.node_id);
+      const status = entry.kind === 'entity.bindNode' ? 'bound' : 'ignored';
+      store.db.prepare(`
+        INSERT INTO entity_node_bindings (entity_id, node_id, status)
+        VALUES (?, ?, ?)
+        ON CONFLICT(entity_id, node_id) DO UPDATE SET
+          status = excluded.status,
+          updated_at = CURRENT_TIMESTAMP
+      `).run(entityId, nodeId, status);
+      break;
+    }
+    case 'entity.clearNodeBinding': {
+      store.db.prepare(`
+        DELETE FROM entity_node_bindings
+        WHERE entity_id = ? AND node_id = ?
+      `).run(resolveEntityId(entry.entity_ref), resolveNodeId(entry.node_id));
+      break;
+    }
+    default:
+      throw new Error(`Unhandled entity edit branch entry kind: ${entry.kind}`);
+  }
 }

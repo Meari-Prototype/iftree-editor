@@ -9,7 +9,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { buildNodeSentenceLabelMap } from '../core/source-ranges.mjs';
 import { findNode, flattenTree } from '../core/tree.mjs';
-import { createGpuEmbeddingService } from '../vector/gpu-embedding-service.js';
 
 import {
   depthOf, isFactAxiomRef, clampDepthLimit, normalizeNodeLayoutSettingsByView, fullDepthForDoc, loadedDepthForDoc, treeDocRequest, sameDocId, mergeDocView,
@@ -62,7 +61,6 @@ import {
   assetRepository,
   axiomRepository,
   documentRepository,
-  embeddingBridge,
   historyRepository,
   importService,
   nodeRepository,
@@ -827,37 +825,6 @@ export function App() {
     });
     return undefined;
   }, [activeTab, currentDoc?.doc?.id, currentDoc?.sourceDocument?.doc_id, currentDoc?.sourceWindow?.anchorNodeId, selectedNodeId]);
-
-  useEffect(() => {
-    if (vectorSettings?.enabled !== true) return undefined;
-    if (!embeddingBridge.canHandleBatchRequests()) return undefined;
-    const embeddingService = createGpuEmbeddingService();
-    const unsubscribe = embeddingBridge.subscribeBatchRequests(async (payload) => {
-      try {
-        const vectors = await embeddingService.embed(payload?.texts || [], payload?.config || {}, (progressEvent) => {
-          embeddingBridge.sendBatchProgress({
-            requestId: payload?.requestId,
-            ...progressEvent
-          });
-        });
-        embeddingBridge.sendBatchResult({
-          requestId: payload?.requestId,
-          vectors
-        });
-      } catch (error) {
-        embeddingBridge.sendBatchResult({
-          requestId: payload?.requestId,
-          error: {
-            message: error?.message || String(error)
-          }
-        });
-      }
-    });
-    return () => {
-      unsubscribe?.();
-      embeddingService.dispose();
-    };
-  }, [vectorSettings?.enabled]);
 
   function editorHistoryViewState(targetDocId = currentDoc?.doc?.id) {
     const docId = normalizeDocId(targetDocId);

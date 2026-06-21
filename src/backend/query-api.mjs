@@ -1,5 +1,5 @@
 import { parseJsonObject, compareNodeAddress } from './shared.mjs';
-import { listMemoryVolumes, sealDueMemoryVolumes } from './memory-volumes.mjs';
+import { runMemoryRead, MEMORY_READ_ACTIONS } from './memory/index.mjs';
 import { handleDebugOverviewQuery, handleDebugSqlQuery } from './handlers/read/debug.mjs';
 import { ENTITY_READ_ACTIONS, runEntityRead } from './entities/read.mjs';
 import { normalizeStableId } from './db/ids.mjs';
@@ -27,6 +27,7 @@ const ACTIONS = Object.freeze([
   'doc.list',
   'docFolder.list',
   'history.diff',
+  'history.snapshot',
   'diff.refs',
   'history.nodeLog',
   'editBranch.listPending',
@@ -1027,6 +1028,18 @@ function resolveKeywordDocFilter(store, payload = {}, ctx = {}) {
   return allowed;
 }
 
+// 文档类型分类 SQL（event/memory/knowledge 的单一真相，避免在多处检索 SQL 间口径漂移）：
+// 文档 meta 带记忆卷标记→event；否则文档下存在受控节点→memory；再否则→knowledge。
+// 三分语义定义归记忆域（src/backend/memory/）。docAlias=外层 docs 别名；内层受控节点子查询
+// 用独立别名 mk_node、与任何外层别名不冲突。
+function docKindCaseSql(docAlias = 'd') {
+  return `CASE
+        WHEN json_extract(${docAlias}.meta,'$.memoryVolume') IS NOT NULL THEN 'event'
+        WHEN EXISTS (SELECT 1 FROM nodes mk_node WHERE mk_node.doc_id = ${docAlias}.id AND mk_node.trust_level = '受控') THEN 'memory'
+        ELSE 'knowledge'
+      END`;
+}
+
 // 元数据过滤（工作区 / agent / 文档类型）：无此类过滤时返回 null（不限制）。
 // 类型 kind：event=事件卷、memory=含受控节点的核心记忆、knowledge=其余知识文档。
 function resolveMetaDocFilter(store, payload = {}) {
@@ -1038,11 +1051,7 @@ function resolveMetaDocFilter(store, payload = {}) {
     SELECT d.id AS id,
       json_extract(d.meta,'$.memoryVolume.agent') AS agent,
       json_extract(d.meta,'$.memoryVolume.hostAnchor') AS host_anchor,
-      CASE
-        WHEN json_extract(d.meta,'$.memoryVolume') IS NOT NULL THEN 'event'
-        WHEN EXISTS (SELECT 1 FROM nodes n WHERE n.doc_id = d.id AND n.trust_level = '受控') THEN 'memory'
-        ELSE 'knowledge'
-      END AS kind
+      ${docKindCaseSql('d')} AS kind
     FROM docs d
   `).all();
   const allowed = new Set();
@@ -1134,11 +1143,7 @@ function keywordRowsByIds(store, ids = []) {
     WITH matched AS (
       SELECT n.*,
         d.title AS doc_title,
-        CASE
-          WHEN json_extract(d.meta,'$.memoryVolume') IS NOT NULL THEN 'event'
-          WHEN EXISTS (SELECT 1 FROM nodes nn WHERE nn.doc_id = d.id AND nn.trust_level = '受控') THEN 'memory'
-          ELSE 'knowledge'
-        END AS doc_kind
+        ${docKindCaseSql('d')} AS doc_kind
       FROM nodes n
       JOIN docs d ON d.id = n.doc_id
       WHERE n.id IN (${placeholders})
@@ -1655,11 +1660,22 @@ function requireDocId(payload = {}) {
   return docId;
 }
 
-function historySnapshot(row = {}) {
-  const snapshot = parseJsonObject(row.snapshot, null);
-  if (snapshot?.nodes) return snapshot;
-  const diff = parseJsonObject(row.diff, {});
-  return diff.snapshot || (diff.kind === 'snapshot' ? diff : null);
+// 历史快照重建统一走 store.commitSnapshotFromRow（对象库展开 + 内联 meta；旧行回退读 snapshot/diff 列）。
+function historySnapshot(store, row = {}) {
+  return store.commitSnapshotFromRow(row);
+}
+
+// computeDiff 的 field-diff entry 只带 node_id；补 address（库的定位语言）供展示层用。
+// 删除的节点在 to 侧已不存在，故 to 优先、from 兜底；这些是实时算出的临时对象，不入库。
+function fillEntryAddresses(entries, toSnapshot, fromSnapshot) {
+  const addressByNode = new Map();
+  for (const node of toSnapshot?.nodes || []) addressByNode.set(node.id, node.address);
+  for (const node of fromSnapshot?.nodes || []) if (!addressByNode.has(node.id)) addressByNode.set(node.id, node.address);
+  for (const entry of entries) {
+    if (entry && entry.node_id != null && entry.address == null) {
+      entry.address = addressByNode.get(entry.node_id) ?? null;
+    }
+  }
 }
 
 function historyEntryRow(store, ref, docId = null) {
@@ -1676,6 +1692,7 @@ function historyMetaRow(row = {}) {
   const rest = /** @type {Record<string, any>} */ ({ ...(row || {}) });
   delete rest.diff;
   delete rest.snapshot;
+  delete rest.meta;
   return rest;
 }
 
@@ -1685,36 +1702,38 @@ function queryHistoryDiff(store, payload = {}) {
   const toRef = payload.toHistoryId ?? payload.to_history_id ?? payload.to ?? payload.historyId ?? payload.history_id;
   if (!toRef) throw new Error('history.diff requires toHistoryId');
   const toRow = historyEntryRow(store, toRef, docId);
-  const toDiff = parseJsonObject(toRow.diff, {});
+  const toSnapshot = historySnapshot(store, toRow);
   if (!fromRef) {
+    // 单 ref：edit-branch 提交用存档的操作级条目（meta.entries；旧行回退 diff.entries）——它精确表达
+    // 「本 commit 做了什么」、且首提交（无父）也有。无操作条目的 save/revert 提交现算「父→本」field-diff。
+    const stored = parseJsonObject(toRow.meta, null)?.entries ?? parseJsonObject(toRow.diff, null)?.entries;
+    let entries = Array.isArray(stored) ? stored : [];
+    if (entries.length === 0 && toRow.parent_commit_id) {
+      const parentRow = store.db.prepare('SELECT * FROM commits WHERE id = ?').get(toRow.parent_commit_id);
+      const parentSnapshot = parentRow ? historySnapshot(store, parentRow) : null;
+      if (parentSnapshot?.nodes && toSnapshot?.nodes) {
+        entries = store.computeDiff(parentSnapshot, toSnapshot);
+        fillEntryAddresses(entries, toSnapshot, parentSnapshot);
+      }
+    }
     return {
       kind: 'history.diff',
       docId: toRow.doc_id,
       to: historyMetaRow(toRow),
-      entries: Array.isArray(toDiff.entries) ? toDiff.entries : [],
-      snapshotAvailable: Boolean(historySnapshot(toRow))
+      entries,
+      snapshotAvailable: Boolean(toSnapshot)
     };
   }
   const fromRow = historyEntryRow(store, fromRef, docId ?? toRow.doc_id);
   if (!sameDocHistory(fromRow, toRow)) {
     throw new Error('history.diff entries must belong to the same document');
   }
-  const fromSnapshot = historySnapshot(fromRow);
-  const toSnapshot = historySnapshot(toRow);
+  const fromSnapshot = historySnapshot(store, fromRow);
   if (!fromSnapshot?.nodes || !toSnapshot?.nodes) {
     throw new Error('history.diff requires restorable snapshots on both history entries');
   }
   const entries = store.computeDiff(fromSnapshot, toSnapshot);
-  // computeDiff 的 field-diff entry 只带 node_id；补 address（库的定位语言）供展示层用。
-  // 删除的节点在 to 侧已不存在，故 to 优先、from 兜底；这些是实时算出的临时对象，不入库。
-  const addressByNode = new Map();
-  for (const node of toSnapshot.nodes) addressByNode.set(node.id, node.address);
-  for (const node of fromSnapshot.nodes) if (!addressByNode.has(node.id)) addressByNode.set(node.id, node.address);
-  for (const entry of entries) {
-    if (entry && entry.node_id != null && entry.address == null) {
-      entry.address = addressByNode.get(entry.node_id) ?? null;
-    }
-  }
+  fillEntryAddresses(entries, toSnapshot, fromSnapshot);
   return {
     kind: 'history.diff',
     docId: toRow.doc_id,
@@ -1734,7 +1753,7 @@ function resolveRefSnapshot(store, ref = {}, fallbackDocId = null) {
   }
   if (ref.historyId != null) {
     const row = historyEntryRow(store, ref.historyId, ref.docId ?? fallbackDocId);
-    const snap = historySnapshot(row);
+    const snap = historySnapshot(store, row);
     if (!snap?.nodes) throw new Error('diff ref 历史快照不可用（该 commit 无可恢复快照）');
     return snap;
   }
@@ -1752,16 +1771,22 @@ function queryRefDiff(store, payload = {}) {
   const fromSnap = resolveRefSnapshot(store, payload.from ?? {}, fallbackDocId);
   const toSnap = resolveRefSnapshot(store, payload.to ?? {}, fallbackDocId);
   const entries = store.computeDiff(fromSnap, toSnap);
-  // 补 address（to 侧优先、from 兜底），与 history.diff 展示口径一致。
-  const addressByNode = new Map();
-  for (const node of toSnap.nodes || []) addressByNode.set(node.id, node.address);
-  for (const node of fromSnap.nodes || []) if (!addressByNode.has(node.id)) addressByNode.set(node.id, node.address);
-  for (const entry of entries) {
-    if (entry && entry.node_id != null && entry.address == null) {
-      entry.address = addressByNode.get(entry.node_id) ?? null;
-    }
-  }
+  fillEntryAddresses(entries, toSnap, fromSnap);
   return { kind: 'diff.refs', entries };
+}
+
+// 按 commit id 重建完整历史快照（db-shell 的 --at 等只读消费者用；走对象库展开，不再读 diff/snapshot 列）。
+function queryHistorySnapshot(store, payload = {}) {
+  const commitId = normalizeQueryId(
+    payload.commitId ?? payload.commit_id ?? payload.historyId ?? payload.history_id ?? payload.id,
+    null
+  );
+  if (!commitId) throw new Error('history.snapshot requires commit id');
+  const row = store.db.prepare('SELECT * FROM commits WHERE id = ?').get(commitId);
+  if (!row) throw new Error(`Commit not found: ${commitId}`);
+  const snapshot = store.commitSnapshotFromRow(row);
+  if (!snapshot?.nodes) throw new Error(`Commit is not restorable: ${commitId}`);
+  return { kind: 'history.snapshot', commitId, doc_id: row.doc_id, snapshot };
 }
 
 function queryNodeHistory(store, payload = {}) {
@@ -2104,21 +2129,12 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   if (action === 'content.search') return queryContentSearch(store, payload, ctx);
   if (action === 'content.searchAll') return queryContentSearchAll(store, payload, ctx);
   if (ENTITY_READ_ACTIONS.includes(action)) return runEntityRead(store, payload, action, ctx);
-  if (action === 'memory.listVolumes') {
-    // 封卷自动化（15-10-1/15-11-5）：列卷时顺手物理封到期卷（末次活动+24h），不再设 seal 动词。
-    // 纯时间戳判断、零 LLM；只在可写连接上做（query-db 的只读路径跳过）。
-    if (!store.readonly) sealDueMemoryVolumes(store);
-    return listMemoryVolumes(store, {
-      state: payload.state ?? null,
-      agent: payload.agent ?? null,
-      sessionId: payload.sessionId ?? payload.session_id ?? null,
-      limit: payload.limit
-    });
-  }
+  if (MEMORY_READ_ACTIONS.includes(action)) return runMemoryRead(store, payload, action);
   if (action === 'debug.overview') return handleDebugOverviewQuery(store);
   if (action === 'doc.list') return store.listDocs().map(normalizeDocRow);
   if (action === 'docFolder.list') return store.listDocFolders().map(plainRow);
   if (action === 'history.diff') return queryHistoryDiff(store, payload);
+  if (action === 'history.snapshot') return queryHistorySnapshot(store, payload);
   if (action === 'diff.refs') return queryRefDiff(store, payload);
   if (action === 'history.nodeLog') return queryNodeHistory(store, payload);
   if (action === 'editBranch.listPending') return queryPendingEditBranches(store, payload);

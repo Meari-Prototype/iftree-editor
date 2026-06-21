@@ -5,8 +5,12 @@ import test from 'node:test';
 
 import {
   buildTree,
+  collectChainText,
   collectDescendantText,
+  findNode,
+  getChainNodeIds,
   maxTreeDepth,
+  resolveDisplayChildren,
   splitSentences
 } from '../src/core/tree.mjs';
 
@@ -66,4 +70,36 @@ test('maxTreeDepth follows the actual document tree depth', () => {
   ]);
 
   assert.equal(maxTreeDepth(tree), 4);
+});
+
+test('超节点：单链 TEXT 合并的展开与链文本', () => {
+  // A→B→C 连续单链（各自仅一个子节点），C 有两个子 → 链止于 C
+  const tree = buildTree([
+    { id: 'r', doc_id: 1, parent_id: null, sort_order: 1, node_type: 'TEXT', text: '根' },
+    { id: 'a', doc_id: 1, parent_id: 'r', sort_order: 1, node_type: 'TEXT', text: 'A文本' },
+    { id: 'b', doc_id: 1, parent_id: 'a', sort_order: 1, node_type: 'TEXT', text: 'B文本' },
+    { id: 'c', doc_id: 1, parent_id: 'b', sort_order: 1, node_type: 'TEXT', text: 'C文本' },
+    { id: 'd1', doc_id: 1, parent_id: 'c', sort_order: 1, node_type: 'TEXT', text: 'D1' },
+    { id: 'd2', doc_id: 1, parent_id: 'c', sort_order: 2, node_type: 'IF', text: 'D2' }
+  ]);
+  const nodeA = findNode(tree, 'a');
+
+  const chainIds = getChainNodeIds(nodeA);
+  assert.deepEqual(chainIds, ['a', 'b', 'c'], 'A→B→C 是连续单链');
+
+  const chainText = collectChainText(nodeA);
+  assert.match(chainText, /A文本/);
+  assert.match(chainText, /B文本/);
+  assert.match(chainText, /C文本/);
+
+  // 展开：跳过链中的 B、C，返回 C 的实际子节点
+  const displayKids = resolveDisplayChildren(nodeA);
+  assert.equal(displayKids.length, 2, '超节点解析后应有 2 个实际子节点');
+  const texts = displayKids.map((n) => n.text);
+  assert.ok(texts.includes('D1'));
+  assert.ok(texts.includes('D2'));
+
+  // 非链节点（IF）直接返回自己的子节点
+  const nodeD2 = displayKids.find((n) => n.text === 'D2');
+  assert.equal(resolveDisplayChildren(nodeD2).length, 0, 'IF 节点不参与链合并');
 });

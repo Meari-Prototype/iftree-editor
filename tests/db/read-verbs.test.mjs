@@ -8,6 +8,7 @@ import {
   commitSingleTextChange,
   modifyChangedText,
   modifyOriginalText,
+  parseJsonStdout,
   runBashDb,
   stdoutOf,
   withImportedFixture
@@ -79,6 +80,15 @@ test('article：导入原件原文窗口，按字符偏移，可附 source spans
     assert.match(head, /\[原文窗口 offset 0-/);
     assert.match(head, /\[原文开始\]/);
     assert.match(head, /# IFTreeEditor 数据库读写测试样例/);
+
+    // --json：结构化 window 字段（startOffset/endOffset/totalLength/hasBefore/hasAfter）
+    const headJson = parseJsonStdout(await runBashDb(dbPath, ['article', docId, '--limit', '400', '--json']));
+    assert.ok(headJson.window, 'article --json 应含 window 对象');
+    assert.equal(headJson.window.startOffset, 0);
+    assert.ok(headJson.window.endOffset > 0, 'endOffset 应 > 0');
+    assert.ok(headJson.window.totalLength > 0, 'totalLength 应 > 0');
+    assert.equal(typeof headJson.text, 'string');
+    assert.ok(headJson.text.length > 0);
 
     // --spans：附 source spans 紧凑行（默认上限 30，截断标「窗口共 N」）
     const withSpans = stdoutOf(await runBashDb(dbPath, ['article', docId, '--spans']));

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store.mjs';
+import { IftreeStore } from '../src/backend/store/index.mjs';
 import { createDatabaseService } from '../src/backend/database-service.mjs';
 
 async function withStore(fn) {
@@ -122,38 +122,27 @@ test('有冲突 apply：拒绝写回，返回冲突，主干与分支不变', as
   });
 });
 
-test('applyMerge 成功写回后只做 BM25 增量同步：向量不随保存生成/重算（4-6-1/8-3-2-2）', async () => {
+test('applyMerge 成功写回后由写分发收尾重建派生索引：handler 不发增量 effect、向量零耦合（4-6-1）', async () => {
   await withStore(async (store) => {
-    const { doc, a } = forkAndDiverge(store, 'MergeEffects', {
+    const { doc } = forkAndDiverge(store, 'MergeEffects', {
       branchEdits: (s, branch, { a }) => s.stageEditBranchNodeUpdate(branch, { nodeId: a.id, patch: { text: 'a-branch' } }),
       mainEdits: (s, { b }) => s.updateNode(b.id, { text: 'b-main' })
     });
-    const calls = [];
+    const maintained = [];
     const service = createDatabaseService({
       store,
       writeContext: {
-        updateKeywordForNodes: (docId, upsertIds, deleteIds) => calls.push([
-          'keyword.update_nodes',
-          String(docId),
-          (upsertIds || []).map(String),
-          (deleteIds || []).map(String)
-        ]),
-        reconcile: (docId, opts) => calls.push(['vector.reconcile', String(docId), opts || {}])
+        maintainDerivedAfterWrite: (docId, opts) => maintained.push([String(docId), opts || {}])
       }
     });
 
     const applied = await service.write({ action: 'editBranch.applyMerge', baseDocId: doc.id, owner: 'human', includeDoc: false });
     assert.equal(applied.applied, true);
     assert.deepEqual(
-      calls.map((c) => c[0]),
-      ['keyword.update_nodes', 'vector.reconcile'],
-      'BM25 增量同步 + 向量发 pull 自对账信号（保存不 embed）'
+      maintained,
+      [[String(doc.id), {}]],
+      '落主干后收尾对该文档重建一次派生索引（BM25 整篇重建、向量零耦合、保存不 embed）'
     );
-    const [, docIdArg, upsertIds, deleteIds] = calls[0];
-    assert.equal(docIdArg, String(doc.id));
-    assert.deepEqual(upsertIds, [String(a.id)], '增量集合 = 本次实际受影响节点（分支改的 a）');
-    assert.deepEqual(deleteIds, [], '本次无删除');
-    assert.deepEqual(calls[1], ['vector.reconcile', String(doc.id), { fillNow: false }], '向量发自对账信号、fillNow=false 不在保存路径 embed');
     assert.ok(
       !('touchedNodeIds' in applied) && !('deletedNodeIds' in applied) && !('vectorStaleNodeIds' in applied),
       '受影响节点集不进响应'

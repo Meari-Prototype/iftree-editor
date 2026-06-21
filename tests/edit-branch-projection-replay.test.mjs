@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store.mjs';
+import { IftreeStore } from '../src/backend/store/index.mjs';
 import { runDatabaseWrite } from '../src/backend/mutation-api.mjs';
 
 // 投影 vs 重放一致性：编辑期 projectEditBranchDoc 给用户看的结果，必须与

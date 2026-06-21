@@ -292,7 +292,7 @@ async function main() {
   const hasExplicitIndex = records.some((record) => record.index != null || Array.isArray(record.indexes));
 
   // ── 路径 A：直写基线 + 源文档层（import-chm-doc.mjs 同款）──
-  const { IftreeStore } = await import('../src/backend/store.mjs');
+  const { IftreeStore } = await import('../src/backend/store/index.mjs');
   const dbPathA = join(homeA, 'store.sqlite');
   const storeA = new IftreeStore(dbPathA);
   storeA.init();

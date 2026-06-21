@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { basename, join, parse } from 'node:path';
 
 import { readSentences } from '../src/core/source-text.mjs';
-import { IftreeStore } from '../src/backend/store.mjs';
+import { IftreeStore } from '../src/backend/store/index.mjs';
 
 const verifyDir = join(tmpdir(), 'iftree-editor-verify');
 const dbPath = join(verifyDir, 'verify.sqlite');

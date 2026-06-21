@@ -12,8 +12,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.mjs';
-import { createSharedBackendClient } from '../src/backend/llm/backend-pipe-client.mjs';
+import { createBackendClient } from '../src/backend/llm/backend-client.mjs';
 import { NODE_TYPES, NODE_TYPE_LABELS } from '../src/core/node-model.mjs';
 import { formatDiffText } from '../src/backend/diff-text.mjs';
 import { formatBranchLine, parseBranchEntryCounts } from '../src/backend/branch-status.mjs';
@@ -127,7 +126,7 @@ function slimWriteResult(res) {
 }
 
 async function dbShell(client, argv, currentDocId) {
-  const res = await client.request('db.shell', { argv, currentDocId });
+  const res = await client.dbShell(argv, { currentDocId });
   return res?.text != null ? String(res.text) : '';
 }
 
@@ -146,7 +145,7 @@ function registerRetrievalTools(server, client) {
     if (includeSummary) payload.includeSummary = true;
     if (includeHidden) payload.includeHidden = true;
     if (uuid) payload.uuid = true;
-    const res = await client.request('database.read', { payload });
+    const res = await client.databaseRead(payload);
     return textResult(res?.text || '(库里暂无已导入文档)');
   });
 
@@ -342,7 +341,7 @@ function registerRetrievalTools(server, client) {
         to: toGiven ? parseDiffRef(to, { docId, draftRef }) : (fromGiven ? headRef : draftRef())
       };
       if (docId !== undefined) payload.docId = docId;
-      const res = await client.request('database.read', { payload });
+      const res = await client.databaseRead(payload);
       return json ? jsonTextResult(slimDiffView(res)) : textResult(formatDiffText(res, { detail }));
     }
     // 历史两版优先：给了 docId + historyId 即比历史，不抢草稿态。
@@ -350,7 +349,7 @@ function registerRetrievalTools(server, client) {
     if (docId && targetHistoryId) {
       const payload = { action: 'history.diff', docId, toHistoryId: targetHistoryId };
       if (fromHistoryId) payload.fromHistoryId = fromHistoryId;
-      const res = await client.request('database.read', { payload });
+      const res = await client.databaseRead(payload);
       return json ? jsonTextResult(slimDiffView(res)) : textResult(formatDiffText(res, { detail }));
     }
     // 草稿↔正文：显式目标或 switch 选中的草稿（草稿按 branchId 唯一定位，owner 仅 baseDocId 场景消歧、缺省兜档位默认）。
@@ -364,7 +363,7 @@ function registerRetrievalTools(server, client) {
     if (shadowDocId !== undefined) payload.shadowDocId = shadowDocId;
     if (tgtBaseDocId !== undefined) payload.baseDocId = tgtBaseDocId;
     payload.owner = owner ?? selectedBranch.owner ?? DEFAULT_WRITE_OWNER;
-    const res = await client.request('database.read', { payload });
+    const res = await client.databaseRead(payload);
     return json ? jsonTextResult(slimDiffView(res)) : textResult(formatDiffText(res, { detail }));
   });
 
@@ -391,7 +390,7 @@ function registerRetrievalTools(server, client) {
     const payload = { action: 'debug.sql', sql };
     if (params !== undefined) payload.params = params;
     if (limit !== undefined) payload.limit = limit;
-    const res = await client.request('database.read', { payload });
+    const res = await client.databaseRead(payload);
     return json ? jsonTextResult(res) : textResult(formatSqlResult(res));
   });
 
@@ -434,7 +433,7 @@ function registerRetrievalTools(server, client) {
     if (agent !== undefined) payload.agent = agent;
     if (sessionId !== undefined) payload.sessionId = sessionId;
     if (limit !== undefined) payload.limit = limit;
-    const res = await client.request('database.read', { payload });
+    const res = await client.databaseRead(payload);
     return json ? jsonTextResult(res) : textResult(formatVolumeList(res));
   });
 }
@@ -468,7 +467,7 @@ export function registerAgentTools(server, client, tier = TIER) {
         if (typeof keepAlive?.unref === 'function') keepAlive.unref();
       }
       try {
-        const result = await client.request('agent.run', { payload });
+        const result = await client.runAgent(payload);
         const answer = result?.answer || result?.error || '(无回答)';
         const sid = result?.sessionId != null ? `\n\n[sessionId: ${result.sessionId}]` : '';
         return textResult(`${answer}${sid}`);
@@ -489,14 +488,16 @@ function registerLifecycleTools(server, client) {
   server.registerTool('restart_backend', {
     description: 'full 档运维：强制重启共享后端。先优雅关停、再按 pid 强杀兜底——确保被其他客户端（opencode/codex 等）续住的旧后端也被杀掉，下次工具调用拉起最新源码实例。会中断其余客户端正在进行的后端操作（它们下次调用自会重连/重拉）。改了 MCP server 自身仍需调用方重连 MCP。'
   }, async () => {
-    const pid = client.pid;
+    // pid 取自当前连接的 ready 帧；本进程还没连过后端时（client.pid 为 null）回退描述文件——
+    // 别的客户端/GUI 续住的游离共享后端 pid 一直记在那里，否则首调会误判「未启动」而漏杀。
+    const pid = client.sharedBackendPid;
     try {
       await client.shutdown();
     } catch { /* 后端可能已在退出 */ }
     client.close();
     // 强杀兜底（该杀就杀）：优雅 shutdown 会因 socket 已断、shutdown 请求被其他客户端的长操作阻塞在
     // 队列、或共享后端被别的客户端续住而漏杀。restart_backend 是运维动词、语义就是「保证下次拉起最新
-    // 实例」，故按 pid 强制终止共享后端进程；pid 取自 ready 帧（是后端进程、非本 mcp-server）。
+    // 实例」，故按 pid 强制终止共享后端进程（pid 见上：当前连接或描述文件，均为后端进程、非本 mcp-server）。
     // SQLite(WAL)/LanceDB(版本化提交) 均崩溃安全，强杀不致损坏；残留连接描述文件下次发现失败即重写。
     let forced = false;
     if (pid && pid !== process.pid) {
@@ -538,7 +539,7 @@ export function registerWriteTools(server, client, tier) {
   const importLibraryDocument = async ({ relativePath, mode, embed, vectors }) => {
     // vectors 是 push 的内联向量口径、不是 import 的开关——传错直接回报错，别静默不建。
     if (vectors !== undefined) return textResult('import 不接受 vectors 参数；导入时同步建向量用 embed:true（vectors 是 push 的内联向量口径）。');
-    const res = await client.request('import.libraryDocument', { payload: { relativePath, mode, embed } });
+    const res = await client.importLibraryDocument({ relativePath, mode, embed });
     if (!res?.ok) return textResult(`导入失败：${JSON.stringify(res)}`);
     const lines = [`已导入 ${res.relativePath || relativePath}`, `#${res.docId} ${res.title || ''}`, `节点数：${res.nodeCount || 0}`];
     if (embed === true) lines.push(res.vectorWarning ? `向量：同步建立失败（${res.vectorWarning}）` : '向量：已同步建立');
@@ -547,7 +548,7 @@ export function registerWriteTools(server, client, tier) {
   };
 
   const ensureVectors = async ({ docId }) => {
-    const res = await client.request('vector.ensureDoc', { payload: { docId } });
+    const res = await client.ensureDocVectors({ docId });
     if (!res || res.ok === false) return textResult(formatWriteResult(res, { label: 'vectors' }));
     if (res.skipped) return textResult(`vectors  doc:${res.docId || docId}  跳过（${res.reason || '向量未启用'}）`);
     const after = Number(res.vectorCountAfter) || 0;
@@ -572,7 +573,7 @@ export function registerWriteTools(server, client, tier) {
     if (baseDocId !== undefined) payload.baseDocId = baseDocId;
     if (owner) payload.owner = owner;
     if (summary || tag) payload.summary = summary || tag;
-    const res = await client.request('database.write', { payload });
+    const res = await client.databaseWrite(payload);
     return textResult(formatWriteResult(res, { label: 'commit' }));
   };
 
@@ -586,7 +587,7 @@ export function registerWriteTools(server, client, tier) {
     if (shadowDocId !== undefined) payload.shadowDocId = shadowDocId;
     if (baseDocId !== undefined) payload.baseDocId = baseDocId;
     if (owner) payload.owner = owner;
-    const res = await client.request('database.write', { payload });
+    const res = await client.databaseWrite(payload);
     return textResult(formatWriteResult(res, { label: 'discard' }));
   };
 
@@ -600,7 +601,7 @@ export function registerWriteTools(server, client, tier) {
     if (shadowDocId !== undefined) payload.shadowDocId = shadowDocId;
     if (baseDocId !== undefined) payload.baseDocId = baseDocId;
     if (owner) payload.owner = owner;
-    const res = await client.request('database.write', { payload });
+    const res = await client.databaseWrite(payload);
     return textResult(formatWriteResult(res, { label: action }));
   };
 
@@ -645,9 +646,9 @@ export function registerWriteTools(server, client, tier) {
       targetNodeId: docIdSchema.optional().describe('目标节点 id：node.moveAfter 移到其后 / node.moveBefore 移到其前 / node.mergeInto 合并进的目标节点（afterNodeId 会兜底映射到它）。'),
       direction: z.enum(['up', 'down']).optional().describe('node.move 方向。'),
       splitAsciiPunctuation: z.boolean().optional().describe('node.split: enable ASCII .!? sentence splitting; default false for Chinese documents.'),
-      payload: z.record(z.string(), z.any()).optional().describe(`兜底参数：仅 axiom/ref/entity 等低频动作、或上面未覆盖的字段才需要；高频 node 操作用上面的具名字段、不必手写 payload（不裸 json，见 15-5-2）。${nodeTypeContractText}`),
+      payload: z.record(z.string(), z.any()).optional().describe(`兜底参数：仅 axiom/ref/entity 等低频动作、或上面未覆盖的字段才需要；高频 node 操作用上面的具名字段、不必手写 payload（不裸 json，见 15-5-2）。低频动作字段（统一推荐驼峰；docId 一律走顶层 baseDocId）：axiom.add{content,status?,nodeTitle?,nodeNote?} / axiom.update{axiomId,content?,status?} / axiom.delete{axiomId} / axiom.move{axiomId,direction}；ref.addNodeToNode{sourceNodeId,targetNodeId,refKind,note?} / ref.addAxiomToNode{nodeId,axiomId,note?} / ref.delete{refId}；entity.create{literal} / entity.update{entityId,literal} / entity.delete{entityId} / entity.link|unlink{sourceEntityId,targetEntityId,kind:synonym|related} / entity.bindNode|ignoreNode|clearNodeBinding{entityId,nodeId}。${nodeTypeContractText}`),
       owner: ownerSchema.optional().describe('写入者身份；缺省取档位默认（非 human 档不接受 owner=human，18-3 运行中不升档）。'),
-      baseDocId: docIdSchema.optional().describe('可选 editBranchBaseDocId；动作参数不能推出 docId 时必须给。'),
+      baseDocId: docIdSchema.optional().describe('目标文档 id：node/axiom/ref/entity 各动作均认（顶层给即可，进编辑分支后作 docId 真相）。动作参数能推出 docId（带 nodeId/entityId/axiomId/refId 反查）时可省。'),
       branchId: z.number().int().positive().optional().describe('目标草稿 branchId：多草稿并存时精确指定写哪个分支；省略则用 switch 选中的草稿，再退回 (baseDocId, owner) 定位。')
     }
   }, async ({ action, nodeId, text, nodeType, nodeTitle, nodeNote, parentId, afterNodeId, targetNodeId, direction, splitAsciiPunctuation, payload = {}, owner, baseDocId, branchId }) => {
@@ -678,7 +679,7 @@ export function registerWriteTools(server, client, tier) {
     if (targetBranchId !== undefined) writePayload.editBranchId = targetBranchId;
     const targetBaseDocId = baseDocId ?? selectedBranch.baseDocId ?? undefined;
     if (targetBaseDocId !== undefined) writePayload.editBranchBaseDocId = targetBaseDocId;
-    const res = await client.request('database.write', { payload: writePayload });
+    const res = await client.databaseWrite(writePayload);
     return textResult(formatWriteResult(res));
   });
 
@@ -691,9 +692,7 @@ export function registerWriteTools(server, client, tier) {
     }
   }, async ({ action, docId, owner } = /** @type {{ action?: string, docId?: DocId, owner?: string }} */ ({})) => {
     if (action === 'list') {
-      const res = await client.request('database.read', {
-        payload: { action: 'editBranch.listPending', ...(owner ? { owner } : {}) }
-      });
+      const res = await client.databaseRead({ action: 'editBranch.listPending', ...(owner ? { owner } : {}) });
       const branches = (res?.branches || []).filter((branch) => (
         docId ? String(branch.base_doc_id) === String(docId) : true
       ));
@@ -704,7 +703,7 @@ export function registerWriteTools(server, client, tier) {
       const resolved = resolveWriteOwner(owner);
       if (resolved.error) return textResult(resolved.error);
       const payload = { action: 'editBranch.begin', docId, includeDoc: false, owner: resolved.owner };
-      const res = await client.request('database.write', { payload });
+      const res = await client.databaseWrite(payload);
       return textResult(formatWriteResult(res, { label: 'draft' }));
     }
     return textResult(`未知 draft action: ${action}`);
@@ -753,7 +752,7 @@ export function registerWriteTools(server, client, tier) {
     if (yes && summary) payload.summary = summary;
     if (yes && Array.isArray(resolutions) && resolutions.length > 0) payload.resolutions = resolutions;
     else if (yes && strategy) payload.strategy = strategy;
-    const res = await client.request(yes ? 'database.write' : 'database.read', { payload });
+    const res = yes ? await client.databaseWrite(payload) : await client.databaseRead(payload);
     if (yes) return json ? jsonTextResult(slimWriteResult(res)) : textResult(formatWriteResult(res, { label: 'merge' }));
     return json ? jsonTextResult(res) : textResult(formatThreeWayMergeText(res));
   });
@@ -772,13 +771,13 @@ export function registerWriteTools(server, client, tier) {
       if (branchId !== undefined) payload.branchId = branchId;
       if (baseDocId !== undefined) payload.baseDocId = baseDocId;
       payload.owner = owner ?? DEFAULT_WRITE_OWNER; // 同上：缺省兜档位默认，避免 switch 校验阶段被 owner 挡死
-      await client.request('database.read', { payload });
+      await client.databaseRead(payload);
     }
     return textResult(formatWriteResult(setSelectedBranch({ branchId, baseDocId, owner }), { label: 'switch' }));
   });
 
   server.registerTool('import', {
-    description: 'edit/full/human 档可见：导入 library 内真实文件。mode 默认 simple，可为 simple/complete/direct/smart/vector（切分方式）。embed=true 导入后同步建向量（吃性能），默认不建、留待后补。',
+    description: 'edit/full/human 档可见：导入 library 内真实文件。mode 默认 simple：simple=按标题/段落切树，但结构不达标（无标题/层级过浅/只有单一顶层标题）且文档≤1000字时自动退化为整篇单节点（回执会提示退化原因）、超1000字则报错让你改 direct；complete=按句子细切；direct=整篇不切、单节点；smart/vector 暂未接入。embed=true 导入后同步建向量（吃性能），默认不建、留待后补。',
     inputSchema: {
       relativePath: z.string().describe('library 内相对路径，不要使用绝对路径。'),
       mode: z.enum(['simple', 'complete', 'direct', 'smart', 'vector']).optional(),
@@ -790,31 +789,30 @@ export function registerWriteTools(server, client, tier) {
     description: 'edit/full/human 档可见：删除已导入文档的 doc 数据，不删除 library 真实文件（`18-3-1`：与 import 成对）。`forget` 一词留给记忆系统的"遗忘记忆"。',
     inputSchema: { docId: docIdSchema }
   }, async ({ docId }) => {
-    const res = await client.request('import.deleteDocument', { payload: { docId } });
+    const res = await client.deleteImportedDocument({ docId });
     if (!res?.ok) return textResult(`删除失败：${JSON.stringify(res)}`);
     return textResult(`${res.changed ? '已删除' : '未找到'} doc ${docId}${res.title ? `「${res.title}」` : ''}`);
   });
 
   server.registerTool('memory_deliver', {
-    description: 'edit/full/human 档可见：事件卷投递（projectneed 18-8-4）——外部 agent 会话收尾把结构化自述日志投递成一个 session 卷（投递语义就是新建一个文档，15-10-1）。这是外部 agent 唯一合法的记忆侧写入形态（18-8-3）：投的是"发生过什么"的原料，不是记忆结论；不得直写当前事实层。节点一律 trust_level=不受控（15-10-3，受控会被拒绝）。自述日志骨架：用户原话逐字引用段（日志中唯一逐字的部分）、每任务结果标记（成功/失败）、失败与教训、可复用结论、宿主原始记录锚。卷落库后按 24h 节律自动封卷/进入可提炼（15-11-5）。',
+    description: 'edit/full/human 档可见：事件卷投递（projectneed 18-8-4）——把这个 session 的宿主记录导入成事件卷。你不复述、不整理：系统读 hostAnchor 指向的真实 session 文件、纯规则解析成卷（确定可重复），所以你只需给 agent + sessionId + hostAnchor。一 session 一卷：同 agent+sessionId 重投 = 旧卷全删 + 完整重导（session 只追加 + 解析确定，重导 ≡ 追加）。无真实源文件就拒投、不建空卷。节点一律 trust_level=不受控（15-10-3）。卷落库后按 24h 节律自动封卷/进入可提炼（15-11-5）。',
     inputSchema: {
       agent: z.string().describe('agent 身份标识，如 claude-code、codex。'),
       sessionId: z.string().describe('宿主侧 session id。'),
-      hostAnchor: z.string().optional().describe('宿主原始记录锚（路径+session id）；仅供人工深查，允许悬空。'),
+      hostAnchor: z.string().describe('宿主 session 文件锚（路径#sessionid）：必填，指向你这个 session 的真实 transcript 文件；系统读它解析成卷，文件不存在/解析不出对话即拒（15-10-4）。'),
       title: z.string().optional().describe('卷标题；省略时按 agent+日期+session 生成。'),
       startedAt: z.string().optional().describe('会话起始时间 ISO 8601。'),
       endedAt: z.string().optional().describe('会话结束时间 ISO 8601。'),
-      nodes: z.array(z.any()).describe('自述日志节点树；每个 { text, trust_level:"不受控", node_title?, node_note?, children? }。'),
-      idempotencyKey: z.string().optional().describe('投递级防抖键；重试不会长出第二个卷。')
+      idempotencyKey: z.string().optional().describe('请求级防抖键：只抵消同一次请求的网络重试（省去无谓的重复重导），非内容去重；同 session 重投本就由 session 身份去重，不靠此键。')
     }
-  }, async ({ agent, sessionId, hostAnchor, title, startedAt, endedAt, nodes, idempotencyKey } = /** @type {{ agent?: string, sessionId?: string, hostAnchor?: string, title?: string, startedAt?: string, endedAt?: string, nodes?: any[], idempotencyKey?: string }} */ ({})) => {
-    const payload = { action: 'memory.deliverVolume', agent, sessionId, nodes: nodes || [] };
+  }, async ({ agent, sessionId, hostAnchor, title, startedAt, endedAt, idempotencyKey } = /** @type {{ agent?: string, sessionId?: string, hostAnchor?: string, title?: string, startedAt?: string, endedAt?: string, idempotencyKey?: string }} */ ({})) => {
+    const payload = { action: 'memory.deliverVolume', agent, sessionId };
     if (hostAnchor !== undefined) payload.hostAnchor = hostAnchor;
     if (title !== undefined) payload.title = title;
     if (startedAt !== undefined) payload.startedAt = startedAt;
     if (endedAt !== undefined) payload.endedAt = endedAt;
     if (idempotencyKey !== undefined) payload.idempotencyKey = idempotencyKey;
-    const res = await client.request('database.write', { payload });
+    const res = await client.databaseWrite(payload);
     return textResult(formatDeliverResult(res));
   });
 
@@ -902,7 +900,7 @@ export function registerWriteTools(server, client, tier) {
     }, async ({ commitId, docId, json }) => {
       const payload = { action: 'history.revert', commitId, owner: DEFAULT_WRITE_OWNER };
       if (docId !== undefined) payload.docId = docId;
-      const res = await client.request('database.write', { payload });
+      const res = await client.databaseWrite(payload);
       return json ? jsonTextResult(res) : textResult(formatWriteResult(res, { label: 'revert' }));
     });
 
@@ -931,7 +929,7 @@ export function registerWriteTools(server, client, tier) {
       if (parentId !== undefined) payload.parentId = parentId;
       if (idempotencyKey !== undefined) payload.idempotencyKey = idempotencyKey;
       if (embed !== undefined) payload.embed = embed;
-      const res = await client.request('database.write', { payload });
+      const res = await client.databaseWrite(payload);
       return json ? jsonTextResult(res) : textResult(formatPushResult(res));
     });
 
@@ -942,17 +940,17 @@ export function registerWriteTools(server, client, tier) {
         mode: z.enum(['readonly', 'incremental', 'full'])
       }
     }, async ({ docId, mode } = /** @type {{ docId?: DocId, mode?: string }} */ ({})) => {
-      const res = await client.request('database.write', { payload: { action: 'doc.setEditMode', docId, mode, includeDoc: false } });
+      const res = await client.databaseWrite({ action: 'doc.setEditMode', docId, mode, includeDoc: false });
       return textResult(formatWriteResult(res, { label: 'set_mode' }));
     });
 
     server.registerTool('bulk', {
-      description: 'full/human 档可见：海量流式导入加速会话（projectneed 4-16）。begin 设异步写（synchronous=OFF，journal 保持 WAL 不降级）；end 恢复安全设置并 checkpoint 截断 -wal。索引不再 drop/重建（SQL/FTS 全程增量维护，唯一延迟的重活是离线补 bge-m3 向量）。导大批语料时 begin → 多次 push → end；崩溃丢最近批由地址校验 + 幂等重推兜底。共享后端上 begin 需独占：有其他客户端在线会被拒，会话期间其他客户端的写请求被拒（读不受影响），开启方断线自动恢复安全设置。仅在专门导入阶段用，日常库勿开。',
+      description: 'full/human 档可见：海量流式导入加速会话（projectneed 4-16）。begin 设异步写（synchronous=OFF，journal 保持 WAL 不降级）；end 恢复安全设置并 checkpoint 截断 -wal。索引不再 drop/重建（SQL/FTS 全程增量维护，唯一延迟的重活是离线补 bge-m3 向量）。导大批语料时 begin → 多次 push → end；崩溃丢最近批由地址校验 + 幂等重推兜底。共享后端上 begin 需独占（使用前提）：有其他客户端（如 opencode/codex）在线会被拒——先确保单客户端、或 restart_backend 清场后再用；会话期间其他客户端的写请求被拒（读不受影响），开启方断线自动恢复安全设置。仅在专门导入阶段用，日常库勿开。',
       inputSchema: {
         action: z.enum(['begin', 'end'])
       }
     }, async ({ action } = /** @type {{ action?: 'begin' | 'end' }} */ ({})) => {
-      const res = await client.request('database.write', { payload: { action: action === 'begin' ? 'stream.bulkBegin' : 'stream.bulkEnd' } });
+      const res = await client.databaseWrite({ action: action === 'begin' ? 'stream.bulkBegin' : 'stream.bulkEnd' });
       return textResult(formatWriteResult(res, { label: 'bulk' }));
     });
 
@@ -963,12 +961,12 @@ export function registerWriteTools(server, client, tier) {
         force: z.boolean().optional().describe('跳过冷却期（用户明确指示时）。')
       }
     }, async ({ docId, force } = /** @type {{ docId?: DocId, force?: boolean }} */ ({})) => {
-      const res = await client.request('database.write', { payload: { action: 'memory.markDistilled', docId, force: force === true } });
+      const res = await client.databaseWrite({ action: 'memory.markDistilled', docId, force: force === true });
       return textResult(formatWriteResult(res, { label: 'memory_distill' }));
     });
 
     server.registerTool('relink', {
-      description: 'full/human 档可见：把已导入 doc 重绑到新的源文件路径（锚改名/迁移后用，15-10-4），更新 meta.sourcePath 与 source_documents.original_path，不动正文、不改 source_type。',
+      description: 'full/human 档可见：把已导入 doc 重绑到新的源文件路径（锚改名/迁移后用，15-10-4），更新 meta.sourcePath 与 source_documents.original_path，不动正文、不改 source_type。不强制校验目标存在（记忆/会话卷由对应 agent 自己维护、我们不替外部程序管文件状态），但回执会自检并报 targetExists。',
       inputSchema: {
         docId: docIdSchema,
         sourcePath: z.string().describe('新源文件路径（与 import 记录一致，建议库内绝对路径）。')
@@ -984,9 +982,7 @@ export function registerWriteTools(server, client, tier) {
         limit: z.number().int().positive().optional().describe('返回字数门禁；默认 1 万，超了截断并提示。要导全文显式加大到所需字数（二次突破）。')
       }
     }, async ({ docId, limit }) => {
-      const res = await client.request('database.read', {
-        payload: { action: 'doc.exportMarkdown', docId }
-      });
+      const res = await client.databaseRead({ action: 'doc.exportMarkdown', docId });
       return textResult(clipText(res?.text || '', limit || CHAR_LIMITS.fullText, { label: '导出全文' }));
     });
 
@@ -1006,7 +1002,7 @@ export function registerWriteTools(server, client, tier) {
       if (target.branchId !== undefined) payload.branchId = target.branchId;
       if (target.baseDocId !== undefined) payload.baseDocId = target.baseDocId;
       if (target.owner) payload.owner = target.owner;
-      const res = await client.request('database.write', { payload });
+      const res = await client.databaseWrite(payload);
       return textResult(formatWriteResult(res, { label: 'rebase' }));
     });
 
@@ -1032,10 +1028,21 @@ export function registerWriteTools(server, client, tier) {
       if (target.owner) payload.targetOwner = target.owner;
       if (entryId !== undefined) payload.entryId = entryId;
       if (entryIndex !== undefined) payload.entryIndex = entryIndex;
-      const res = await client.request('database.write', { payload });
+      const res = await client.databaseWrite(payload);
       return textResult(formatWriteResult(res, { label: 'cherry-pick' }));
     });
 
+  }
+
+  if (tier === 'full' || tier === 'human') {
+    // full 档运维：对象库 GC（mark-sweep，lazy/手动）——回收不被任何 commit 引用的历史对象。
+    server.registerTool('gc_objects', {
+      description: 'full 档运维：对象库垃圾回收（mark-sweep）。回收不被任何 commit 引用的历史对象（blob/tree/source）——即删文档/删 commit 后变孤儿的内容寻址对象。reset/revert 跳过的 commit 仍在表中、其对象不会被收（保住可后悔窗口）。不在写热路径，需要时手动跑。'
+    }, async () => {
+      const res = await client.databaseWrite({ action: 'objects.gc' });
+      if (!res?.ok) return textResult(`gc 失败：${JSON.stringify(res)}`);
+      return textResult(`对象库 GC 完成：扫描 ${res.scanned} · 可达 ${res.reachable} · 回收 ${res.deleted}`);
+    });
   }
 
   if (tier === 'human') {
@@ -1055,7 +1062,7 @@ export function registerWriteTools(server, client, tier) {
       if (address !== undefined) payload.address = address;
       if (scope !== undefined) payload.scope = scope;
       if (trust !== undefined) payload.trust = trust;
-      const res = await client.request('database.write', { payload });
+      const res = await client.databaseWrite(payload);
       return textResult(formatWriteResult(res, { label: 'certify' }));
     });
   }
@@ -1065,18 +1072,16 @@ async function main() {
   // 后端共用（projectneed 18-6-1）：写档（edit/full）实例经连接描述文件发现并复用共享后端，
   // 连不上自行拉起（detached），单机离线回退私有 stdio；只读实例照旧各起私有后端（并发读安全）。
   const hostScriptPath = join(PROJECT_ROOT, 'scripts', 'agent-host.mjs');
-  const client = IS_WRITE_TIER
-    ? createSharedBackendClient({
-      projectRoot: PROJECT_ROOT,
-      hostScriptPath,
-      onStderr: (text) => process.stderr.write(text),
-      onStatus: (text) => process.stderr.write(text)
-    })
-    : createHeadlessAgentClient({
-      cwd: PROJECT_ROOT,
-      scriptPath: hostScriptPath,
-      onStderr: (text) => process.stderr.write(text)
-    });
+  // 统一 backend-client SDK：写档（edit/full）走共享管道复用同一后端、只读档走私有 stdio（并发读安全）；
+  // 各动词只调 SDK 的语义方法、内部不再散写 request('database.read'...)。owner 解析 / payload 构造仍是
+  // mcp-server 的入口业务、留在动词侧不进 SDK。
+  const client = createBackendClient({
+    projectRoot: PROJECT_ROOT,
+    hostScriptPath,
+    mode: IS_WRITE_TIER ? 'shared' : 'private',
+    onStderr: (text) => process.stderr.write(text),
+    onStatus: (text) => process.stderr.write(text)
+  });
 
   // schema 自述（projectneed 15-12-5 / 18-8-1）：外部 agent 接入第一读物。
   // 数百 token 的约定说明，不是内容清单——不预载"库里有什么"。

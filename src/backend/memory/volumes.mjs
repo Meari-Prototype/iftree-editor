@@ -111,16 +111,19 @@ export function listMemoryVolumes(store, { state = null, agent = null, sessionId
   }
   const max = Number.isInteger(Number(limit)) && Number(limit) > 0 ? Math.min(500, Number(limit)) : 5;
   const rows = [];
+  let total = 0;
+  // 遍历全部匹配卷算 total（不早停）：selectVolumeDocRows 已一次性查出所有卷、volumeRow 是纯内存
+  // 转换，遍历全部成本可忽略；total 让调用方知道「列出的只是前 max 卷、库里其实有多少」、防误判。
   for (const docRow of selectVolumeDocRows(store)) {
     const row = volumeRow(store, docRow, nowMs);
     if (!row) continue;
     if (wantState && row.state !== wantState) continue;
     if (agent && row.agent !== String(agent)) continue;
     if (sessionId && String(row.sessionId) !== String(sessionId)) continue;
-    rows.push(row);
-    if (rows.length >= max) break;
+    total += 1;
+    if (rows.length < max) rows.push(row);
   }
-  return { kind: 'memory.listVolumes', now: new Date(nowMs).toISOString(), volumes: rows };
+  return { kind: 'memory.listVolumes', now: new Date(nowMs).toISOString(), volumes: rows, total };
 }
 
 // 该 session 当前可追加的卷：最新一卷未物理封卷即活跃；已封则返回 null，
@@ -142,6 +145,23 @@ export function findActiveSessionVolume(store, { agent = null, sessionId = null 
   if (!volume) return null;
   if (volume.sealedAt || (row.edit_mode || 'full') !== 'incremental') return null;
   return { docId: row.id, volume };
+}
+
+// 该 session 的卷（不管封没封）：一 session 一卷的幂等依据——deliverVolume 投递前据此查重，
+// 已有就返回首投的卷、绝不新建第二个（根除「重投抢锚造孤儿卷」）。与 findActiveSessionVolume 的
+// 区别：那个只认未封活跃卷（中途追加用），这个认任何状态、只回答「这个 session 投过没有」。
+export function findSessionVolume(store, { agent = null, sessionId = null } = {}) {
+  const row = store.db.prepare(`
+    SELECT id, title, meta FROM docs
+    WHERE json_extract(meta, '$.memoryVolume.agent') = ?
+      AND json_extract(meta, '$.memoryVolume.sessionId') = ?
+    ORDER BY id DESC
+    LIMIT 1
+  `).get(String(agent ?? ''), String(sessionId ?? ''));
+  if (!row) return null;
+  const volume = memoryVolumeMetaOf(row.meta);
+  if (!volume) return null;
+  return { docId: row.id, title: row.title, volume };
 }
 
 function mergeVolumeMeta(store, docId, patch) {

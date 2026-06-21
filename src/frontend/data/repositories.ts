@@ -8,4 +8,4 @@ export { axiomRepository } from './axiom-repository.js';
 export { sourceRepository } from './source-repository.js';
 export { refRepository } from './ref-repository.js';
 export { historyRepository } from './history-repository.js';
-export { embeddingBridge, importService, summaryService, vectorService } from './operation-services.js';
+export { importService, summaryService, vectorService } from './operation-services.js';

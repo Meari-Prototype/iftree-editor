@@ -163,7 +163,11 @@ export function formatDeliverResult(res) {
 export function formatVolumeList(res) {
   const vols = res && Array.isArray(res.volumes) ? res.volumes : [];
   if (!vols.length) return '(无记忆卷)';
-  const lines = [`记忆卷 ${vols.length} 条${res.now ? '（now ' + res.now + '）' : ''}：`];
+  const total = Number.isFinite(res?.total) ? res.total : vols.length;
+  const head = total > vols.length
+    ? `已列出最新 ${vols.length} 卷，共 ${total} 卷，统计库内总量请显式调大 limit 或用 sql COUNT`
+    : `共 ${total} 卷`;
+  const lines = [`${head}${res.now ? '（now ' + res.now + '）' : ''}：`];
   for (const v of vols) {
     const last = v.lastActivityAt ? `  末活:${v.lastActivityAt}` : '';
     lines.push(`  ${v.docId}  ${v.state || ''}  ${v.agent || ''}/${v.sessionId || ''}  「${clip(v.title, 40)}」  nodes:${v.nodeCount ?? '?'}${last}`);

@@ -9,7 +9,8 @@ import { createHash } from 'node:crypto';
 
 const HASH_HEX_LENGTH = 32; // 128 bits
 
-function sha256_128(input) {
+// 内容寻址对象库（db/object-store.mjs）也用它给 raw_markdown 算 blob key，故导出复用。
+export function sha256_128(input) {
   return createHash('sha256').update(input).digest('hex').slice(0, HASH_HEX_LENGTH);
 }
 

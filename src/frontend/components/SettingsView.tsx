@@ -82,7 +82,7 @@ export function SettingsView({
     {
       icon: <HardDrive size={17} />,
       label: '向量库',
-      value: settings.vectorDbPath || '加载中',
+      value: settings.lanceDbPath || '加载中',
       detail: settings.vectorTable ? `LanceDB 表：${settings.vectorTable}` : ''
     }
   ];

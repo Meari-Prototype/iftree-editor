@@ -7,6 +7,15 @@ import { formatDiffText } from './diff-text.mjs';
 import { parseDiffRef } from './diff-refs.mjs';
 import { formatWriteResult } from './write-result-text.mjs';
 import { contentHash } from '../core/merkle.mjs';
+import {
+  pruneTreeDepth,
+  snapshotAddressDepth,
+  snapshotChildrenByParent,
+  snapshotNodeId,
+  snapshotParentId,
+  snapshotReadNode,
+  snapshotSubtreeRows
+} from '../core/snapshot-tree.mjs';
 
 function cleanLine(value = '') {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -341,7 +350,7 @@ function historyRefSpec(flags = {}, positional = []) {
   return { kind: 'committed_at_or_summary', value: ref, docId };
 }
 
-async function resolveHistoryRef(database, spec = {}, options = {}) {
+async function resolveHistoryRef(database, spec = {}) {
   const value = String(spec.value ?? '').trim();
   if (!value) throw new Error('history ref requires history id, saved_at, or tag');
 
@@ -366,11 +375,9 @@ async function resolveHistoryRef(database, spec = {}, options = {}) {
     clauses.push('doc_id = @docId');
     params.docId = spec.docId;
   }
-  const columns = options.includeDiff
-    ? 'id, doc_id, committed_at, summary, diff, snapshot'
-    : 'id, doc_id, committed_at, summary';
+  // 快照不再随行返回（diff/snapshot 列已退役）；需要正文走 history.snapshot 动作按 id 重建（loadHistorySnapshot）。
   const sql = `
-    SELECT ${columns}
+    SELECT id, doc_id, committed_at, summary
     FROM commits
     WHERE ${clauses.join(' AND ')}
     ORDER BY committed_at DESC, id DESC
@@ -901,87 +908,16 @@ async function dbInspect(database, docId, address, options = {}) {
   return lines.join('\n');
 }
 
-function parseHistorySnapshot(row = {}) {
-  let snapshot = null;
-  try {
-    snapshot = JSON.parse(row.snapshot || 'null');
-  } catch {
-    snapshot = null;
-  }
-  if (!Array.isArray(snapshot?.nodes)) {
-    // 兼容旧 save_history 行：快照内嵌在 diff payload 里。
-    try {
-      const payload = JSON.parse(row.diff || '{}');
-      snapshot = payload.snapshot || (payload.kind === 'snapshot' ? payload : null);
-    } catch { /* ignore */ }
-  }
-  if (!Array.isArray(snapshot?.nodes)) throw new Error(`history snapshot is not readable: ${row.id ?? ''}`);
+// 历史快照按 commit id 走后端 history.snapshot 动作重建（对象库展开 + 内联 meta）；
+// 不再客户端解析 diff/snapshot 列（已退役）。
+async function loadHistorySnapshot(database, history = {}) {
+  const res = await database.run({
+    operation: 'read',
+    payload: { action: 'history.snapshot', commitId: history.id }
+  }, 'read');
+  const snapshot = res?.snapshot;
+  if (!Array.isArray(snapshot?.nodes)) throw new Error(`history snapshot is not readable: ${history.id ?? ''}`);
   return snapshot;
-}
-
-function snapshotNodeId(row = {}) {
-  return String(row.id ?? row.nodeId ?? row.node_id ?? '');
-}
-
-function snapshotParentId(row = {}) {
-  const parent = row.parent_id ?? row.parentId ?? null;
-  return parent === null || parent === undefined ? '' : String(parent);
-}
-
-function snapshotChildrenByParent(rows = []) {
-  const byParent = new Map();
-  for (const row of rows) {
-    const key = snapshotParentId(row);
-    if (!byParent.has(key)) byParent.set(key, []);
-    byParent.get(key).push(row);
-  }
-  for (const siblings of byParent.values()) {
-    siblings.sort((left, right) => {
-      const order = Number(left.sort_order ?? left.sortOrder ?? 0) - Number(right.sort_order ?? right.sortOrder ?? 0);
-      return order || String(left.address || '').localeCompare(String(right.address || ''));
-    });
-  }
-  return byParent;
-}
-
-function snapshotTextChars(row = {}) {
-  return String(row.text || '').length;
-}
-
-function snapshotSubtreeTextChars(row, byParent) {
-  return snapshotTextChars(row) + (byParent.get(snapshotNodeId(row)) || [])
-    .reduce((sum, child) => sum + snapshotSubtreeTextChars(child, byParent), 0);
-}
-
-function snapshotReadNode(row, byParent) {
-  const children = byParent.get(snapshotNodeId(row)) || [];
-  return {
-    id: row.id,
-    docId: row.doc_id ?? row.docId,
-    parentId: row.parent_id ?? row.parentId ?? null,
-    address: row.address || '',
-    depth: row.depth ?? null,
-    sortOrder: row.sort_order ?? row.sortOrder ?? null,
-    type: row.node_type ?? row.nodeType ?? 'TEXT',
-    title: row.node_title ?? row.nodeTitle ?? '',
-    text: row.text || '',
-    note: row.node_note ?? row.nodeNote ?? '',
-    childCount: children.length,
-    tags: {
-      trustLevel: row.trust_level ?? row.trustLevel ?? null
-    },
-    meta: {
-      textChars: snapshotTextChars(row),
-      subtreeTextChars: snapshotSubtreeTextChars(row, byParent)
-    },
-    children: children.map((child) => snapshotReadNode(child, byParent))
-  };
-}
-
-function snapshotSubtreeRows(root, byParent) {
-  const rows = [root];
-  for (const child of byParent.get(snapshotNodeId(root)) || []) rows.push(...snapshotSubtreeRows(child, byParent));
-  return rows;
 }
 
 function snapshotBodyText(root, byParent, options = {}) {
@@ -997,21 +933,10 @@ function snapshotBodyText(root, byParent, options = {}) {
   });
 }
 
-function snapshotAddressDepth(address = '') {
-  const value = String(address || '').trim();
-  return value ? value.split('-').length : 0;
-}
-
-// 把快照树剪到 maxLevels 层（level 1 = 当前节点）；tree --at 默认只展 2 层，与在线 tree 一致。
-function pruneTreeDepth(node, maxLevels, level = 1) {
-  if (level >= maxLevels) return { ...node, children: [] };
-  return { ...node, children: (node.children || []).map((child) => pruneTreeDepth(child, maxLevels, level + 1)) };
-}
-
 // tree --at（D3）：从 commit 快照重建结构树，复用在线 tree 的 formatIndexNode 渲染。
 async function treeHistorySnapshot(database, docId, address, flags = {}) {
-  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId), { includeDiff: true });
-  const snapshot = parseHistorySnapshot(history);
+  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId));
+  const snapshot = await loadHistorySnapshot(database, history);
   if (String(snapshot.doc?.id ?? docId) !== String(docId)) {
     throw new Error(`db tree --at history ${history.id} belongs to another doc`);
   }
@@ -1042,8 +967,8 @@ async function findHistorySnapshot(database, terms, flags = {}, context = {}) {
   if (!scope.docId || scope.allDocs) {
     throw new Error('find --at 需限定单篇（给 docId 或 --scope）；历史快照不支持跨文档检索');
   }
-  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, scope.docId), { includeDiff: true });
-  const snapshot = parseHistorySnapshot(history);
+  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, scope.docId));
+  const snapshot = await loadHistorySnapshot(database, history);
   const rows = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
   const scopeAddress = flags.scopeAddress ? String(flags.scopeAddress) : '';
   const matched = rows.filter((row) => {
@@ -1081,8 +1006,8 @@ async function findHistorySnapshot(database, terms, flags = {}, context = {}) {
 // 历史元信息/出处/引用是另一回事（snapshot 也不存 source spans），不在 read 里兼。
 async function readHistorySnapshot(database, docId, address, flags = {}) {
   const range = ['node', 'subtree', 'siblings'].includes(String(flags.range)) ? String(flags.range) : 'subtree';
-  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId), { includeDiff: true });
-  const snapshot = parseHistorySnapshot(history);
+  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId));
+  const snapshot = await loadHistorySnapshot(database, history);
   if (String(snapshot.doc?.id ?? docId) !== String(docId)) {
     throw new Error(`db read --at history ${history.id} belongs to another doc`);
   }

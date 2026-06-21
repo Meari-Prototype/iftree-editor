@@ -402,13 +402,16 @@ function assertAgentOpenUrlAllowed(rawUrl) {
 }
 
 function decodeHtmlEntities(value = '') {
+  // 数字实体（&#92; / &#x27; 等）是封闭规则，用两条带回调的 replace 全覆盖、不逐个枚举；
+  // 非法码点回退原文（|| m）防 RangeError。&amp; 放最后解，避免把已解出的 & 再当实体头。
+  const fromCp = (cp) => (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF ? String.fromCodePoint(cp) : '');
   return String(value || '')
-    .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x2F;/g, '/');
+    .replace(/&#x([0-9a-fA-F]+);/g, (m, hex) => fromCp(parseInt(hex, 16)) || m)
+    .replace(/&#(\d+);/g, (m, dec) => fromCp(parseInt(dec, 10)) || m)
+    .replace(/&amp;/g, '&');
 }
 
 function stripHtml(value = '') {
@@ -1021,15 +1024,7 @@ const REQUIRED_DEPS = [
   'libraryRelativePathForAgent'
 ];
 
-// schema 自述（15-12-5）：接入第一读物，数百 token 的约定说明，不是内容清单。
-// 正文维护在 system_prompt.md 的 memory.schema 段；这里是文件缺失时的回退。
-const MEMORY_SCHEMA_FALLBACK = [
-  '本库按时态分三层，结构同构（同一套树地址与检索动词）、语义异质：完整记忆（session 事件卷）答"确曾发生"——一个 session 一卷，只追加、封卷不可变、永不删除；长期核心记忆答"现在如此"——经提炼与人工审批产生的当前事实层，每条事实回指事件出处；知识文档答"未来可用"——导入的资料文档。',
-  '你有跨会话记忆：开工先看最近发生过什么（`db memory list` 列卷及状态，按 docId 用 tree/read 下钻卷正文），再看工作区文件。知道库里有什么是检索的产物、不是检索的前提——别等清单，直接检索。',
-  '信任语义：节点分受控/不受控两级。受控=经人工审批的结论；不受控=机器产物未经人审——事件卷一律不受控，这是层级的时态属性，不是质量评分。命中未解决的 ERROR 节点必须停下向用户报告，不得绕过续跑。',
-  '时间纪律：召回结果附带时间元数据，采信前先看时间；同主题证据冲突时新者胜，不得以"内容看起来更合理"推翻时间新旧——合理感是模型先验，时间是客观信号；找不到更新的证据时，旧证据就是最佳可用证据，知旧而用。',
-  '更详尽的记忆库使用（召回动线、写入边界与提炼、操作要点）见 docs/memory.md。'
-].join('\n');
+// memory.schema 的代码内 fallback 已随收口删除——正文以 system_prompt.md 的 memory.schema 段为单一真相（解耦第 3 步）。
 
 // 内置自动落卷的 session→节点树转换（15-10-2）：消息粒度局部展开——一条消息一个节点，
 // 工具事件作为助手消息的子节点；事件卷一律不受控（15-10-3）。
@@ -1073,8 +1068,8 @@ export function createAgentRuntime(deps = {}) {
       throw new Error(`createAgentRuntime: missing required dep "${key}"`);
     }
   }
-  if (!deps.database) {
-    throw new Error('createAgentRuntime: missing required dep "database"');
+  if (!deps.sdk || typeof deps.sdk.request !== 'function') {
+    throw new Error('createAgentRuntime: missing required dep "sdk" (in-process backend SDK handle)');
   }
 
   const sendAgentStream = (requestId, event) => {
@@ -1082,13 +1077,22 @@ export function createAgentRuntime(deps = {}) {
     deps.sendAgentStream?.(requestId, event);
   };
 
-  const database = () => {
-    const value = typeof deps.database === 'function' ? deps.database() : deps.database;
-    if (!value || typeof value.run !== 'function') {
-      throw new Error('createAgentRuntime: database service is not available');
-    }
-    return value;
-  };
+  // agent 框架只通过 in-process SDK 句柄访问后端（与外部 agent 经 MCP 同契约的 request 信封），
+  // 不直连 database 实例。database() 把触点的 run/write 信封适配成 sdk.request：
+  //   · run(command, fallback) → database.run（buildAgentContext / admin_override / listAgentDiffs 的读，
+  //     以及 agentBash 经 db-shell 的全部访问——db-shell 对 database 只用 .run）；
+  //   · write(payload, ctx) → database.write，editBranch* 内联进 payload（与 mcp-server 写路径一致）。
+  const sdk = deps.sdk;
+  const database = () => ({
+    run: (command, fallback = 'read') => sdk.request('database.run', { databaseCommand: command, fallbackOperation: fallback }),
+    write: (payload, ctx = {}) => sdk.request('database.write', {
+      payload: {
+        ...payload,
+        ...(ctx.editBranchOwner != null ? { editBranchOwner: ctx.editBranchOwner } : {}),
+        ...(ctx.editBranchBaseDocId != null ? { editBranchBaseDocId: ctx.editBranchBaseDocId } : {})
+      }
+    })
+  });
   const getAgentStore = () => deps.getAgentStore();
   const readAgentSettings = () => deps.readAgentSettings();
   const getToolSettings = () => normalizeAgentToolSettings(readAgentSettings().toolSettings || {});
@@ -1452,9 +1456,9 @@ export function createAgentRuntime(deps = {}) {
     if (argv[0] === 'db') {
       const result = await runDbShellArgv(database(), argv, {
         currentDocId: context.file?.docId,
-        importLibraryDocument: deps.importLibraryDocument,
-        deleteImportedDocument: deps.deleteImportedDocument,
-        ensureDocVectors: deps.ensureDocVectors,
+        importLibraryDocument: (payload) => sdk.request('import.libraryDocument', { payload }),
+        deleteImportedDocument: (payload) => sdk.request('import.deleteDocument', { payload }),
+        ensureDocVectors: (payload) => sdk.request('vector.ensureDoc', { payload }),
         askAgent: runAgent,
         agentTool: ({ name, args: toolArgs }) => runAgentTool(name, toolArgs, {
           mode: 'full',
@@ -1655,18 +1659,15 @@ export function createAgentRuntime(deps = {}) {
     }
     if (name === 'import_library_document') {
       if (mode !== 'edit' && mode !== 'full') return { rejected: true, reason: '当前模式不能导入 library 文档。' };
-      if (typeof deps.importLibraryDocument !== 'function') return { rejected: true, reason: '当前后端未注册导入入口。' };
-      return deps.importLibraryDocument(args);
+      return sdk.request('import.libraryDocument', { payload: args });
     }
     if (name === 'delete_library_document') {
       if (mode !== 'edit' && mode !== 'full') return { rejected: true, reason: '当前模式不能删除已导入文档。' };
-      if (typeof deps.deleteImportedDocument !== 'function') return { rejected: true, reason: '当前后端未注册删除入口。' };
-      return deps.deleteImportedDocument(args);
+      return sdk.request('import.deleteDocument', { payload: args });
     }
     if (name === 'ensure_doc_vectors') {
       if (mode !== 'edit' && mode !== 'full') return { rejected: true, reason: '当前模式不能写入派生向量索引。' };
-      if (typeof deps.ensureDocVectors !== 'function') return { rejected: true, reason: '当前后端未注册向量补建入口。' };
-      return deps.ensureDocVectors(args);
+      return sdk.request('vector.ensureDoc', { payload: args });
     }
     if (name === 'database_write') {
       if (mode === 'qa') return { rejected: true, reason: '当前模式没有数据库写入权限。' };
@@ -1814,53 +1815,18 @@ export function createAgentRuntime(deps = {}) {
 
   function agentSystemPrompt(mode, personalPrompt = '') {
     const fixedPrompt = String(personalPrompt || '').trim();
-    const baseLines = [
-      '# P0 必须遵守',
-      '1. 语言：始终用简体中文回答。',
-      '2. 权限：只按上下文 permissions 行动；没有写权限就不写文件、不改数据库、不生成直接写入。',
-      '3. 真实性：不要假装读过未读取的内容；信息不足就继续读取或说明缺什么。',
-      '4. 用户可读：最终回答不要暴露工具名、函数名、action 名、字段名、变量名；用户明确要求代码细节时除外。',
-      '',
-      '# P1 取数顺序',
-      '1. 找文档：优先用 library.index 按 library 文件夹层级定位 docId；它只列已导入文件，默认不显示摘要内容；索引里的字数是子树合计，不是节点自有正文。',
-      '2. 默认作用域是当前文档：上下文已给出当前文档 docId，检索与读取都先锚定它、每次检索都显式带上该 docId；除非用户明确要求跨文档或全库，否则不得用 all-docs／跨库检索，也不得擅自把作用域偏移到别的文档。',
-      '3. 当前文档查结构：先看默认 treeIndex；节点短就读取单节点，子树大就按范围读取；当前文档找关键词用本文档关键词检索并带上当前 docId。',
-      '4. 仅当用户明确要求跨文档、或已确认当前文档确实查不到时，才显式走跨文档正文搜索；跨文档检索默认不含隐藏系统目录（如 .memory），要纳入须显式声明。',
-      '5. 需要给人或模型看树结构时请求 ASCII tree；程序继续处理时保留 JSON。',
-      '',
-      '# P2 IF-tree 规则',
-      '1. IF-tree 使用稳定地址：1 是根节点，1-3 是 1 的第 3 个子节点，1-3-2 是 1-3 的第 2 个子节点。',
-      '2. 地址前缀表示父子关系，兄弟节点共享同一父地址。',
-      '',
-      '# P3 回答风格',
-      '1. 默认 3-6 句，除非用户要求展开、逐节总结或生成长文。',
-      '2. 回答文章内容时先给核心概述，不默认复述全文。',
-      '3. 调用工具前先用一句短话声明意图，例如"我先读取节点 1-3 的正文。"',
-      '4. 不要把渲染坐标、调试日志、数据库内部行号、父节点 id 或排序字段写给用户。'
-    ];
-    if (mode === 'edit' || mode === 'full') {
-      baseLines.push(
-        '本地文件只允许使用 library 工作区内的相对路径；不要向用户暴露内部绝对路径映射。permissions.localFiles.canWrite 为 false 时只能读，不能写、删、移动。',
-        '需要联网时，先搜索关键词，再按结果打开具体网页；不要把搜索结果当作已经阅读过的正文。'
-      );
-    }
-    if (mode === 'full') {
-      baseLines.push('需要改数据库且 permissions.database.canWriteShadow 为 true 时，使用 database_write；数据库变更写入 LLM 影子分支。');
-    }
-    const basePrompt = deps.systemPromptSection('agent.base', baseLines.join('\n'));
+    // 提示词文案以 system_prompt.md 为单一真相（经语言模块按键取值）。原先这里硬编码了一整套
+    // 与 md 重复的 fallback（agent.base 的 P0-P3 全文），但 md 段落齐全、运行时从不触发——已删。
+    // 注：随之删除的还有 edit/full 模式往 fallback 里 push 的几条额外指令（本地文件相对路径限制、
+    // 联网说明、database_write 用法）——它们因 md 的 agent.base 覆盖而一直未生效；若需生效，
+    // 应补进 system_prompt.md 的 agent.base / agent.mode.* 段（内容决策，留给用户单独定）。
+    const basePrompt = deps.systemPromptSection('agent.base', '');
     // schema 自述（15-12-5）+ 常驻指令（15-12-2）：只点"你有记忆、先看看最近发生什么"，
     // 不注入正文或命中指针。记忆子系统关闭时整段不挂载（15-10-5：禁用时召回常驻指令不挂载）。
     const memorySchemaPrompt = deps.isMemoryEnabled?.() === true
-      ? deps.systemPromptSection('memory.schema', MEMORY_SCHEMA_FALLBACK)
+      ? deps.systemPromptSection('memory.schema', '')
       : '';
-    const modePrompt = deps.systemPromptSection(
-      `agent.mode.${mode}`,
-      mode === 'edit'
-        ? '当前是协作模式：需要改当前树结构、节点内容、引用关系或绑定路径时，生成待审变更；结束回答时只用普通话简短说明改了哪里，不要提内部工具名或 action 名。'
-        : mode === 'full'
-          ? '当前是完全权限：可以在 permissions 允许范围内直接读写 library 工作区文件；数据库封装操作写入 LLM 影子分支，结束回答时简短说明实际做了什么。'
-          : '当前是问答模式。禁止生成协作修改或待审变更，禁止写入；只回答问题。'
-    );
+    const modePrompt = deps.systemPromptSection(`agent.mode.${mode}`, '');
     return [
       basePrompt,
       memorySchemaPrompt,

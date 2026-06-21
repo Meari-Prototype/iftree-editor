@@ -2,6 +2,30 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.0 — 2026-06-21
+
+后端模块解耦重构：主进程通信收口到统一 backend-client SDK，巨石 `store.mjs` 拆成 `store/` 目录模块，host 的业务闭包下沉到独立服务，记忆区升级为多租户隔离；schema 演进改为库级导入式迁移，事件卷投递改纯规则解析。本轮以架构整理为主，对外动词契约不变（verb-bridge / db 契约套件全绿佐证）。
+
+### 新增
+
+- **启动版本闸 + 库级迁移**：数据库带 schema 版本号，启动只读校验，不再每次开机靠全表扫描兜底。schema 演进改为「按最新声明建空库、把旧库数据当素材导入」的一次性往复，配套 `scripts/export-db-to-json`（库 → json）、`import-db-from-json`（json → 新空库）、`migrate-tree-objects`、`migrate-memory-tenant` 四个运维脚本，取代原地改库。
+- **记忆多租户隔离**：事件卷锚与长期核心记忆按 `.memory|memory/<租户>/<工作区>/<会话>` 分层——租户＝agent 身份、工作区＝真实工作区，二者都不许占位兜底；落到占位目录（`unknown-agent` / `_local`）即判结构非法、报错引导迁移或清理，不再让各 agent 记忆混放或游离。
+- **事件卷投递改纯规则解析**：投递读 `hostAnchor` 指向的真实 session 文件、启发式解析成对话回合再成卷，与内置 agent 落卷走同一条路径；文件不存在 / 解析不出对话即拒，不造空卷、不留悬空锚。
+
+### 修复
+
+- **`restart_backend` 漏杀游离后端**：共享后端首次重启时按 pid 兜底强杀，避免旧后端进程残留占住管道。
+- **edit-branch entity 提交**：修 `this` 误用，entity 提交改回经 `store` 落库。
+
+### 工程（后端模块解耦）
+
+- **统一 backend-client SDK**：主进程、MCP、CLI 的后端通信收口到一套 backend-client SDK，主进程只调 SDK；共享后端请求分发改薄注册表，关停清理集中一处。
+- **`store` 巨石拆分**：`store.mjs` 拆成 `store/` 目录——`index.mjs`（存储底座）＋ `history.mjs`（历史子系统）＋ `edit-branch.mjs`（编辑分支子系统），门面保留同名转调，对外调用不变。
+- **host 闭包下沉**：嵌入 / 摘要 / 导入 / 快照树等业务从 host 闭包下沉到独立模块（`import-service`、`library-document-service`、`summary`、`snapshot-tree`、`diff-view` 等），host 只做依赖注入与编排。
+- **内容寻址对象库**：commit 快照拆进对象库（blob / tree 按 hash 去重、source 对象去重），新增 `objects.gc` 回收无引用对象。
+- **清理**：删渲染进程 WebGPU 嵌入旧桥（功能并入 `vector/embedding-service.mjs`）、`src/core/search.mjs` 检索逻辑并入 `query-api` / `keyword-index`、provider 选择下沉 settings、语言提示词集中到 `lang/` 模块、entity 落库 SQL 去重。
+- 顶层套件（227 pass / 1 skip）/ `test:verbs`（46 pass）/ `check:types` / `lint` 全绿；新增 object-store 历史 GC、edit-branch entity 提交、库导出导入往复、token 计数、迁移往复、backend restart pid 兜底等单测。
+
 ## 0.5.0 — 2026-06-19
 
 动词形态完整定型：编辑/流式/管理动词的参数面收口，向量维护改为 pull 自对账架构，新增记忆卷孤儿清理工具。

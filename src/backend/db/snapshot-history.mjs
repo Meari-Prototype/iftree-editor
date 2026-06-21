@@ -22,11 +22,12 @@ export function computeSnapshotDiff(prevSnapshot, currentSnapshot) {
   const entries = [];
   const prevById = new Map((prevSnapshot.nodes || []).map((node) => [node.id, node]));
   const currById = new Map((currentSnapshot.nodes || []).map((node) => [node.id, node]));
+  // source_position 不入 diff（路径丙）：它是 source_spans 表的冗余加速键、导入元数据，不是节点生命周期字段；
+  // 句位真相由 source_spans（node_id 直挂）承载，内容寻址历史也不存它，故历史不再报「句号变了」。
   const fields = [
     'text',
     'node_title',
     'node_note',
-    'source_position',
     'node_type',
     'trust_level'
   ];

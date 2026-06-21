@@ -299,6 +299,15 @@ export function createSharedBackendClient({
     get pid() {
       return channel?.client.pid ?? null;
     },
+    // 解析在跑的共享后端 pid（供 restart_backend 强杀）：已连接取 ready 帧 pid；本进程还没 request 过、
+    // channel 仍为 null 时回退描述文件——别的客户端/GUI 续住的游离后端 pid 一直记在那里。否则
+    // restart_backend 首调会因 client.pid 为 null 误判「未启动」而漏杀，下次调用复用旧进程跑旧代码。
+    get sharedBackendPid() {
+      const live = channel?.client.pid;
+      if (live) return live;
+      const recorded = Number(readBackendDescriptor(descriptorPath)?.pid);
+      return Number.isInteger(recorded) && recorded > 0 ? recorded : null;
+    },
     get mode() {
       return channel?.kind ?? null;
     }

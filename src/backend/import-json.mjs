@@ -250,6 +250,7 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
       ...report
     };
   } finally {
-    await database.run({ operation: 'write', payload: { action: 'stream.bulkEnd' } }, 'write');
+    // bulkEnd 带 embed：写分发收尾据此对本批文档统一建（或不建）向量。
+    await database.run({ operation: 'write', payload: { action: 'stream.bulkEnd', embed: embed === true || payload.embed === true } }, 'write');
   }
 }

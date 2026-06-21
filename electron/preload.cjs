@@ -56,13 +56,6 @@ contextBridge.exposeInMainWorld('iftree', {
   saveNodeLayoutSettings: wrap('settings:saveNodeLayout'),
   chooseLocalModelRoot: wrap('settings:chooseLocalModelRoot'),
   downloadVectorModel: wrap('settings:downloadVectorModel'),
-  sendEmbeddingBatchResult: (payload) => ipcRenderer.send('embedding:batch:result', payload),
-  sendEmbeddingBatchProgress: (payload) => ipcRenderer.send('embedding:batch:progress', payload),
-  onEmbeddingBatchRequest: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on('embedding:batch:request', listener);
-    return () => ipcRenderer.removeListener('embedding:batch:request', listener);
-  },
   setMenuHandler: (handler) => { menuHandler = handler; },
   onProgress: (callback) => {
     const listener = (_event, data) => callback(data);

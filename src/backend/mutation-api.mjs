@@ -1,6 +1,6 @@
 import { handleAxiomMutation, handleRefMutation } from './handlers/write/axiom-ref.mjs';
 import { handleDocFolderMutation, handleDocMutation, handleStreamMutation } from './handlers/write/doc.mjs';
-import { handleMemoryMutation } from './handlers/write/memory.mjs';
+import { handleMemoryMutation } from './memory/index.mjs';
 import { handleEditorHistoryMutation, handleHistoryMutation } from './handlers/write/history.mjs';
 import { handleNodeMutation } from './handlers/write/node.mjs';
 import { plain } from './handlers/write/shared.mjs';
@@ -61,6 +61,7 @@ const ACTIONS = Object.freeze([
   'history.restore',
   'history.certify',
   'history.revert',
+  'objects.gc',
   ...ENTITY_WRITE_ACTIONS,
 ]);
 
@@ -162,7 +163,7 @@ export function databaseWriteToolSchema() {
       idempotencyKey: { type: 'string' },
       agent: { type: 'string', description: '记忆卷 agent 身份（memory.deliverVolume 必填）' },
       sessionId: { type: 'string', description: '记忆卷 session id（memory.deliverVolume 必填）' },
-      hostAnchor: { type: 'string', description: '宿主原始记录锚（路径+session id），允许悬空' },
+      hostAnchor: { type: 'string', description: '宿主 session 文件锚（路径#sessionid）；deliverVolume 投递前校验真实存在、不接受悬空（15-10-4）' },
       startedAt: { type: 'string', description: '卷起始时间 ISO 8601' },
       endedAt: { type: 'string', description: '卷结束时间 ISO 8601' },
       force: { type: 'boolean', description: 'memory.markDistilled：用户明确指示时跳过冷却期立即触发' },
@@ -308,11 +309,57 @@ function dispatchEditBranchStage(store, branch, action, payload) {
   }
 }
 
+// 写操作落主库后需要重建 BM25 关键词的动作（直写主库的内容/结构变更；编辑分支 staging 不到这里、
+// 在上方提前 return）。稠密向量零耦合、不在此维护。doc.delete / doc.refreshAddresses 形态特殊，
+// 单独分支处理。stream.*（批量导入）不逐条维护、避免 O(N²)，由导入收尾统一处理。
+const KEYWORD_REBUILD_ACTIONS = new Set([
+  'node.insert', 'node.update', 'node.delete', 'node.move', 'node.promote', 'node.split',
+  'node.mergePrevious', 'node.mergeInto', 'node.reparent', 'node.moveBefore', 'node.moveAfter',
+  'doc.create', 'editBranch.save', 'editBranch.applyMerge',
+  'history.restore', 'history.revert', 'history.certify', 'editorHistory.restore'
+]);
+
+// 写分发收尾的派生索引维护：主库只报告"哪篇文档怎么变了"，怎么维护派生索引交给向量模块
+// （ctx.maintainDerivedAfterWrite）。失败不阻塞写返回——关键词可重建、检索入口有缺失补建兜底。
+async function maintainDerivedIndexAfterWrite(ctx, store, action, result) {
+  if (typeof ctx?.maintainDerivedAfterWrite !== 'function') return;
+  if (!result || result.changed === false || result.applied === false) return;
+  try {
+    if (action === 'stream.bulkEnd') {
+      // 批量导入结束：对本批写过的每篇文档统一维护一次（BM25 整篇重建；embed 决定建不建向量）。
+      for (const docId of result.touchedDocIds || []) {
+        await ctx.maintainDerivedAfterWrite(docId, { embed: result.embed === true });
+      }
+      return;
+    }
+    if (action === 'stream.push') {
+      // bulk 中：失活累积、留 bulkEnd 统一维护；非 bulk 单推：当场维护该文档。
+      if (store?.hasActiveBulkImport?.()) return;
+      if (result.docId) await ctx.maintainDerivedAfterWrite(result.docId, { embed: result.embed === true });
+      return;
+    }
+    const docId = result.docId ?? result.baseDocId ?? null;
+    if (action === 'doc.delete') {
+      if (docId) await ctx.maintainDerivedAfterWrite(docId, { deleted: true });
+    } else if (action === 'doc.refreshAddresses') {
+      await ctx.maintainDerivedAfterWrite(docId || null, { allDocs: !docId });
+    } else if (KEYWORD_REBUILD_ACTIONS.has(action) && docId) {
+      await ctx.maintainDerivedAfterWrite(docId, {});
+    }
+  } catch (error) {
+    if (Array.isArray(result.sideEffects)) {
+      result.sideEffects.push({ effect: 'derived.maintain', ok: false, error: error?.message || String(error) });
+    }
+  }
+}
+
 export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
   const action = normalizeMutationAction(payload.action || payload.type);
   if (!action) throw new Error(`Unknown database_write action: ${payload.action || payload.type || ''}`);
   if (action === 'mutation.actions') return { actions: databaseWriteActions() };
   requireStore(store);
+  // 对象库 GC（运维动词）：不针对某文档、不进 edit branch、不受编辑模式约束——在分支路由前直接处理。
+  if (action === 'objects.gc') return { ok: true, action, ...store.gcHistoryObjects() };
   guardEditMode(store, action, payload);
 
   const routeOwner = requestedEditBranchOwner(payload, ctx);
@@ -351,5 +398,6 @@ export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
   else if (action.startsWith('memory.')) result = await handleMemoryMutation(store, payload, ctx, action, effects);
   else throw new Error(`Unhandled database_write action: ${action}`);
 
+  await maintainDerivedIndexAfterWrite(ctx, store, action, result);
   return result;
 }

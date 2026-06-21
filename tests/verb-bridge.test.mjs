@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store.mjs';
+import { IftreeStore } from '../src/backend/store/index.mjs';
 import { runDatabaseWrite } from '../src/backend/mutation-api.mjs';
 import { registerWriteTools, registerAgentTools } from '../scripts/mcp-server.mjs';
 
@@ -22,24 +22,24 @@ async function withStore(fn) {
   }
 }
 
-// --- 后端 mutation 路由 + 派生索引 effect：history.certify / history.revert 不被 editBranch stage 拦、直达 handler ---
+// --- 后端 mutation 路由 + 派生索引收尾：history.certify / history.revert 不被 editBranch stage 拦、
+//     直达 handler；handler 只动主库，派生索引维护统一由写分发收尾调 maintainDerivedAfterWrite ---
 
-test('runDatabaseWrite 路由 history.certify：改 trust + 触发 keyword 同步 effect', async () => {
+test('runDatabaseWrite 路由 history.certify：改 trust + 收尾触发派生索引重建', async () => {
   await withStore(async (store) => {
     const doc = store.createDoc({ title: 'C', rootText: '根' });
     const child = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '子' });
-    const keywordCalls = [];
-    const ctx = { updateKeywordForNodes: (docId, touched) => keywordCalls.push({ docId, touched }) };
+    const maintained = [];
+    const ctx = { maintainDerivedAfterWrite: (docId, opts) => maintained.push([String(docId), opts || {}]) };
 
     await runDatabaseWrite(store, { action: 'history.certify', docId: doc.id, nodeId: child.id, scope: 'node', trust: '受控', owner: 'human' }, ctx);
 
     assert.equal(store.db.prepare('SELECT trust_level FROM nodes WHERE id = ?').get(child.id).trust_level, '受控');
-    assert.equal(keywordCalls.length, 1, 'keyword 同步 effect 触发一次');
-    assert.deepEqual(keywordCalls[0].touched, [String(child.id)]);
+    assert.deepEqual(maintained, [[String(doc.id), {}]], '收尾对该文档触发一次派生索引重建');
   });
 });
 
-test('runDatabaseWrite 路由 history.revert：撤改 + 触发索引重建 effect', async () => {
+test('runDatabaseWrite 路由 history.revert：撤改 + 收尾触发派生索引重建', async () => {
   await withStore(async (store) => {
     const doc = store.createDoc({ title: 'R', rootText: '根' });
     const a = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'A原文' });
@@ -47,17 +47,13 @@ test('runDatabaseWrite 路由 history.revert：撤改 + 触发索引重建 effec
     store.updateNode(a.id, { text: 'A改后' });
     const c2 = store.saveHistorySnapshot({ docId: doc.id, summary: 'c2', owner: 'human' });
 
-    const effects = [];
-    const ctx = {
-      rebuildKeywordIndexForDoc: (d) => effects.push(['keyword', d]),
-      reconcile: (d, opts) => effects.push(['vec-reconcile', d, opts])
-    };
+    const maintained = [];
+    const ctx = { maintainDerivedAfterWrite: (docId, opts) => maintained.push([String(docId), opts || {}]) };
 
     await runDatabaseWrite(store, { action: 'history.revert', commitId: c2.commit_id, owner: 'human' }, ctx);
 
     assert.equal(store.db.prepare('SELECT text FROM nodes WHERE id = ?').get(a.id).text, 'A原文');
-    assert.ok(effects.some((e) => e[0] === 'keyword'), 'keyword 重建');
-    assert.ok(effects.some((e) => e[0] === 'vec-reconcile'), '向量发自对账信号');
+    assert.deepEqual(maintained, [[String(doc.id), {}]], '收尾对该文档触发一次派生索引重建（向量零耦合、不在此 embed）');
   });
 });
 
@@ -69,7 +65,24 @@ function mockServer() {
 }
 function mockClient() {
   const calls = [];
-  return { calls, async request(type, body) { calls.push({ type, body }); return { ok: true, applied: true, changed: true }; } };
+  // 统一 SDK 接口（解耦第 10 步）：mcp-server 的 handler 调语义方法（databaseWrite / runAgent…）而非
+  // request(type, body)；mock 按方法名记录 { method, payload } 供断言核对入口的参数→payload 转换。
+  const record = (method) => async (payload, opts) => {
+    calls.push({ method, payload, opts });
+    return { ok: true, applied: true, changed: true };
+  };
+  return {
+    calls,
+    databaseRead: record('databaseRead'),
+    databaseWrite: record('databaseWrite'),
+    databaseRun: record('databaseRun'),
+    dbShell: record('dbShell'),
+    runAgent: record('runAgent'),
+    importLibraryDocument: record('importLibraryDocument'),
+    deleteImportedDocument: record('deleteImportedDocument'),
+    ensureDocVectors: record('ensureDocVectors'),
+    updateImportedSourcePaths: record('updateImportedSourcePaths')
+  };
 }
 
 test('MCP 档位注册：certify 只 human、revert/web_search 在 full、edit_agent/admin_agent 按档', async () => {
@@ -116,21 +129,22 @@ test('MCP payload 转换：certify→history.certify(owner=human)、revert→his
 
   await srv.tools.get('certify').handler({ docId: 'd1', nodeId: 'n1', trust: '受控' });
   const certifyReq = client.calls.at(-1);
-  assert.equal(certifyReq.type, 'database.write');
-  assert.equal(certifyReq.body.payload.action, 'history.certify');
-  assert.equal(certifyReq.body.payload.owner, 'human', 'certify 恒以 human 身份写');
-  assert.equal(certifyReq.body.payload.nodeId, 'n1');
+  assert.equal(certifyReq.method, 'databaseWrite');
+  assert.equal(certifyReq.payload.action, 'history.certify');
+  assert.equal(certifyReq.payload.owner, 'human', 'certify 恒以 human 身份写');
+  assert.equal(certifyReq.payload.nodeId, 'n1');
 
   await srv.tools.get('revert').handler({ commitId: 'c1' });
   const revertReq = client.calls.at(-1);
-  assert.equal(revertReq.body.payload.action, 'history.revert');
-  assert.equal(revertReq.body.payload.commitId, 'c1');
+  assert.equal(revertReq.method, 'databaseWrite');
+  assert.equal(revertReq.payload.action, 'history.revert');
+  assert.equal(revertReq.payload.commitId, 'c1');
 
   const aClient = mockClient();
   const aSrv = mockServer();
   registerAgentTools(aSrv, aClient, 'full');
   await aSrv.tools.get('admin_agent').handler({ prompt: 'hi' });
   const agentReq = aClient.calls.at(-1);
-  assert.equal(agentReq.type, 'agent.run');
-  assert.equal(agentReq.body.payload.mode, 'full', 'admin_agent 委托 full 能力');
+  assert.equal(agentReq.method, 'runAgent');
+  assert.equal(agentReq.payload.mode, 'full', 'admin_agent 委托 full 能力');
 });

@@ -44,10 +44,11 @@ function simpleImportRejectedError(sourceDocument, filePath, reason) {
   return new Error(`未识别到“${name}”的可用目录结构：${reason}，源文件总字数 ${charCount} > ${SIMPLE_AUTO_DIRECT_CHAR_LIMIT}，请改用智能导入或直接导入。`);
 }
 
-function directImportResult(sourceDocument) {
+function directImportResult(sourceDocument, degraded = null) {
   const text = sourceDocumentText(sourceDocument);
   return {
     direct: true,
+    degraded,
     records: [{ index: 1, text, vector: null }],
     structured: null,
     sourceDocument
@@ -65,7 +66,9 @@ export function importSourceDocumentForMode(sourceDocument, mode, filePath) {
     const failureReason = simpleImportFailureReason(structure, structured);
     if (failureReason) {
       if (sourceDocumentCharCount(sourceDocument) <= SIMPLE_AUTO_DIRECT_CHAR_LIMIT) {
-        return directImportResult(sourceDocument);
+        // simple 结构不达标但文档够小：退化为整篇单节点（而非报错）；带上退化原因供回执提示，
+        // 不静默——调用方能看到「没按标题切、是整篇导入」。
+        return directImportResult(sourceDocument, { from: 'simple', reason: failureReason });
       }
       throw simpleImportRejectedError(sourceDocument, filePath, failureReason);
     }

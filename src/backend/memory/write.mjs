@@ -1,9 +1,10 @@
-import { handleStreamMutation } from './doc.mjs';
+import { handleStreamMutation } from '../handlers/write/doc.mjs';
 import {
   createMemoryVolume,
   findActiveSessionVolume,
+  findSessionVolume,
   markMemoryVolumeDistilled
-} from '../../memory-volumes.mjs';
+} from './volumes.mjs';
 
 // 建卷与节点写入不在同一事务（push 的事务在 store 内自管），先把最常见的违约拦在建卷前，
 // 避免写入失败留下空卷。
@@ -27,40 +28,56 @@ function anchorMemoryVolumeOrRollback(store, ctx, { docId, agent, sessionId, hos
   try {
     ctx.writeMemoryAnchor({ docId, agent, sessionId, hostAnchor });
   } catch (error) {
+    // 结构非法（锚落占位 _local / unknown-agent）：锚已建、卷已完整落库——不回滚，把报错冒泡引导用户
+    // 迁移到正确工作区，或删除对象后用运维工具清理（projectneed 15-10-4 多租户隔离）。
+    if (error?.illegalMemoryLayout) throw error;
+    // 其余建锚失败（symlink 建不出等）仍回滚删卷（无锚即拒）。
     store.deleteDoc(docId);
     throw new Error(`记忆卷建锚失败、已回滚（projectneed 15-10-4 非导航文档必有库内实体锚）：${error?.message || error}`);
   }
 }
 
 // 完整记忆动词（projectneed 15-10 / 15-11-5 / 18-8-4）。
-// deliverVolume = 建卷 + 流式写入一步完成：投递语义就是新建一个文档（15-10-1），
-// 节点写入复用 stream.push 同一条链（FTS/向量增量随行），不设第二套机制（15-10-2）。
+// deliverVolume = 一 session 一卷：纯规则解析 hostAnchor 指向的 session 文件成卷节点（不收 agent 复述），
+// 旧卷全删 + 完整重新导入。session 只追加 + 解析确定 → 节点位置恒常不变，「全删 + 重导」≡「增量追加」却
+// 甩掉声明地址 / 幂等键 / 抢锚那一摊（15-10-1）。节点写入复用 stream.push 同一条链（FTS/向量增量随行）。
 export async function handleMemoryMutation(store, payload, ctx, action, effects) {
   if (action === 'memory.deliverVolume') {
-    // 投递级幂等：网络层重试不该长出第二个卷。
+    // 请求级防抖：只抵消同一次请求的网络重试（省去无谓的重复重导）；同 session 的去重由下方身份兜底。
     const dedupeKey = payload.idempotencyKey ?? payload.idempotency_key ?? null;
     const deliverKey = dedupeKey ? `memory.deliverVolume:${dedupeKey}` : null;
     const cached = store._streamPushFromCache(deliverKey);
     if (cached) return { ...cached, deduped: true };
 
-    const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
-    if (!nodes.length) throw new Error('memory.deliverVolume 需要至少一个节点（自述日志骨架见 projectneed 18-8-4）');
-    assertDeliverNodes(nodes);
+    const agent = payload.agent ?? payload.agentId ?? payload.agent_id ?? null;
+    const sessionId = payload.sessionId ?? payload.session_id ?? null;
+    const hostAnchor = payload.hostAnchor ?? payload.host_anchor ?? null;
+
+    // 纯规则解析：读 hostAnchor 指向的真实 session 文件、确定性解析成卷节点（不收 agent 复述的 nodes）。
+    // host 注入（有 fs）；文件不存在 / 解析不出对话即抛——不空卷直接造（15-10-4）。
+    if (typeof ctx?.sessionVolumeNodes !== 'function') {
+      throw new Error('当前写入上下文不支持 session 导入（缺 sessionVolumeNodes）');
+    }
+    const nodes = ctx.sessionVolumeNodes(hostAnchor);
+
+    // 一 session 一卷：旧卷全删（解锚 + deleteDoc）后完整重新导入。session 只追加 + 解析确定 → 重导的
+    // 前缀与旧卷逐字一致、节点位置恒常不变，所以「全删 + 重导」≡「增量追加」、却甩掉了声明地址 / 幂等键 /
+    // 抢锚那一摊（15-10-1）。封卷无需特判：session 文件停止增长后重导结果不再变，天然终态。
+    const existing = findSessionVolume(store, { agent, sessionId });
+    if (existing) {
+      store.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(existing.docId);
+      store.deleteDoc(existing.docId);
+    }
 
     const created = createMemoryVolume(store, {
       title: payload.title ?? null,
-      agent: payload.agent ?? payload.agentId ?? payload.agent_id ?? null,
-      sessionId: payload.sessionId ?? payload.session_id ?? null,
-      hostAnchor: payload.hostAnchor ?? payload.host_anchor ?? null,
+      agent,
+      sessionId,
+      hostAnchor,
       startedAt: payload.startedAt ?? payload.started_at ?? null,
       endedAt: payload.endedAt ?? payload.ended_at ?? null
     });
-    anchorMemoryVolumeOrRollback(store, ctx, {
-      docId: created.docId,
-      agent: payload.agent ?? payload.agentId ?? payload.agent_id ?? null,
-      sessionId: payload.sessionId ?? payload.session_id ?? null,
-      hostAnchor: payload.hostAnchor ?? payload.host_anchor ?? null
-    });
+    anchorMemoryVolumeOrRollback(store, ctx, { docId: created.docId, agent, sessionId, hostAnchor });
     const pushed = await handleStreamMutation(store, {
       docId: created.docId,
       nodes,
@@ -74,6 +91,7 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
       volume: created.volume,
       createdCount: pushed.createdCount,
       created: pushed.created,
+      overwrote: existing ? existing.docId : null,
       refresh: { kind: 'doc', docId: created.docId },
       sideEffects: effects
     };

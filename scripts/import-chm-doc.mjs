@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { IftreeStore } from '../src/backend/store.mjs';
+import { IftreeStore } from '../src/backend/store/index.mjs';
 import { readChmSourceDocument } from '../src/core/source-chm.mjs';
 import { normalizeImportBaseName } from '../src/core/source-markdown.mjs';
 

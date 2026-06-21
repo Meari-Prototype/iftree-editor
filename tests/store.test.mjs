@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import test from 'node:test';
 
 import { buildMarkdownStructureRecords, buildSourceDocument } from '../src/core/source-markdown.mjs';
-import { IftreeStore } from '../src/backend/store.mjs';
+import { IftreeStore } from '../src/backend/store/index.mjs';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-store-'));
@@ -94,11 +94,6 @@ test('normalizes document folder names when creating and renaming', async () => 
     const renamed = store.updateDocFolder(emptyNamed.id, { name: longName });
     assert.equal(Array.from(renamed.name).length, 100);
     assert.equal(renamed.name, '甲'.repeat(100));
-
-    store.db.prepare('INSERT INTO doc_folders (name, sort_order) VALUES (?, ?)').run('   ', 99);
-    store.migrateData();
-    const migrated = store.listDocFolders().find((folder) => folder.sort_order === 99);
-    assert.equal(migrated.name, '新建文件夹');
   });
 });
 

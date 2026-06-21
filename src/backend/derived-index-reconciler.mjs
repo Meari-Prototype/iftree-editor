@@ -1,4 +1,4 @@
-import { keywordIndexRowsForAllDocs, keywordIndexRowsForDoc, keywordIndexRowsForNodeIds } from './keyword-index.mjs';
+import { keywordIndexRowsForAllDocs } from './keyword-index.mjs';
 import { KeywordStore } from '../vector/keyword-store.mjs';
 import { VectorStore } from '../vector/vector-store.mjs';
 import { normalizeStableId } from './db/ids.mjs';
@@ -15,13 +15,22 @@ function positiveIds(values = []) {
     .filter(Boolean))];
 }
 
+// 嵌入对象（第 2 步）：标题 + 正文 + 备注（content_hash 本就含这三者，重嵌不再白费一次）。
+// 只对已嵌节点（正文非空）enrich 输入、不扩大节点集——降影响面、对齐 plan 主旨。
+function embedInputOf(row) {
+  return [row.node_title, row.text, row.node_note]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
 export function createDerivedIndexReconciler(options = {}) {
   let keywordStore = null;
   let vectorStore = null;
 
-  function vectorDbPath() {
-    const value = String(resolveValue(options.vectorDbPath, '') || '').trim();
-    if (!value) throw new Error('derived index reconciler requires vectorDbPath');
+  function lanceDbPath() {
+    const value = String(resolveValue(options.lanceDbPath, '') || '').trim();
+    if (!value) throw new Error('derived index reconciler requires lanceDbPath');
     return value;
   }
 
@@ -43,9 +52,27 @@ export function createDerivedIndexReconciler(options = {}) {
     if (!isVectorModuleEnabled()) throw new Error(options.vectorDisabledMessage || '向量模块已由用户禁用');
   }
 
+  // 嵌入前按 token 预算分桶（第 2 步守卫）：超模型窗口的节点跳过（不嵌、不中断整批，避免后端 HTTP 400
+  // 整批空转），记进 skipped 供回执醒目列出、引导拆分。countTokens（注入）或 maxInputTokens（按模型配置）
+  // 任一缺失 → 守卫关闭、全部可嵌（旧行为）。item.text 即嵌入串（embedInputOf 产出）。
+  async function partitionByBudget(items = []) {
+    const maxTokens = Number(getVectorConfig().maxInputTokens) || 0;
+    if (!maxTokens || typeof options.countTokens !== 'function') {
+      return { embeddable: items, skipped: [] };
+    }
+    const embeddable = [];
+    const skipped = [];
+    for (const item of items) {
+      const tokens = await options.countTokens(item.text);
+      if (tokens > maxTokens) skipped.push({ id: item.id, tokens, maxTokens });
+      else embeddable.push(item);
+    }
+    return { embeddable, skipped };
+  }
+
   async function getKeywordStore() {
     if (!keywordStore) {
-      keywordStore = new KeywordStore(vectorDbPath());
+      keywordStore = new KeywordStore(lanceDbPath());
       await keywordStore.init();
     }
     return keywordStore;
@@ -56,52 +83,15 @@ export function createDerivedIndexReconciler(options = {}) {
     await keywords.ensureRows(rows);
   }
 
+  // 整篇重建该文档 BM25：分批游标拉 SQL 行（绝不全量进内存），扛百万字大文档。
   async function rebuildKeywordIndexForDoc(docId) {
     const keywords = await getKeywordStore();
-    await keywords.replaceRows(keywordIndexRowsForDoc(getStore(), docId));
-  }
-
-  // 增量同步（projectneed 4-6-2）：分支合并落主干时只动本次受影响节点的索引行，不整篇重建。
-  // 先删后加幂等：upsert 行与被删节点行一并先删，再批量 add upsert 行的新内容。
-  async function updateKeywordForNodes(docId, upsertNodeIds = [], deleteNodeIds = []) {
-    const upserts = positiveIds(upsertNodeIds);
-    const deletes = positiveIds(deleteNodeIds);
-    if (upserts.length === 0 && deletes.length === 0) {
-      return { ok: true, docId, upserted: 0, deleted: 0 };
-    }
-    const keywords = await getKeywordStore();
-    await keywords.deleteNodes([...upserts, ...deletes]);
-    const rows = upserts.length ? keywordIndexRowsForNodeIds(getStore(), docId, upserts) : [];
-    if (rows.length) await keywords.addRows(rows);
-    return { ok: true, docId, upserted: rows.length, deleted: deletes.length };
+    await rebuildDocKeywordIncremental(keywords, docId);
   }
 
   async function rebuildKeywordIndexForAllDocs() {
     const keywords = await getKeywordStore();
     await keywords.replaceRows(keywordIndexRowsForAllDocs(getStore()));
-  }
-
-  async function upsertKeywordForNode(node) {
-    const keywords = await getKeywordStore();
-    await keywords.upsertNode(node);
-  }
-
-  // 流式增量关键字入库（projectneed 4-16）：只 add 这批刚写入节点的 FTS 行（O(K)），
-  // LanceDB FTS 即时可搜；不 delete 整 doc、不全量重建。
-  async function addStreamKeywords(docId, nodes = []) {
-    const list = Array.isArray(nodes) ? nodes.filter((node) => node && node.id != null) : [];
-    if (list.length === 0) return { ok: true, docId, added: 0 };
-    const keywords = await getKeywordStore();
-    await keywords.addRows(list.map((node) => ({
-      id: node.id,
-      doc_id: docId,
-      address: node.address,
-      node_title: node.node_title ?? node.nodeTitle ?? '',
-      text: node.text ?? '',
-      node_note: node.node_note ?? node.nodeNote ?? '',
-      updated_at: node.updated_at ?? ''
-    })));
-    return { ok: true, docId, added: list.length };
   }
 
   // 分批补建某 doc 的关键字索引：delete + 按 id 游标分批拉 SQL 行 add，绝不全量进 JS 内存。
@@ -158,7 +148,7 @@ export function createDerivedIndexReconciler(options = {}) {
   async function getVectorStore() {
     assertVectorModuleEnabled();
     if (!vectorStore) {
-      vectorStore = new VectorStore(vectorDbPath(), { dimensions: getVectorConfig().dimensions });
+      vectorStore = new VectorStore(lanceDbPath(), { dimensions: getVectorConfig().dimensions });
       await vectorStore.init();
     }
     return vectorStore;
@@ -169,7 +159,7 @@ export function createDerivedIndexReconciler(options = {}) {
       vectorStore.close();
       vectorStore = null;
     }
-    const vectors = new VectorStore(vectorDbPath(), { dimensions, reset: true });
+    const vectors = new VectorStore(lanceDbPath(), { dimensions, reset: true });
     await vectors.init();
     vectors.close();
   }
@@ -265,7 +255,7 @@ export function createDerivedIndexReconciler(options = {}) {
     const lanceIds = new Set(await vectors.listDocVectorIds(docId));
     const vectorCountBefore = lanceIds.size;
     const SCAN = 1000;
-    const stmt = store.db.prepare("SELECT id, text FROM nodes WHERE doc_id = ? AND TRIM(text) <> '' AND id > ? ORDER BY id LIMIT ?");
+    const stmt = store.db.prepare("SELECT id, text, node_title, node_note FROM nodes WHERE doc_id = ? AND TRIM(text) <> '' AND id > ? ORDER BY id LIMIT ?");
     let lastId = '';
     let nodeCount = 0;
     let existingCurrent = 0;
@@ -285,7 +275,7 @@ export function createDerivedIndexReconciler(options = {}) {
       const lanceText = presentIds.length ? await vectors.textByNodeIds(presentIds) : new Map();
       for (const row of rows) {
         const id = String(row.id);
-        const current = String(row.text ?? '');
+        const current = embedInputOf(row); // 嵌入串 = 标题+正文+备注（与 reconcile 同口径）
         if (!lanceIds.has(id)) {
           missingCount += 1;
           if (onMissing) await onMissing({ id, text: current });
@@ -326,6 +316,7 @@ export function createDerivedIndexReconciler(options = {}) {
     let scannedSoFar = 0;
     const pendingMissing = [];
     const pendingChanged = [];
+    const skippedItems = []; // 超长跳过（第 2 步守卫）：不嵌、不中断整批、汇总进返回。
     // 攒满 embedChunk 才 embed：embed 批大小与 SQL 扫描批解耦；内存峰值 = 单个 embed 批。
     const flushEmbed = async (force = false) => {
       while (
@@ -337,10 +328,15 @@ export function createDerivedIndexReconciler(options = {}) {
           if (pendingChanged.length) batch.push({ ...pendingChanged.shift(), changed: true });
           else batch.push({ ...pendingMissing.shift(), changed: false });
         }
-        const embeddings = await embedTexts(batch.map((item) => item.text));
+        // 超长守卫：分桶跳超长（避免后端 HTTP 400 整批空转），只 embed 余下。
+        const partition = await partitionByBudget(batch);
+        for (const item of partition.skipped) skippedItems.push(item);
+        const embeddable = partition.embeddable;
+        if (embeddable.length === 0) continue;
+        const embeddings = await embedTexts(embeddable.map((item) => item.text));
         const changedRows = [];
         const missingRows = [];
-        batch.forEach((item, index) => {
+        embeddable.forEach((item, index) => {
           const row = { nodeId: item.id, docId, text: item.text, vector: embeddings[index] };
           (item.changed ? changedRows : missingRows).push(row);
         });
@@ -400,7 +396,9 @@ export function createDerivedIndexReconciler(options = {}) {
       existingCurrent: integrity.existingCurrent,
       staleDeleted,
       changedDeleted,
-      missingInserted
+      missingInserted,
+      skippedNodes: skippedItems,
+      skippedCount: skippedItems.length
     };
   }
 
@@ -427,14 +425,14 @@ export function createDerivedIndexReconciler(options = {}) {
     ).all(id);
     const sqlHashes = computeSubtreeHashes(rows);
 
-    // 正文非空节点才进向量；同时按邻接表建子表（按 sort_order）。
+    // 正文非空节点才进向量；嵌入串 = 标题+正文+备注（embedInputOf）。同时按邻接表建子表（按 sort_order）。
     const textById = new Map();
     const childrenByParent = new Map();
     for (const row of rows) {
       const key = row.parent_id == null ? '__root__' : String(row.parent_id);
       if (!childrenByParent.has(key)) childrenByParent.set(key, []);
       childrenByParent.get(key).push(row);
-      if (String(row.text ?? '').trim() !== '') textById.set(String(row.id), String(row.text));
+      if (String(row.text ?? '').trim() !== '') textById.set(String(row.id), embedInputOf(row));
     }
     for (const list of childrenByParent.values()) {
       list.sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0));
@@ -483,33 +481,42 @@ export function createDerivedIndexReconciler(options = {}) {
     const toDelete = dryRun ? [] : [...orphans, ...staleIds];
     const deleted = toDelete.length ? await vectors.deleteNodeVectors(toDelete) : 0;
 
-    // fillNow：当场 embed 待补并 upsert（带 Merkle 哈希）；否则留给 completeness 闸后补。
+    // 超长守卫 + fillNow 当场 embed：分桶跳超长（skipped），embed 余下待补并 upsert（带 Merkle 哈希）。
+    // dryRun（completeness 检查）不分桶、只数 pending（超长仍计入待补、自然阻断就绪以引导拆分）。
     let filled = 0;
-    if (pending.length && fillNow && !dryRun) {
-      const batchSize = Math.max(1, Math.min(128, Number(getVectorConfig().batchSize) || 16));
-      const embedChunk = Math.max(batchSize, 256);
-      for (let offset = 0; offset < pending.length; offset += embedChunk) {
-        const batch = pending.slice(offset, offset + embedChunk);
-        const embeddings = await embedTexts(batch.map((item) => item.text));
-        await vectors.upsertNodeVectors(batch.map((item, index) => ({
-          nodeId: item.id,
-          docId: id,
-          text: item.text,
-          contentHash: item.contentHash,
-          subtreeHash: item.subtreeHash,
-          vector: embeddings[index]
-        })));
-        filled += batch.length;
+    let skipped = [];
+    if (pending.length && !dryRun) {
+      const partition = await partitionByBudget(pending);
+      skipped = partition.skipped;
+      if (fillNow) {
+        const batchSize = Math.max(1, Math.min(128, Number(getVectorConfig().batchSize) || 16));
+        const embedChunk = Math.max(batchSize, 256);
+        for (let offset = 0; offset < partition.embeddable.length; offset += embedChunk) {
+          const batch = partition.embeddable.slice(offset, offset + embedChunk);
+          const embeddings = await embedTexts(batch.map((item) => item.text));
+          await vectors.upsertNodeVectors(batch.map((item, index) => ({
+            nodeId: item.id,
+            docId: id,
+            text: item.text,
+            contentHash: item.contentHash,
+            subtreeHash: item.subtreeHash,
+            vector: embeddings[index]
+          })));
+          filled += batch.length;
+        }
       }
     }
 
     if (!dryRun) await refreshDocSemanticMeta(id);
-    // ready = 对账后一致：dryRun 看「无待补且无孤儿」；写模式看 pending 是否已解决（fillNow 补全 / 无待补）。
+    // ready = 对账后一致：dryRun 看「无待补且无孤儿」；写模式看「可嵌的都嵌了」。超长 skipped 不计入应嵌
+    // （它本就不可嵌、报告引导拆分而非硬阻断，plan 落实点3）——否则 filled 永不等于 pending，永远 not ready。
+    const embeddableCount = pending.length - skipped.length;
     const ready = dryRun
       ? (pending.length === 0 && orphans.length === 0)
-      : (pending.length === 0 || (fillNow && filled === pending.length));
-    return { ok: true, docId: id, fillNow, pendingCount: pending.length, orphanCount: orphans.length, filled, deleted, ready };
+      : (pending.length === 0 || (fillNow && filled === embeddableCount));
+    return { ok: true, docId: id, fillNow, pendingCount: pending.length, orphanCount: orphans.length, filled, deleted, ready, skippedNodes: skipped, skippedCount: skipped.length };
   }
+
 
   // ── 写侧向量维护已收口进 reconcile（pull 自对账，见本文件 reconcile()）：以下原三个函数功能未删除、只是改由 reconcile 统一承担，别误以为这块功能被砍了 ──
   // 1) 原 upsertVectorForNode（节点改正文后即时重嵌单节点）
@@ -559,6 +566,35 @@ export function createDerivedIndexReconciler(options = {}) {
     });
   }
 
+  // 写操作落主库之后的派生索引维护（projectneed 4-6）：调用方=写分发收尾（mutation-api）或导入编排层，
+  // 主库只报告"这篇文档怎么变了"（普通内容变更 / 删除 / 全库地址重排 + 要不要当场建向量），
+  // 派生索引自己消化怎么维护。
+  // - BM25 关键词：编辑/导入完即整篇重建该文档（分批游标、扛大文档；纯 CPU、不算计增量）。
+  // - 稠密向量：零耦合，默认不建（失活留显式 vectors 动词补）；唯一当场建的情形是导入显式 embed:true
+  //   （这里当场全量 reconcile）。删除连带回收向量行（纯删行、不涉 embedding 成本，不清会命中已删内容）。
+  async function maintainDerivedAfterWrite(docId, { deleted = false, allDocs = false, embed = false } = {}) {
+    if (allDocs) {
+      await rebuildKeywordIndexForAllDocs();
+      return { ok: true, scope: 'allDocs' };
+    }
+    const id = normalizeStableId(docId, null);
+    if (!id) return { ok: true, scope: 'noop' };
+    if (deleted) {
+      await deleteKeywordDoc(id);
+      await deleteDocVectors(id);
+      return { ok: true, docId: id, scope: 'deleted' };
+    }
+    await rebuildKeywordIndexForDoc(id);
+    if (embed) {
+      await reconcile(id, { fillNow: true });
+    } else {
+      // 不建向量，但刷一次向量就绪状态缓存（docs.meta.semantic）：让 index 列表反映当前向量覆盖率
+      //（新导入=missing 0/N）。这是派生索引模块维护自己的缓存、读 lance 计数、轻量、不 embedding。
+      await refreshDocSemanticMeta(id);
+    }
+    return { ok: true, docId: id, scope: embed ? 'keyword+vector' : 'keyword' };
+  }
+
   function readContext() {
     return {
       docVectorStatus,
@@ -574,16 +610,14 @@ export function createDerivedIndexReconciler(options = {}) {
       ensureDocVectors,
       refreshDocSemanticMeta,
       backfillDocSemanticMeta,
-      addStreamKeywords,
       isVectorModuleEnabled,
       rebuildKeywordIndexForDoc,
       rebuildKeywordIndexForAllDocs,
-      upsertKeywordForNode,
-      updateKeywordForNodes,
       deleteKeywordDoc,
       deleteDocVectors,
       pruneStaleDocVectors,
-      reconcile
+      reconcile,
+      maintainDerivedAfterWrite
     };
   }
 
@@ -598,9 +632,7 @@ export function createDerivedIndexReconciler(options = {}) {
     ensureKeywordIndexRows,
     rebuildKeywordIndexForDoc,
     rebuildKeywordIndexForAllDocs,
-    upsertKeywordForNode,
     deleteKeywordDoc,
-    updateKeywordForNodes,
     keywordSearch,
     resetVectorStoreTable,
     requireDocVectorIndex,
@@ -611,6 +643,7 @@ export function createDerivedIndexReconciler(options = {}) {
     deleteDocVectors,
     pruneStaleDocVectors,
     reconcile,
+    maintainDerivedAfterWrite,
     vectorSearch,
     readContext,
     writeContext,

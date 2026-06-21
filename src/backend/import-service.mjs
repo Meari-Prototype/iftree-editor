@@ -1,8 +1,10 @@
-import { parse, resolve } from 'node:path';
+import { statSync } from 'node:fs';
+import { join, parse, resolve } from 'node:path';
 
 import { importRecordsForFile } from '../core/import-formats/router.mjs';
 import { normalizeImportMode } from '../core/import-formats/shared.mjs';
-import { assertEmbeddingVector } from '../vector/embeddings.mjs';
+import { isSameOrChildPath, normalizeLibraryRelativePath } from './library-fs.mjs';
+import { normalizeStableId, sameStableId } from './db/ids.mjs';
 
 function parseDocMetaJson(meta) {
   if (meta && typeof meta === 'object' && !Array.isArray(meta)) return meta;
@@ -15,6 +17,16 @@ function parseDocMetaJson(meta) {
 
 function pathKey(value) {
   return resolve(String(value || '')).toLowerCase();
+}
+
+// 路径前缀替换（库文件移动/改名后重写源绑定用）：target 落在 fromPath 下时把前缀换成 toPath，
+// target 恰为 fromPath 时整体替换为 toPath。
+function replacePathPrefix(target, fromPath, toPath) {
+  const targetResolved = resolve(target);
+  const fromResolved = resolve(fromPath);
+  if (pathKey(targetResolved) === pathKey(fromResolved)) return resolve(toPath);
+  const suffix = targetResolved.slice(fromResolved.length).replace(/^[\\/]+/, '');
+  return join(resolve(toPath), suffix);
 }
 
 function sourcePathKey(value) {
@@ -61,18 +73,14 @@ function importRecordSentenceIndexes(record, fallbackIndex, hasExplicitIndex) {
   return hasExplicitIndex ? [] : [fallbackIndex];
 }
 
-async function cleanupFailedImport(store, docId, vectorStore) {
+function cleanupFailedImport(store, docId) {
   if (!docId) return;
   try {
     store.deleteDoc(docId);
   } catch {
     // Best-effort rollback; preserve the original import error.
   }
-  try {
-    await vectorStore?.deleteDoc?.(docId);
-  } catch {
-    // Best-effort vector cleanup; preserve the original import error.
-  }
+  // 失败回滚只删文档；导入时不建向量（向量由 host 返回后统一 reconcile），无向量可清。
 }
 
 export async function importFilePathsToStore(options = {}) {
@@ -81,9 +89,7 @@ export async function importFilePathsToStore(options = {}) {
     filePaths = [],
     mode,
     sendProgress = () => {},
-    refreshDoc = null,
-    vector = null,
-    keyword = null
+    refreshDoc = null
   } = options;
   if (!store?.db) throw new Error('importFilePathsToStore requires an initialized store');
 
@@ -96,7 +102,6 @@ export async function importFilePathsToStore(options = {}) {
     throwDuplicateImportError(findExistingImportedDocForSourcePaths(store, [filePath]));
 
     let doc = null;
-    let vectorStore = null;
     try {
       const routedImport = await importRecordsForFile(filePath, { mode: normalizeImportMode(mode) });
       const structured = routedImport.structured;
@@ -152,61 +157,143 @@ export async function importFilePathsToStore(options = {}) {
         });
       }
 
-      if (vector?.enabled?.()) {
-        vectorStore = await vector.getStore?.();
-        const vectorConfig = vector.getConfig?.() || {};
-        const srcRecords = structured || records;
-        const nodeCount = srcRecords.length;
-        const vectorRows = [];
-        const recordsToEmbed = [];
-        for (const [index, record] of srcRecords.entries()) {
-          if (record.skipVector) continue;
-          const sentenceIndex = importRecordSentenceIndexes(record, index + 1, false)[0] || index + 1;
-          const nodeId = doc.importedNodeIdsByRecordIndex?.[sentenceIndex] || doc.importedNodeIds[index];
-          if (!nodeId) continue;
-          if (record.vector && record.vector.length > 0) {
-            vectorRows.push({
-              nodeId,
-              docId: doc.id,
-              text: record.text || '',
-              vector: assertEmbeddingVector(record.vector, `imported vector for node ${nodeId}`, vectorConfig.dimensions)
-            });
-          } else {
-            recordsToEmbed.push({ index, nodeId, text: record.text || '' });
-          }
-        }
-
-        if (recordsToEmbed.length > 0 && vectorConfig.importVectors !== false) {
-          const embeddings = await vector.embedTexts?.(
-            recordsToEmbed.map((record) => record.text),
-            { label: `生成 ${vectorConfig.label} 向量` }
-          );
-          for (const [index, record] of recordsToEmbed.entries()) {
-            vectorRows.push({
-              nodeId: record.nodeId,
-              docId: doc.id,
-              text: record.text,
-              vector: embeddings[index]
-            });
-          }
-        }
-        if (vectorRows.length > 0 && vectorStore) {
-          sendProgress({ label: '写入 LanceDB 向量库', step: nodeCount, total: nodeCount });
-          await vectorStore.upsertNodeVectors(vectorRows);
-        }
+      // 派生索引（BM25/向量）不在导入落库时建：本函数只解析+落库+存源文档，返回后由 host 对每篇
+      // 文档调派生索引模块的统一维护入口（与流式导入 bulkEnd 收尾同一口径）。
+      const entry = typeof refreshDoc === 'function' ? refreshDoc(doc.id) : { docId: doc.id, title };
+      if (routedImport.degraded?.from === 'simple') {
+        entry.degraded = routedImport.degraded;
+        entry.notice = `simple 模式未识别到可用目录结构（${routedImport.degraded.reason}），已按整篇单节点导入；要按标题切分请补全标题层级或改用其它 mode。`;
       }
-
-      if (keyword?.rebuildDoc) {
-        sendProgress({ label: '写入 LanceDB 关键词索引', step: 0, total: 0 });
-        await keyword.rebuildDoc(doc.id);
-      }
-
-      imported.push(typeof refreshDoc === 'function' ? refreshDoc(doc.id) : { docId: doc.id, title });
+      imported.push(entry);
     } catch (error) {
-      await cleanupFailedImport(store, doc?.id, vectorStore);
+      cleanupFailedImport(store, doc?.id);
       throw error;
     }
   }
   sendProgress({ done: true });
   return imported;
+}
+
+// 已导入库文档的生命周期编排（从 headless-agent-host 闭包下沉，解耦第 1c 步）：把「导入一个 library
+// 文件成文档 / 删一篇已导入文档 / 库文件移动后批量重写源路径绑定」从 host 收口到导入域。落库仍直接走
+// store 的整篇建库能力（导入是后端内部编排、不走 mutation-api 信封；删走 database.write 信封复用现成
+// doc.delete 动作）。派生索引维护沿用「落库后对每篇文档调统一维护入口」的口径，与流式导入 bulkEnd 收尾一致。
+// 等价搬迁、保持 in-process。依赖注入：
+//   · getStore() —— 主库 store 实例；runWrite(payload) —— database.write 信封（删文档用）；
+//   · maintainDerivedAfterWrite(docId, opts) —— 派生索引维护；refreshDoc(docId, opts) —— 刷新文档视图；
+//   · notifyLibraryChanged() —— 通知前端 library 变化；libraryPath(rel) —— library 相对路径转绝对；
+//   · treeSliceDepth —— 导入回执的树切片深度。
+export function createLibraryDocumentService(deps = {}) {
+  const {
+    getStore,
+    runWrite,
+    maintainDerivedAfterWrite,
+    refreshDoc,
+    notifyLibraryChanged,
+    libraryPath,
+    treeSliceDepth = 1
+  } = deps;
+
+  function importedDocSummary(item = {}, fallbackSourcePath = '') {
+    const doc = item.doc || item.created || item;
+    const meta = parseDocMetaJson(doc?.meta);
+    return {
+      docId: normalizeStableId(doc?.id ?? item.docId, null),
+      title: doc?.title || item.title || '',
+      sourcePath: meta.sourcePath || fallbackSourcePath,
+      nodeCount: Number(doc?.node_count ?? doc?.nodeCount ?? item.nodeCount) || 0
+    };
+  }
+
+  async function importLibraryDocument(payload = {}) {
+    const relativePath = normalizeLibraryRelativePath(
+      payload.relativePath ?? payload.relative_path ?? payload.path ?? payload.libraryPath
+    );
+    if (!relativePath) throw new Error('import_library_document requires relativePath');
+    // vectors 是 stream.push 的内联向量口径、不是 import 的开关——传成 vectors 先于导入报错（fail-fast），
+    // 别让人以为同步建了向量、实则静默不建。导入时同步建向量用 embed:true。
+    if (payload.vectors !== undefined) {
+      throw new Error('import 不接受 vectors 参数；导入时同步建向量请用 embed:true（vectors 是 stream.push 的内联向量口径）。');
+    }
+    const filePath = libraryPath(relativePath);
+    if (!statSync(filePath).isFile()) throw new Error('import_library_document 只能导入 library 内真实文件');
+    const imported = await importFilePathsToStore({
+      store: getStore(),
+      filePaths: [filePath],
+      mode: payload.mode,
+      refreshDoc: (docId) => refreshDoc(docId, {
+        maxTreeDepth: treeSliceDepth,
+        includeNodes: false,
+        includeSourceSpans: false,
+        includeSourceDocumentContent: false
+      })
+    });
+    notifyLibraryChanged();
+    const docs = imported.map((item) => importedDocSummary(item, filePath));
+    // 文件导入直接落库、不走流式：落库后对每篇文档调派生索引模块的统一维护入口——BM25 整篇重建，
+    // embed:true 当场全量建向量、否则失活留显式补（vectors 动词 / completeness 闸）。与流式导入
+    // bulkEnd 收尾同一口径。这与「向量式导入」（mode:'vector' 按字数切块）正交：怎么切归 mode，
+    // 建不建 embedding 归 embed 开关（vectors 参数在入口已被拒，见上）。
+    const wantVectors = payload.embed === true;
+    let vectorWarning = null;
+    for (const doc of docs) {
+      if (!doc?.docId) continue;
+      try {
+        await maintainDerivedAfterWrite(doc.docId, { embed: wantVectors });
+      } catch (error) {
+        // 派生索引可重建、SQL 已落库 → 不让导入失败；显式建向量时把错误冒泡成 warning。
+        if (wantVectors) vectorWarning = error?.message || String(error);
+      }
+    }
+    return {
+      ok: true,
+      action: 'import.libraryDocument',
+      relativePath,
+      imported: docs,
+      docId: docs[0]?.docId ?? null,
+      title: docs[0]?.title || '',
+      nodeCount: docs[0]?.nodeCount || 0,
+      ...(vectorWarning ? { vectorWarning } : {})
+    };
+  }
+
+  async function deleteImportedDocument(payload = {}) {
+    const docId = normalizeStableId(payload.docId ?? payload.doc_id, null);
+    if (!docId) throw new Error('delete_library_document requires docId');
+    const existing = getStore().listDocs().find((doc) => sameStableId(doc.id, docId)) || null;
+    const result = await runWrite({ action: 'doc.delete', docId });
+    notifyLibraryChanged();
+    return {
+      ok: result?.ok !== false,
+      action: 'import.deleteDocument',
+      docId,
+      changed: Boolean(result?.changed),
+      title: existing?.title || '',
+      nodeCount: Number(existing?.node_count) || 0
+    };
+  }
+
+  function updateImportedSourcePaths(fromPath, toPath, isDirectory) {
+    const db = getStore().db;
+    const docs = db.prepare('SELECT id, meta FROM docs').all();
+    const updateDoc = db.prepare('UPDATE docs SET meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?');
+    for (const doc of docs) {
+      const meta = parseDocMetaJson(doc.meta);
+      if (!meta.sourcePath) continue;
+      const matched = isDirectory ? isSameOrChildPath(meta.sourcePath, fromPath) : pathKey(meta.sourcePath) === pathKey(fromPath);
+      if (!matched) continue;
+      updateDoc.run(JSON.stringify({
+        ...meta,
+        sourcePath: replacePathPrefix(meta.sourcePath, fromPath, toPath)
+      }), doc.id);
+    }
+    const sourceDocs = db.prepare('SELECT doc_id, original_path FROM source_documents WHERE original_path IS NOT NULL').all();
+    const updateSourceDoc = db.prepare('UPDATE source_documents SET original_path = ? WHERE doc_id = ?');
+    for (const row of sourceDocs) {
+      const matched = isDirectory ? isSameOrChildPath(row.original_path, fromPath) : pathKey(row.original_path) === pathKey(fromPath);
+      if (matched) updateSourceDoc.run(replacePathPrefix(row.original_path, fromPath, toPath), row.doc_id);
+    }
+  }
+
+  return { importLibraryDocument, deleteImportedDocument, updateImportedSourcePaths };
 }

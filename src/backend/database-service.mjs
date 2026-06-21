@@ -1,4 +1,4 @@
-import { IftreeStore } from './store.mjs';
+import { IftreeStore } from './store/index.mjs';
 import { runDatabaseCommand } from './database-command.mjs';
 import { createLibraryService } from './library-service.mjs';
 import { runDatabaseRead, databaseReadActions } from './query-api.mjs';

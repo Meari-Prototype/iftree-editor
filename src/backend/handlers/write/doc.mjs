@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+
 import {
   normalizeStableId
 } from '../../db/ids.mjs';
@@ -9,8 +11,7 @@ import {
   ownPatch,
   plain,
   requireDocId,
-  requireId,
-  runOptionalEffect
+  requireId
 } from './shared.mjs';
 
 export function handleDocFolderMutation(store, payload, action, effects) {
@@ -62,7 +63,6 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
       meta: payload.meta ?? null,
       folderId: payload.folderId ?? payload.folder_id ?? null
     });
-    await runOptionalEffect(effects, 'keyword.rebuild_doc', () => ctx.rebuildKeywordIndexForDoc?.(created.id));
     const doc = maybeRefreshDoc(store, ctx, created.id, payload.refreshOptions || {});
     return docRefresh(action, created.id, { doc, created: plain(created), sideEffects: effects });
   }
@@ -79,10 +79,6 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
   if (action === 'doc.delete') {
     const docId = requireDocId(payload);
     const changed = store.deleteDoc(docId);
-    if (changed) {
-      await runOptionalEffect(effects, 'vector.delete_doc', () => ctx.deleteDocVectors?.(docId));
-      await runOptionalEffect(effects, 'keyword.delete_doc', () => ctx.deleteKeywordDoc?.(docId));
-    }
     return docsRefresh(action, { docId, changed: Boolean(changed), docs: listDocs(store), sideEffects: effects });
   }
 
@@ -148,21 +144,11 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
       resolutions: payload.resolutions ?? null,
       strategy: payload.strategy ?? null
     });
-    if (result.applied && result.changed) {
-      // 保存离场只押主数据落库（8-3-2-2）：BM25 按本次受影响节点增量更新（4-6-2），
-      // CPU 毫秒级，不整篇重建；向量不随保存生成/重算（4-6-1），但正文已变更与已删除
-      // 节点的旧向量行连带删除——就地清陈旧（完整性只会被编辑破坏），库中不存陈旧行，
-      // 跨文档检索按已建索引节点即安全；补齐归完整性检验（14-2/15-8-1）。
-      await runOptionalEffect(effects, 'keyword.update_nodes', () => (
-        ctx.updateKeywordForNodes?.(result.baseDocId, result.touchedNodeIds, result.deletedNodeIds)
-      ));
-      // 向量：发 pull 自对账信号（保存路径不 embed，4-6-1）——向量库自查 SQL 删孤儿/标待补，留 completeness 后补。
-      await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(result.baseDocId, { fillNow: false }));
-    }
     const doc = payload.includeDoc === false || !result.applied
       ? null
       : maybeRefreshDoc(store, ctx, result.baseDocId, payload.refreshOptions || {});
-    // 受影响节点集只服务索引同步，不进响应（大编辑会把响应撑大）。
+    // 派生索引（BM25/向量）不在 handler 维护：落主干后由写分发收尾整篇重建 BM25、向量零耦合（4-6-1）。
+    // touched/deleted/vectorStale 是 store 内部产物，从响应剔除（大编辑会把响应撑大）。
     const { touchedNodeIds: _touched, deletedNodeIds: _deleted, vectorStaleNodeIds: _stale, ...resultForResponse } = result;
     return docRefresh(action, result.baseDocId, {
       ...resultForResponse,
@@ -205,19 +191,11 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
       owner: payload.owner,
       summary: payload.summary || '保存编辑分支'
     });
-    // 非快进被前置验证拒绝（blocked/conflicts）→ 未写回，跳过索引同步与 doc 刷新。
-    if (result.applied && result.changed) {
-      // 同 editBranch.applyMerge：保存离场只押主数据落库，BM25 增量、
-      // 向量只清陈旧行（正文变更+删除节点）不生成。
-      await runOptionalEffect(effects, 'keyword.update_nodes', () => (
-        ctx.updateKeywordForNodes?.(result.baseDocId, result.touchedNodeIds, result.deletedNodeIds)
-      ));
-      // 向量：发 pull 自对账信号（保存路径不 embed，4-6-1）——向量库自查 SQL 删孤儿/标待补，留 completeness 后补。
-      await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(result.baseDocId, { fillNow: false }));
-    }
+    // 非快进被前置验证拒绝（blocked/conflicts）→ applied:false、未写回，下面跳过 doc 刷新。
     const doc = payload.includeDoc === false || result.applied === false
       ? null
       : maybeRefreshDoc(store, ctx, result.baseDocId, payload.refreshOptions || {});
+    // 派生索引（BM25/向量）不在 handler 维护：落主干后由写分发收尾整篇重建 BM25、向量零耦合（4-6-1）。
     const { touchedNodeIds: _touched, deletedNodeIds: _deleted, vectorStaleNodeIds: _stale, ...resultForResponse } = result;
     return docRefresh(action, result.baseDocId, {
       ...resultForResponse,
@@ -288,11 +266,9 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
     const docId = normalizeStableId(rawDocId);
     if (docId) {
       const result = store.refreshDocAddresses(docId);
-      await runOptionalEffect(effects, 'keyword.rebuild_doc', () => ctx.rebuildKeywordIndexForDoc?.(docId));
       return docRefresh(action, docId, { result: plain(result), sideEffects: effects });
     }
     const result = store.refreshAllAddresses();
-    await runOptionalEffect(effects, 'keyword.rebuild_all_docs', () => ctx.rebuildKeywordIndexForAllDocs?.());
     return docsRefresh(action, { result: plain(result), sideEffects: effects });
   }
 
@@ -320,33 +296,13 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
     const current = store.db.prepare('SELECT source_type FROM source_documents WHERE doc_id = ?').get(docId);
     const sourceType = payload.sourceType ?? payload.source_type ?? current?.source_type ?? 'md';
     const source = store.updateSourceBinding({ docId, sourcePath, sourceType });
+    // 目标文件自检（不阻断）：relink 只改登记、不替外部程序维护其文件状态；但顺手报一句目标在不在，
+    // 免得静默绑到不存在的路径。结果进 sideEffects，写入照常成功。
+    effects.push({ effect: 'relink.targetCheck', ok: true, targetExists: existsSync(sourcePath), sourcePath });
     return docsRefresh(action, { docId, source: plain(source), docs: listDocs(store), sideEffects: effects });
   }
 
   throw new Error(`Unhandled database_write action: ${action}`);
-}
-
-// 把 store 返回的 created 树（含写入 id）与原始 payload.nodes（含正文字段）按同构位置拉链成
-// [{id,address,text,node_title,node_note}]，供向量与关键字两个增量入口共用。
-function zipStreamNodes(srcList, createdList, out = []) {
-  const src = Array.isArray(srcList) ? srcList : [];
-  const made = Array.isArray(createdList) ? createdList : [];
-  for (let i = 0; i < made.length; i += 1) {
-    const node = made[i];
-    if (!node) continue;
-    const s = src[i] || {};
-    out.push({
-      id: node.id,
-      address: node.address,
-      text: typeof s.text === 'string' ? s.text : '',
-      node_title: s.node_title ?? s.nodeTitle ?? '',
-      node_note: s.node_note ?? s.nodeNote ?? ''
-    });
-    if (Array.isArray(node.children) && node.children.length) {
-      zipStreamNodes(s.children, node.children, out);
-    }
-  }
-  return out;
 }
 
 // 流式写入（projectneed 4-16）：直接 append，不走 edit branch。
@@ -355,14 +311,16 @@ export async function handleStreamMutation(store, payload, ctx, action, effects)
     return { ok: true, action, ...store.beginBulkImport(), sideEffects: effects };
   }
   if (action === 'stream.bulkEnd') {
-    return { ok: true, action, ...store.endBulkImport(), sideEffects: effects };
+    // endBulkImport 返回本批写过的文档；连同 embed 意图交给写分发收尾统一维护派生索引
+    //（bulk 期间一路失活不逐批维护，避免 O(N²)）。
+    return { ok: true, action, ...store.endBulkImport(), embed: payload.embed === true, sideEffects: effects };
   }
   if (action === 'stream.push') {
     // 同步建向量统一用 embed（与 import 一名到底）；vectors 是旧名，传了直接报错、别静默不建。
     if (payload.vectors !== undefined) throw new Error('stream.push 用 embed 表示同步建向量，不再接受 vectors 参数。');
-    const wantVectors = payload.embed === true;
-    if (wantVectors && ctx?.isVectorModuleEnabled?.() !== true) {
-      // fail-fast：声明启用向量但配置不可用 → 写 SQL 前抛，SQL 一字不写（4-16）。
+    // embed:true 的 fail-fast：声明建向量但模块不可用 → 写 SQL 前抛（4-16）。向量不在 push 当场建，
+    // 由导入收尾（bulkEnd）按 embed 统一建；派生索引一律不在 push 逐批维护，避免流式百万级 O(N²)。
+    if (payload.embed === true && ctx?.isVectorModuleEnabled?.() !== true) {
       throw new Error('stream.push 声明 embed:true，但向量模块不可用；请检查向量配置，或改为不启用向量。');
     }
     const result = store.pushStreamNodes({
@@ -372,32 +330,14 @@ export async function handleStreamMutation(store, payload, ctx, action, effects)
       nodes: payload.nodes ?? [],
       idempotencyKey: payload.idempotencyKey ?? payload.idempotency_key ?? null
     });
-    if (!result.deduped && Array.isArray(result.created) && result.created.length) {
-      const nodes = zipStreamNodes(payload.nodes ?? [], result.created);
-      // 首推新建文档时根节点不在推送列表里：补进本批 FTS 行。漏掉它索引行数会
-      // 永远比 SQL 少 1，首次关键字查询的就绪比对（ensureKeywordIndexReady）
-      // 会把"增量索引"整文档推倒重建。
-      if (result.createdRootId) {
-        const rootRow = store.db.prepare(
-          'SELECT id, doc_id, address, node_title, text, node_note, updated_at FROM nodes WHERE id = ?'
-        ).get(result.createdRootId);
-        if (rootRow) nodes.unshift(rootRow);
-      }
-      // FTS 增量入库（默认，CPU 轻量）：写一批 add 一批，立刻可被 find 关键字检索（projectneed 4-16）。
-      await runOptionalEffect(effects, 'keyword.add_stream', () => ctx.addStreamKeywords?.(result.docId, nodes));
-      // 向量：发 pull 自对账信号（fillNow 即时嵌）——向量库自查 SQL、subtree 剪枝跳已嵌、只嵌本批新增。
-      // 任一索引运行时失败 → runOptionalEffect 记入 sideEffects 不阻塞；调用方停止后重发信号幂等重补。
-      if (wantVectors) {
-        await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(result.docId, { fillNow: true }));
-      }
-    }
     return {
       ok: true,
       action,
+      ...result,
       docId: result.docId,
       changed: Boolean(!result.deduped && result.createdCount > 0),
       refresh: { kind: 'doc', docId: result.docId },
-      ...result,
+      embed: payload.embed === true,
       sideEffects: effects
     };
   }

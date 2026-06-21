@@ -13,6 +13,7 @@ dist-electron/
 !/library/generated/
 /library/generated/*
 !/library/generated/IFTreeEditor数据库读写测试样例.md
+!/library/generated/IFTreeEditor导入导出测试夹具.md
 /benchmark/
 /testcode/
 /testtext/

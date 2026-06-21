@@ -1,5 +1,9 @@
 export const AXIOM_ORDER_SQL = "CAST(CASE WHEN label GLOB 'A[0-9]*' THEN substr(label, 2) ELSE 0 END AS INTEGER), id";
 
+// schema 版本号（PRAGMA user_version）：建库/导入时盖章；启动只读它判断要不要迁移，跑过不再全表扫。
+// 升版本号 = 需要一次 导出→导入 迁移（本版本不在 init 里做旧库原地升级）。
+export const SCHEMA_VERSION = 1;
+
 export const TABLES_SQL = `
 PRAGMA foreign_keys = ON;
 
@@ -43,6 +47,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   trust_level TEXT CHECK(trust_level IN ('受控', '不受控') OR trust_level IS NULL),
   content_hash TEXT,
   subtree_hash TEXT,
+  title_chars INTEGER NOT NULL DEFAULT 0,
+  text_chars INTEGER NOT NULL DEFAULT 0,
+  note_chars INTEGER NOT NULL DEFAULT 0,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -50,6 +57,9 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS idx_nodes_doc ON nodes(doc_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_doc_parent_order ON nodes(doc_id, parent_id, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_nodes_doc_depth ON nodes(doc_id, depth);
+CREATE INDEX IF NOT EXISTS idx_nodes_doc_address ON nodes(doc_id, address);
+CREATE INDEX IF NOT EXISTS idx_nodes_doc_source_position ON nodes(doc_id, source_position, id);
 
 CREATE TABLE IF NOT EXISTS axioms (
   id TEXT PRIMARY KEY,
@@ -134,11 +144,24 @@ CREATE TABLE IF NOT EXISTS commits (
   committed_at TEXT DEFAULT CURRENT_TIMESTAMP,
   summary TEXT,
   author TEXT,
-  diff TEXT NOT NULL DEFAULT '{}',
-  snapshot TEXT NOT NULL DEFAULT '{}'
+  -- 内容寻址历史（第 4 步）：root_tree_hash 指向对象库节点树、source_hash 指向 raw_markdown source 对象、
+  -- meta 内联 doc/axioms/refs 这三块小且重复率低的数据（不进对象库，见 algo-refactor-plan 第 4 步）。
+  root_node_id TEXT,
+  root_tree_hash TEXT,
+  source_hash TEXT,
+  meta TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_commits_doc_time ON commits(doc_id, committed_at, id);
+
+-- 内容寻址对象库（第 4 步 git 对象模型）：commit 只存根 tree 的 hash，节点内容/结构按 hash 去重存进对象库。
+-- blob = 单节点内容（merkle CONTENT_FIELDS 5 字段），tree = {自己 blob_hash + 各子 tree_hash 按序}。
+-- hash 纯复用 core/merkle 的 contentHash / subtreeHash（位置无关），相同子树跨 commit 跨文档只存一份。
+CREATE TABLE IF NOT EXISTS objects (
+  hash TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK(kind IN ('blob', 'tree', 'source')),
+  data TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS doc_heads (
   doc_id TEXT PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
@@ -205,4 +228,28 @@ CREATE TABLE IF NOT EXISTS entity_node_bindings (
 CREATE INDEX IF NOT EXISTS idx_entity_node_bindings_entity ON entity_node_bindings(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_node_bindings_node ON entity_node_bindings(node_id);
 CREATE INDEX IF NOT EXISTS idx_entity_node_bindings_status ON entity_node_bindings(status);
+
+-- 派生维护触发器（随表声明，建空库即带，导入/迁移与 init 共用同一份，不再靠 init 单独补建）。
+-- 失效触发器：对 nodes 内容/结构列的写把所属 doc 标脏（O(1)，覆盖一切写路径，回写 hash 不自我失效）。
+CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_insert
+AFTER INSERT ON nodes BEGIN
+  UPDATE docs SET nodes_hash_dirty = 1 WHERE id = NEW.doc_id AND nodes_hash_dirty = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_update
+AFTER UPDATE OF text, node_title, node_note, node_type, trust_level, parent_id, sort_order ON nodes BEGIN
+  UPDATE docs SET nodes_hash_dirty = 1 WHERE id = NEW.doc_id AND nodes_hash_dirty = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_delete
+AFTER DELETE ON nodes BEGIN
+  UPDATE docs SET nodes_hash_dirty = 1 WHERE id = OLD.doc_id AND nodes_hash_dirty = 0;
+END;
+-- 字数缓存触发器：写 text/title/note 即按主键单行同步 *_chars，只更 *_chars 不触发上面的失效、不自我递归。
+CREATE TRIGGER IF NOT EXISTS trg_nodes_text_chars_insert
+AFTER INSERT ON nodes BEGIN
+  UPDATE nodes SET title_chars = LENGTH(COALESCE(NEW.node_title, '')), text_chars = LENGTH(COALESCE(NEW.text, '')), note_chars = LENGTH(COALESCE(NEW.node_note, '')) WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_nodes_text_chars_update
+AFTER UPDATE OF text, node_title, node_note ON nodes BEGIN
+  UPDATE nodes SET title_chars = LENGTH(COALESCE(NEW.node_title, '')), text_chars = LENGTH(COALESCE(NEW.text, '')), note_chars = LENGTH(COALESCE(NEW.node_note, '')) WHERE id = NEW.id;
+END;
 `;

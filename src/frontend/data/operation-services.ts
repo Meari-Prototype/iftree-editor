@@ -1,4 +1,4 @@
-import { callIftree, getIftreeApi, hasIftreeMethod } from './iftree-api.js';
+import { callIftree, hasIftreeMethod } from './iftree-api.js';
 import { readDatabase } from './database-client.js';
 
 export const importService = {
@@ -47,27 +47,5 @@ export const summaryService = {
 
   cancelNodeSummary(payload) {
     return callIftree('cancelNodeSummary', payload);
-  }
-};
-
-export const embeddingBridge = {
-  canHandleBatchRequests() {
-    const api = getIftreeApi();
-    return typeof api.onEmbeddingBatchRequest === 'function' && typeof api.sendEmbeddingBatchResult === 'function';
-  },
-
-  subscribeBatchRequests(callback) {
-    const api = getIftreeApi();
-    return api.onEmbeddingBatchRequest?.(callback);
-  },
-
-  sendBatchProgress(payload) {
-    const api = getIftreeApi();
-    return api.sendEmbeddingBatchProgress?.(payload);
-  },
-
-  sendBatchResult(payload) {
-    const api = getIftreeApi();
-    return api.sendEmbeddingBatchResult(payload);
   }
 };

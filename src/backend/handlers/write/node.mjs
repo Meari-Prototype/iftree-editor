@@ -6,8 +6,7 @@ import {
   plain,
   requireDocId,
   requireId,
-  rowById,
-  runOptionalEffect
+  rowById
 } from './shared.mjs';
 
 function hasTrustField(source = {}) {
@@ -40,8 +39,6 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
   if (action === 'node.insert') {
     const docId = requireDocId(payload);
     const node = store.insertNode(nodeInsertPayload(payload));
-    await runOptionalEffect(effects, 'keyword.upsert_node', () => ctx.upsertKeywordForNode?.(node));
-    await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(docId, { fillNow: false }));
     const doc = maybeRefreshDoc(store, ctx, docId, payload.refreshOptions || {});
     return docRefresh(action, docId, {
       doc,
@@ -57,18 +54,6 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
     const patch = ownPatch(payload);
     assertNoNodeTrustField(patch, 'node.update patch');
     const node = store.updateNode(nodeId, patch);
-    if (Object.prototype.hasOwnProperty.call(patch, 'text')) {
-      await runOptionalEffect(effects, 'vector.reconcile', () => ctx.reconcile?.(node.doc_id, { fillNow: false }));
-    }
-    if (
-      Object.prototype.hasOwnProperty.call(patch, 'text')
-      || Object.prototype.hasOwnProperty.call(patch, 'node_title')
-      || Object.prototype.hasOwnProperty.call(patch, 'nodeTitle')
-      || Object.prototype.hasOwnProperty.call(patch, 'node_note')
-      || Object.prototype.hasOwnProperty.call(patch, 'nodeNote')
-    ) {
-      await runOptionalEffect(effects, 'keyword.upsert_node', () => ctx.upsertKeywordForNode?.(node));
-    }
     return nodeRefresh(action, node.doc_id, node.id, { node: plain(node), sideEffects: effects });
   }
 
@@ -103,9 +88,6 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
   });
   else throw new Error(`Unhandled database_write action: ${action}`);
 
-  if (changed) {
-    await runOptionalEffect(effects, 'keyword.rebuild_doc', () => ctx.rebuildKeywordIndexForDoc?.(docId));
-  }
   const doc = maybeRefreshDoc(store, ctx, docId, payload.refreshOptions || {});
   return docRefresh(action, docId, {
     changed: Boolean(changed),

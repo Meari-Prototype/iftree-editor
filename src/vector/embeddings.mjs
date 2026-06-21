@@ -11,6 +11,7 @@ export const VECTOR_MODEL_OPTIONS = Object.freeze([
     modelName: 'Xenova/bge-m3',
     modelPath: 'Hugging Face model repo: Xenova/bge-m3',
     dimensions: 1024,
+    maxInputTokens: 8192,
     pooling: 'cls',
     gpuDtype: 'fp16',
     cpuDtype: 'q8'
@@ -22,6 +23,7 @@ export const VECTOR_MODEL_OPTIONS = Object.freeze([
     modelName: 'Xenova/bge-large-zh-v1.5',
     modelPath: 'Hugging Face model repo: Xenova/bge-large-zh-v1.5',
     dimensions: 1024,
+    maxInputTokens: 512,
     pooling: 'mean',
     gpuDtype: 'fp16',
     cpuDtype: 'q8'
@@ -33,6 +35,7 @@ export const VECTOR_MODEL_OPTIONS = Object.freeze([
     modelName: 'Xenova/bge-large-en-v1.5',
     modelPath: 'Hugging Face model repo: Xenova/bge-large-en-v1.5',
     dimensions: 1024,
+    maxInputTokens: 512,
     pooling: 'mean',
     gpuDtype: 'fp16',
     cpuDtype: 'q8'
@@ -112,6 +115,7 @@ export function normalizeVectorConfig(input = {}) {
     pooling: model.pooling,
     dimensions: model.dimensions,
     minDimensions: model.dimensions,
+    maxInputTokens: model.maxInputTokens,
     computePolicy: compute.id === 'gpu'
       ? 'GPU WebGPU computation'
       : 'CPU wasm computation explicitly selected in settings'
