@@ -39,6 +39,7 @@ function sleep(ms) {
 export function createPipeBackendClient({ pipeName = null, connectTimeoutMs = 3000 } = {}) {
   if (!pipeName) throw new Error('createPipeBackendClient requires pipeName');
   let socket = null;
+  let readline = null;
   let readyPromise = null;
   let remotePid = null;
   let nextId = 1;
@@ -51,10 +52,13 @@ export function createPipeBackendClient({ pipeName = null, connectTimeoutMs = 30
 
   function reset(error) {
     const current = socket;
+    const currentRl = readline;
     socket = null;
+    readline = null;
     readyPromise = null;
     remotePid = null;
     if (error) rejectAll(error);
+    currentRl?.close();
     current?.destroy();
   }
 
@@ -73,6 +77,7 @@ export function createPipeBackendClient({ pipeName = null, connectTimeoutMs = 30
       if (typeof timer.unref === 'function') timer.unref();
 
       const rl = createInterface({ input: s, crlfDelay: Infinity });
+      readline = rl;
       // readline 会把 input 的 error 转发 re-emit 到 Interface 自身；不挂监听，
       // 连接中断的 EPIPE/ECONNRESET 会以 uncaughtException 炸掉客户端进程。
       rl.on('error', () => { /* socket 侧 error 已走 reset 流程 */ });
@@ -265,16 +270,24 @@ export function createSharedBackendClient({
     return channel;
   }
 
+  // 非幂等动词连接中断后不自动重发：从头重跑会重复 LLM 调用与不可逆副作用（草稿/卷/导入）。
+  // agent.run（长任务）与 import.*（导入/删档）上抛、由调用方决定是否重试；幂等读写（database.* 带
+  // 请求级防抖键、vector.ensureDoc 等）仍重发现重发，吸收连接抖动。
+  const isNonRetriable = (verb) => verb === 'agent.run' || String(verb).startsWith('import.');
+
   async function request(type, payload = {}, requestOptions = {}) {
     const active = await ensureChannel();
     try {
       return await active.client.request(type, payload, requestOptions);
     } catch (error) {
       if (active.kind === 'pipe' && error?.isConnectionError) {
-        // 连接层失败（后端被重启/退出）：重发现一次再发，不重试业务错误。
+        // 连接层失败（后端被重启/退出）：标记重发现，下个请求重连。
         channel = null;
-        const next = await ensureChannel();
-        return next.client.request(type, payload, requestOptions);
+        // 幂等动词重发现一次再发；非幂等动词上抛（连接已置空，调用方重试时自会重连）。不重试业务错误。
+        if (!isNonRetriable(type)) {
+          const next = await ensureChannel();
+          return next.client.request(type, payload, requestOptions);
+        }
       }
       throw error;
     }

@@ -23,7 +23,7 @@ function isSymlink(p) {
   try { return lstatSync(p).isSymbolicLink(); } catch { return false; }
 }
 
-function main() {
+async function main() {
   const db = new Database(DB_PATH);
   const volumes = db.prepare(`
     SELECT d.id, json_extract(d.meta,'$.memoryVolume.agent') AS agent, s.original_path AS p
@@ -74,6 +74,12 @@ function main() {
     return;
   }
 
+  // 动手前备份（对齐 migrate-tree-objects；记忆区迁移同样不可逆，留一个回滚点）。
+  const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '-').slice(0, 15);
+  const backupPath = `${DB_PATH}.pre-memory-tenant-${stamp}.bak`;
+  console.log(`[migrate] 备份 DB → ${backupPath}`);
+  await db.backup(backupPath);
+
   let done = 0;
   let failed = 0;
   for (const p of plan) {
@@ -105,4 +111,7 @@ function main() {
   db.close();
 }
 
-main();
+main().catch((error) => {
+  console.error('[migrate] 失败：', error);
+  process.exitCode = 1;
+});

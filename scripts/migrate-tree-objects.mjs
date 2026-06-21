@@ -197,7 +197,15 @@ async function main() {
     ? db.prepare('SELECT id, root_node_id, root_tree_hash, source_hash, meta, snapshot, diff FROM commits')
     : db.prepare('SELECT id, root_node_id, root_tree_hash, source_hash, meta FROM commits');
   for (const row of verifySelect.all()) {
-    const r = verifyCommit(db, row);
+    let r;
+    try {
+      r = verifyCommit(db, row);
+    } catch (error) {
+      // 对象缺失等重建异常：记一条 failed、不中断整轮，让"verify 全过才删列"的安全闸照常拦住删列。
+      failed += 1;
+      console.error(`[verify x] commit ${row.id}：重建异常 ${error.message}`);
+      continue;
+    }
     if (r.skipped) continue;
     if (r.ok) { verified += 1; continue; }
     failed += 1;

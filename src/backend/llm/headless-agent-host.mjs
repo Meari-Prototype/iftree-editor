@@ -247,7 +247,10 @@ export function createHeadlessAgentHost(options = {}) {
 
   function sanitizeAnchorSegment(value, fallback) {
     const text = String(value || '').replace(/[\\/:*?"<>|]+/g, '_').trim();
-    return text || fallback;
+    // 纯 . / .. 是路径跳转（join 会规约、.. 能逃出 .memory 锚目录），空段同样非法——一律落占位 fallback，
+    // 再由 isLegalEventVolumeLayout 当占位拦下报错（健壮性：畸形 agent/工作区不许穿透成目录跳转）。
+    if (!text || text === '.' || text === '..') return fallback;
+    return text;
   }
 
   // 记忆卷库内实体锚（projectneed 15-10-4）：library/.memory/<身份>/<工作区>/<会话>.jsonl
@@ -268,7 +271,7 @@ export function createHeadlessAgentHost(options = {}) {
       // 锚位不存在即可，直接建
     }
     // 不空卷直接造（projectneed 15-10-4）：事件卷必须锚定真实 session 文件，去掉悬空占位兜底——
-    // targetPath 已由 deliverVolume 投递前 assertSessionFileResolvable 校验，这里是落库前的双保险。
+    // targetPath 的存在性由 deliverVolume 的 sessionVolumeNodes（existsSync）先行校验，这里是落库前的双保险。
     if (!targetPath || !existsSync(targetPath)) {
       throw new Error(`session 文件不存在、无法锚定：${targetPath || '(空)'}（不接受悬空锚，projectneed 15-10-4）`);
     }

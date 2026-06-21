@@ -106,7 +106,7 @@ export function createSummaryService(deps = {}) {
           }]
         })
       }, {
-        fetchers: options.fetchers || options.fetchers?.() || [],
+        fetchers: options.fetchers || [],
         errorPrefix: 'LLM 请求失败',
         signal: options.signal
       });

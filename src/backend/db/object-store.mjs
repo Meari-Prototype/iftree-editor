@@ -168,7 +168,9 @@ export function materializeTree(db, rootTreeHash, rootNodeId) {
   const expand = (treeHash, parentId, sortOrder, nodeId, address, depth) => {
     const tree = loadTree(treeHash);
     if (!tree) return;
-    const blob = JSON.parse(blobStmt.get(tree.blob_hash, 'blob').data);
+    const blobRow = blobStmt.get(tree.blob_hash, 'blob');
+    if (!blobRow) throw new Error(`对象库缺 blob ${tree.blob_hash}（节点 ${nodeId} / tree ${treeHash}），快照不完整`);
+    const blob = JSON.parse(blobRow.data);
     nodes.push({
       ...blob,
       id: nodeId,

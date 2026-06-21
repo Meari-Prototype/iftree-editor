@@ -24,8 +24,17 @@ export function isPlaceholderWorkspace(workspace) {
   return value === '' || value === PLACEHOLDER_WORKSPACE;
 }
 
-// 事件卷锚是否落在合法的 <租户>/<工作区>/ 结构下（两层都非占位）。
+// 路径段是否会逃出锚目录或在路径里游走：. / .. 在 join 里被规约成目录跳转（.. 还能逃出 .memory），
+// 残留分隔符同理。身份/工作区都必须是不逃逸的单段普通名（健壮性，非安全——本地无攻击者，
+// 但畸形 agent/工作区值不许穿透成路径跳转、坏掉「删 .memory 即清空记忆」的结构契约）。
+function isUnsafeSegment(value) {
+  const v = String(value || '').trim();
+  return v === '.' || v === '..' || v.includes('/') || v.includes('\\');
+}
+
+// 事件卷锚是否落在合法的 <租户>/<工作区>/ 结构下（两层都非占位、且都是不逃逸的单段普通名）。
 export function isLegalEventVolumeLayout(tenant, workspace) {
+  if (isUnsafeSegment(tenant) || isUnsafeSegment(workspace)) return false;
   return !isPlaceholderTenant(tenant) && !isPlaceholderWorkspace(workspace);
 }
 

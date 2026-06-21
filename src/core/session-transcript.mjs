@@ -36,11 +36,29 @@ function toolEventsFromBlocks(blocks) {
     }));
 }
 
+// CC 会把不少「系统合成内容」也写成 type=user 的行——斜杠命令展开（<command-name> 等）、本地命令
+// 输出（<local-command-stdout/stderr/caveat>）、system-reminder（可夹带整段 CLAUDE.md / 工具列表）、
+// task-notification（后台任务通知）、/compact·续接生成的对话摘要、以及工具重试提示（"…malformed…"）。
+// 它们不是用户原话，混进卷会污染事件卷与下游检索。判据对齐 CC 自身的过滤、并按本机全量 session 实测校准：
+//   · 事件级元标记：isMeta（caveat / 重试提示）、isCompactSummary / isVisibleInTranscriptOnly（compact 摘要）；
+//   · 已知系统标签前缀（仅出现在 string 形态的 user 正文）。
+// 负向排除：默认当真实保留（尽量不丢真实事件），只在确证是系统行时才跳过。
+const SYSTEM_USER_LINE_PREFIXES = [
+  '<command-name', '<command-message', '<command-args',
+  '<local-command-stdout', '<local-command-stderr', '<local-command-caveat',
+  '<system-reminder', '<task-notification', '<user-memory-input'
+];
+
+function isSyntheticUserEvent(event, text) {
+  if (event.isMeta === true) return true;
+  if (event.isCompactSummary === true || event.isVisibleInTranscriptOnly === true) return true;
+  return SYSTEM_USER_LINE_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
+
 // Claude Code transcript（每行一个事件 JSON）→ 标准 turn messages。
 // 只取真正的对话回合：
-//   · type=user：content 为字符串（或块数组里的 text 块）= 用户逐字原话。
+//   · type=user：content 为字符串（或块数组里的 text 块）= 用户逐字原话；系统合成的 user 行（见上）过滤掉。
 //   · type=assistant：text 块拼成回复正文，tool_use 块成工具事件（子节点）。
-// 过滤所有系统行（attachment / queue-operation / ai-title / 纯 tool_result 的 user 行）。
 export function messagesFromClaudeTranscript(text) {
   const messages = [];
   for (const line of String(text || '').split(/\r?\n/)) {
@@ -59,7 +77,7 @@ export function messagesFromClaudeTranscript(text) {
       const userText = typeof content === 'string'
         ? content.trim()
         : Array.isArray(content) ? textFromBlocks(content) : '';
-      if (userText) {
+      if (userText && !isSyntheticUserEvent(event, userText)) {
         messages.push({ role: 'user', content: userText, createdAt: event.timestamp || '' });
       }
       continue;

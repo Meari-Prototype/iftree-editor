@@ -2,6 +2,24 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.1 — 2026-06-21
+
+0.6.0 重构后的小修复：收紧事件卷投递的输入过滤与记忆锚路径校验，迁移脚本补备份，连接层重试避开非幂等动词重复执行。
+
+### 修复
+
+- **事件卷不再收录系统合成行**：纯规则解析 session 文件时，过滤 Claude Code 写成 user 行的系统合成内容（斜杠命令展开 `<command-*>`、本地命令输出 `<local-command-*>`、`<system-reminder>`、`<task-notification>`、compact 摘要、工具重试提示），只留用户原话——避免系统噪声污染事件卷与下游检索 / 蒸馏。
+- **记忆锚路径段校验**：`agent` / 工作区值为 `.`、`..` 或含路径分隔符时落占位并判结构非法，不再让畸形值穿透成目录跳转、逃出 `.memory` 锚目录。
+- **非幂等动词不在连接中断后自动重发**：`agent.run`、`import.*` 连接层失败时上抛、由调用方决定，避免从头重跑导致重复 LLM 调用与重复草稿 / 卷；幂等读写仍自动重连吸收抖动。
+
+### 工程
+
+- `migrate-memory-tenant` `--apply` 前 `db.backup()`（对齐 `migrate-tree-objects`），留回滚点。
+- `migrate-tree-objects` verify 对象缺失记一条 failed 而非中断整轮，保住「verify 全过才删列」的安全闸。
+- 对象库 `materializeTree` 缺 blob 时抛带 hash 的明确错误，替代无定位的 TypeError。
+- 清理 summary 服务里一处永不可达的死代码。
+- 顶层套件（228 pass / 1 skip）/ `test:verbs`（46 pass）/ `check:types` / `lint` 全绿；新增 `isLegalEventVolumeLayout` 路径段校验单测、扩充 `messagesFromClaudeTranscript` 合成行过滤用例（含负向保留真实用户话）。
+
 ## 0.6.0 — 2026-06-21
 
 后端模块解耦重构：主进程通信收口到统一 backend-client SDK，巨石 `store.mjs` 拆成 `store/` 目录模块，host 的业务闭包下沉到独立服务，记忆区升级为多租户隔离；schema 演进改为库级导入式迁移，事件卷投递改纯规则解析。本轮以架构整理为主，对外动词契约不变（verb-bridge / db 契约套件全绿佐证）。

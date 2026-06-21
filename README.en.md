@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.0%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.1%20alpha-orange)
 
-> **Project status: 0.6.0, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.6.1, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
