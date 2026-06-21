@@ -65,6 +65,7 @@
 | `memory_distill` | 标记记忆卷已提炼（提炼=人审地界；原 memory_admin 的 mark_distilled；seal 已自动化、不再设动词） |
 | `revert` | 反向提交：撤销某次已落 commit 的改动、生成反向变更并保留其后历史（区别于 `restore` 的 reset 回滚）；三方调和，撞冲突 blocked 交人裁 |
 | `web_search` | 联网检索（只读）：对齐通用 web_search，带 URL 校验与内网拦截，给 query 返回搜索结果 |
+| `gc_objects` | 对象库垃圾回收（mark-sweep）：回收不被任何 commit 引用的历史对象（blob/tree/source）；reset/revert 跳过的 commit 仍保其对象（可后悔窗口）。不在写热路径、手动跑 |
 | `certify`（仅 `human` 档） | 节点级背书：把节点 / 子树标受控——受控内容的唯一合法来源，owner 恒 human 进历史；`scope=node/subtree`、`trust=不受控` 撤销背书；定位给 `nodeId` 或 `address` |
 
 ## db 命令契约
@@ -91,6 +92,18 @@
 ```
 
 常用别名：`docs`、`library-index`、`library-navigation`、`index`、`depth`、`node-content`、`subtree`、`search`、`search-all`、`article`、`overview`、`sql`。`help` 列出全部 action。`--db <path>` 或环境变量 `IFTREE_DB` 指定库文件。
+
+## 运维脚本
+
+须以 Electron ABI 运行（`ELECTRON_RUN_AS_NODE=1 electron scripts/<脚本>`）、在共享后端空闲时跑；迁移类默认 dry-run、`--apply` 才动，详见各脚本头部注释。
+
+| 脚本 | 作用 |
+| --- | --- |
+| `export-db-to-json.mjs` | 库级导出：live 库 → 单个 JSON（带 schema 版本头），只读 |
+| `import-db-from-json.mjs` | 库级导入：JSON → 按最新 schema 新建的空库 |
+| `migrate-tree-objects.mjs` | 旧整篇快照 → 内容寻址对象库 |
+| `migrate-memory-tenant.mjs` | 记忆区补租户层（多租户隔离迁移） |
+| `purge-orphaned-volumes.mjs` | 清理「锚已被删」的脱锚记忆卷（配合手动删 `.memory` 锚） |
 
 ## import-json 契约
 

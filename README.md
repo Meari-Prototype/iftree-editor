@@ -251,11 +251,12 @@ MCP server 把文档库开放给 Claude Code、Codex 等外部 agent 框架，st
 │   │   ├── lib/          # 前端工具函数
 │   │   └── styles.css
 │   ├── backend/          # 主进程业务逻辑
-│   │   ├── store.mjs     # SQLite schema 与文档/节点写操作
-│   │   ├── db/           # schema、id、归一化、快照历史
+│   │   ├── store/        # 存储底座 / 历史 / 编辑分支子系统（SQLite schema 与文档/节点写操作）
+│   │   ├── db/           # schema、id、归一化、快照历史、内容寻址对象库
+│   │   ├── memory/       # 记忆卷：多租户隔离、锚布局、读写与维护
 │   │   ├── entities/     # 实体读写与投影
 │   │   ├── handlers/     # 读 / 写命令处理器
-│   │   └── llm/          # Agent 运行时、共享后端（命名管道）、headless agent、LLM 设置
+│   │   └── llm/          # Agent 运行时、共享后端 SDK（命名管道）、headless agent、LLM 设置
 │   ├── core/             # 纯逻辑（无 Electron 依赖）
 │   │   ├── tree.mjs      # 树构建、动态地址、Markdown/JSON 导出
 │   │   ├── mindmap.mjs   # 树视图投影、深度控制、布局

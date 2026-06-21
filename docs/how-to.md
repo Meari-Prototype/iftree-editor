@@ -137,3 +137,10 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
 
 - 备份：`library/` + `database/store.sqlite` 即可恢复全部内容；向量可随时重建。
 - 换库 / 隔离测试：`IFTREE_DB` 指定另一个 SQLite 路径，`IFTREE_HOME` 指定另一个派生数据目录（也可把向量库挪到大盘）。
+
+**库级迁移 / 重建**（0.6.0 起；升级或调整库结构时）：数据库带 schema 版本号、启动只读校验；schema 演进走「导出 → 建新空库 → 导入」的一次性往复，不在旧库原地改。均须以 Electron ABI 运行、在共享后端空闲时跑，默认 dry-run、`--apply` 才动：
+
+- `electron scripts/export-db-to-json.mjs [输出路径]` —— live 库导成单个 JSON（带 schema 版本头），只读不改源库。
+- `electron scripts/import-db-from-json.mjs <dump.json> [目标库] --apply` —— 按最新 schema 建全新空库再灌入。
+- `electron scripts/migrate-tree-objects.mjs --apply` —— 旧整篇快照迁成内容寻址对象库（`--apply` 前自动 `db.backup()`）。
+- `electron scripts/migrate-memory-tenant.mjs --apply` —— 记忆区补租户层（旧 `.memory/<工作区>` → `.memory/<租户>/<工作区>`）。

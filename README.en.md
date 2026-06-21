@@ -253,11 +253,12 @@ The app, MCP, and CLI share one backend process per database and can stay online
 │   │   ├── lib/          # Frontend utilities
 │   │   └── styles.css
 │   ├── backend/          # Main-process business logic
-│   │   ├── store.mjs     # SQLite schema and document/node write operations
-│   │   ├── db/           # schema, ids, normalizers, snapshot history
+│   │   ├── store/        # Storage core / history / edit-branch subsystems (SQLite schema, document/node writes)
+│   │   ├── db/           # schema, ids, normalizers, snapshot history, content-addressed object store
+│   │   ├── memory/       # Memory volumes: multi-tenant isolation, anchor layout, read/write & maintenance
 │   │   ├── entities/     # Entity read/write and projection
 │   │   ├── handlers/     # Read / write command handlers
-│   │   └── llm/          # Agent runtime, shared backend (named pipe), headless agent, LLM settings
+│   │   └── llm/          # Agent runtime, shared backend SDK (named pipe), headless agent, LLM settings
 │   ├── core/             # Pure logic (no Electron dependency)
 │   │   ├── tree.mjs      # Tree building, dynamic addresses, Markdown/JSON export
 │   │   ├── mindmap.mjs   # Tree-view projection, depth control, layout
