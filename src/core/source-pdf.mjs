@@ -18,13 +18,14 @@ export async function readPdfSourceDocument(filePath) {
     pages.push({ pageNumber, width: viewport.width, height: viewport.height });
 
     const content = await page.getTextContent();
+    const boldByFont = await pdfBoldByFont(page, content);
     const pageItems = [];
     for (const item of content.items || []) {
       const text = String(/** @type {any} */ (item).str || '');
       if (!text) continue;
       const rect = textItemRect(item, viewport);
       if (!rect) continue;
-      pageItems.push({ text, rect, pageNumber });
+      pageItems.push({ text, rect, pageNumber, bold: boldByFont.get(/** @type {any} */ (item).fontName) === true });
     }
 
     const pageText = pdfPageText(pageItems, viewport);
@@ -64,6 +65,35 @@ export async function readPdfSourceDocument(filePath) {
   };
 }
 
+// 加粗判据 = 字体名含 Bold。getTextContent 不填 commonObjs，需先 getOperatorList 触发字体加载。
+async function pdfBoldByFont(page, content) {
+  const map = new Map();
+  const refs = [...new Set((content.items || []).map((item) => item.fontName).filter(Boolean))];
+  if (refs.length === 0) return map;
+  await page.getOperatorList();
+  for (const ref of refs) {
+    let bold = false;
+    try {
+      if (page.commonObjs.has(ref)) bold = /bold/i.test(page.commonObjs.get(ref)?.name || '');
+    } catch {
+      bold = false;
+    }
+    map.set(ref, bold);
+  }
+  return map;
+}
+
+function pdfLineBold(line) {
+  let boldChars = 0;
+  let total = 0;
+  for (const segment of line.segments || []) {
+    const count = [...String(segment.text || '')].length;
+    total += count;
+    if (segment.bold) boldChars += count;
+  }
+  return total > 0 && boldChars / total >= 0.6;
+}
+
 function pdfPageText(items, viewport) {
   const lines = orderPdfLines(buildPdfLines(items, viewport.width), viewport.width);
   let text = '';
@@ -85,7 +115,8 @@ function pdfPageText(items, viewport) {
         x0: line.x0,
         x1: line.x1,
         y0: line.y0,
-        y1: line.y1
+        y1: line.y1,
+        bold: pdfLineBold(line)
       });
     }
     previousLine = line;
@@ -374,37 +405,80 @@ function findPdfTitleRange(rawMarkdown, title, approx) {
   return null;
 }
 
+// 没有原生 outline 时的兜底：先字号、字号没区分度再加粗+缩进，全程不看文字内容（删了 ◆ / 第X章 / Chapter 文字 pattern）。
+// 字号穷举分级——论文字号种类有限，按字符加权取众数即正文，比众数大的字号从大到小直接排 L1/L2/…（无 1.3 阈值）；
+// 与正文同字号的行再看「加粗 + 顶格（缩进信号）+ 短」，不纯靠加粗，加粗档排在字号档之后。逆天结构交智能导入收拾。
 function inferredPdfHeadingBlocks(lines) {
-  const bodyHeight = median((lines || [])
-    .filter((line) => line.text.length >= 8 && !isPdfPageNumberLine(line.text))
-    .map((line) => line.height)
-    .filter(Number.isFinite));
-  const minimum = bodyHeight ? bodyHeight * 1.16 : 12;
-  return (lines || [])
-    .filter((line) => isInferredPdfHeading(line, minimum))
-    .map((line) => ({
-      type: 'heading',
-      level: pdfHeadingLevel(line, bodyHeight),
-      start: line.start,
-      end: line.end,
-      contentStart: line.start,
-      contentEnd: line.end,
-      text: line.text.replace(/\s+/gu, '')
-    }));
+  const candidates = (lines || []).filter((line) => {
+    const text = String(line?.text || '').trim();
+    return text && !isPdfPageNumberLine(text) && text.length <= 80;
+  });
+  if (candidates.length === 0) return [];
+
+  const weights = new Map();
+  for (const line of candidates) {
+    const height = Math.round(Number(line.height));
+    if (Number.isFinite(height)) weights.set(height, (weights.get(height) || 0) + [...line.text].length);
+  }
+  const bodyHeight = dominantPdfHeight(weights);
+  const headingSizes = bodyHeight == null ? [] : [...new Set(candidates
+    .map((line) => Math.round(Number(line.height)))
+    .filter((height) => Number.isFinite(height) && height > bodyHeight))]
+    .sort((a, b) => b - a);
+  const leftMargin = modePdfLeft(candidates);
+  const boldLevel = headingSizes.length + 1;
+
+  const headings = [];
+  for (const line of candidates) {
+    const height = Math.round(Number(line.height));
+    let level = 0;
+    if (bodyHeight != null && height > bodyHeight) {
+      level = headingSizes.indexOf(height) + 1;
+    } else if (line.bold && isPdfTopAligned(line, leftMargin) && line.text.length <= 40) {
+      level = boldLevel;
+    }
+    if (level > 0) {
+      headings.push({
+        type: 'heading',
+        level,
+        start: line.start,
+        end: line.end,
+        contentStart: line.start,
+        contentEnd: line.end,
+        text: line.text.replace(/\s+/gu, '')
+      });
+    }
+  }
+  return headings;
 }
 
-function isInferredPdfHeading(line, minimumHeight) {
-  const text = String(line?.text || '').trim();
-  if (!text || isPdfPageNumberLine(text) || text.length > 60) return false;
-  if (/^◆/.test(text)) return true;
-  if (/^(Chapter|第[零一二三四五六七八九十百千万\d]+[章节篇部卷])/iu.test(text)) return true;
-  return Number(line.height) >= minimumHeight && !/[。？！；，、,.!?;]/u.test(text);
+function dominantPdfHeight(weights) {
+  let best = null;
+  let bestWeight = -1;
+  for (const [height, weight] of weights) {
+    if (weight > bestWeight) { bestWeight = weight; best = height; }
+  }
+  return best;
 }
 
-function pdfHeadingLevel(line, bodyHeight) {
-  if (/^◆/.test(line.text)) return 2;
-  if (bodyHeight && Number(line.height) >= bodyHeight * 1.8) return 1;
-  return 2;
+function modePdfLeft(lines) {
+  const counts = new Map();
+  for (const line of lines) {
+    const x0 = Math.round(Number(line.x0));
+    if (Number.isFinite(x0)) counts.set(x0, (counts.get(x0) || 0) + 1);
+  }
+  let best = null;
+  let bestCount = -1;
+  for (const [x0, count] of counts) {
+    if (count > bestCount) { bestCount = count; best = x0; }
+  }
+  return best;
+}
+
+function isPdfTopAligned(line, leftMargin) {
+  if (leftMargin == null) return true;
+  const tolerance = Math.max(2, (Number(line.height) || 10) * 0.6);
+  return Math.abs(Number(line.x0) - leftMargin) <= tolerance;
 }
 
 function isPdfPageNumberLine(text) {
@@ -414,12 +488,6 @@ function isPdfPageNumberLine(text) {
 
 function compactPdfText(text) {
   return String(text || '').replace(/\s+/gu, '').toLowerCase();
-}
-
-function median(values) {
-  const sorted = [...values].sort((a, b) => a - b);
-  if (sorted.length === 0) return 0;
-  return sorted[Math.floor(sorted.length / 2)];
 }
 
 function headingLevel(block) {

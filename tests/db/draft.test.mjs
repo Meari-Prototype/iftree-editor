@@ -31,14 +31,14 @@ test('db draft new 幂等 + list 计数 + diff --json 结构', { timeout: 180000
     assert.equal(branchResult.baseDocId, docId);
     assert.equal(branchResult.shadowDocId, docId, 'lazy 模式 shadow==base');
     assert.equal(branchResult.branch.id, branch.branchId);
-    assert.equal(branchResult.branch.owner, owner);
+    assert.equal(String(branchResult.branch.owner).split('#')[0], owner);
     assert.equal(branchResult.branch.status, 'active');
 
     await editSetText(dbPath, docId, '1-1-6-1-1', modifyChangedText, owner);
 
     // draft list：branch:doc:owner + 改/增/删 计数
     const listText = stdoutOf(await runBashDb(dbPath, ['draft', 'list', docId, '--owner', owner]));
-    assert.match(listText, new RegExp(`branch:${branch.branchId}\\s+doc:${docId}\\s+owner:${owner}\\s+改:1\\s+增:0\\s+删:0`));
+    assert.match(listText, new RegExp(`branch:${branch.branchId}\\s+doc:${docId}\\s+owner:${owner}(?:#[\\d:T-]+)?\\s+改:1\\s+增:0\\s+删:0`));
 
     // diff --json：草稿↔正文，stats/rows/entries/branch/mergeBase/projectedDoc 齐全
     const diff = parseJsonStdout(await runBashDb(dbPath, ['diff', '--base', docId, '--owner', owner, '--json']));
@@ -79,7 +79,7 @@ test('db merge：dry-run 不落库，--yes 落库后正文变 + 草稿删', { ti
 
     // dry-run：预览文案，不报错，正文/草稿都不动
     const dryMerge = stdoutOf(await runBashDb(dbPath, ['merge', '--base', docId, '--owner', owner]));
-    assert.match(dryMerge, new RegExp(`would merge doc:${docId} owner:${owner}; rerun with --yes to apply`));
+    assert.match(dryMerge, new RegExp(`would merge doc:${docId} owner:${owner}(?:#[\\d:T-]+)?; rerun with --yes to apply`));
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-6-1-1'])), modifyOriginalText, '预览不落库：正文不变');
     assert.match(stdoutOf(await runBashDb(dbPath, ['draft', 'list', docId, '--owner', owner])), /改:1/, '预览不落库：草稿仍在');
     const diffAfterDry = parseJsonStdout(await runBashDb(dbPath, ['diff', '--base', docId, '--owner', owner, '--json']));
@@ -106,7 +106,7 @@ test('db discard：dry-run 草稿仍在，--yes 删草稿且改动不落正文',
 
     // dry-run：预览文案，草稿仍在
     const dryDiscard = stdoutOf(await runBashDb(dbPath, ['discard', '--base', docId, '--owner', owner]));
-    assert.match(dryDiscard, new RegExp(`would discard doc:${docId} owner:${owner}; rerun with --yes to apply`));
+    assert.match(dryDiscard, new RegExp(`would discard doc:${docId} owner:${owner}(?:#[\\d:T-]+)?; rerun with --yes to apply`));
     assert.match(stdoutOf(await runBashDb(dbPath, ['draft', 'list', docId, '--owner', owner])), /改:1/, '预览不落库：草稿仍在');
 
     // --yes：删草稿，改动不落正文

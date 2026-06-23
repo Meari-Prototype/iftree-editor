@@ -1,7 +1,7 @@
 import { callIftree } from './iftree-api.js';
 import { canReadDatabase, readDatabase, writeDatabase } from './database-client.js';
 
-function read(action, payload?: any) {
+function read(action, payload?: Record<string, unknown>) {
   return readDatabase({ action, ...(payload || {}) });
 }
 
@@ -21,7 +21,7 @@ export const documentRepository = {
   listDocs() { return read('doc.list'); },
   listDocFolders() { return read('docFolder.list'); },
   listContentDocs(payload) { return read('content.listDocs', payload); },
-  getLibraryNavigation(payload?: any) { return read('library.getNavigation', payload); },
+  getLibraryNavigation(payload?: Record<string, unknown>) { return read('library.getNavigation', payload); },
   getContentIndex(payload) { return read('content.getIndex', payload); },
   getContentNode(payload) { return read('content.getNode', payload); },
   getContentSubtree(payload) { return read('content.getSubtree', payload); },
@@ -35,7 +35,7 @@ export const documentRepository = {
   getDocNodesPage(payload) { return read('node.listPage', payload); },
   getSubtreeTextWindow(payload) { return read('subtree.getTextWindow', payload); },
   getSourceWindow(payload) { return read('source.getWindow', payload); },
-  getPendingEditBranches(payload?: any) { return read('editBranch.listPending', payload); },
+  getPendingEditBranches(payload?: Record<string, unknown>) { return read('editBranch.listPending', payload); },
 
   getDoc(request) {
     return read('doc.get', typeof request === 'object' ? request : { docId: request });

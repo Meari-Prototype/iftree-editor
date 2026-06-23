@@ -75,7 +75,7 @@ test('db switch：无参看选择、--base 设选择、diff 缺目标报错', { 
     // --base 设选择（草稿不存在时 branchId=null）
     const selectedBase = parseJsonStdout(await runBashDb(dbPath, ['switch', '--base', docId, '--owner', 'dbt-selected']));
     assert.equal(selectedBase.baseDocId, docId);
-    assert.equal(selectedBase.owner, 'dbt-selected');
+    assert.equal(String(selectedBase.owner).split('#')[0], 'dbt-selected');
     assert.ok(selectedBase.branchId === null, 'switch 到不存在的草稿时 branchId 为 null');
 
     // 错误路径：diff 缺目标

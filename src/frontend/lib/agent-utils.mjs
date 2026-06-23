@@ -94,6 +94,7 @@ export function agentMessagesFromSession(session) {
         diffCount: Number(message.diffCount || 0),
         usage: message.usage || null,
         toolEvents: Array.isArray(message.toolEvents) ? message.toolEvents : [],
+        segments: Array.isArray(message.segments) ? message.segments : [],
         error: Boolean(message.error),
         streaming: false,
         createdAt: Date.parse(message.createdAt || '') || Date.parse(session.updated_at || '') || Date.now()
@@ -232,6 +233,39 @@ export function upsertAgentToolEvent(events = [], tool = {}) {
   return list.map((event, eventIndex) => (eventIndex === index ? { ...event, ...next } : event));
 }
 
+// 有序段（交错渲染）：delta 落到末尾 text 段（无则新建）；tool 事件按 toolId 占位、保持时间线顺序。
+// tool 段只记 toolId，工具数据始终在 toolEvents 单一来源，渲染时按 id 回查。
+export function appendTextToSegments(segments, text) {
+  if (!text) return Array.isArray(segments) ? segments : [];
+  const list = Array.isArray(segments) ? segments.slice() : [];
+  const last = list[list.length - 1];
+  if (last && last.kind === 'text') {
+    list[list.length - 1] = { ...last, text: `${last.text}${text}` };
+  } else {
+    list.push({ kind: 'text', text });
+  }
+  return list;
+}
+
+export function appendToolToSegments(segments, toolId) {
+  const id = String(toolId || '');
+  const list = Array.isArray(segments) ? segments : [];
+  if (!id || list.some((segment) => segment.kind === 'tool' && segment.toolId === id)) return list;
+  return [...list, { kind: 'tool', toolId: id }];
+}
+
+export function appendReasoningToSegments(segments, text) {
+  if (!text) return Array.isArray(segments) ? segments : [];
+  const list = Array.isArray(segments) ? segments.slice() : [];
+  const last = list[list.length - 1];
+  if (last && last.kind === 'reasoning') {
+    list[list.length - 1] = { ...last, text: `${last.text}${text}` };
+  } else {
+    list.push({ kind: 'reasoning', text });
+  }
+  return list;
+}
+
 export function agentToolStatusText(status) {
   if (status === 'done') return '完成';
   if (status === 'error') return '失败';
@@ -316,7 +350,8 @@ export function agentBranchOwnerLabel(branch, sessions = []) {
       : null;
     return session ? agentSessionTitle(session) : `会话 ${sessionId}`;
   }
-  if (owner === 'llm') return '智能体';
-  if (owner === 'human') return '人类';
+  const ownerRoleSeg = String(owner || '').split('#')[0].split(':')[0];
+  if (ownerRoleSeg === 'llm') return '智能体';
+  if (ownerRoleSeg === 'human') return '人类';
   return owner;
 }

@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { type ElementType, useMemo } from 'react';
 
 import { parseMarkdownBlocks, renderTexMathToText } from '../../core/markdown.mjs';
 import { useResolvedImageSources } from '../hooks/useResolvedImages.js';
@@ -11,7 +11,7 @@ export function MarkdownBlock({ markdown, docId }) {
     <div className="markdown-block">
       {blocks.map((block, index) => {
         if (block.type === 'heading') {
-          const Tag = (`h${Math.min(block.level, 4)}`) as any;
+          const Tag = (`h${Math.min(block.level, 4)}`) as ElementType;
           return <Tag key={index}>{block.text}</Tag>;
         }
         if (block.type === 'image') {

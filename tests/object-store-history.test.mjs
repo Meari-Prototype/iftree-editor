@@ -105,9 +105,10 @@ test('object store dedups: re-committing an unchanged doc adds no objects', asyn
 
     store.saveHistorySnapshot({ docId: doc.id, summary: 'v1', owner: 'human' });
     const after1 = objectCounts(store);
-    // 3 个节点（根 + 2 叶）内容各异 → 3 blob；3 tree（每节点一棵子树）；1 source。
+    // 3 个节点（根 + 2 叶）内容各异 → 3 blob；source 1。tree 为 4：createDoc 存的初始 commit 有一棵
+    // 「根无子」tree，v1 再存「根有 2 叶」+ 叶一 + 叶二 三棵，根的两版 hash 不同（5bf9fc7 建档存初始 commit）。
     assert.equal(after1.blob, 3, '不同内容节点各一 blob');
-    assert.equal(after1.tree, 3, '每节点一棵 tree');
+    assert.equal(after1.tree, 4, '初始 commit 的根 tree + v1 三节点 tree');
     assert.equal(after1.source, 1, 'raw_markdown 一个 source 对象');
 
     // 文档未变，再提交一次：对象按 hash 去重，objects 不增长。

@@ -17,21 +17,18 @@ export const modifyOriginalText = 'DBT_DIFF_MODIFY 的原始正文是 old-diff-t
 export const modifyChangedText = 'DBT_DIFF_MODIFY 的原始正文是 new-diff-text。执行编辑分支测试时，把 old-diff-text 改成 new-diff-text，然后打开 diff 视图，应看到同地址修改。';
 export const restoredDeleteText = 'DBT_DIFF_DELETE_TARGET 是删除测试节点。执行删除测试后，diff 视图应在左侧显示删除、右侧显示缺失。';
 
-const electronBin = process.platform === 'win32'
-  ? join(process.cwd(), 'node_modules', 'electron', 'dist', 'electron.exe')
-  : join(process.cwd(), 'node_modules', '.bin', 'electron');
-
+// db 契约测试经 node 跑 scripts/db.mjs（headless 解耦：后端是 node ABI；原经 electron-as-node 跑、
+// host 会因 electron ABI 加载 node ABI 的 better-sqlite3 而崩，故反转用 node、host 继承 node runtime）。
 export async function runDb(dbPath, args, options = {}) {
   const env = {
     ...process.env,
-    ELECTRON_RUN_AS_NODE: '1',
     IFTREE_DB: dbPath,
     // 默认隔离 IFTREE_HOME：否则关键词/向量索引会落在用户真实 ~/.iftree 的
     // LanceDB 大库上，import 被拖到分钟级并污染真实数据
     IFTREE_HOME: options.homePath || isolatedHomeForDb(dbPath)
   };
   try {
-    const result = await execFileAsync(electronBin, ['scripts/db.mjs', ...args], {
+    const result = await execFileAsync(process.execPath, ['scripts/db.mjs', ...args], {
       cwd: process.cwd(),
       env,
       maxBuffer: 16 * 1024 * 1024,

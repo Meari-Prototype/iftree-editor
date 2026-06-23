@@ -7,7 +7,7 @@ import {
   rmSync,
   symlinkSync
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 
 import { createDatabaseService } from '../database-service.mjs';
 import { createDerivedIndexReconciler } from '../derived-index-reconciler.mjs';
@@ -363,7 +363,7 @@ export function createHeadlessAgentHost(options = {}) {
     libraryPath,
     treeSliceDepth: DEFAULT_TREE_SLICE_DEPTH
   });
-  const { importLibraryDocument, deleteImportedDocument, updateImportedSourcePaths } = libraryDocService;
+  const { importLibraryDocument, smartImportTask, deleteImportedDocument, updateImportedSourcePaths } = libraryDocService;
 
   // 记忆卷校验扫除（projectneed 15-10-4）：清除「实体锚已被人工删除」的卷。
   // 判据 = 锚的库内路径本身是否还在（lstatSync 不解引用 symlink）：
@@ -466,7 +466,34 @@ export function createHeadlessAgentHost(options = {}) {
     'database.run': (request) => getDatabase().run(request.databaseCommand || request.commandPayload || request.payload || {}, request.fallbackOperation || 'read'),
     'database.read': (request) => getDatabase().run({ operation: 'read', payload: request.payload || {} }, 'read'),
     'database.write': (request) => getDatabase().run({ operation: 'write', payload: request.payload || {} }, 'write'),
+    // source 只读（路 B：前端去 native，PDF 原件/高亮也走后端 RPC，内部调既有 store 方法）。
+    'source.readPdfData': (request) => {
+      const docId = normalizeStableId(request.payload?.docId ?? request.docId, null);
+      if (!docId) return null;
+      const sourceDocument = getDatabase().getStore().db
+        .prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(docId);
+      if (!sourceDocument || sourceDocument.source_type !== 'pdf' || !sourceDocument.original_path) return null;
+      return {
+        fileName: basename(sourceDocument.original_path),
+        base64: readFileSync(sourceDocument.original_path).toString('base64')
+      };
+    },
+    'source.readPdfHighlights': (request) => {
+      const docId = normalizeStableId(request.payload?.docId ?? request.docId, null);
+      if (!docId) return [];
+      const payload = request.payload || {};
+      const ranges = Array.isArray(payload.ranges)
+        ? payload.ranges
+        : [{ start: payload.startOffset, end: payload.endOffset }];
+      return getDatabase().getStore().getPdfHighlightRects(docId, ranges);
+    },
+    'source.readPdfSpanRects': (request) => {
+      const docId = normalizeStableId(request.payload?.docId ?? request.docId, null);
+      if (!docId) return [];
+      return getDatabase().getStore().getPdfSpanHitRects(docId);
+    },
     'import.libraryDocument': (request) => importLibraryDocument(request.payload || {}),
+    'import.smartTask': (request) => smartImportTask(request.payload || {}),
     'import.deleteDocument': (request) => deleteImportedDocument(request.payload || {}),
     'memory.purgeOrphaned': (request) => purgeOrphanedMemoryVolumes({ dryRun: request.dryRun === true }),
     'database.updateSourceBinding': (request) => getDatabase().updateSourceBinding(request.payload || {}),

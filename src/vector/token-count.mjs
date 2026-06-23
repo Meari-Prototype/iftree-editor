@@ -2,8 +2,9 @@
 // 三后端通用——@huggingface/transformers 的 AutoTokenizer 已是依赖，按模型 Xenova 名加载就是
 // bge-m3 / bge-large 的真 tokenizer；无论嵌入实际跑在 ollama / llama.cpp / 本地 DirectML（都跑同一 bge），
 // JS 侧这一个 tokenizer 都对得上，不必为每个后端各接 /tokenize。
-// 加载失败（离线 / 无模型文件）退回保守字数估算 + 标记 fallback——绝不硬编码窗口大小。
-import { AutoTokenizer, env } from '@huggingface/transformers';
+// 加载失败（离线 / 无模型文件 / 未装 transformers）退回保守字数估算 + 标记 fallback——绝不硬编码窗口大小。
+// 步骤4：@huggingface/transformers 降为可选依赖，这里改动态 import（懒加载）；未装时 import 抛错被
+// 下面 catch 接住，直接走字数 fallback，不崩模块加载。
 
 /** @param {{ modelName?: string, localModelRoot?: string }} [opts] */
 export function createTokenCounter({ modelName, localModelRoot = '' } = {}) {
@@ -15,6 +16,7 @@ export function createTokenCounter({ modelName, localModelRoot = '' } = {}) {
       tokenizerPromise = (async () => {
         try {
           if (!modelName) throw new Error('token counter requires modelName');
+          const { AutoTokenizer, env } = await import('@huggingface/transformers');
           // transformers env：有本地模型根用本地、否则允许远程拉取（首次下载后缓存）。
           if (localModelRoot) {
             env.allowLocalModels = true;

@@ -2,6 +2,32 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.2 — 2026-06-23
+
+继 0.6.0 的后端解耦，本轮把前后端彻底解开：后端可在纯 node runtime 下独立部署（headless，docker / VPS 只跑 stdio MCP、不带 Electron），桌面前端不再 in-process 用 better-sqlite3、改走后端 RPC，原生模块 ABI 从 electron 统一到 node。配套把文档解析层公共化（切句 / 坐标 / 富文本抽独立模块），新增 epub 与向量式导入。对外动词契约不变。
+
+### 新增
+
+- **epub 导入**：解析 epub 章节结构与正文，句子可定位回原文（`core/source-epub` + `import-formats/epub`）。
+- **向量式导入**：按字符块切分导入（`import-formats/vector`），与按句 / 按结构导入并列，供检索优先的场景用。
+- **docx 块锚点**：导入 word 时记录每个句子在原始排版中的块区间（`source_doc_blocks` 表），句子能定位回原 docx 段落。
+- **智能导入可切到句子层**：照完整导入「切到句子」的形态产出（段落空容器 + 句子子节点、半步位置标边界），由 `splitSentences` 契约开关控制；导入契约的节点 `address` 改为可选，缺失按前序自动补全。
+- **富视图按节点渲染**：富文本视图拆成 `RichMarkdown` / `RichNodeView` 按节点渲染；agent 面板消息按正文 / 推理 / 工具分段渲染。
+
+### 工程（前后端解耦）
+
+- **headless 后端可纯 node 部署**：better-sqlite3 统一 node ABI（`prebuild-install` 下载、无需编译工具链），新增 `mcp:node`（纯 node 起 stdio MCP）/ `rebuild:native:node` / `check:native`；`@lancedb/lancedb` 是 N-API 预编译、node 与 electron 通用，不参与 rebuild。
+- **前端去 native**：electron 主进程不再 in-process 用 better-sqlite3，PDF 原件 / 高亮 / span 矩形改走后端 RPC（新增 `source.readPdfData` / `readPdfHighlights` / `readPdfSpanRects` 与 `import.smartTask` 请求口）；主进程显式拉起 node host，自身零 native rebuild。
+- **嵌入 HTTP 首选**：`embedding-service` / `token-count` 改动态 import `@huggingface/transformers`（懒加载 + fallback），默认走 HTTP 嵌入（ollama / OpenAI 兼容），本地 onnxruntime 推理降为可选依赖。
+- **依赖重分类**：前端构建链（react / react-dom / vite / @vitejs/plugin-react / @radix-ui / lucide-react / electron）移入 `devDependencies`，`@huggingface/transformers` 移入 `optionalDependencies`；`npm ci --omit=dev` 即不带前端全家桶与本地嵌入。
+- **解析层公共化**：切句抽 `core/sentence-split`、字符坐标 / span 抽 `core/source-spans`、文本读取 / XML 解码抽 `core/source-text-utils`、富 markdown 抽 `core/rich-markdown`，markdown / docx / chm / epub / 智能导入共用一套、偏移基准统一。
+- **建档存初始 commit**：建档 / 导入默认存一条「初始版本」commit 作历史起点，首个编辑可退回初始态。
+- **运行时统一 node**：测试与原生重建从 electron 切到 node（`node --test`），退役 electron 专用的原生重建 / 自检脚本。
+
+### 测试
+
+- 顶层套件 228 pass / 1 skip、`test:verbs` 46 pass、`check:types` / `lint` 全绿。
+
 ## 0.6.1 — 2026-06-21
 
 0.6.0 重构后的小修复：收紧事件卷投递的输入过滤与记忆锚路径校验，迁移脚本补备份，连接层重试避开非幂等动词重复执行。

@@ -1,4 +1,5 @@
-const SENTENCE_ENDINGS = '。！？!?.';
+import { splitSentenceSpans } from './sentence-split.mjs';
+import { appendSpans } from './source-spans.mjs';
 
 export function normalizeSourceMarkdown(markdown) {
   return String(markdown || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
@@ -134,7 +135,12 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown, options 
     if (block.type === 'heading') {
       addHeading(block);
     } else if (block.type === 'math') {
-      addParagraphFromRange(block.contentStart, block.contentEnd);
+      // 公式块整块一个节点（拉齐代码块待遇）：不切句子、不进向量，保留 $$ / \[ 定界的完整公式。
+      addRecord(currentParentAddress(), {
+        text: rawMarkdown.slice(block.start, block.end).trim(),
+        role: 'math',
+        skipVector: true
+      });
     } else if (block.type === 'paragraph' || block.type === 'blockquote') {
       const lines = block.lines || [];
       if (lines.length > 0) addParagraphFromRange(lines[0].start, lines[lines.length - 1].end);
@@ -192,14 +198,10 @@ export function sourceSpansFromMarkdown(markdown, options = {}) {
   const spans = [];
 
   function addRange(start, end) {
-    for (const part of splitSentenceRange(rawMarkdown, start, end, options)) {
-      spans.push({
-        sentence_index: spans.length + 1,
-        start_offset: part.start,
-        end_offset: part.end,
-        text: part.text
-      });
-    }
+    const segment = rawMarkdown.slice(start, end);
+    // 公共切句返回段内偏移，公共坐标层加回段落起点换成原文绝对坐标（选区高亮 / 句位回溯靠它）。完整导入总切 ASCII。
+    const segmentSpans = splitSentenceSpans(segment, { splitAsciiPunctuation: true, hardLineBreaks: options.hardLineBreaks === true });
+    appendSpans(spans, start, segmentSpans);
   }
 
   function addExactRange(start, end) {
@@ -295,35 +297,7 @@ export function parseSourceMarkdownBlocks(markdown) {
       continue;
     }
 
-    const numberedHeading = numberedHeadingBlock(line);
-    if (numberedHeading) {
-      blocks.push(numberedHeading);
-      index += 1;
-      continue;
-    }
-
-    const chineseChapter = chineseChapterBlock(line);
-    if (chineseChapter) {
-      blocks.push(chineseChapter);
-      index += 1;
-      continue;
-    }
-
-    const decoratedHeading = decoratedHeadingBlock(line);
-    if (decoratedHeading) {
-      blocks.push(decoratedHeading);
-      index += 1;
-      continue;
-    }
-
     if (isSeparatorLine(line.text)) {
-      index += 1;
-      continue;
-    }
-
-    const standaloneTitle = standaloneTitleBlock(line, blocks);
-    if (standaloneTitle) {
-      blocks.push(standaloneTitle);
       index += 1;
       continue;
     }
@@ -396,13 +370,6 @@ export function parseSourceMarkdownBlocks(markdown) {
       end = lines[index].end;
       index += 1;
     }
-    if (paragraphLines.length === 1) {
-      const lineText = rawMarkdown.slice(paragraphLines[0].start, paragraphLines[0].end).trim();
-      if (isStandaloneTitleText(lineText)) {
-        blocks.push({ type: 'heading', level: 1, start, end, text: lineText, contentStart: paragraphLines[0].start, contentEnd: paragraphLines[0].end });
-        continue;
-      }
-    }
     blocks.push({ type: 'paragraph', start, end, lines: paragraphLines });
   }
 
@@ -425,105 +392,6 @@ function collectLines(markdown) {
   return lines;
 }
 
-function splitSentenceRange(markdown, start, end, options = {}) {
-  if (start == null || end == null || end <= start) return [];
-  const range = trimAbsoluteRange(markdown.slice(start, end), start, end);
-  if (!range) return [];
-  const result = [];
-  let sentenceStart = range.start;
-  let inlineMath = false;
-  let codeTicks = 0;
-  let bracketDepth = 0;
-  let parenDepth = 0;
-
-  for (let index = range.start; index < range.end; index += 1) {
-    const char = markdown[index];
-
-    if (char === '`' && !inlineMath) {
-      const tickEnd = readRepeated(markdown, index, '`');
-      const tickCount = tickEnd - index;
-      if (codeTicks === 0) codeTicks = tickCount;
-      else if (tickCount >= codeTicks) codeTicks = 0;
-      index = tickEnd - 1;
-      continue;
-    }
-
-    if (codeTicks === 0 && char === '$') {
-      const dollarEnd = readRepeated(markdown, index, '$');
-      const dollarCount = dollarEnd - index;
-      if (dollarCount === 1) inlineMath = !inlineMath;
-      index = dollarEnd - 1;
-      continue;
-    }
-
-    if (codeTicks !== 0 || inlineMath) continue;
-
-    if (options.hardLineBreaks === true && char === '\n') {
-      pushSentence(sentenceStart, index);
-      sentenceStart = index + 1;
-      continue;
-    }
-
-    if (char === '[') bracketDepth += 1;
-    else if (char === ']' && bracketDepth > 0) bracketDepth -= 1;
-    else if (char === '(') parenDepth += 1;
-    else if (char === ')' && parenDepth > 0) parenDepth -= 1;
-
-    if (!isSentenceEnding(markdown, index, bracketDepth, parenDepth)) continue;
-
-    const closeEnd = consumeClosingPunctuation(markdown, index + 1, range.end);
-    pushSentence(sentenceStart, closeEnd);
-    sentenceStart = closeEnd;
-    index = closeEnd - 1;
-  }
-  pushSentence(sentenceStart, range.end);
-  return result;
-
-  function pushSentence(partStart, partEnd) {
-    const partRange = trimAbsoluteRange(markdown.slice(partStart, partEnd), partStart, partEnd);
-    if (!partRange) return;
-    const text = markdown.slice(partRange.start, partRange.end);
-    if (isIgnorableSourceSpanText(text)) return;
-    result.push({
-      start: partRange.start,
-      end: partRange.end,
-      text
-    });
-  }
-}
-
-function isIgnorableSourceSpanText(text) {
-  const trimmed = String(text || '').trim();
-  return trimmed === '$$' || /^[-_:| ]{3,}$/.test(trimmed);
-}
-
-function readRepeated(text, start, char) {
-  let index = start;
-  while (index < text.length && text[index] === char) index += 1;
-  return index;
-}
-
-function isSentenceEnding(markdown, index, bracketDepth, parenDepth) {
-  const char = markdown[index];
-  if (!SENTENCE_ENDINGS.includes(char)) return false;
-  if (char === '.' && isInternalAsciiDot(markdown, index)) return false;
-  if ((bracketDepth > 0 || parenDepth > 0) && char === '.') return false;
-  if (char === '.' && markdown[index + 1] === '.') return false;
-  return true;
-}
-
-function isInternalAsciiDot(markdown, index) {
-  const previous = markdown[index - 1] || '';
-  const next = markdown[index + 1] || '';
-  return /[A-Za-z0-9]/.test(previous) && /[A-Za-z0-9]/.test(next);
-}
-
-function consumeClosingPunctuation(markdown, start, end) {
-  let index = start;
-  while (index < end && /["'”’）」】》〉〕］）]/u.test(markdown[index])) index += 1;
-  return index;
-}
-
 function isFenceStart(trimmed) {
   return trimmed.startsWith('```') || trimmed.startsWith('~~~');
 }
@@ -531,12 +399,15 @@ function isFenceStart(trimmed) {
 function mathBlock(lines, index, rawMarkdown) {
   const line = lines[index];
   const trimmed = line.text.trim();
-  if (!trimmed.startsWith('$$')) return null;
+  // 块级公式：$$...$$ 或 \[...\]（带明确成对定界符，不碰裸括号）。
+  const open = trimmed.startsWith('$$') ? '$$' : (trimmed.startsWith('\\[') ? '\\[' : null);
+  if (!open) return null;
+  const close = open === '$$' ? '$$' : '\\]';
 
-  const openAt = line.text.indexOf('$$');
-  const closeAt = line.text.lastIndexOf('$$');
+  const openAt = line.text.indexOf(open);
+  const closeAt = line.text.indexOf(close, openAt + open.length);
   if (closeAt > openAt) {
-    const contentStart = line.start + openAt + 2;
+    const contentStart = line.start + openAt + open.length;
     const contentEnd = line.start + closeAt;
     const range = trimAbsoluteRange(rawMarkdown.slice(contentStart, contentEnd), contentStart, contentEnd);
     return {
@@ -553,12 +424,12 @@ function mathBlock(lines, index, rawMarkdown) {
   }
 
   let closeIndex = index + 1;
-  while (closeIndex < lines.length && lines[closeIndex].text.trim() !== '$$') closeIndex += 1;
+  while (closeIndex < lines.length && !lines[closeIndex].text.trim().endsWith(close)) closeIndex += 1;
   const hasClose = closeIndex < lines.length;
   const contentLines = lines.slice(index + 1, hasClose ? closeIndex : lines.length);
   const firstContent = contentLines[0];
   const lastContent = contentLines.at(-1);
-  const contentStart = firstContent?.start ?? (line.start + openAt + 2);
+  const contentStart = firstContent?.start ?? (line.start + openAt + open.length);
   const contentEnd = lastContent?.end ?? contentStart;
   const range = trimAbsoluteRange(rawMarkdown.slice(contentStart, contentEnd), contentStart, contentEnd);
   const endLine = hasClose ? lines[closeIndex] : (lastContent || line);
@@ -586,24 +457,6 @@ function headingBlock(line) {
   return {
     type: 'heading',
     level: match[2].length,
-    start: line.start,
-    end: line.end,
-    text: line.text.slice(range.start - line.start, range.end - line.start),
-    contentStart: range.start,
-    contentEnd: range.end
-  };
-}
-
-function numberedHeadingBlock(line) {
-  const match = line.text.match(/^(\s*)(\d+(?:\.\d+)+\.?\s+.+?)\s*$/);
-  if (!match) return null;
-  const range = trimAbsoluteRange(line.text, line.start + match[1].length, line.end);
-  if (!range) return null;
-  const numbering = match[2].trim().match(/^(\d+(?:\.\d+)+)\.?/);
-  const level = numbering ? numbering[1].split('.').length : 1;
-  return {
-    type: 'heading',
-    level,
     start: line.start,
     end: line.end,
     text: line.text.slice(range.start - line.start, range.end - line.start),
@@ -777,12 +630,9 @@ function isParagraphLine(lines, index) {
   if (trimmed.startsWith('$$')) return false;
   if (/^<table\b/i.test(trimmed)) return false;
   if (headingBlock(line)) return false;
-  if (chineseChapterBlock(line)) return false;
-  if (decoratedHeadingBlock(line)) return false;
   if (isSeparatorLine(line.text)) return false;
   if (imageBlock(line)) return false;
   if (listItemRange(line)) return false;
-  if (isStandaloneTitleText(trimmed)) return false;
   if (trimmed.startsWith('>')) return false;
   if (isTableStart(lines, index)) return false;
   return true;
@@ -810,96 +660,8 @@ function trimRelativeRange(text, start, end) {
   return { start: left, end: right };
 }
 
-function chineseChapterBlock(line) {
-  const trimmed = line.text.trim();
-  if (!trimmed) return null;
-  if (!/^第[零一二三四五六七八九十百千万\d]+[章节篇部卷]/.test(trimmed)) return null;
-  const sectionChar = trimmed.match(/[章节篇部卷]/)?.[0] || '章';
-  const level = sectionChar === '节' ? 2 : 1;
-  const leadingSpaces = line.text.length - line.text.trimStart().length;
-  const range = trimAbsoluteRange(line.text, line.start + leadingSpaces, line.end);
-  if (!range) return null;
-  return {
-    type: 'heading',
-    level,
-    start: line.start,
-    end: line.end,
-    text: trimmed,
-    contentStart: range.start,
-    contentEnd: range.end
-  };
-}
-
-function decoratedHeadingBlock(line) {
-  const trimmed = line.text.trim();
-  if (!trimmed || trimmed.length > 80) return null;
-
-  let level = null;
-  if (/^Chapter\s+[A-Za-z0-9IVXLCDM]+[.．:：]?\s*\S+/i.test(trimmed)) {
-    level = 1;
-  } else if (/^[（(][零一二三四五六七八九十百千万\d]+[）)]\s*\S+/.test(trimmed)) {
-    level = 2;
-  } else if (/^[零一二三四五六七八九十百千万]+[、.．]\s*\S+/.test(trimmed)) {
-    level = 2;
-  } else if (/^【[^】]+】[：:]?$/.test(trimmed)) {
-    level = 4;
-  } else if (/^[①②③④⑤⑥⑦⑧⑨⑩]\s*[^：:，。！？；,.!?]+$/.test(trimmed)) {
-    level = 4;
-  } else if (/^\d+[.)](?!\s)[^：:，。！？；,.!?]+$/.test(trimmed)) {
-    level = 4;
-  }
-
-  if (!level) return null;
-  const leadingSpaces = line.text.length - line.text.trimStart().length;
-  const range = trimAbsoluteRange(line.text, line.start + leadingSpaces, line.end);
-  if (!range) return null;
-  return {
-    type: 'heading',
-    level,
-    start: line.start,
-    end: line.end,
-    text: trimmed,
-    contentStart: range.start,
-    contentEnd: range.end
-  };
-}
-
-function standaloneTitleBlock(line, blocks = []) {
-  const trimmed = line.text.trim();
-  if (!isStandaloneTitleText(trimmed)) return null;
-  const leadingSpaces = line.text.length - line.text.trimStart().length;
-  const range = trimAbsoluteRange(line.text, line.start + leadingSpaces, line.end);
-  if (!range) return null;
-  return {
-    type: 'heading',
-    level: inferredStandaloneTitleLevel(blocks),
-    start: line.start,
-    end: line.end,
-    text: trimmed,
-    contentStart: range.start,
-    contentEnd: range.end
-  };
-}
-
-function inferredStandaloneTitleLevel(blocks) {
-  const lastHeadingIndex = blocks.map((block, index) => ({ block, index })).reverse()
-    .find((item) => item.block.type === 'heading');
-  if (!lastHeadingIndex) return 1;
-  const parentLevel = Math.max(1, Number(lastHeadingIndex.block.level) || 1);
-  const hasBodyAfterHeading = blocks.slice(lastHeadingIndex.index + 1)
-    .some((block) => block.type !== 'heading');
-  return Math.min(6, hasBodyAfterHeading ? parentLevel : parentLevel + 1);
-}
-
 function isSeparatorLine(text) {
   const trimmed = text.trim();
   if (!trimmed) return false;
   return /^[⸻—–]+$/.test(trimmed) || /^[-*=_]{3,}$/.test(trimmed);
-}
-
-function isStandaloneTitleText(text) {
-  if (!text || text.length > 15) return false;
-  if (isSeparatorLine(text)) return false;
-  if (/^(?:[-*+•]|\d+[.)])\s+/u.test(text)) return false;
-  return !/[。？！；：，、,.!?;:"""''()\[\]【】《》]/.test(text);
 }

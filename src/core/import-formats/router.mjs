@@ -2,15 +2,20 @@ import { extname } from 'node:path';
 
 import { readChmSourceDocument } from '../source-chm.mjs';
 import { readDocxSourceDocument } from '../source-docx.mjs';
+import { readEpubSourceDocument } from '../source-epub.mjs';
 import { readPdfSourceDocument } from '../source-pdf.mjs';
 import { readSourceDocument } from '../source-text.mjs';
 import { importChmDocument } from './chm.mjs';
 import { importDocxDocument } from './docx.mjs';
+import { importEpubDocument } from './epub.mjs';
 import { importPdfDocument } from './pdf.mjs';
 import { normalizeImportMode } from './shared.mjs';
 import { importTextDocument } from './text.mjs';
+import { chunkTextByChars } from './vector.mjs';
 
-async function importDirectDocument(filePath, extension) {
+// 读源文全文 + 源文档层（direct 与 vector 共用）：各格式取其纯文本载体（rawMarkdown / rawText），
+// 返回 { text, sourceDocument }。text 即后续切分所依据的权威文本。
+async function readFullTextSourceDocument(filePath, extension) {
   let text = '';
   let sourceDocument = null;
   if (extension === '.md' || extension === '.txt') {
@@ -24,10 +29,18 @@ async function importDirectDocument(filePath, extension) {
     text = sourceDocument.rawText || sourceDocument.rawMarkdown || '';
   } else if (extension === '.docx') {
     sourceDocument = readDocxSourceDocument(filePath);
-    text = sourceDocument.rawMarkdown || '';
+    text = sourceDocument.rawText || sourceDocument.rawMarkdown || '';
+  } else if (extension === '.epub') {
+    sourceDocument = await readEpubSourceDocument(filePath, { granularity: 'paragraph' });
+    text = sourceDocument.rawText || sourceDocument.rawMarkdown || '';
   } else {
-    throw new Error(`不支持直接导入格式：${extension || '未知格式'}`);
+    throw new Error(`不支持的导入格式：${extension || '未知格式'}`);
   }
+  return { text, sourceDocument };
+}
+
+async function importDirectDocument(filePath, extension) {
+  const { text, sourceDocument } = await readFullTextSourceDocument(filePath, extension);
   return {
     direct: true,
     records: [{ index: 1, text, vector: null }],
@@ -36,16 +49,40 @@ async function importDirectDocument(filePath, extension) {
   };
 }
 
+// 向量式导入：读全文 → 定长切块 → 每块一节点平铺（走 createDocFromSentenceRecords）。
+// 源文档层 spans 按块边界重建，让块节点获得选区高亮 / 原文回溯能力。
+// rawMarkdown / rawText 统一回写成切块所依据的全文，确保 spans 偏移与落库的源文严格一致
+// （抹平不同 reader 的 rawText / rawMarkdown 取值差异，否则偏移会错位）。
+async function importVectorDocument(filePath, extension, options) {
+  const { text, sourceDocument } = await readFullTextSourceDocument(filePath, extension);
+  const chunks = chunkTextByChars(text, options);
+  const records = chunks.map((chunk) => ({ index: chunk.index, text: chunk.text, vector: null }));
+  const spans = chunks.map((chunk) => ({
+    sentence_index: chunk.index,
+    start_offset: chunk.start,
+    end_offset: chunk.end,
+    text: chunk.text
+  }));
+  return {
+    records,
+    structured: null,
+    sourceDocument: sourceDocument
+      ? { ...sourceDocument, rawMarkdown: text, rawText: text, spans }
+      : null
+  };
+}
+
 export async function importRecordsForFile(filePath, options = {}) {
   const extension = extname(filePath).toLowerCase();
   const mode = normalizeImportMode(options.mode);
   if (mode === 'smart') throw new Error('智能导入入口未接入');
-  if (mode === 'vector') throw new Error('向量导入入口未接入');
   if (mode === 'direct') return importDirectDocument(filePath, extension);
+  if (mode === 'vector') return importVectorDocument(filePath, extension, options);
   if (extension === '.md' || extension === '.txt') return importTextDocument(filePath, options);
   if (extension === '.pdf') return importPdfDocument(filePath, options);
   if (extension === '.chm') return importChmDocument(filePath, options);
   if (extension === '.docx') return importDocxDocument(filePath, options);
+  if (extension === '.epub') return importEpubDocument(filePath, options);
   if (extension === '.xlsx' || extension === '.csv') {
     throw new Error(`${extension} 是数据库导出中继格式，不支持普通文档导入。`);
   }

@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('iftree', {
   resolveImageSources: wrap('asset:resolveImageSources'),
   chooseImportFile: wrap('import:chooseFile'),
   importLibraryDocument: wrap('import:libraryDocument'),
+  smartImportTask: wrap('import:smartTask'),
   readVectorSettings: wrap('settings:readVector'),
   saveVectorSettings: wrap('settings:saveVector'),
   readMemorySettings: wrap('settings:readMemory'),

@@ -1,8 +1,28 @@
-import { env as transformersEnv, pipeline } from '@huggingface/transformers';
-
 import { assertEmbeddingVector, zeroEmbedding } from './embeddings.mjs';
 import { createRemoteEmbedder, resolveEmbedBackendConfig } from './remote-embedding.mjs';
 import { createTokenCounter } from './token-count.mjs';
+
+// 步骤4：@huggingface/transformers 降可选依赖，本地推理改懒加载——只有真正用本地嵌入（getExtractor）
+// 才动态 import；未装时返回 null，由调用处报「未装本地嵌入、请走 HTTP」。token 计数侧的懒加载在 token-count.mjs。
+let transformersModulePromise = null;
+function loadTransformers() {
+  if (!transformersModulePromise) {
+    transformersModulePromise = import('@huggingface/transformers').catch(() => null);
+  }
+  return transformersModulePromise;
+}
+
+// 步骤4：HTTP 嵌入为首选（projectneed 3137）。没配 IFTREE_EMBED_BACKEND 时的默认后端——ollama
+// localhost，model 由向量模型名派生（Xenova/bge-m3 → bge-m3）；健康检查失败回落本地 transformers。
+function defaultOllamaEmbedConfig(config) {
+  return {
+    backend: 'ollama',
+    baseUrl: 'http://localhost:11434',
+    model: String(config.modelName || '').split('/').pop() || 'bge-m3',
+    apiKey: '',
+    fallback: true
+  };
+}
 
 // 嵌入计算服务（从 headless-agent-host 闭包下沉，解耦第 1a 步）：把「本地 transformers 推理 +
 // 远/近后端选择 + 嵌入总入口 + token 计数守卫」从 host 收口成一处，host 只注入向量配置读取与模块开关。
@@ -40,6 +60,9 @@ export function createEmbeddingService(deps = {}) {
     const key = `${runtime.modelName}|${runtime.nodeDevice}|${runtime.dtype}|${runtime.localModelRoot}|${runtime.remoteModelHost || ''}`;
     if (!extractorPromises.has(key)) {
       extractorPromises.set(key, (async () => {
+        const tf = await loadTransformers();
+        if (!tf) throw new Error('未装本地嵌入（@huggingface/transformers / onnxruntime）；请配 IFTREE_EMBED_BACKEND 走 HTTP 嵌入（ollama / openai 兼容）。');
+        const { env: transformersEnv, pipeline } = tf;
         const hasLocal = Boolean(runtime.localModelRoot);
         transformersEnv.allowLocalModels = hasLocal;
         transformersEnv.localModelPath = hasLocal ? `${runtime.localModelRoot.replace(/\\/g, '/')}/` : '/models/';
@@ -95,12 +118,13 @@ export function createEmbeddingService(deps = {}) {
   function resolveEmbedBackend(config) {
     if (!embedBackendPromise) {
       embedBackendPromise = (async () => {
-        const remoteConfig = resolveEmbedBackendConfig(process.env);
+        // 步骤4：HTTP 首选——配了 IFTREE_EMBED_BACKEND 用之，没配也默认 ollama localhost；
+        // 本地 transformers 纯兜底（remote 不可达且装了本地时才回落）。
+        const remoteConfig = resolveEmbedBackendConfig(process.env) || defaultOllamaEmbedConfig(config);
         const local = {
           label: 'transformers',
           embed: (textList) => transformersEmbed(textList, headlessVectorRuntime(config))
         };
-        if (!remoteConfig) return local;
         try {
           const embedder = createRemoteEmbedder({ ...remoteConfig, dimensions: config.dimensions });
           const health = await embedder.healthCheck();

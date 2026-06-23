@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { agentMessagesFromSession, upsertAgentToolEvent } from '../lib/agent-utils.mjs';
+import { agentMessagesFromSession, appendReasoningToSegments, appendTextToSegments, appendToolToSegments, upsertAgentToolEvent } from '../lib/agent-utils.mjs';
 import { agentRepository } from '../data/repositories.js';
 
 export function useAgentChat({ setNotice }: any = {}) {
@@ -32,9 +32,13 @@ export function useAgentChat({ setNotice }: any = {}) {
       setAgentMessages((previous) => previous.map((message) => {
         const entry = batch.get(message.requestId);
         if (!entry || message.role !== 'assistant') return message;
+        let segments = message.segments;
+        if (entry.reasoning) segments = appendReasoningToSegments(segments, entry.reasoning);
+        if (entry.text) segments = appendTextToSegments(segments, entry.text);
         return {
           ...message,
-          answer: `${message.answer || ''}${entry.text}`,
+          answer: `${message.answer || ''}${entry.text || ''}`,
+          segments,
           status: '正在回复...',
           streaming: true
         };
@@ -45,6 +49,18 @@ export function useAgentChat({ setNotice }: any = {}) {
         const entry = pendingDeltas.get(event.requestId) || { text: '', usage: null };
         entry.text += event.text || '';
         if (event.usage) entry.usage = event.usage;
+        pendingDeltas.set(event.requestId, entry);
+        if (!flushTimer) {
+          flushTimer = window.setTimeout(() => {
+            flushTimer = 0;
+            applyPendingDeltas();
+          }, 80);
+        }
+        return;
+      }
+      if (event?.type === 'reasoning') {
+        const entry = pendingDeltas.get(event.requestId) || { text: '', usage: null };
+        entry.reasoning = `${entry.reasoning || ''}${event.text || ''}`;
         pendingDeltas.set(event.requestId, entry);
         if (!flushTimer) {
           flushTimer = window.setTimeout(() => {
@@ -72,6 +88,7 @@ export function useAgentChat({ setNotice }: any = {}) {
           return {
             ...message,
             toolEvents: upsertAgentToolEvent(message.toolEvents, event.tool),
+            segments: appendToolToSegments(message.segments, event.tool?.id),
             streaming: true
           };
         }

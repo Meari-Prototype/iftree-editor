@@ -25,7 +25,6 @@ import {
   normalizeVectorConfig
 } from '../src/vector/embeddings.mjs';
 import { normalizeDocMeta, resolveMarkdownImageUrl, workspaceSearchRoots } from '../src/core/image-paths.mjs';
-import { IftreeStore } from '../src/backend/store/index.mjs';
 import { createBackendClient } from '../src/backend/llm/backend-client.mjs';
 import {
   clampNumber,
@@ -95,7 +94,6 @@ let launchedMainProcess = null;
 let launcherPollTimer = null;
 let launcherLastFailure = null;
 let mainStartupSucceeded = false;
-let store = null;
 let headlessAgentClient = null;
 let llmWorkspaceState = null;
 let vectorConfigCache = null;
@@ -555,12 +553,6 @@ function stopLibraryWatcher() {
   }
 }
 
-function dbPath() {
-  // SQLite 路径认 IFTREE_DB（与 CLI / 无头后端一致），默认仍在项目 database/；
-  // 配合 IFTREE_HOME（向量/关键词 LanceDB 库）可把全部数据指到大盘。
-  return process.env.IFTREE_DB || join(DATABASE_ROOT, 'store.sqlite');
-}
-
 // 数据库三口的请求观测：旧实现在每个 IPC handler 里各抄一套 try/catch + 计时 + start/end；现下沉到
 // 统一 SDK 的 onDebug 回调（SDK 出站点统一触发），这里只决定「记什么」——保持只观测数据库读 / 写 /
 // 跑三口、沿用既有 event 名（run 记作 database.command）与 debugValueSummary 截断，行为不变。
@@ -585,14 +577,33 @@ function backendDebugLogger({ type, phase, body = {}, ok, ms, result, error }) {
   });
 }
 
+// 后端 host 跑 node runtime（路 B）：electron 主进程拉起 host 不能继承 electron execPath（那会让 host 是
+// electron-as-node、要 electron ABI 的 better-sqlite3）。自动在 PATH 里找真 node，不要求手配 env
+// （IFTREE_BACKEND_NODE 仅作可选覆盖）；找不到就报清晰错误、不静默回退 electron。
+function resolveNodeExecutable() {
+  const explicit = String(process.env.IFTREE_BACKEND_NODE || '').trim();
+  if (explicit && existsSync(explicit)) return explicit;
+  const exeName = process.platform === 'win32' ? 'node.exe' : 'node';
+  const pathSep = process.platform === 'win32' ? ';' : ':';
+  for (const dir of String(process.env.PATH || '').split(pathSep)) {
+    const trimmed = dir.trim();
+    if (!trimmed) continue;
+    const candidate = join(trimmed, exeName);
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error('未找到 node 可执行文件：headless 后端需 node runtime（把 node 加入 PATH，或设 IFTREE_BACKEND_NODE 指向 node 可执行）。');
+}
+
 function getHeadlessAgentClient() {
   if (!headlessAgentClient) {
     // 解耦第 10 步：主进程经统一 backend-client SDK 连共享管道后端（与 mcp-server 写档同一个 host
     // 实例）——发现→连接→连不上自拉起→单机离线回退私有 stdio。主进程从此只调 SDK 的语义方法、
     // 内部不再写连接 / 请求信封 / 日志这些通信处理；退出时 close 在管道模式只断连接、不杀共享后端。
+    // 路 B：显式传真 node 作 host runtime（node ABI），主进程自身不再 in-process 用 better-sqlite3。
     headlessAgentClient = createBackendClient({
       projectRoot: PROJECT_ROOT,
       hostScriptPath: HEADLESS_AGENT_SCRIPT,
+      processPath: resolveNodeExecutable(),
       mode: 'shared',
       onStderr: (text) => console.error(`[headless-agent] ${String(text || '').trimEnd()}`),
       onStatus: (text) => console.error(`[backend] ${String(text || '').trimEnd()}`),
@@ -850,42 +861,6 @@ function assetsDir(docId) {
   return join(appHome(), 'assets', `doc-${docId}`);
 }
 
-function getStore() {
-  if (!store) {
-    store = new IftreeStore(dbPath());
-    store.init();
-    seedEmptyStore();
-  }
-  return store;
-}
-
-function seedEmptyStore() {
-  if (store.listDocs().length > 0) return;
-  const doc = store.createDoc({
-    title: '条件树编辑器入门',
-    rootText: '构建一份符合条件树语法规范的文档。'
-  });
-  const main = store.insertNode({
-    docId: doc.id,
-    parentId: doc.rootNodeId,
-    nodeType: 'IF',
-    text: '如果用户导入原始文本，那么按句子生成待整理节点。'
-  });
-  store.insertNode({
-    docId: doc.id,
-    parentId: main.id,
-    nodeType: 'TEXT',
-    text: '用户逐步调整节点层级、类型、前提和错误，直到文档可以导出。'
-  });
-  store.insertNode({
-    docId: doc.id,
-    parentId: doc.rootNodeId,
-    nodeType: 'ELSE',
-    text: '否则显示空文档列表并等待用户创建或导入。'
-  });
-  store.addAxiom({ docId: doc.id, content: '应用运行在用户本地机器上', status: 'confirmed' });
-}
-
 function startupStatusPath() {
   return process.env.IFTREE_STARTUP_STATUS_PATH || join(app.getPath('userData'), 'startup-status.json');
 }
@@ -1132,8 +1107,10 @@ async function captureZoomedE2EWindow(win) {
   };
 }
 
-function launcherDocs() {
-  return getStore().listDocs().map((doc) => ({
+async function launcherDocs() {
+  const result = await headlessDatabaseRead({ action: 'doc.list' });
+  const docs = Array.isArray(result) ? result : (result?.rows || result?.docs || []);
+  return docs.map((doc) => ({
     id: doc.id,
     title: doc.title || `Doc ${doc.id}`,
     node_count: doc.node_count ?? doc.nodeCount ?? 0,
@@ -1141,13 +1118,13 @@ function launcherDocs() {
   }));
 }
 
-function launcherState() {
+async function launcherState() {
   const config = readProjectConfig();
   return {
     renderMode: config.renderMode || 'hardware',
     forceHardwareAcceleration: config.forceHardwareAcceleration !== false,
     debugLogging: config.debugLogging === true,
-    docs: launcherDocs(),
+    docs: await launcherDocs(),
     failure: launcherLastFailure || readStartupStatus().failure || null
   };
 }
@@ -1635,9 +1612,12 @@ async function openEntityMaintenanceWindow(payload = {}) {
   return { ok: true, reused: false };
 }
 
-function refreshDoc(docId, options = {}) {
-  const data = getStore().getDoc(docId, {
+async function refreshDoc(docId, options = {}) {
+  const data = await headlessDatabaseRead({
+    action: 'doc.get',
+    docId,
     maxTreeDepth: options.full === true ? null : (options.maxTreeDepth || DEFAULT_TREE_SLICE_DEPTH),
+    includeNodes: options.includeNodes === true,
     includeSourceSpans: options.includeSourceSpans === true,
     includeSourceDocumentContent: options.includeSourceDocumentContent === true
   });
@@ -1666,7 +1646,13 @@ async function importFilePaths(filePaths = [], options = {}) {
   for (const filePath of paths) {
     const relativePath = libraryRelativePathForAgent(filePath);
     if (!relativePath) throw new Error('请选择 library 文件夹内的文件');
-    const result = await getHeadlessAgentClient().importLibraryDocument({ relativePath, mode: options.mode });
+    const result = await getHeadlessAgentClient().importLibraryDocument({
+      relativePath,
+      mode: options.mode,
+      chunkSize: options.chunkSize,
+      overlap: options.overlap,
+      embed: options.embed
+    });
     const docs = Array.isArray(result?.imported)
       ? result.imported
       : [{ docId: result?.docId, title: result?.title, nodeCount: result?.nodeCount }];
@@ -1707,7 +1693,7 @@ function stripTree(node) {
 }
 
 function registerLauncherIpc() {
-  ipcMain.handle('launcher:state', () => launcherState());
+  ipcMain.handle('launcher:state', async () => await launcherState());
   ipcMain.handle('launcher:start', (_event, payload) => startMainAppFromLauncher(payload || {}));
   ipcMain.handle('launcher:deleteDoc', async (_event, payload) => {
     const docId = normalizeMainDocId(payload?.docId ?? payload?.doc_id, null);
@@ -1715,7 +1701,7 @@ function registerLauncherIpc() {
     const result = await headlessDatabaseWrite({ action: 'doc.delete', docId });
     launcherLastFailure = null;
     return {
-      ...launcherState(),
+      ...(await launcherState()),
       deleteResult: result
     };
   });
@@ -1933,12 +1919,7 @@ function registerIpc() {
   ipcMain.handle('source:readPdfData', (_event, docId) => {
     const normalizedDocId = normalizeMainDocId(docId, null);
     if (!normalizedDocId) return null;
-    const sourceDocument = getStore().db.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(normalizedDocId);
-    if (!sourceDocument || sourceDocument.source_type !== 'pdf' || !sourceDocument.original_path) return null;
-    return {
-      fileName: parse(sourceDocument.original_path).base,
-      base64: readFileSync(sourceDocument.original_path).toString('base64')
-    };
+    return getHeadlessAgentClient().readPdfData(normalizedDocId);
   });
 
   ipcMain.handle('source:readPdfHighlights', (_event, payload) => {
@@ -1947,13 +1928,13 @@ function registerIpc() {
     const ranges = Array.isArray(payload?.ranges)
       ? payload.ranges
       : [{ start: payload?.startOffset, end: payload?.endOffset }];
-    return getStore().getPdfHighlightRects(docId, ranges);
+    return getHeadlessAgentClient().readPdfHighlights({ docId, ranges });
   });
 
   ipcMain.handle('source:readPdfSpanRects', (_event, docId) => {
     const normalizedDocId = normalizeMainDocId(docId, null);
     if (!normalizedDocId) return [];
-    return getStore().getPdfSpanHitRects(normalizedDocId);
+    return getHeadlessAgentClient().readPdfSpanRects(normalizedDocId);
   });
 
   ipcMain.handle('summary:generateNode', async (_event, payload) => {
@@ -1995,7 +1976,7 @@ function registerIpc() {
         { name: '所有文件', extensions: ['*'] }
       ]
     });
-    if (result.canceled || !result.filePaths[0]) return refreshDoc(payload.docId);
+    if (result.canceled || !result.filePaths[0]) return await refreshDoc(payload.docId);
 
     const source = result.filePaths[0];
     const parsed = parse(source);
@@ -2019,16 +2000,16 @@ function registerIpc() {
       nodeId: payload.nodeId,
       text: nextText
     });
-    return refreshDoc(payload.docId);
+    return await refreshDoc(payload.docId);
   });
 
-  ipcMain.handle('asset:resolveImageSources', (_event, payload) => {
+  ipcMain.handle('asset:resolveImageSources', async (_event, payload) => {
     const docId = normalizeMainDocId(payload?.docId, null);
     const sources = Array.isArray(payload?.sources) ? payload.sources : [];
     if (!docId || sources.length === 0) return {};
 
-    const doc = getStore().db.prepare('SELECT meta FROM docs WHERE id = ?').get(docId);
-    const docMeta = normalizeDocMeta(doc?.meta);
+    const info = await headlessDatabaseRead({ action: 'doc.getInfo', docId });
+    const docMeta = normalizeDocMeta(info?.doc?.meta);
     const searchRoots = workspaceSearchRoots(docMeta.sourcePath);
     const resolved = {};
 
@@ -2060,7 +2041,7 @@ function registerIpc() {
       ]
     });
     if (result.canceled) return null;
-    return importFilePaths(result.filePaths || [], { mode });
+    return importFilePaths(result.filePaths || [], { mode, chunkSize: payload?.chunkSize, overlap: payload?.overlap, embed: payload?.embed });
   });
 
   ipcMain.handle('import:libraryDocument', async (_event, payload) => {
@@ -2068,8 +2049,11 @@ function registerIpc() {
     if (!relativePath) throw new Error('请选择要导入的 library 文件');
     const filePath = libraryPath(relativePath);
     if (!statSync(filePath).isFile()) throw new Error('请选择要导入的文件');
-    return importFilePaths([filePath], { mode: payload?.mode });
+    return importFilePaths([filePath], { mode: payload?.mode, chunkSize: payload?.chunkSize, overlap: payload?.overlap, embed: payload?.embed });
   });
+
+  // 智能导入：后端只构造「发给 agent 的任务」（prompt + 建议档位），由渲染层据此发起 agent 会话。
+  ipcMain.handle('import:smartTask', (_event, payload) => getHeadlessAgentClient().smartImportTask(payload || {}));
 
 }
 
@@ -2094,11 +2078,10 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   // 关停清理集中一处（原先 before-quit 注册了两次、stopHeadlessAgent 跑两遍）：停文件监听 +
-  // 清启动器轮询 + 断后端连接（共享管道模式只断连、不杀别的客户端在用的后端）+ 关本进程 store。
+  // 清启动器轮询 + 断后端连接（共享管道模式只断连、不杀别的客户端在用的后端）。
   stopLibraryWatcher();
   if (launcherPollTimer) clearInterval(launcherPollTimer);
   stopHeadlessAgent();
-  if (store) store.close();
 });
 
 app.on('activate', async () => {

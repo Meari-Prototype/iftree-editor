@@ -1,41 +1,14 @@
 import { FlatTree, isFlatTree } from './flat-tree.mjs';
 import { toTreeNode } from './node-model.mjs';
-
-// 句末标点字符片段：中文版只认全角 。？！；mixed 版再并入 ASCII 的 .!?。
-// 两个正则由同一片段拼出，避免字符类重复且保证 .source 与手写版逐字节一致。
-const CHINESE_PUNCT = '。？！';
-const MIXED_PUNCT = `${CHINESE_PUNCT}.!?`;
-const sentencePattern = (punct) => new RegExp(`([^${punct}\\r\\n]+[${punct}]?)`, 'g');
-const CHINESE_SENTENCE_PATTERN = sentencePattern(CHINESE_PUNCT);
-const MIXED_SENTENCE_PATTERN = sentencePattern(MIXED_PUNCT);
+import { splitSentences as splitSentencesCore } from './sentence-split.mjs';
 
 export { NODE_TYPES } from './node-model.mjs';
 
+// 按行断句（历史行为）：tree.mjs 的调用方（GUI 拆分 / docx / epub / chm / txt / 智能导入）默认把换行
+// 也当句子边界。切句规则（句末标点、块级公式整块、ASCII 开关）都在公共模块 sentence-split，这里只
+// 钉死 hardLineBreaks 保持旧的「按行」语义、丢掉偏移只回句子字符串。
 export function splitSentences(text, options = {}) {
-  if (!text || !text.trim()) return [];
-
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const sentences = [];
-  const pattern = options.splitAsciiPunctuation === true
-    ? MIXED_SENTENCE_PATTERN
-    : CHINESE_SENTENCE_PATTERN;
-
-  for (const line of normalized.split('\n')) {
-    const trimmedLine = line.trim();
-    if (!trimmedLine) continue;
-
-    const matches = [...trimmedLine.matchAll(pattern)].map((match) => match[1].trim());
-    if (matches.length === 0) {
-      sentences.push(trimmedLine);
-      continue;
-    }
-
-    for (const sentence of matches) {
-      if (sentence.length > 1) sentences.push(sentence);
-    }
-  }
-
-  return sentences;
+  return splitSentencesCore(text, { ...options, hardLineBreaks: true });
 }
 
 /**

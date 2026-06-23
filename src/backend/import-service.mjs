@@ -88,6 +88,8 @@ export async function importFilePathsToStore(options = {}) {
     store,
     filePaths = [],
     mode,
+    chunkSize,
+    overlap,
     sendProgress = () => {},
     refreshDoc = null
   } = options;
@@ -103,7 +105,7 @@ export async function importFilePathsToStore(options = {}) {
 
     let doc = null;
     try {
-      const routedImport = await importRecordsForFile(filePath, { mode: normalizeImportMode(mode) });
+      const routedImport = await importRecordsForFile(filePath, { mode: normalizeImportMode(mode), chunkSize, overlap });
       const structured = routedImport.structured;
       const records = routedImport.records;
       const sourceDocument = routedImport.sourceDocument;
@@ -153,6 +155,7 @@ export async function importFilePathsToStore(options = {}) {
           spans: sourceDocument.spans,
           pdfPages: sourceDocument.pdfPages || [],
           pdfChars: sourceDocument.pdfChars || [],
+          docBlocks: sourceDocument.docBlocks || [],
           nodeIdsBySentenceIndex
         });
       }
@@ -183,6 +186,33 @@ export async function importFilePathsToStore(options = {}) {
 //   · maintainDerivedAfterWrite(docId, opts) —— 派生索引维护；refreshDoc(docId, opts) —— 刷新文档视图；
 //   · notifyLibraryChanged() —— 通知前端 library 变化；libraryPath(rel) —— library 相对路径转绝对；
 //   · treeSliceDepth —— 导入回执的树切片深度。
+// 智能导入任务 prompt（projectneed 4-3-2-1 导入流程入口）：发给内置 agent 的一次性任务指令。
+// agent 在 full 档下按 smart-import skill 自主跑——观察源文、写一次性切割脚本、产节点树 JSON、
+// 经 db import-json 校验后原子入库（不走影子分支审批；入库前的脚本/修整副本是 agent 在工作区的过程
+// 产物，不进我们的版本管理）。正文逐字节切片由 skill 纪律 + 校验器逐字节比对双重保证。
+// 源文用绝对路径：agent 跑 db import-json 时按后端进程 cwd 解析，相对路径会落到项目根而非 library。
+function buildSmartImportPromptText(relativePath, absolutePath) {
+  const rel = String(relativePath || '').trim();
+  const abs = String(absolutePath || '').trim();
+  return [
+    `执行「智能导入」：把 library 文件 \`${rel}\` 整理成条件树文档并入库。源文件绝对路径：${abs}`,
+    '',
+    '先读 skill 文档 `.iftree-llm-workspace/skills/smart-import/SKILL.md`，严格照它的工作流做。要点：',
+    '1. 读源文件开头 / 中间 / 结尾样本，识别它特有的章节与段落结构（章节标题特征、编号体系、段落分隔）。',
+    '2. 在 `.iftree-llm-workspace` 工作区写一个一次性 node 切割脚本，扫全文产出与 db push 同契约的节点树 JSON——',
+    '   只切到「章节 → 段落」两层：章节标题作 text 节点、其下每个自然段作一个子 text 节点。不要切到句子（句子层由系统补），也不要只切到章节那么粗。',
+    '   正文 text 必须是源文的逐字节切片——你只贡献结构、不得改写/润色/纠正任何正文字符；自己起的章节名只写进 nodeTitle、绝不混进 text。',
+    '   JSON 顶层加 `"splitSentences": true`：入库后系统会用句末标点正则把每个段落自动细切成句子子节点，你不用自己切句子。',
+    '   不用写 address：只用 children 嵌套表达层级（章节节点的 children 放它的段落），连续地址由系统按 children 前序自动生成，你不用算地址。',
+    `3. 跑脚本产出 tree.json，校验：\`db import-json <工作区>/tree.json "${abs}" --dry-run\`。读报告只按 missing / out_of_order 修脚本（正文逐字节 + 前序顺序），直到 ok:true；地址、gap、句子层都由系统处理、你不用管。`,
+    `4. 校验通过后去掉 --dry-run 正式入库（需要建向量则加 --embed）：\`db import-json <工作区>/tree.json "${abs}"\`。`,
+    '5. 入库后向用户简述：识别出的结构层级、节点数、有无 gap。',
+    '',
+    '约束：所有真实 shell 命令（跑脚本等）的工作目录必须留在 library 或 .iftree-llm-workspace 内，不要触碰这两个目录之外的文件。',
+    '若源文无法直接切割（乱序文本层 / OCR 噪声 / XML 残渣），先在工作区生成修整副本，再对副本走整套流程（见 skill）。'
+  ].join('\n');
+}
+
 export function createLibraryDocumentService(deps = {}) {
   const {
     getStore,
@@ -221,6 +251,8 @@ export function createLibraryDocumentService(deps = {}) {
       store: getStore(),
       filePaths: [filePath],
       mode: payload.mode,
+      chunkSize: payload.chunkSize,
+      overlap: payload.overlap,
       refreshDoc: (docId) => refreshDoc(docId, {
         maxTreeDepth: treeSliceDepth,
         includeNodes: false,
@@ -234,6 +266,8 @@ export function createLibraryDocumentService(deps = {}) {
     // embed:true 当场全量建向量、否则失活留显式补（vectors 动词 / completeness 闸）。与流式导入
     // bulkEnd 收尾同一口径。这与「向量式导入」（mode:'vector' 按字数切块）正交：怎么切归 mode，
     // 建不建 embedding 归 embed 开关（vectors 参数在入口已被拒，见上）。
+    // 建向量与切分方式正交：所有 mode（含向量式导入）默认不建 embedding、留 embed:true 手动触发
+    //（4-6-1「文档导入时不得自动执行 embedding」）。向量式导入只管按字数切块，不因名字带「向量」就默认建。
     const wantVectors = payload.embed === true;
     let vectorWarning = null;
     for (const doc of docs) {
@@ -254,6 +288,24 @@ export function createLibraryDocumentService(deps = {}) {
       title: docs[0]?.title || '',
       nodeCount: docs[0]?.nodeCount || 0,
       ...(vectorWarning ? { vectorWarning } : {})
+    };
+  }
+
+  // 智能导入只产「发给 agent 的任务」、不在后端落库：由前端以 full 档发起 agent 会话，agent 自主跑
+  // skill 工作流（观察 / 写脚本 / 校验 / 入库），过程在 AgentPanel 可监控。这里只做定位 + 构造 prompt。
+  function smartImportTask(payload = {}) {
+    const relativePath = normalizeLibraryRelativePath(
+      payload.relativePath ?? payload.relative_path ?? payload.path ?? payload.libraryPath
+    );
+    if (!relativePath) throw new Error('smart import requires relativePath');
+    const filePath = libraryPath(relativePath);
+    if (!statSync(filePath).isFile()) throw new Error('智能导入只能导入 library 内真实文件');
+    return {
+      ok: true,
+      action: 'import.smartTask',
+      relativePath,
+      mode: 'full',
+      prompt: buildSmartImportPromptText(relativePath, filePath)
     };
   }
 
@@ -295,5 +347,5 @@ export function createLibraryDocumentService(deps = {}) {
     }
   }
 
-  return { importLibraryDocument, deleteImportedDocument, updateImportedSourcePaths };
+  return { importLibraryDocument, smartImportTask, deleteImportedDocument, updateImportedSourcePaths };
 }

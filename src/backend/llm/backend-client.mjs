@@ -13,6 +13,7 @@ import { createHeadlessAgentClient } from './headless-agent-client.mjs';
 export function createBackendClient({
   projectRoot = null,
   hostScriptPath = null,
+  processPath = process.execPath,
   mode = 'shared',
   env = process.env,
   onStderr = null,
@@ -20,9 +21,11 @@ export function createBackendClient({
   onDebug = null
 } = {}) {
   if (!projectRoot) throw new Error('createBackendClient requires projectRoot');
+  // processPath 决定 host 跑什么 runtime（路 B）：默认跟随父进程 execPath（mcp-server 由 node 起即 node host）；
+  // electron 主进程显式传真 node 路径，让 host 跑 node ABI、主进程自身不再 in-process 用 better-sqlite3。
   const transport = mode === 'private'
-    ? createHeadlessAgentClient({ cwd: projectRoot, scriptPath: hostScriptPath, env, onStderr: onStderr || undefined })
-    : createSharedBackendClient({ projectRoot, hostScriptPath, env, onStderr, onStatus });
+    ? createHeadlessAgentClient({ cwd: projectRoot, scriptPath: hostScriptPath, processPath, env, onStderr: onStderr || undefined })
+    : createSharedBackendClient({ projectRoot, hostScriptPath, processPath, env, onStderr, onStatus });
 
   // 唯一的出站点：可选 onDebug 包住 transport.request 做计时 + start/end 观测（消除调用方各抄一套的
   // try/catch+计时模板）。requestOptions 透传给传输层（onEvent 流式回调原样转发，不在 SDK 缓冲）。
@@ -48,8 +51,14 @@ export function createBackendClient({
     dbShell: (argv = [], extra = {}) => call('db.shell', { argv, ...extra }),
     updateSourceBinding: (payload = {}) => call('database.updateSourceBinding', { payload }),
 
+    // —— source 只读（路 B：前端去 native，PDF 原件/高亮走后端 RPC）——
+    readPdfData: (docId) => call('source.readPdfData', { payload: { docId } }),
+    readPdfHighlights: (payload = {}) => call('source.readPdfHighlights', { payload }),
+    readPdfSpanRects: (docId) => call('source.readPdfSpanRects', { payload: { docId } }),
+
     // —— 导入 / 库 ——
     importLibraryDocument: (payload = {}) => call('import.libraryDocument', { payload }),
+    smartImportTask: (payload = {}) => call('import.smartTask', { payload }),
     deleteImportedDocument: (payload = {}) => call('import.deleteDocument', { payload }),
     updateImportedSourcePaths: (payload = {}) => call('library.updateImportedSourcePaths', { payload }),
 

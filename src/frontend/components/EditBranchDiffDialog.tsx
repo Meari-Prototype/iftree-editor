@@ -44,7 +44,7 @@ function fieldValueLabel(node, field) {
 }
 
 function ownerLabel(owner) {
-  return String(owner || 'human') === 'llm' ? 'LLM' : 'human';
+  return String(owner || 'human').split('#')[0].split(':')[0] === 'llm' ? 'LLM' : 'human';
 }
 
 function statusLabel(status) {

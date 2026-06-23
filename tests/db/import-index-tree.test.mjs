@@ -22,7 +22,7 @@ test('db import, index, and tree expose the imported fixture and reject bad args
     // —— index --folder --uuid：组头带文件名 + #docId + 字数 + semantic 状态 ——
     const indexText = stdoutOf(await runBashDb(dbPath, ['index', '--folder', 'generated', '--uuid']));
     assert.match(indexText, new RegExp(`${fixtureTitle}\\.md #${docId}`));
-    assert.match(indexText, /\(2227字\) \[semantic:missing 0\/\d+\]/);
+    assert.match(indexText, /\(2233字\) \[semantic:missing 0\/\d+\]/);
 
     // —— index 无 folder 值报错 ——
     const indexMissingFolderValue = await runBashDb(dbPath, ['index', '--folder'], { expectFailure: true });

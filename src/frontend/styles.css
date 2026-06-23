@@ -2466,6 +2466,8 @@ code {
 }
 
 .agent-answer {
+  flex: 1 1 auto;
+  min-width: 0;
   display: grid;
   gap: 6px;
   max-width: 100%;
@@ -2590,6 +2592,73 @@ code {
   overflow-wrap: anywhere;
   color: #8a847b;
   font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* 工具聚合组：summary 复用工具行的横向布局,展开后子工具用左边线归拢(组 → 工具 → 详情三层)。 */
+.agent-tool-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  font-size: 12px;
+  color: #6d675f;
+}
+
+.agent-tool-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-tool-group > summary .agent-tool-status-dot.running {
+  background: #bd8744;
+  animation: agent-tool-pulse 1.2s ease-in-out infinite;
+}
+
+.agent-tool-group > summary .agent-tool-status-dot.done {
+  background: #4e6b58;
+}
+
+.agent-tool-group-body {
+  display: grid;
+  gap: 2px;
+  margin: 4px 0 2px 4px;
+  padding-left: 12px;
+  border-left: 1px solid #e2ded4;
+}
+
+/* 思考链：低调灰字,默认折叠成一行。 */
+.agent-reasoning {
+  font-size: 12px;
+  color: #8a857b;
+}
+
+.agent-reasoning > summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  color: #8a857b;
+}
+
+.agent-reasoning > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-reasoning-label {
+  font-weight: 600;
+}
+
+.agent-reasoning-body {
+  margin-top: 4px;
+  padding-left: 17px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+  color: #837e75;
 }
 
 .agent-stream-cursor {
@@ -5075,6 +5144,151 @@ body.ide-resizing {
   text-underline-offset: 2px;
 }
 
+/* 统一 md 富文本渲染（无版面格式：树 / 码 / 富 md / agent 共用一处）。
+   结构样式（表格 / 代码 / 引用边框配色）与 .source-block-body 对齐保持视觉统一；
+   字号继承父容器，让 agent 紧凑场景与文档阅读场景各自合适。 */
+.rich-markdown {
+  font-size: inherit;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.rich-markdown > :first-child { margin-top: 0; }
+.rich-markdown > :last-child { margin-bottom: 0; }
+
+.rich-markdown h1,
+.rich-markdown h2,
+.rich-markdown h3,
+.rich-markdown h4,
+.rich-markdown h5,
+.rich-markdown h6 {
+  margin: 1em 0 0.5em;
+  line-height: 1.35;
+  font-weight: 700;
+}
+
+.rich-markdown h1 { font-size: 1.5em; }
+.rich-markdown h2 { font-size: 1.32em; }
+.rich-markdown h3 { font-size: 1.16em; }
+.rich-markdown h4,
+.rich-markdown h5,
+.rich-markdown h6 { font-size: 1.05em; }
+
+.rich-markdown p { margin: 0 0 0.7em; }
+
+.rich-markdown ul,
+.rich-markdown ol {
+  margin: 0 0 0.7em;
+  padding-left: 1.6em;
+}
+
+.rich-markdown li { margin: 0.15em 0; }
+
+.rich-markdown blockquote {
+  margin: 0 0 0.7em;
+  padding: 0.2em 0 0.2em 0.9em;
+  border-left: 3px solid #d1cbbf;
+  color: #4d4a43;
+}
+
+.rich-markdown-table-wrap {
+  margin: 0 0 0.7em;
+  overflow-x: auto;
+}
+
+.rich-markdown table {
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+
+.rich-markdown th,
+.rich-markdown td {
+  padding: 6px 10px;
+  border: 1px solid #d8d5cc;
+  vertical-align: top;
+  text-align: left;
+}
+
+.rich-markdown th {
+  background: #ece9e0;
+  font-weight: 700;
+}
+
+.rich-markdown-code {
+  margin: 0 0 0.7em;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid #d8d5cc;
+  border-radius: 6px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.86em;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.rich-markdown :not(pre) > code {
+  padding: 1px 4px;
+  border: 1px solid #ddd8cc;
+  border-radius: 4px;
+  background: #fffdfa;
+  color: #3c4b42;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.rich-markdown-math {
+  margin: 0 0 0.7em;
+  text-align: center;
+  overflow-x: auto;
+}
+
+.rich-markdown-figure {
+  margin: 0 0 0.7em;
+}
+
+.rich-markdown-figure img,
+.rich-markdown-inline-image {
+  max-width: 100%;
+}
+
+.rich-markdown a {
+  color: #365f91;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* agent 回答的富文本容器：沿用 agent 正文配色 / 字号，但不要纯文本态的 pre-wrap。 */
+.agent-message-rich {
+  color: #282621;
+  font-size: 13px;
+}
+
+.agent-answer.error .agent-message-rich {
+  color: #8d3b31;
+}
+
+/* 交错段容器：文字段与工具卡片按时间线竖排,统一间距。 */
+.agent-segments {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 收缩链:每层 flex/grid 容器都要 min-width:0,否则子项默认 min-width:auto、不收缩到比内容更窄,
+   长命令 / 代码 / 表格会把行撑破,窗口变窄时溢出到容器外。配合行内的 ellipsis / wrap / 横向滚动才生效。 */
+.agent-segments > *,
+.agent-tool-group-body,
+.agent-tool-group-body > * {
+  min-width: 0;
+}
+
+.agent-segments .agent-message-rich {
+  margin: 0;
+}
+
 .source-sentence {
   border-radius: 3px;
   cursor: pointer;
@@ -5088,6 +5302,74 @@ body.ide-resizing {
 
 .source-sentence.selected {
   background: rgba(255, 225, 0, 0.18);
+}
+
+/* 富视图按节点渲染（md/txt/docx）:每节点一行,地址 gutter + 正文,点击选中高亮。 */
+.rich-node-reader {
+  display: flex;
+  flex-direction: column;
+}
+
+.rich-node {
+  display: flex;
+  gap: 14px;
+  padding: 5px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.rich-node:hover {
+  background: rgba(255, 225, 0, 0.06);
+}
+
+.rich-node.selected {
+  background: rgba(255, 225, 0, 0.16);
+}
+
+.rich-node-gutter {
+  flex: none;
+  width: 60px;
+  padding: 2px 0 0;
+  text-align: right;
+  background: none;
+  border: none;
+  color: #9a948a;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.rich-node-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rich-node-body > .rich-markdown {
+  font-size: 16px;
+  line-height: 1.86;
+}
+
+.rich-node-title {
+  margin-bottom: 4px;
+  color: #11110f;
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.rich-node-note {
+  margin-top: 6px;
+  color: #5a6358;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.rich-node-note-label {
+  margin-right: 6px;
+  color: #8a857b;
+  font-size: 12px;
 }
 
 .pdf-rich-surface {
@@ -5615,6 +5897,13 @@ body.ide-resizing {
 .c2d-node-body.muted {
   color: #8f897f;
   font-style: italic;
+}
+
+/* 节点正文走统一富文本渲染:容器接管排版(关掉 pre-wrap、行高对齐卡片),富文本自身的块间距保留。 */
+.c2d-node-body > .rich-markdown {
+  white-space: normal;
+  line-height: 1.55;
+  font-size: 14px;
 }
 
 .c2d-node-more {

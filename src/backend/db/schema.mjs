@@ -135,6 +135,19 @@ CREATE TABLE IF NOT EXISTS source_pdf_chars (
 CREATE INDEX IF NOT EXISTS idx_source_pdf_chars_doc_offset ON source_pdf_chars(doc_id, char_offset);
 CREATE INDEX IF NOT EXISTS idx_source_pdf_chars_doc_page ON source_pdf_chars(doc_id, page_number);
 
+-- word(docx) 块锚点：每行一个 XML 块（<w:p>/<w:tbl>）→ 它在重建文本的偏移范围 + 在 document.xml 里的
+-- 全局块序号。字符 i（重建文本偏移）定位 = 找包含 i 的块 + (i − start_offset) 块内偏移；前端 docx-preview
+-- 渲到第 block_index 个块的 DOM、数块内偏移高亮。块内偏移可推算，故每块一行（不像 pdf 每字符一行）。
+CREATE TABLE IF NOT EXISTS source_doc_blocks (
+  id INTEGER PRIMARY KEY,
+  doc_id TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+  block_index INTEGER NOT NULL,
+  start_offset INTEGER NOT NULL,
+  end_offset INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_doc_blocks_doc_offset ON source_doc_blocks(doc_id, start_offset, end_offset);
+
 -- save_history 已退役：历史以 commits 为事实来源；旧库残留表在 dropLegacySaveHistory 迁移期删除。
 
 CREATE TABLE IF NOT EXISTS commits (

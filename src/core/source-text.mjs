@@ -11,39 +11,11 @@ import {
 } from './source-markdown.mjs';
 import { readPdfSourceDocument } from './source-pdf.mjs';
 import { splitSentences } from './tree.mjs';
+import { attr, readTextFile, xmlUnescape } from './source-text-utils.mjs';
 
-export function readTextFile(filePath) {
-  const buffer = readFileSync(filePath);
-  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
-    return buffer.toString('utf16le');
-  }
-  const charset = detectTextCharset(buffer);
-  return decodeBuffer(buffer, charset).replace(/^\uFEFF/, '');
-}
-
-function detectTextCharset(buffer) {
-  const head = buffer.subarray(0, Math.min(buffer.length, 4096)).toString('ascii');
-  const meta = head.match(/charset\s*=\s*["']?([a-z0-9._-]+)/i);
-  if (meta) return normalizeCharset(meta[1]);
-  const utf8 = buffer.toString('utf8');
-  const replacementCount = (utf8.match(/\uFFFD/g) || []).length;
-  return replacementCount > Math.max(2, utf8.length * 0.01) ? 'gb18030' : 'utf-8';
-}
-
-function normalizeCharset(value) {
-  const normalized = String(value || '').toLowerCase();
-  if (['gb2312', 'gbk', 'gb18030'].includes(normalized)) return 'gb18030';
-  if (['shift_jis', 'sjis', 'cp932'].includes(normalized)) return 'shift_jis';
-  return normalized || 'utf-8';
-}
-
-function decodeBuffer(buffer, charset) {
-  try {
-    return new TextDecoder(charset || 'utf-8').decode(buffer);
-  } catch {
-    return buffer.toString('utf8');
-  }
-}
+// re-export \u5E95\u5C42\u6587\u672C/XML \u5DE5\u5177\uFF08\u5DF2\u62BD\u5230 source-text-utils \u4EE5\u62C6 source-chm/docx \u5FAA\u73AF\u4F9D\u8D56\uFF09\uFF1A\u65E7 importer
+// \uFF08tests \u53D6 decodeXmlEntities \u7B49\uFF09\u4ECD\u53EF\u4ECE source-text \u62FF\uFF1B\u65B0\u4EE3\u7801\u76F4\u63A5 import source-text-utils\u3002
+export { attr, decodeXmlEntities, readTextFile, xmlUnescape } from './source-text-utils.mjs';
 
 function parseCsvRows(text) {
   const rows = [];
@@ -590,11 +562,6 @@ function cellValue(body, type, sharedStrings) {
   return xmlUnescape(textOf(body, 'v')).trim();
 }
 
-export function attr(attrs, name) {
-  const match = attrs.match(new RegExp(`${name}="([^"]*)"`, 'i'));
-  return match ? match[1] : null;
-}
-
 function parseCellRef(ref) {
   const match = String(ref || '').match(/^([A-Z]+)(\d+)$/i);
   if (!match) return null;
@@ -617,17 +584,3 @@ function textOf(xml, tagName) {
   return match ? xmlUnescape(match[1]) : '';
 }
 
-export function decodeXmlEntities(value) {
-  return String(value)
-    .replace(/&#x([0-9a-fA-F]+);/g, (_match, code) => String.fromCodePoint(Number.parseInt(code, 16)))
-    .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number.parseInt(code, 10)))
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
-}
-
-export function xmlUnescape(value) {
-  return decodeXmlEntities(value);
-}

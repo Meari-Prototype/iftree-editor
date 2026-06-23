@@ -98,7 +98,7 @@ export async function handleDocMutation(store, payload, ctx, action, effects) {
 
   if (action === 'editBranch.begin') {
     const docId = requireDocId(payload);
-    const branch = store.beginEditBranch(docId, payload.owner);
+    const branch = store.beginEditBranch(docId, payload.owner, { fresh: payload.fresh === true });
     const doc = payload.includeDoc === false ? null : maybeRefreshDoc(store, ctx, branch.shadow_doc_id, payload.refreshOptions || {});
     return docRefresh(action, branch.shadow_doc_id, {
       baseDocId: branch.base_doc_id,
@@ -356,6 +356,7 @@ export async function handleStreamMutation(store, payload, ctx, action, effects)
       spans: payload.spans ?? [],
       pdfPages: payload.pdfPages ?? payload.pdf_pages ?? [],
       pdfChars: payload.pdfChars ?? payload.pdf_chars ?? [],
+      docBlocks: payload.docBlocks ?? payload.doc_blocks ?? [],
       nodeIdsBySentenceIndex: payload.nodeIdsBySentenceIndex ?? payload.node_ids_by_sentence_index ?? null
     });
     const spanCount = Array.isArray(payload.spans) ? payload.spans.length : 0;

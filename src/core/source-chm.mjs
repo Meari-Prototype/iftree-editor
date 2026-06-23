@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
-import { readTextFile } from './source-text.mjs';
-import { splitSentences } from './tree.mjs';
+import { readTextFile } from './source-text-utils.mjs';
+import { createSpanAccumulator, addSentenceContainer } from './source-spans.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -35,51 +35,9 @@ export async function readChmSourceDocument(filePath, options = {}) {
 function chmItemsToSourceDocument(items, outputDir, sourcePath, options = {}) {
   const granularity = options.granularity === 'sentence' ? 'sentence' : 'paragraph';
   const records = [];
-  const spans = [];
-  const rawParts = [];
+  const acc = createSpanAccumulator(); // 载体重建 + 句位 spans（取代本地 rawParts/rawOffset/appendRawText）
   const counters = new Map();
   const stack = [];
-  let rawOffset = 0;
-
-  function appendRawText(text, spanTexts = null) {
-    const normalized = String(text || '').trim();
-    if (!normalized) return null;
-    const start = rawOffset;
-    rawParts.push(normalized);
-    rawOffset += normalized.length;
-    rawParts.push('\n\n');
-    rawOffset += 2;
-    const sourceTexts = Array.isArray(spanTexts) && spanTexts.length > 0 ? spanTexts : [normalized];
-    const indexes = [];
-    let searchStart = 0;
-    for (const sourceText of sourceTexts) {
-      const textPart = String(sourceText || '').trim();
-      if (!textPart) continue;
-      const localStart = normalized.indexOf(textPart, searchStart);
-      const partStart = localStart >= 0 ? localStart : searchStart;
-      const partEnd = Math.min(normalized.length, partStart + textPart.length);
-      const index = spans.length + 1;
-      spans.push({
-        sentence_index: index,
-        start_offset: start + partStart,
-        end_offset: start + partEnd,
-        text: normalized.slice(partStart, partEnd) || textPart
-      });
-      indexes.push(index);
-      searchStart = partEnd;
-    }
-    if (indexes.length === 0) {
-      const index = spans.length + 1;
-      spans.push({
-        sentence_index: index,
-        start_offset: start,
-        end_offset: start + normalized.length,
-        text: normalized
-      });
-      indexes.push(index);
-    }
-    return indexes;
-  }
 
   function nextAddress(parentAddress) {
     const key = parentAddress || '';
@@ -89,7 +47,7 @@ function chmItemsToSourceDocument(items, outputDir, sourcePath, options = {}) {
   }
 
   function addRecord(parentAddress, text, role, options = {}) {
-    const indexes = Array.isArray(options.indexes) ? options.indexes : appendRawText(text, options.spanTexts);
+    const indexes = Array.isArray(options.indexes) ? options.indexes : acc.appendSegment(text);
     if (!indexes?.length) return null;
     const index = indexes[0];
     const address = nextAddress(parentAddress);
@@ -135,29 +93,14 @@ function chmItemsToSourceDocument(items, outputDir, sourcePath, options = {}) {
 
       const parentAddressForBlock = htmlStack.at(-1)?.address || heading.address;
       if (granularity === 'sentence' && block.role === 'html-paragraph') {
-        const sentences = splitSentences(block.text);
-        const sentenceTexts = sentences.length > 0 ? sentences : [block.text];
-        const indexes = appendRawText(block.text, sentenceTexts);
-        if (!indexes?.length) continue;
-        const paragraph = addRecord(parentAddressForBlock, '', 'html-paragraph', {
-          indexes,
-          sourcePosition: indexes[0] - 0.5,
-          skipVector: true
-        });
-        if (!paragraph) continue;
-        for (const [index, sentence] of sentenceTexts.entries()) {
-          addRecord(paragraph.address, sentence, 'html-sentence', {
-            indexes: [indexes[index] ?? indexes.at(-1)],
-            sourcePosition: indexes[index] ?? indexes.at(-1)
-          });
-        }
+        addSentenceContainer({ acc, addRecord, parentAddress: parentAddressForBlock, text: block.text, rolePrefix: 'html' });
       } else {
         addRecord(parentAddressForBlock, block.text, block.role);
       }
     }
   }
 
-  const rawText = rawParts.join('').trim();
+  const { rawText, spans } = acc.finalize();
 
   return {
     sourcePath,

@@ -402,7 +402,7 @@ export function App() {
     return [{
       id: branch.id,
       owner,
-      label: owner === 'llm' ? 'LLM 分支' : 'human 分支',
+      label: owner.split('#')[0].split(':')[0] === 'llm' ? 'LLM 分支' : 'human 分支',
       activeEntryCount,
       disabled: activeEntryCount <= 0,
       branch
@@ -1585,7 +1585,7 @@ export function App() {
     });
   }
 
-  async function runAgentRequest({ mode, prompt, modelOption, reasoningEffort }) {
+  async function runAgentRequest({ mode, prompt, modelOption = null, reasoningEffort = 'auto' }) {
     const text = String(prompt || '').trim();
     if (!text) return;
     const requestId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1613,6 +1613,7 @@ export function App() {
         streaming: true,
         diffCount: 0,
         toolEvents: [],
+        segments: [],
         createdAt: startedAt
       }
     ]);
@@ -1644,6 +1645,7 @@ export function App() {
               elapsedMs: Date.now() - startedAt,
               usage: result?.usage || message.usage,
               toolEvents: Array.isArray(result?.toolEvents) ? result.toolEvents : (message.toolEvents || []),
+              segments: Array.isArray(result?.segments) ? result.segments : (message.segments || []),
               status: result?.canceled ? '已取消' : '完成',
               streaming: false
             }
@@ -1810,11 +1812,21 @@ export function App() {
     const rawMode = String(mode || 'simple').trim();
     const importMode = ['simple', 'complete', 'direct', 'smart', 'vector'].includes(rawMode) ? rawMode : 'simple';
     if (importMode === 'smart') {
-      setNotice('智能导入入口未接入');
-      return;
-    }
-    if (importMode === 'vector') {
-      setNotice('向量导入入口未接入');
+      if (selectedLibraryEntry?.type !== 'file') {
+        setNotice('智能导入请先在库里选中要导入的文件');
+        return;
+      }
+      try {
+        // 智能导入不在前端/后端落库：后端构造任务 prompt，前端以 full 档发起一次 agent 会话，
+        // agent 自主跑 smart-import skill（观察源文 → 写脚本 → 校验 → 入库），过程在 AgentPanel 可见。
+        const task = await importService.smartImportTask({ relativePath: selectedLibraryEntry.relativePath });
+        await runAgentRequest({ mode: task?.mode || 'full', prompt: task?.prompt || '' });
+        // agent 跑 db import-json 直接入库、不一定进 runAgent 的 changedDocIds，显式刷新库与文档列表。
+        await refreshLibraryTree();
+        await refreshDocList();
+      } catch (error) {
+        setNotice(error?.message || '智能导入发起失败');
+      }
       return;
     }
     if (selectedLibraryEntry?.type === 'file' && !isSupportedLibraryImport(selectedLibraryEntry)) {

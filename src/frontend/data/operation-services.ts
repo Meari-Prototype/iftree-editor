@@ -10,6 +10,11 @@ export const importService = {
     return callIftree('importLibraryDocument', payload);
   },
 
+  // 智能导入：后端只回「发给 agent 的任务」（prompt + 建议档位），调用方据此发起 agent 会话。
+  smartImportTask(payload) {
+    return callIftree('smartImportTask', payload);
+  },
+
   chooseImportFile(payload) {
     return callIftree('chooseImportFile', payload);
   }

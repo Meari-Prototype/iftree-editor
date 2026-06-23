@@ -173,6 +173,7 @@ export function databaseWriteToolSchema() {
       spans: { type: 'array' },
       pdfPages: { type: 'array' },
       pdfChars: { type: 'array' },
+      docBlocks: { type: 'array' },
       nodeIdsBySentenceIndex: { type: 'object' },
       refreshOptions: { type: 'object' }
     },

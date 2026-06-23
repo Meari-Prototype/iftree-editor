@@ -565,7 +565,7 @@ export class IftreeStore {
     return true;
   }
 
-  createDoc({ title, rootText = title, meta = null, folderId = null }) {
+  createDoc({ title, rootText = title, meta = null, folderId = null, skipInitialCommit = false }) {
     return this.withTransaction(() => {
       const normalizedFolderId = this.normalizeFolderId(folderId);
       const sortOrder = this.nextDocSortOrder(normalizedFolderId);
@@ -585,6 +585,12 @@ export class IftreeStore {
         ON CONFLICT(doc_id) DO NOTHING
       `).run(docId);
       this.refreshDocAddresses(docId);
+
+      // 建文档即建初始 commit（历史起点）：否则首个编辑 commit 无父，编辑后 revert/restore 退不回初始态。
+      // 结构化/句子导入会在装完整棵树后另建一次「导入」commit，故调用方传 skipInitialCommit 跳过这里的单根快照。
+      if (!skipInitialCommit) {
+        this.createCommit({ docId, summary: '初始版本', snapshot: this.createSnapshot(docId), author: 'import' });
+      }
 
       return { id: docId, title, rootNodeId };
     });
@@ -917,7 +923,8 @@ export class IftreeStore {
       const doc = this.createDoc({
         title,
         rootText: title,
-        meta: JSON.stringify({ sourcePath, importedAt: new Date().toISOString() })
+        meta: JSON.stringify({ sourcePath, importedAt: new Date().toISOString() }),
+        skipInitialCommit: true
       });
       const chapter = this.insertNode({
         docId: doc.id,
@@ -941,6 +948,7 @@ export class IftreeStore {
         }
       }
       this.refreshAddressScopes(doc.id, [chapter.id]);
+      this.createCommit({ docId: doc.id, summary: '导入', snapshot: this.createSnapshot(doc.id), author: 'import' });
 
       return { ...doc, importedNodeIds, importedNodeIdsByRecordIndex };
     });
@@ -951,7 +959,8 @@ export class IftreeStore {
       const doc = this.createDoc({
         title,
         rootText: title,
-        meta: JSON.stringify({ sourcePath, importedAt: new Date().toISOString(), structured: true })
+        meta: JSON.stringify({ sourcePath, importedAt: new Date().toISOString(), structured: true }),
+        skipInitialCommit: true
       });
 
       // Build address → nodeId map as we create nodes
@@ -1004,6 +1013,7 @@ export class IftreeStore {
         }
       }
       this.refreshDocAddresses(doc.id);
+      this.createCommit({ docId: doc.id, summary: '导入', snapshot: this.createSnapshot(doc.id), author: 'import' });
 
       return { ...doc, importedNodeIds, importedNodeIdsByRecordIndex };
     });
@@ -1779,6 +1789,7 @@ export class IftreeStore {
     spans = [],
     pdfPages = [],
     pdfChars = [],
+    docBlocks = [],
     nodeIdsBySentenceIndex = null
   }) {
     const doc = this.db.prepare('SELECT id FROM docs WHERE id = ?').get(docId);
@@ -1798,6 +1809,7 @@ export class IftreeStore {
       this.db.prepare('DELETE FROM source_spans WHERE doc_id = ?').run(docId);
       this.db.prepare('DELETE FROM source_pdf_chars WHERE doc_id = ?').run(docId);
       this.db.prepare('DELETE FROM source_pdf_pages WHERE doc_id = ?').run(docId);
+      this.db.prepare('DELETE FROM source_doc_blocks WHERE doc_id = ?').run(docId);
       this.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
       this.db.prepare(`
         INSERT INTO source_documents (doc_id, source_type, original_path, raw_markdown)
@@ -1857,6 +1869,18 @@ export class IftreeStore {
           !Number.isFinite(y1)
         ) continue;
         insertPdfChar.run(docId, charOffset, pageNumber, x0, y0, x1, y1, item.char_text ?? item.charText ?? '');
+      }
+
+      const insertDocBlock = this.db.prepare(`
+        INSERT INTO source_doc_blocks (doc_id, block_index, start_offset, end_offset)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const block of docBlocks || []) {
+        const blockIndex = Number(block.block_index ?? block.blockIndex);
+        const startOffset = Number(block.start_offset ?? block.startOffset);
+        const endOffset = Number(block.end_offset ?? block.endOffset);
+        if (!Number.isFinite(blockIndex) || !Number.isFinite(startOffset) || !Number.isFinite(endOffset) || endOffset < startOffset) continue;
+        insertDocBlock.run(docId, blockIndex, startOffset, endOffset);
       }
 
       this.touchDoc(docId);

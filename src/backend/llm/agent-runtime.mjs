@@ -1794,6 +1794,9 @@ export function createAgentRuntime(deps = {}) {
         const choice = chunk?.choices?.[0];
         const delta = choice?.delta || {};
         appendReasoningContent(message, delta.reasoning_content);
+        if (delta.reasoning_content) {
+          sendAgentStream(requestId, { type: 'reasoning', text: delta.reasoning_content });
+        }
         if (typeof delta.content === 'string' && delta.content) {
           message.content += delta.content;
           sendAgentStream(requestId, { type: 'delta', text: delta.content });
@@ -1882,6 +1885,13 @@ export function createAgentRuntime(deps = {}) {
       { role: 'user', content: prompt }
     ]);
     const toolEvents = [];
+    // 有序段（15-12 交错渲染）：assistant 一回合按时间线记 text / tool 段。tool 段只记 toolId 作
+    // 顺序锚，工具数据仍在 toolEvents 单一来源；前端按同样顺序实时组装，历史重放读持久化的 segments。
+    const segments = [];
+    const pushTextSegment = (content) => {
+      const text = String(content || '').trim();
+      if (text) segments.push({ kind: 'text', text });
+    };
     const emitToolEvent = (tool) => {
       const id = String(tool?.id || `${tool?.name || 'tool'}-${toolEvents.length}`);
       const next = { ...tool, id };
@@ -1901,6 +1911,7 @@ export function createAgentRuntime(deps = {}) {
         selectedAddress: context.selectedNode?.address || null
       }, 3000)
     });
+    segments.push({ kind: 'tool', toolId: 'default-context' });
 
     try {
       let answer = '';
@@ -1914,6 +1925,8 @@ export function createAgentRuntime(deps = {}) {
           usage = message.usage;
           sendAgentStream(requestId, { type: 'usage', usage });
         }
+        if (message.reasoning_content) segments.push({ kind: 'reasoning', text: String(message.reasoning_content).trim() });
+        pushTextSegment(message.content);
         const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
         if (toolCalls.length === 0) {
           answer = String(message.content || '').trim();
@@ -1927,6 +1940,7 @@ export function createAgentRuntime(deps = {}) {
           const args = parseToolArgs(call?.function?.arguments);
           const toolEventId = call?.id || `tool-${step}-${messages.length}`;
           emitToolEvent({ id: toolEventId, name, status: 'running', argsPreview: jsonPreview(args, 1200) });
+          segments.push({ kind: 'tool', toolId: toolEventId });
           let result;
           try {
             result = await runAgentTool(name, args, { mode, sessionId: session.id, context, signal });
@@ -1988,6 +2002,7 @@ export function createAgentRuntime(deps = {}) {
           diffCount: diffs.length,
           usage,
           toolEvents,
+          segments,
           createdAt: new Date().toISOString()
         }
       ];
@@ -2000,7 +2015,7 @@ export function createAgentRuntime(deps = {}) {
         changedDocIds: Array.from(changedDocIds)
       }, turnMessages);
       sendAgentStream(requestId, { type: 'done', answer, diffCount: diffs.length, usage });
-      return { sessionId: session.id, answer, diffs, usage, toolEvents, changedDocIds: Array.from(changedDocIds) };
+      return { sessionId: session.id, answer, diffs, usage, toolEvents, segments, changedDocIds: Array.from(changedDocIds) };
     } catch (error) {
       if (isAbortError(error)) {
         const answer = '已取消。';
@@ -2019,6 +2034,7 @@ export function createAgentRuntime(deps = {}) {
             status: '已取消',
             canceled: true,
             toolEvents,
+            segments,
             createdAt: new Date().toISOString()
           }
         ];
@@ -2030,7 +2046,7 @@ export function createAgentRuntime(deps = {}) {
           toolEvents
         }, turnMessages);
         sendAgentStream(requestId, { type: 'done', answer, diffCount: diffs.length, canceled: true });
-        return { sessionId: session.id, answer, diffs, toolEvents, canceled: true, changedDocIds: [] };
+        return { sessionId: session.id, answer, diffs, toolEvents, segments, canceled: true, changedDocIds: [] };
       }
       const turnMessages = [
         {
@@ -2046,6 +2062,7 @@ export function createAgentRuntime(deps = {}) {
           status: '失败',
           error: true,
           toolEvents,
+          segments,
           createdAt: new Date().toISOString()
         }
       ];

@@ -29,24 +29,23 @@ test('buildSourceDocument keeps raw markdown and emits offset sentence spans', (
   });
 
   assert.equal(source.rawMarkdown, rawMarkdown);
-  assert.equal(source.spans.length, 8);
-  assert.deepEqual(source.spans.map((span) => span.sentence_index), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal(source.spans.length, 6);
+  assert.deepEqual(source.spans.map((span) => span.sentence_index), [1, 2, 3, 4, 5, 6]);
   for (const span of source.spans) {
     assert.equal(source.rawMarkdown.slice(span.start_offset, span.end_offset), span.text);
   }
+  // 表格收敛成结构块：header / 分隔行不产 span，只数据 cell 的句子产 span（9913f72 导入收敛）。
   assert.deepEqual(source.spans.map((span) => span.text), [
     'Title',
     'First sentence.',
     'Second sentence!',
-    '| Name | Note |',
-    '| --- | --- |',
-    '| A | Table sentence one.',
-    'Table sentence two!',
-    '|'
+    'A',
+    'Table sentence one.',
+    'Table sentence two!'
   ]);
 });
 
-test('parseSourceMarkdownBlocks preserves current pipe-table line structure', () => {
+test('parseSourceMarkdownBlocks collapses a pipe-table into one table block', () => {
   const rawMarkdown = [
     'Paragraph one. Paragraph two.',
     '',
@@ -57,14 +56,12 @@ test('parseSourceMarkdownBlocks preserves current pipe-table line structure', ()
 
   const blocks = parseSourceMarkdownBlocks(rawMarkdown);
 
-  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'heading', 'heading', 'paragraph']);
+  // pipe-table 收敛成一个 table 结构块，不再把表格各行当独立 heading / paragraph（9913f72 导入收敛）。
+  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'table']);
   assert.equal(blocks[0].lines.length, 1);
-  assert.equal(blocks[1].text, '| Name | Note |');
-  assert.equal(blocks[2].text, '| --- | --- |');
-  assert.equal(blocks[3].lines.length, 1);
 });
 
-test('source spans keep soft-wrapped lines as separate sentence spans', () => {
+test('source spans merge soft-wrapped lines into the same sentence span', () => {
   const rawMarkdown = [
     '# Title',
     '',
@@ -74,10 +71,10 @@ test('source spans keep soft-wrapped lines as separate sentence spans', () => {
 
   const source = buildSourceDocument({ rawMarkdown });
 
+  // 段落内软换行（单换行）按 CommonMark 算同一句的延续、跨行成句；只有显式 hardLineBreaks 才按行断。
   assert.deepEqual(source.spans.map((span) => span.text), [
     'Title',
-    'Soft wrapped',
-    'sentence still one.',
+    'Soft wrapped\nsentence still one.',
     'Next sentence.'
   ]);
 });
@@ -106,15 +103,14 @@ test('parseSourceMarkdownBlocks keeps math, images, and tables out of plain para
   const source = buildSourceDocument({ rawMarkdown });
   const records = buildMarkdownStructureRecords(source);
 
-  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'math', 'image', 'heading', 'heading', 'paragraph']);
+  // math / image / table 各自独立成块、不混进正文段；表格收敛成一个 table 结构块。
+  assert.deepEqual(blocks.map((block) => block.type), ['paragraph', 'math', 'image', 'table']);
   assert.deepEqual(source.spans.map((span) => span.text), [
     'Lead paragraph before math continues',
     '\\mu(v) \\propto |T_v|',
-    '| Item | Note |',
-    '| --- | --- |',
-    '| A | Table sentence one.',
-    'Table sentence two!',
-    '|'
+    'A',
+    'Table sentence one.',
+    'Table sentence two!'
   ]);
   assert.equal(records.some((record) => record.role === 'media' && record.text.includes('assets/diagram.png')), true);
 });

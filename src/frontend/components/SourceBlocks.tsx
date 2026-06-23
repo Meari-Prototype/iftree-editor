@@ -1,5 +1,5 @@
 ﻿
-import { memo } from 'react';
+import { type ElementType, memo } from 'react';
 import { renderTexMathToText } from '../../core/markdown.mjs';
 import { plainNodeNote } from '../../core/node-notes.mjs';
 import { formatSentenceIndexes } from '../../core/source-ranges.mjs';
@@ -100,7 +100,7 @@ function SourceMarkdownBlockImpl({
 
   let body;
   if (block.type === 'heading') {
-    const Tag = (`h${Math.min(block.level, 6)}`) as any;
+    const Tag = (`h${Math.min(block.level, 6)}`) as ElementType;
     body = <Tag>{textRange(block.contentStart, block.contentEnd, 'heading')}</Tag>;
   } else if (block.type === 'paragraph') {
     body = (

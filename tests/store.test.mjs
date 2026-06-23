@@ -497,7 +497,8 @@ test('saves document snapshots and restores an earlier history entry', async () 
 
     store.updateNode(first.id, { text: 'Changed.' });
     store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'Second.' });
-    assert.equal(store.listHistory(doc.id).length, 1);
+    // 历史 = 建档初始 commit「初始版本」+ 手动快照「initial version」；中间的 update/insert 编辑不自动产 commit。
+    assert.equal(store.listHistory(doc.id).length, 2);
 
     store.restoreCommit(history.id);
     const restored = store.getDoc(doc.id);

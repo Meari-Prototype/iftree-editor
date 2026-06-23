@@ -1,6 +1,8 @@
-﻿import { ArrowUp, Bot, Check, ChevronDown, ChevronRight, Trash2, X
+﻿import { ArrowUp, Bot, Brain, Check, ChevronDown, ChevronRight, Trash2, X
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+
+import { RichMarkdown } from './RichMarkdown';
 
 import {
   AGENT_REASONING_OPTIONS, agentBranchDocLabel, agentBranchEntries, agentBranchOwnerLabel, agentContextUsageView, agentModeLabel, agentReasoningLabel, agentReasoningShortLabel,
@@ -9,6 +11,93 @@ import {
 } from '../lib/agent-utils.mjs';
 
 
+
+// 单个工具调用卡片：segments 交错渲染与旧会话两段式回退共用一处。默认折叠、可展开看参数 / 返回 / 错误。
+function AgentToolRow({ tool }) {
+  const hasDisplayPreview = Object.prototype.hasOwnProperty.call(tool, 'displayPreview');
+  const resultText = hasDisplayPreview ? tool.displayPreview : tool.resultPreview;
+  const status = tool.status === 'done' || tool.status === 'error' ? tool.status : 'running';
+  const argsSummary = agentToolArgsSummary(tool);
+  return (
+    <details className={`agent-tool-row ${status}`}>
+      <summary>
+        <span className="agent-tool-status-dot" aria-hidden="true" />
+        <span className="agent-tool-name">{agentToolNameText(tool.name)}</span>
+        {argsSummary && <span className="agent-tool-args">({argsSummary})</span>}
+        <em className="agent-tool-state">{agentToolStatusText(status)}</em>
+      </summary>
+      <div className="agent-tool-body">
+        {tool.argsPreview && (
+          <>
+            <span className="agent-tool-label">参数</span>
+            <pre>{tool.argsPreview}</pre>
+          </>
+        )}
+        {resultText && (
+          <>
+            <span className="agent-tool-label">返回</span>
+            <pre>{resultText}</pre>
+          </>
+        )}
+        {tool.error && (
+          <>
+            <span className="agent-tool-label">错误</span>
+            <pre>{tool.error}</pre>
+          </>
+        )}
+      </div>
+    </details>
+  );
+}
+
+// 连续工具聚合成组（CC 式"已使用 N 个工具"）：单个直接一行,多个折叠成组、展开看各工具（组 → 工具 → 详情三层）。
+function AgentToolGroup({ toolIds, toolById }) {
+  const tools = toolIds.map((id) => toolById.get(id)).filter(Boolean);
+  if (tools.length === 0) return null;
+  if (tools.length === 1) return <AgentToolRow tool={tools[0]} />;
+  const running = tools.some((tool) => tool.status !== 'done' && tool.status !== 'error');
+  return (
+    <details className="agent-tool-group">
+      <summary>
+        <span className={`agent-tool-status-dot ${running ? 'running' : 'done'}`} aria-hidden="true" />
+        <span className="agent-tool-name">已使用 {tools.length} 个工具</span>
+        <em className="agent-tool-state">{running ? '运行中' : '完成'}</em>
+      </summary>
+      <div className="agent-tool-group-body">
+        {tools.map((tool) => <AgentToolRow key={tool.id} tool={tool} />)}
+      </div>
+    </details>
+  );
+}
+
+// 思考链：默认折叠成一行,展开看全文；流式途中默认展开看实时思考。
+function AgentReasoning({ text, live }) {
+  return (
+    <details className="agent-reasoning" open={live || undefined}>
+      <summary>
+        <Brain size={12} />
+        <span className="agent-reasoning-label">思考</span>
+        {live && <span className="agent-stream-cursor" />}
+      </summary>
+      <div className="agent-reasoning-body">{text}</div>
+    </details>
+  );
+}
+
+// 渲染前把连续的 tool 段聚合成组,text / reasoning 段原样保留时间线顺序。
+function groupSegments(segments) {
+  const groups = [];
+  for (const segment of segments) {
+    if (segment.kind === 'tool') {
+      const last = groups[groups.length - 1];
+      if (last && last.kind === 'tool-group') last.tools.push(segment.toolId);
+      else groups.push({ kind: 'tool-group', tools: [segment.toolId] });
+    } else {
+      groups.push(segment);
+    }
+  }
+  return groups;
+}
 
 export function AgentPanel({
   agentSettings,
@@ -244,54 +333,58 @@ export function AgentPanel({
                     </div>
                   );
                 }
+                const toolById = new Map((message.toolEvents || []).map((toolEvent) => [toolEvent.id, toolEvent]));
+                const segments = Array.isArray(message.segments) ? message.segments : [];
+                const lastSegmentIndex = segments.length - 1;
+                const streamingTail = message.streaming && segments[lastSegmentIndex]?.kind === 'tool';
                 return (
                   <div key={message.id} className="agent-message-row assistant">
                     <div className={`agent-answer${message.error ? ' error' : ''}`}>
                       <span className="agent-message-meta">{meta}</span>
-                      {Array.isArray(message.toolEvents) && message.toolEvents.length > 0 && (
-                        <div className="agent-tool-list">
-                          {message.toolEvents.map((tool) => {
-                            const hasDisplayPreview = Object.prototype.hasOwnProperty.call(tool, 'displayPreview');
-                            const resultText = hasDisplayPreview ? tool.displayPreview : tool.resultPreview;
-                            const status = tool.status === 'done' || tool.status === 'error' ? tool.status : 'running';
-                            const argsSummary = agentToolArgsSummary(tool);
-                            return (
-                              <details key={tool.id} className={`agent-tool-row ${status}`}>
-                                <summary>
-                                  <span className="agent-tool-status-dot" aria-hidden="true" />
-                                  <span className="agent-tool-name">{agentToolNameText(tool.name)}</span>
-                                  {argsSummary && <span className="agent-tool-args">({argsSummary})</span>}
-                                  <em className="agent-tool-state">{agentToolStatusText(status)}</em>
-                                </summary>
-                                <div className="agent-tool-body">
-                                  {tool.argsPreview && (
-                                    <>
-                                      <span className="agent-tool-label">参数</span>
-                                      <pre>{tool.argsPreview}</pre>
-                                    </>
-                                  )}
-                                  {resultText && (
-                                    <>
-                                      <span className="agent-tool-label">返回</span>
-                                      <pre>{resultText}</pre>
-                                    </>
-                                  )}
-                                  {tool.error && (
-                                    <>
-                                      <span className="agent-tool-label">错误</span>
-                                      <pre>{tool.error}</pre>
-                                    </>
-                                  )}
-                                </div>
-                              </details>
-                            );
+                      {segments.length > 0 ? (
+                        <div className="agent-segments">
+                          {groupSegments(segments).map((group, index, groups) => {
+                            const isLastGroup = index === groups.length - 1;
+                            if (group.kind === 'tool-group') {
+                              return <AgentToolGroup key={`group-${index}`} toolIds={group.tools} toolById={toolById} />;
+                            }
+                            if (group.kind === 'reasoning') {
+                              return <AgentReasoning key={`reason-${index}`} text={group.text} live={message.streaming && isLastGroup} />;
+                            }
+                            if (message.streaming && isLastGroup) {
+                              return (
+                                <p key={`text-${index}`} className="agent-message-content">
+                                  {group.text}
+                                  <span className="agent-stream-cursor" />
+                                </p>
+                              );
+                            }
+                            return <RichMarkdown key={`text-${index}`} className="agent-message-rich" markdown={group.text} />;
                           })}
+                          {streamingTail && (
+                            <p className="agent-message-content">
+                              {message.status || '正在处理...'}
+                              <span className="agent-stream-cursor" />
+                            </p>
+                          )}
                         </div>
+                      ) : (
+                        <>
+                          {message.toolEvents && message.toolEvents.length > 0 && (
+                            <div className="agent-tool-list">
+                              {message.toolEvents.map((tool) => <AgentToolRow key={tool.id} tool={tool} />)}
+                            </div>
+                          )}
+                          {!message.streaming && text ? (
+                            <RichMarkdown className="agent-message-rich" markdown={text} />
+                          ) : (
+                            <p className="agent-message-content">
+                              {text || message.status || '正在处理...'}
+                              {message.streaming && <span className="agent-stream-cursor" />}
+                            </p>
+                          )}
+                        </>
                       )}
-                      <p className="agent-message-content">
-                        {text || message.status || '正在处理...'}
-                        {message.streaming && <span className="agent-stream-cursor" />}
-                      </p>
                       {role === 'assistant' && message.diffCount > 0 && (
                         <span className="agent-message-note">{message.diffCount} 个待审变更</span>
                       )}

@@ -5,7 +5,10 @@
 import { readFileSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
 
-// 与导入管线的源文本规范化语义一致（CRLF→LF、去 BOM）；不 import core 层，避免耦合文件重组。
+import { splitSentences } from '../core/tree.mjs';
+import { isBlockMath } from '../core/sentence-split.mjs';
+
+// 与导入管线的源文本规范化语义一致（CRLF→LF、去 BOM）。
 export function normalizeImportSourceText(raw) {
   return String(raw || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^﻿/, '');
 }
@@ -55,6 +58,32 @@ function validateAddresses(nodes, parentAddress, errors) {
       validateAddresses(node.children, addr, errors);
     }
   }
+}
+
+// 契约增强：address 缺失时按 children 嵌套前序自动补全（顶层 1-1、1-2…，子节点 父地址-序号）。
+// agent 只贡献「哪里是章节、哪里是段落」的结构与逐字文本，连续地址这种纯机械的事由这里生成——
+// 规则先于 LLM，地址连续性不该让模型写代码去算（最易翻车处）。已带 address 的节点原样保留（向后兼容）。
+export function fillMissingAddresses(nodes, parentAddress = '1') {
+  return (Array.isArray(nodes) ? nodes : []).map((node, index) => {
+    const address = String(node?.address ?? '').trim() || `${parentAddress}-${index + 1}`;
+    const next = { ...node, address };
+    if (Array.isArray(node?.children) && node.children.length) {
+      next.children = fillMissingAddresses(node.children, address);
+    }
+    return next;
+  });
+}
+
+// 插入 gap 节点后整树位置变了，必须按 children 前序重排全部地址（不能沿用旧 address，否则与新位置撞号）。
+export function reassignAddresses(nodes, parentAddress = '1') {
+  return (Array.isArray(nodes) ? nodes : []).map((node, index) => {
+    const address = `${parentAddress}-${index + 1}`;
+    const next = { ...node, address };
+    if (Array.isArray(node?.children) && node.children.length) {
+      next.children = reassignAddresses(node.children, address);
+    }
+    return next;
+  });
 }
 
 // 核心校验（4-3-3）：
@@ -115,13 +144,15 @@ export function validateImportTree(payload, sourceText) {
     coveredChars += anchor.end - anchor.start;
     if (anchor.start > previousEnd) {
       const gapText = source.slice(previousEnd, anchor.start);
-      if (gapText.trim()) gaps.push({ start: previousEnd, end: anchor.start, preview: preview(gapText) });
+      // 只记带内容的 gap（⸻、漏的正文段）：纯空白（段落间换行、分页符）由段落空容器的半步位置表达
+      // 边界、不补节点。beforeAddress = 下一个内容节点（null=文档末尾）。
+      if (gapText.trim()) gaps.push({ start: previousEnd, end: anchor.start, beforeAddress: anchor.address, preview: preview(gapText) });
     }
     previousEnd = Math.max(previousEnd, anchor.end);
   }
   if (previousEnd < source.length) {
     const tail = source.slice(previousEnd);
-    if (tail.trim()) gaps.push({ start: previousEnd, end: source.length, preview: preview(tail) });
+    if (tail.trim()) gaps.push({ start: previousEnd, end: source.length, beforeAddress: null, preview: preview(tail) });
   }
 
   return {
@@ -171,6 +202,74 @@ function zipCreatedIds(payloadNodes, createdNodes, idByAddress = new Map()) {
   return idByAddress;
 }
 
+// gap 补节点：只补带内容的 gap（⸻、漏的正文段）——补成正文节点（text = 去首尾空白的原文），
+// 插在「下一个内容节点」之前（同层）；纯空白 gap 不进来（gap 检测已只记带内容的）。
+export function fillGapNodes(nodes, gaps, source) {
+  if (!Array.isArray(gaps) || gaps.length === 0) return nodes;
+  const gapsByBefore = new Map();
+  for (const gap of gaps) {
+    const key = gap.beforeAddress ?? '';
+    if (!gapsByBefore.has(key)) gapsByBefore.set(key, []);
+    gapsByBefore.get(key).push(gap);
+  }
+  const makeNode = (gap) => ({ text: source.slice(gap.start, gap.end).trim(), trustLevel: '不受控' });
+  const walk = (list) => {
+    const out = [];
+    for (const node of Array.isArray(list) ? list : []) {
+      const leading = gapsByBefore.get(nodeAddress(node));
+      if (leading) for (const gap of leading) out.push(makeNode(gap)); // 插在该节点之前
+      const next = { ...node };
+      if (Array.isArray(node.children) && node.children.length) next.children = walk(node.children);
+      out.push(next);
+    }
+    return out;
+  };
+  const result = walk(nodes);
+  const trailing = gapsByBefore.get(''); // 文档末尾的 gap
+  return trailing ? [...result, ...trailing.map(makeNode)] : result;
+}
+
+// 切句子（照完整导入「切到句子」那档的形态）：把每个叶子段落正文节点变成「空容器 + 句子子节点」——
+// 段落节点正文清空、给半步 source_position（标记它是段落边界容器）、不进向量；段落正文按句末标点
+// 切成句子、每句作它的子节点。章节容器（有子）只递归、标题占一个句位；已是空节点的原样。
+export function splitParagraphsToSentenceContainers(nodes) {
+  let ordinal = 0; // 已分配句位的正文节点数（标题 + 句子），= 校验锚定后的句位
+  const walk = (list) => (Array.isArray(list) ? list : []).flatMap((node) => {
+    const children = Array.isArray(node.children) ? node.children : [];
+    const text = typeof node.text === 'string' ? node.text : '';
+    if (children.length > 0) {
+      if (text) ordinal += 1; // 章节标题正文占一个句位
+      return [{ ...node, children: walk(children) }];
+    }
+    if (!text) return []; // 空节点：丢弃（智能导入只产嵌套 + 正文，误产的空节点不入库）
+    const sentences = splitSentences(text);
+    if (sentences.length === 0) return []; // 切不出句子（纯空白 / 纯标点段落）：丢弃、不产空容器
+    const trust = node.trustLevel ?? node.trust_level ?? '不受控';
+    // 纯公式段落（整段就一个 $$ / \[ 块）：整块一个 math 节点，拉齐完整导入待遇——不套容器、不切、不进向量。
+    if (sentences.length === 1 && isBlockMath(sentences[0])) {
+      ordinal += 1;
+      return [{ ...node, text: sentences[0], role: 'math', skipVector: true, trustLevel: trust }];
+    }
+    const firstOrdinal = ordinal + 1; // 段落容器半步 = 首句句位 − 0.5
+    const sentenceNodes = sentences.map((sentence) => {
+      ordinal += 1;
+      // 段落内夹的公式块也整块 + 标 math + skipVector（与完整导入一致）；其余是普通句子。
+      return isBlockMath(sentence)
+        ? { text: sentence, role: 'math', skipVector: true, trustLevel: trust }
+        : { text: sentence, role: 'sentence', trustLevel: trust };
+    });
+    return [{
+      ...node,
+      text: '',
+      role: 'paragraph',
+      skipVector: true,
+      sourcePosition: firstOrdinal - 0.5,
+      children: sentenceNodes
+    }];
+  });
+  return walk(nodes);
+}
+
 export async function runImportJson({ database, jsonPath, sourcePath, dryRun = false, allowGaps = false, embed = false }) {
   if (!database) throw new Error('import-json requires a database service');
   const resolvedJsonPath = resolve(String(jsonPath || ''));
@@ -187,20 +286,25 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
     throw new Error('import-json 用 embed 表示同步建向量，不再接受 vectors 参数。');
   }
 
-  const report = validateImportTree(payload, source);
-  const blockedByGaps = report.gaps.length > 0 && !allowGaps;
-  if (!report.ok || blockedByGaps || dryRun) {
-    return {
-      ok: report.ok && !blockedByGaps,
-      imported: false,
-      dryRun: Boolean(dryRun),
-      ...(blockedByGaps ? { gapPolicy: '存在未覆盖区间；确认 gap 合理（页眉页脚等）后用 --allow-gaps 放行' } : {}),
-      ...report
-    };
+  // 契约增强：先按 children 前序补全缺失的 address（agent 不必自己算地址）。
+  let addressedNodes = fillMissingAddresses(payload.nodes);
+  // 切句子开关：把段落正文节点变成空容器（半步位置、不进向量）+ 句子子节点，照完整导入「切到句子」的形态。
+  if (payload.splitSentences === true) {
+    addressedNodes = reassignAddresses(splitParagraphsToSentenceContainers(addressedNodes));
+  }
+  let report = validateImportTree({ ...payload, nodes: addressedNodes }, source);
+  // gap 只补带内容的（⸻、漏的正文段）成正文节点；纯空白（段落间换行、分页符）不补——段落空容器的半步
+  // 位置就是边界。补完重排地址、重新校验。
+  if (report.gaps.length > 0) {
+    addressedNodes = reassignAddresses(fillGapNodes(addressedNodes, report.gaps, source));
+    report = validateImportTree({ ...payload, nodes: addressedNodes }, source);
+  }
+  if (!report.ok || dryRun) {
+    return { ok: report.ok, imported: false, dryRun: Boolean(dryRun), ...report };
   }
 
   const anchorIndexByAddress = new Map(report.anchors.map((anchor, index) => [anchor.address, index + 1]));
-  const nodes = fillSourcePositions(payload.nodes, anchorIndexByAddress);
+  const nodes = fillSourcePositions(addressedNodes, anchorIndexByAddress);
   const spans = report.anchors.map((anchor, index) => ({
     sentence_index: index + 1,
     start_offset: anchor.start,

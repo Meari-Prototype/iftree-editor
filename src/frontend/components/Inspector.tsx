@@ -351,7 +351,7 @@ export function Inspector({
                   disabled={!canEdit}
                   onClick={() => runInspectorAction('deleteRef', {
                     docId: currentDoc.doc.id,
-                    refId: (selectedFactRefByAxiomId.get(String(axiom.id)) as any)?.id
+                    refId: (selectedFactRefByAxiomId.get(String(axiom.id)) as { id?: string | number } | undefined)?.id
                   })}
                 >
                   <Unlink size={14} />

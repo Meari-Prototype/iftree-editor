@@ -33,7 +33,7 @@ test('db edit records set, insert, and delete entries on a real edit branch and 
     assert.equal(setResult.node.address, '1-1-6-1-1', 'node.update 应返回被改节点当前地址');
     assert.equal(setResult.editBranch.id, branch.branchId);
     assert.equal(setResult.editBranch.base_doc_id, docId);
-    assert.equal(setResult.editBranch.owner, owner);
+    assert.equal(String(setResult.editBranch.owner).split('#')[0], owner, 'owner 身份前缀保留，存储带 #ts 后缀唯一化');
     assert.equal(setResult.editBranch.status, 'active');
     assert.equal(setResult.skipDocsRefresh, true);
 
@@ -65,7 +65,7 @@ test('db edit records set, insert, and delete entries on a real edit branch and 
 
     // —— 草稿计数：改1 增2 删1（owner 过滤、未提交时仍在）——
     const changes = stdoutOf(await runBashDb(dbPath, ['draft', 'list', docId, '--owner', owner]));
-    assert.match(changes, new RegExp(`branch:${branch.branchId}\\s+doc:${docId}\\s+owner:${owner}\\s+改:1\\s+增:2\\s+删:1`));
+    assert.match(changes, new RegExp(`branch:${branch.branchId}\\s+doc:${docId}\\s+owner:${owner}(?:#[\\d:T-]+)?\\s+改:1\\s+增:2\\s+删:1`));
 
     // —— diff --json：4 条 entries，1 modified / 2 added / 1 deleted，branch/mergeBase/stats 齐全 ——
     const diff = parseJsonStdout(await runBashDb(dbPath, ['diff', '--base', docId, '--owner', owner, '--json']));

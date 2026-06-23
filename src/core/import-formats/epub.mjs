@@ -1,9 +1,9 @@
-import { readDocxSourceDocument } from '../source-docx.mjs';
+import { readEpubSourceDocument } from '../source-epub.mjs';
 import { normalizeImportMode } from './shared.mjs';
 
-export async function importDocxDocument(filePath, options = {}) {
+export async function importEpubDocument(filePath, options = {}) {
   const importMode = normalizeImportMode(options.mode);
-  const sourceDocument = readDocxSourceDocument(filePath, {
+  const sourceDocument = await readEpubSourceDocument(filePath, {
     granularity: importMode === 'complete' ? 'sentence' : 'paragraph'
   });
   const structured = sourceDocument.records;

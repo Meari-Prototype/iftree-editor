@@ -14,7 +14,7 @@ import {
   withImportedFixture
 } from './_helpers.mjs';
 
-// rebase：刷新分支 lazy base 到当前 HEAD。首次（fixture 无 commit）baseCommitId=null。
+// rebase：刷新分支 lazy base 到当前 HEAD。fixture 导入已建初始 commit，故首次 rebase 的 baseCommitId 为该 HEAD commit（非 null）。
 test('db rebase 刷新分支 base 到 HEAD，返回 changed/baseCommitId/undoDepth', { timeout: 180000 }, async () => {
   await withImportedFixture(async ({ dbPath, docId }) => {
     const owner = 'dbt-rebase';
@@ -27,8 +27,8 @@ test('db rebase 刷新分支 base 到 HEAD，返回 changed/baseCommitId/undoDep
     assert.equal(rebaseResult.action, 'editBranch.rebase');
     assert.equal(rebaseResult.baseDocId, docId);
     assert.equal(rebaseResult.branchId, branch.branchId);
-    assert.equal(rebaseResult.owner, owner);
-    assert.equal(rebaseResult.baseCommitId, null, '首次 rebase（fixture 无 commit）baseCommitId 应为 null');
+    assert.equal(String(rebaseResult.owner).split('#')[0], owner);
+    assert.match(String(rebaseResult.baseCommitId), /^019[a-f0-9-]+$/, '首次 rebase：fixture 导入已建初始 commit，baseCommitId 应为该 HEAD commit（UUIDv7）');
     assert.equal(rebaseResult.undoDepth, 1, 'rebase 后草稿有 1 条生效 entry');
     assert.equal(rebaseResult.redoDepth, 0);
     assert.ok(rebaseResult.branch?.id);
@@ -95,7 +95,7 @@ test('db cherry-pick 摘取 commit entry 入新分支，merge --yes 落库；dry
     assert.equal(picked.baseDocId, docId);
     assert.ok(picked.branchId, 'cherry-pick 应返回目标分支 id');
     assert.equal(typeof picked.branchId, 'number', 'branchId 是 INTEGER 主键');
-    assert.equal(picked.owner, 'dbt-picked-history');
+    assert.equal(String(picked.owner).split('#')[0], 'dbt-picked-history');
     assert.equal(Array.isArray(picked.picked), true);
     assert.equal(picked.picked.length, 1);
     assert.ok(picked.picked[0].cherryPickedFrom, 'picked entry 应记录溯源信息');
@@ -103,7 +103,7 @@ test('db cherry-pick 摘取 commit entry 入新分支，merge --yes 落库；dry
 
     // merge dry-run：不带 --yes 只预览
     const mergeDryRun = stdoutOf(await runBashDb(dbPath, ['merge', '--base', docId, '--owner', 'dbt-picked-history']));
-    assert.match(mergeDryRun, new RegExp(`would merge doc:${docId} owner:dbt-picked-history; rerun with --yes to apply`));
+    assert.match(mergeDryRun, new RegExp(`would merge doc:${docId} owner:dbt-picked-history(?:#[\\d:T-]+)?; rerun with --yes to apply`));
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-3-2-1'])), alphaOriginalText, '预览不落库');
 
     // merge --yes：落库

@@ -152,7 +152,8 @@ export function saveHistorySnapshot(store, { docId, summary = '保存版本', ow
 export function certifyNodes(store, { docId, nodeId = null, address = null, scope = 'subtree', trust = '受控', owner = 'human' } = {}) {
   const normalizedDocId = requireStableId(docId, 'certify docId');
   if (trust !== '受控' && trust !== '不受控') throw new Error(`certify trust 只能是 受控/不受控，收到：${trust}`);
-  if (trust === '受控' && owner !== 'human') throw new Error('标受控只允许 owner=human（18-3）');
+  // owner 现为 role:user:ts 编码（18-3 身份），取 role 段判断：标受控只允许 human 角色。
+  if (trust === '受控' && String(owner || '').trim().split(':', 1)[0] !== 'human') throw new Error('标受控只允许 owner=human（18-3）');
   return store.withTransaction(() => {
     let targetId = null;
     if (nodeId != null && String(nodeId).length > 0) {

@@ -68,14 +68,41 @@ export function normalizeEditBranchOwner(store, owner = 'human') {
     return value || 'human';
   }
 
+// owner 编码（A5-5 多分支 / 18-3 身份）：存储形态 role:user#ts —— role∈{llm,human} 保信任语义、
+// user 是写入身份（MCP 读 IFTREE_OWNER 注入、db shell 经 --owner 传），role:user 合为身份前缀；
+// #ts 是新建时间戳后缀让每草稿 owner 唯一。ts 用 # 隔开，身份前缀内部可含 :（role:user），互不歧义。
+// 配置/传入层用 role:user 身份前缀（不带 #ts）；定位草稿按身份前缀匹配，新建时补 #ts。
+export function ownerRole(owner) {
+  const identity = String(owner || '').trim().split('#', 1)[0];
+  const role = identity.split(':', 1)[0];
+  return role === 'human' ? 'human' : 'llm';
+}
+
+export function ownerIdentity(owner) {
+  const value = String(owner || '').trim();
+  if (!value) return 'human';
+  return value.split('#', 1)[0];
+}
+
+// 草稿创建时间戳后缀：本地时区、标准年月日时分秒（YYYY-MM-DDTHH:mm:ss），可读且让每草稿 owner 唯一。
+// 用 T 连接避免空格（owner 含空格会破坏 db list 字段解析）；时间部分的 : 在 # 之后，不影响身份前缀解析。
+function ownerStamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 export function activeEditBranchForBaseDoc(store, docId, owner = 'human') {
     if (!store.hasEditBranchesTable()) return null;
+    const identity = store.normalizeEditBranchOwner(owner);
+    // 按身份前缀匹配：owner=identity 兼容旧的无 ts 值，owner LIKE 'identity:%' 命中带 ts 的新草稿；取最新一条。
     return store.db.prepare(`
       SELECT * FROM edit_branches
-      WHERE base_doc_id = ? AND owner = ? AND status = 'active'
+      WHERE base_doc_id = ? AND status = 'active'
+        AND (owner = ? OR owner LIKE ?)
       ORDER BY id DESC
       LIMIT 1
-    `).get(normalizePositiveId(docId), store.normalizeEditBranchOwner(owner)) || null;
+    `).get(normalizePositiveId(docId), identity, identity + '#%') || null;
   }
 
 export function activeEditBranchForShadowDoc(store, docId) {
@@ -91,7 +118,7 @@ export function activeEditBranchForShadowDoc(store, docId) {
 export function activeEditBranchForDoc(store, docId, owner = null) {
     const shadow = store.activeEditBranchForShadowDoc(docId);
     if (shadow) {
-      if (!owner || shadow.owner === store.normalizeEditBranchOwner(owner)) return shadow;
+      if (!owner || ownerIdentity(shadow.owner) === ownerIdentity(store.normalizeEditBranchOwner(owner))) return shadow;
       return store.activeEditBranchForBaseDoc(shadow.base_doc_id, owner);
     }
     if (!owner) return null;
@@ -101,8 +128,8 @@ export function activeEditBranchForDoc(store, docId, owner = null) {
 export function listActiveEditBranches(store, owner = null) {
     if (!store.hasEditBranchesTable()) return [];
     const normalizedOwner = owner ? store.normalizeEditBranchOwner(owner) : null;
-    const where = normalizedOwner ? 'WHERE eb.status = \'active\' AND eb.owner = ?' : 'WHERE eb.status = \'active\'';
-    const params = normalizedOwner ? [normalizedOwner] : [];
+    const where = normalizedOwner ? 'WHERE eb.status = \'active\' AND (eb.owner = ? OR eb.owner LIKE ?)' : 'WHERE eb.status = \'active\'';
+    const params = normalizedOwner ? [normalizedOwner, normalizedOwner + '#%'] : [];
     return store.db.prepare(`
       SELECT eb.*,
         base.title AS base_title,
@@ -1476,39 +1503,45 @@ export function applyEditBranchDiffEntries(store, branch, diff = {}) {
     }
   }
 
-export function beginEditBranch(store, docId, owner = 'human') {
+export function beginEditBranch(store, docId, owner = 'human', { fresh = false } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
-    const normalizedOwner = store.normalizeEditBranchOwner(owner);
+    const identity = store.normalizeEditBranchOwner(owner);
     if (!normalizedDocId) throw new Error('beginEditBranch requires docId');
 
-    const shadowExisting = store.activeEditBranchForShadowDoc(normalizedDocId);
-    if (shadowExisting && shadowExisting.owner === normalizedOwner) return shadowExisting;
-    const existing = store.activeEditBranchForBaseDoc(normalizedDocId, normalizedOwner);
-    if (existing && existing.owner === normalizedOwner) return existing;
+    // 默认复用该身份（role:user 前缀）下最新 active 草稿；fresh=true 才另起一行。
+    // 平时没人开两个草稿切来切去，所以默认黏最新、免得每次都传 branchId（A5-5、15-5-2）。
+    if (!fresh) {
+      const shadowExisting = store.activeEditBranchForShadowDoc(normalizedDocId);
+      if (shadowExisting && ownerIdentity(shadowExisting.owner) === identity) return shadowExisting;
+      const existing = store.activeEditBranchForBaseDoc(normalizedDocId, identity);
+      if (existing) return existing;
+    }
 
+    // 新建：owner 补时间戳后缀唯一化（role:user#YYYY-MM-DDTHH:mm:ss），唯一索引 (base_doc_id, owner) 天然不冲突。
+    const fullOwner = `${identity}#${ownerStamp()}`;
     const head = store.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(normalizedDocId);
     const baseSnapshot = createLazyEditBranchBaseSnapshot({
-      owner: normalizedOwner,
+      owner: fullOwner,
       baseDocId: normalizedDocId,
       shadowDocId: normalizedDocId,
       baseCommitId: head?.head_commit_id || null
     });
     const diff = createEmptyEditBranchDiff({
-      owner: normalizedOwner,
+      owner: fullOwner,
       baseDocId: normalizedDocId,
       shadowDocId: normalizedDocId
     });
     const result = store.db.prepare(`
       INSERT INTO edit_branches (base_doc_id, shadow_doc_id, owner, base_snapshot, diff)
       VALUES (?, ?, ?, ?, ?)
-    `).run(normalizedDocId, normalizedDocId, normalizedOwner, JSON.stringify(baseSnapshot), JSON.stringify(diff));
+    `).run(normalizedDocId, normalizedDocId, fullOwner, JSON.stringify(baseSnapshot), JSON.stringify(diff));
     return store.db.prepare('SELECT * FROM edit_branches WHERE id = ?').get(Number(result.lastInsertRowid));
   }
 
 export function findEditBranch(store, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' } = {}) {
     const normalizedOwner = owner == null ? null : store.normalizeEditBranchOwner(owner);
     const acceptOwner = (branch) => (
-      branch && (!normalizedOwner || branch.owner === normalizedOwner) ? branch : null
+      branch && (!normalizedOwner || ownerIdentity(branch.owner) === ownerIdentity(normalizedOwner)) ? branch : null
     );
     if (branchId) {
       // branchId 是主键、全局唯一，唯一锁定一条草稿；owner 是写入身份/消歧维度、不是定位键。

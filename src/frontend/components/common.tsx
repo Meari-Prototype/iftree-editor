@@ -6,9 +6,9 @@ import { closeWindow, minimizeWindow, toggleMaximizeWindow } from '../data/windo
 const IMPORT_MODE_OPTIONS = [
   { mode: 'simple', label: '简单导入' },
   { mode: 'complete', label: '完整导入' },
-  { mode: 'smart', label: '智能导入', disabled: true, title: '智能导入依赖 LLM skill，当前入口未接入' },
+  { mode: 'smart', label: '智能导入', title: '调用内置 agent 按 skill 解析结构并入库（过程在 AgentPanel 可见）' },
   { mode: 'direct', label: '直接导入' },
-  { mode: 'vector', label: '向量导入', disabled: true, title: '向量导入入口未接入普通文档导入' }
+  { mode: 'vector', label: '向量式导入', title: '按字数定长切块导入（块 512 字、相邻块重叠 10%），适合需要切块向量化的数据' }
 ];
 
 export function ViewPromptCard({ selectedLibraryEntry, onImport }) {
@@ -59,7 +59,6 @@ export function ViewPromptCard({ selectedLibraryEntry, onImport }) {
               <button
                 key={option.mode}
                 type="button"
-                disabled={option.disabled === true}
                 title={option.title || option.label}
                 onClick={() => runImport(option.mode)}
               >
@@ -124,7 +123,7 @@ export function ViewAlignedEmptyState({ activeTab, selectedLibraryEntry, onImpor
   );
 }
 
-export function WindowTitlebar({ onClose, title = '条件树编辑器' }: any) {
+export function WindowTitlebar({ onClose, title = '条件树编辑器' }: { onClose?: () => void; title?: string }) {
   const close = onClose || (() => closeWindow?.());
   return (
     <header className="app-titlebar">

@@ -6,6 +6,7 @@ import { buildTreeIndex, getChildren, getNodeByAddress, getSiblings } from '../.
 import { NODE_TYPES } from '../../core/tree.mjs';
 import { plainNodeNote } from '../../core/node-notes.mjs';
 import { nodeTypeLabel } from '../lib/doc-utils.mjs';
+import { RichMarkdown } from './RichMarkdown';
 
 import {
   clampCenterScrollTop, deriveColumns, subtreePreviewText,
@@ -394,7 +395,7 @@ const C2DNodeCard = memo(function C2DNodeCard({
       <div className="c2d-node-meta">{addr}</div>
       {editingField === 'title' ? titleEditor : (title ? <div className="c2d-node-title">{title}</div> : null)}
       {editingField === 'text' ? textEditor : (ownText
-        ? <div className="c2d-node-body" onDoubleClick={editTextFromBody}>{ownText}</div>
+        ? <div className="c2d-node-body" onDoubleClick={editTextFromBody}><RichMarkdown markdown={ownText} /></div>
         : !subtreePreview && <div className="c2d-node-body muted" onDoubleClick={editTextFromBody}>{emptyPlaceholder}</div>)}
       {subtreePreview ? <div className="c2d-node-body c2d-subtree-preview" onDoubleClick={editTextFromBody}>{subtreePreview}</div> : null}
       {editingField === 'note' ? noteEditor : (showNotes && noteText ? <div className="c2d-node-note">{noteText}</div> : null)}
