@@ -12,7 +12,7 @@ import {
   maxTreeDepth,
   resolveDisplayChildren,
   splitSentences
-} from '../src/core/tree.mjs';
+} from '../dist/src/core/tree.js';
 
 test('splitSentences defaults to Chinese punctuation for mixed technical text', () => {
   const result = splitSentences('如果用户导入文本，那么切分。否则等待输入！OK? node.split。末尾无标点');

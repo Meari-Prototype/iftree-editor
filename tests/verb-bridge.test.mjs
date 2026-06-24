@@ -6,9 +6,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store/index.mjs';
-import { runDatabaseWrite } from '../src/backend/mutation-api.mjs';
-import { registerWriteTools, registerAgentTools } from '../scripts/mcp-server.mjs';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { runDatabaseWrite } from '../dist/src/backend/mutation-api.js';
+import { registerWriteTools, registerAgentTools } from '../dist/scripts/mcp-server.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-verb-'));

@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyThreeWayMerge } from '../src/core/merkle-merge.mjs';
+import { classifyThreeWayMerge } from '../dist/src/core/merkle-merge.js';
 
 const n = (id, parentId, text, extra = {}) => ({
   id,

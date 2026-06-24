@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { writeDatabase } from './database-client.js';
 import { documentRepository } from './document-repository.js';
 

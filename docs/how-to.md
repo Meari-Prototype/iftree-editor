@@ -60,7 +60,7 @@ dry-run 报告怎么读：
 - `missing`——正文在源文中找不到：九成是脚本动了内部空白 / 换行；
 - `out_of_order`——顺序与源文不一致：检查脚本遍历顺序；
 - `address_*`——地址不连续或父前缀错；
-- `gaps`——源文有未覆盖区间：逐个确认是页眉页脚等无需入库的内容后，加 `--allow-gaps` 放行。
+- `uncovered`——源文有带字的区间没被任何节点覆盖：系统不替你补、也不放行，对照 `textPreview` 把漏段切进对应节点（或先入库其余、再进系统补这段）。
 
 JSON 契约的完整字段表见[参考手册](reference.md#import-json-契约)。
 
@@ -82,9 +82,8 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
   "mcpServers": {
     "iftree-library": {
       "command": "npm",
-      "args": ["run", "--silent", "mcp"],
+      "args": ["run", "--silent", "mcp:node"],
       "env": {
-        "ELECTRON_RUN_AS_NODE": "1",
         "IFTREE_MCP_TIER": "read"
       }
     }
@@ -138,9 +137,9 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
 - 备份：`library/` + `database/store.sqlite` 即可恢复全部内容；向量可随时重建。
 - 换库 / 隔离测试：`IFTREE_DB` 指定另一个 SQLite 路径，`IFTREE_HOME` 指定另一个派生数据目录（也可把向量库挪到大盘）。
 
-**库级迁移 / 重建**（0.6.0 起；升级或调整库结构时）：数据库带 schema 版本号、启动只读校验；schema 演进走「导出 → 建新空库 → 导入」的一次性往复，不在旧库原地改。均须以 Electron ABI 运行、在共享后端空闲时跑，默认 dry-run、`--apply` 才动：
+**库级迁移 / 重建**（0.6.0 起；升级或调整库结构时）：数据库带 schema 版本号、启动只读校验；schema 演进走「导出 → 建新空库 → 导入」的一次性往复，不在旧库原地改。均须先 `npm run build:runtime`、用 node 跑、在共享后端空闲时跑，默认 dry-run、`--apply` 才动：
 
-- `electron scripts/export-db-to-json.mjs [输出路径]` —— live 库导成单个 JSON（带 schema 版本头），只读不改源库。
-- `electron scripts/import-db-from-json.mjs <dump.json> [目标库] --apply` —— 按最新 schema 建全新空库再灌入。
-- `electron scripts/migrate-tree-objects.mjs --apply` —— 旧整篇快照迁成内容寻址对象库（`--apply` 前自动 `db.backup()`）。
-- `electron scripts/migrate-memory-tenant.mjs --apply` —— 记忆区补租户层（旧 `.memory/<工作区>` → `.memory/<租户>/<工作区>`）。
+- `node dist/scripts/export-db-to-json.js [输出路径]` —— live 库导成单个 JSON（带 schema 版本头），只读不改源库。
+- `node dist/scripts/import-db-from-json.js <dump.json> [目标库] --apply` —— 按最新 schema 建全新空库再灌入。
+- `node dist/scripts/migrate-tree-objects.js --apply` —— 旧整篇快照迁成内容寻址对象库（`--apply` 前自动 `db.backup()`）。
+- `node dist/scripts/migrate-memory-tenant.js --apply` —— 记忆区补租户层（旧 `.memory/<工作区>` → `.memory/<租户>/<工作区>`）。

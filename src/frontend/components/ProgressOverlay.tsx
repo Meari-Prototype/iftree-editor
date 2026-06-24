@@ -1,5 +1,6 @@
+// @ts-nocheck
 import { X } from 'lucide-react';
-import { progressCountText } from '../lib/ui-utils.mjs';
+import { progressCountText } from '../lib/ui-utils.js';
 
 function ProgressBar({ progress, onCancel }) {
   if (!progress) return null;

@@ -11,8 +11,8 @@ import * as lancedb from '@lancedb/lancedb';
 import {
   MIN_VECTOR_DIMENSIONS,
   VECTOR_MODEL_OPTIONS
-} from '../src/vector/embeddings.mjs';
-import { VectorStore } from '../src/vector/vector-store.mjs';
+} from '../dist/src/vector/embeddings.js';
+import { VectorStore } from '../dist/src/vector/vector-store.js';
 
 /** @returns {number[]} */
 function vector(dimensions = MIN_VECTOR_DIMENSIONS, hotIndex = 0) {

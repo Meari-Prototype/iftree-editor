@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store/index.mjs';
-import { runDatabaseWrite } from '../src/backend/mutation-api.mjs';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { runDatabaseWrite } from '../dist/src/backend/mutation-api.js';
 
 // 投影 vs 重放一致性：编辑期 projectEditBranchDoc 给用户看的结果，必须与
 // 保存时 applyEditBranchDiffEntries 真实写入主干的结果一致（所见即所得）。

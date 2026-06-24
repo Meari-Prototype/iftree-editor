@@ -154,13 +154,13 @@ function Invoke-DbSql($IftreeHomePath, $Sql, $Limit = 1000) {
   $querySql = Join-Path $IftreeHomePath "query-$queryId.sql"
   try {
     $env:IFTREE_HOME = $IftreeHomePath
-    # query-db.mjs 只认 IFTREE_DB（不读 IFTREE_HOME），不设则会静默查到主库。
+    # query-db 只认 IFTREE_DB（不读 IFTREE_HOME），不设则会静默查到主库。
     $env:IFTREE_DB = Join-Path $IftreeHomePath 'store.sqlite'
     [System.IO.File]::WriteAllText($querySql, $Sql, [System.Text.UTF8Encoding]::new($false))
     # --db 显式传库路径：本机可能存在用户级 IFTREE_DB（指向压测库）把查询劫持走。
     $queryProcess = $null
     try {
-      $queryProcess = Start-Process -FilePath $electronExe -ArgumentList @('scripts/query-db.mjs', 'sql', '--sqlFile', $querySql, '--limit', ([string]$Limit), '--db', (Join-Path $IftreeHomePath 'store.sqlite')) -WorkingDirectory (Get-Location) -PassThru -WindowStyle Hidden -RedirectStandardOutput $queryOut -RedirectStandardError $queryErr -ErrorAction Stop
+      $queryProcess = Start-Process -FilePath $electronExe -ArgumentList @('dist/scripts/query-db.js', 'sql', '--sqlFile', $querySql, '--limit', ([string]$Limit), '--db', (Join-Path $IftreeHomePath 'store.sqlite')) -WorkingDirectory (Get-Location) -PassThru -WindowStyle Hidden -RedirectStandardOutput $queryOut -RedirectStandardError $queryErr -ErrorAction Stop
     } catch {
       throw "query-db Start-Process failed: $($_.Exception.Message)"
     }
@@ -274,7 +274,7 @@ $testChmPath = Join-Path $inputDir ([System.IO.Path]::GetFileName($ChmPath))
 Copy-Item -LiteralPath $ChmPath -Destination $testChmPath -Force
 Write-Step "INPUT isolated CHM=$testChmPath"
 
-$importArgs = @('scripts/import-chm-doc.mjs', '--file', $testChmPath, '--home', $iftreeHome, '--reset')
+$importArgs = @('dist/scripts/import-chm-doc.js', '--file', $testChmPath, '--home', $iftreeHome, '--reset')
 Write-Step "IMPORT start: $testChmPath"
 $importProcess = Start-Process -FilePath $electronExe -ArgumentList $importArgs -WorkingDirectory (Get-Location) -PassThru -RedirectStandardOutput $importOut -RedirectStandardError $importErr
 $outOffset = 0
@@ -317,7 +317,7 @@ $oldDb = $env:IFTREE_DB
 $appProcess = $null
 try {
   $env:IFTREE_HOME = $iftreeHome
-  # 应用本体解析 SQLite 路径时 IFTREE_DB 优先于 IFTREE_HOME（electron/main.mjs），
+  # 应用本体解析 SQLite 路径时 IFTREE_DB 优先于 IFTREE_HOME（Electron main），
   # 本机可能存在指向压测库的用户级 IFTREE_DB，必须显式覆盖到隔离库。
   $env:IFTREE_DB = Join-Path $iftreeHome 'store.sqlite'
   $env:IFTREE_LAUNCHER_AUTOSTART = '1'

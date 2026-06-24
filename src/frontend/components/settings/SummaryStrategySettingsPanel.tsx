@@ -1,8 +1,9 @@
+// @ts-nocheck
 import { Plus, Trash2
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { newSummaryStrategy, normalizeSummaryConcurrency, normalizeSummaryStrategy, normalizeSummaryStrategySettings
-} from '../../lib/summary-utils.mjs';
+} from '../../lib/summary-utils.js';
 
 export function SummaryStrategySettingsPanel({ settings, onChange }) {
   const config = normalizeSummaryStrategySettings(settings || {});

@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { useEffect, useState } from 'react';
 
 import {
@@ -11,6 +12,7 @@ import {
 } from '../features/entity/entity-actions.js';
 import { readDatabase } from '../data/database-client.js';
 import { openEntityMaintenanceWindow } from '../data/window-service.js';
+import { useAppUIContext } from './useAppUI.js';
 
 const ENTITY_NODE_SEARCH_PAGE_LIMIT = 100;
 const EMPTY_ENTITY_NODE_PAGE = Object.freeze(/** @type {{ total: number, returned: number, offset: number, limit: number, hasMore: boolean, truncated: boolean }} */ ({
@@ -34,8 +36,9 @@ function keywordRowToSearchResult(row) {
 }
 
 // 实体检索/追踪面板（EntityTraceView）的全部状态与动作。
-// 对 App 的依赖收口为 docId/activeTab 两个输入 + busy/notice 两个回写。
-export function useEntityTrace({ docId = null, activeTab = '', setBusy, setNotice }: any = {}) {
+// 输入仅 docId；busy/notice/activeTab 从 useAppUIContext 读。
+export function useEntityTrace({ docId = null }: any = {}) {
+  const { setBusy, setNotice, activeTab } = useAppUIContext();
   const [entityQuery, setEntityQuery] = useState('');
   const [entityRows, setEntityRows] = useState([]);
   const [selectedEntity, setSelectedEntity] = useState(null);

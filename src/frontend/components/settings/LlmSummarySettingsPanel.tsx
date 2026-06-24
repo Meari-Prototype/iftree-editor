@@ -1,9 +1,10 @@
+// @ts-nocheck
 import { useEffect, useState } from 'react';
 import { Database, FileText, KeyRound, Plus, Trash2
 } from 'lucide-react';
 import { LLM_PROVIDER_PRESETS, newLlmApi, newLlmProvider,
   normalizeLlmSettingsForEditor, providerMatchesPreset
-} from '../../lib/summary-utils.mjs';
+} from '../../lib/summary-utils.js';
 
 const ANTHROPIC_MAX_OUTPUT_MESSAGE = 'Anthropic compatible 需要填写最大输出 token。';
 

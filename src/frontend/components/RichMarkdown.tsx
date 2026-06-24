@@ -1,7 +1,8 @@
+// @ts-nocheck
 import { type ElementType, useMemo } from 'react';
 
-import { renderTexMathToText } from '../../core/markdown.mjs';
-import { parseRichMarkdown, richMarkdownImageSources } from '../../core/rich-markdown.mjs';
+import { renderTexMathToText } from '../../core/markdown.js';
+import { parseRichMarkdown, richMarkdownImageSources } from '../../core/rich-markdown.js';
 import { useResolvedImageSourcesForSources } from '../hooks/useResolvedImages.js';
 
 // 无版面格式（md / txt / 节点正文 / agent 文本）统一的富文本渲染组件。

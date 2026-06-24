@@ -4,7 +4,7 @@ REM 先在文件管理器删掉要清的卷的锚文件 library\.memory\<身份>
 setlocal
 cd /d "%~dp0.."
 set ELECTRON_RUN_AS_NODE=1
-call ".\node_modules\.bin\electron.cmd" "scripts\purge-orphaned-volumes.mjs"
+call ".\node_modules\.bin\electron.cmd" "dist\scripts\purge-orphaned-volumes.js"
 echo.
 echo 按任意键关闭此窗口。
 pause >nul

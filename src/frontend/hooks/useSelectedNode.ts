@@ -1,5 +1,6 @@
+// @ts-nocheck
 import { useMemo } from 'react';
-import { findNode } from '../../core/tree.mjs';
+import { findNode } from '../../core/tree.js';
 
 export function useSelectedNode(doc, selectedNodeId) {
   return useMemo(() => {

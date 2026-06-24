@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createTokenCounter } from '../src/vector/token-count.mjs';
+import { createTokenCounter } from '../dist/src/vector/token-count.js';
 
 // 第 2 步守卫的 token 计数：真 tokenizer（bge-m3，本地缓存）算 token 数；加载不到退回保守字数估算。
 // 断言对「真 tokenizer」和「字数兜底」都成立——离线也不挂。

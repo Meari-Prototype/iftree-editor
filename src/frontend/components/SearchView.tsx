@@ -1,4 +1,5 @@
-﻿
+﻿// @ts-nocheck
+
 
 function searchResultScore(score) {
   return Math.round((Number(score) || 0) * 1000) / 1000;

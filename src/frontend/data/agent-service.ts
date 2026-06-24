@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { callIftree, hasIftreeMethod, onAgentStream } from './iftree-api.js';
 import { settingsRepository } from './settings-service.js';
 

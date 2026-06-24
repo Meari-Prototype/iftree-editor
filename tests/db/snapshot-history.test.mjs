@@ -2,7 +2,7 @@ import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { computeSnapshotDiff } from '../../src/backend/db/snapshot-history.mjs';
+import { computeSnapshotDiff } from '../../dist/src/backend/db/snapshot-history.js';
 
 // computeSnapshotDiff 是纯函数；但本项目统一用 electron 跑测试、禁用 node（见 ../_assert-electron.mjs）。覆盖三类比对：节点、公理、引用。
 // 历史回归：曾只比 nodes，快照里现成的 axioms/refs 没比，跨 commit 看不到公理/引用变更。

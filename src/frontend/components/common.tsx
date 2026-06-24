@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { ChevronDown, FileText, ListTree, LocateFixed, Minus, Square, Upload, X
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';

@@ -3,15 +3,15 @@ import './_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildTree } from '../src/core/tree.mjs';
-import { buildTreeIndex, getDescendants, getChildren } from '../src/core/node-model.mjs';
+import { buildTree } from '../dist/src/core/tree.js';
+import { buildTreeIndex, getDescendants, getChildren } from '../dist/src/core/node-model.js';
 import {
   buildStatsIndex,
   contentStats,
   deriveColumns,
   statsForNode,
   subtreePreviewText
-} from '../src/frontend/components/c2d-measure.mjs';
+} from '../dist/src/frontend/components/c2d-measure.js';
 
 function sampleTree() {
   return buildTree([

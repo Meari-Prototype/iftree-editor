@@ -1,4 +1,5 @@
-import { safeDebugLabel } from '../../lib/debug-log.mjs';
+// @ts-nocheck
+import { safeDebugLabel } from '../../lib/debug-log.js';
 
 export function debugElementTarget(target) {
   if (typeof Element === 'undefined' || !(target instanceof Element)) return null;

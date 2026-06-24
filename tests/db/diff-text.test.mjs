@@ -2,7 +2,7 @@ import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formatDiffText, diffShortRef, diffOneLine } from '../../src/backend/diff-text.mjs';
+import { formatDiffText, diffShortRef, diffOneLine } from '../../dist/src/backend/diff-text.js';
 
 // formatDiffText 渲染纯函数，不碰 DB；但本项目统一用 electron 跑测试、禁用 node（见 ../_assert-electron.mjs）。
 // 它此前内嵌在 scripts/mcp-server.mjs 里无法单测，导致下面这个回归长期无人发现：

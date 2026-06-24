@@ -6,9 +6,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { createSharedBackendClient } from '../src/backend/llm/backend-pipe-client.mjs';
-import { createBackendClient } from '../src/backend/llm/backend-client.mjs';
-import { backendDescriptorPath, resolveBackendDbPath } from '../src/backend/llm/backend-discovery.mjs';
+import { createSharedBackendClient } from '../dist/src/backend/llm/backend-pipe-client.js';
+import { createBackendClient } from '../dist/src/backend/llm/backend-client.js';
+import { backendDescriptorPath, resolveBackendDbPath } from '../dist/src/backend/llm/backend-discovery.js';
 
 // 回归：restart_backend 漏杀游离共享后端。
 //

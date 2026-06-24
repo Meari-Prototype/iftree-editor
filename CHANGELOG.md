@@ -2,6 +2,25 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.3 — 2026-06-25
+
+本版主线是运行时源码的 TypeScript 化：把 `src` / `scripts` / `electron` 下的运行时 `.mjs` 全量迁移到 `.ts`，并从 `core` 模块起补全类型标注。这是一轮内部代码质量 / 类型基建工作，对外功能与动词契约不变。
+
+### 工程（TypeScript 化）
+
+- **运行时源码 .mjs → .ts**：`src` / `scripts` / `electron` 的运行时源码全量迁移到 TypeScript，经 esbuild 产出 `dist/`（`build:runtime`），node / electron 两条运行路径与对外行为不变。
+- **core 模块补全类型标注**：`core/*`（树 / merkle / 解析 / 导入格式 / markdown 等）摘除 `@ts-nocheck`、补齐函数签名与接口，新增 `core/source-types` 作为导入与源文档层的公共类型来源。
+- **类型闸分阶段收口**：`tsconfig.check.json` 暂关 `strict`，`core` 先达标（`check:types` 0 错误）；`backend` / `frontend` / `vector` / `agent` 仍带 `@ts-nocheck` 被跳过，留后续版本逐模块摘除。
+- **三方合并类型适配**：`merkle-merge` 字段合并结果改用属性判别（`'value' in r`）收窄 union，适配非 strict 下的控制流分析，运行时分支等价。
+
+### 前端
+
+- 一轮前端状态管理重构：写管线抽出 `hooks/useWritePipeline`、撤销栈抽 `session/history-stack`（带测试）、文档会话状态拆分（`session/` + `AppBody`），附带视图写入回环、preload 加载等修复。
+
+### 测试
+
+- 顶层套件 260 pass / 1 skip、`test:verbs` 46 pass、`check:types` / `lint` 全绿。
+
 ## 0.6.2 — 2026-06-23
 
 继 0.6.0 的后端解耦，本轮把前后端彻底解开：后端可在纯 node runtime 下独立部署（headless，docker / VPS 只跑 stdio MCP、不带 Electron），桌面前端不再 in-process 用 better-sqlite3、改走后端 RPC，原生模块 ABI 从 electron 统一到 node。配套把文档解析层公共化（切句 / 坐标 / 富文本抽独立模块），新增 epub 与向量式导入。对外动词契约不变。

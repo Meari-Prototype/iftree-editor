@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { callIftree, hasIftreeMethod } from './iftree-api.js';
 
 export const assetRepository = {

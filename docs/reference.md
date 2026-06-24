@@ -6,7 +6,7 @@
 
 ## MCP server
 
-- 启动：`npm run mcp`（等价于 `ELECTRON_RUN_AS_NODE=1 electron scripts/mcp-server.mjs`），stdio 传输。
+- 启动：`npm run mcp`（等价于 `node dist/scripts/mcp-server.js`），stdio 传输。
 - 权限档由启动时的环境变量 `IFTREE_MCP_TIER` 决定，运行中不可切换：
 
 | 取值 | 档位 | 可见工具 |
@@ -81,33 +81,33 @@
 
 ## 只读查询 CLI
 
-`scripts/query-db.mjs` 直接查 SQLite，适合脚本化检查（须以 Electron ABI 运行）：
+`scripts/query-db.ts` 直接查 SQLite，适合脚本化检查（先 `npm run build:runtime`，再用 node 跑）：
 
 ```powershell
-.\node_modules\.bin\electron.cmd scripts/query-db.mjs docs
-.\node_modules\.bin\electron.cmd scripts/query-db.mjs index --docId 22 --depth 3
-.\node_modules\.bin\electron.cmd scripts/query-db.mjs node-content --docId 22 --address 1-4-6 --include tags,source
-.\node_modules\.bin\electron.cmd scripts/query-db.mjs search-all --query "keyword" --format ascii_tree
-.\node_modules\.bin\electron.cmd scripts/query-db.mjs debug.sql --sql "SELECT COUNT(*) FROM nodes"
+node dist/scripts/query-db.js docs
+node dist/scripts/query-db.js index --docId 22 --depth 3
+node dist/scripts/query-db.js node-content --docId 22 --address 1-4-6 --include tags,source
+node dist/scripts/query-db.js search-all --query "keyword" --format ascii_tree
+node dist/scripts/query-db.js debug.sql --sql "SELECT COUNT(*) FROM nodes"
 ```
 
 常用别名：`docs`、`library-index`、`library-navigation`、`index`、`depth`、`node-content`、`subtree`、`search`、`search-all`、`article`、`overview`、`sql`。`help` 列出全部 action。`--db <path>` 或环境变量 `IFTREE_DB` 指定库文件。
 
 ## 运维脚本
 
-须以 Electron ABI 运行（`ELECTRON_RUN_AS_NODE=1 electron scripts/<脚本>`）、在共享后端空闲时跑；迁移类默认 dry-run、`--apply` 才动，详见各脚本头部注释。
+用 node 跑：先 `npm run build:runtime`，再 `node dist/scripts/<脚本>.js`、在共享后端空闲时跑；迁移类默认 dry-run、`--apply` 才动，详见各脚本头部注释。
 
 | 脚本 | 作用 |
 | --- | --- |
-| `export-db-to-json.mjs` | 库级导出：live 库 → 单个 JSON（带 schema 版本头），只读 |
-| `import-db-from-json.mjs` | 库级导入：JSON → 按最新 schema 新建的空库 |
-| `migrate-tree-objects.mjs` | 旧整篇快照 → 内容寻址对象库 |
-| `migrate-memory-tenant.mjs` | 记忆区补租户层（多租户隔离迁移） |
-| `purge-orphaned-volumes.mjs` | 清理「锚已被删」的脱锚记忆卷（配合手动删 `.memory` 锚） |
+| `export-db-to-json.ts` | 库级导出：live 库 → 单个 JSON（带 schema 版本头），只读 |
+| `import-db-from-json.ts` | 库级导入：JSON → 按最新 schema 新建的空库 |
+| `migrate-tree-objects.ts` | 旧整篇快照 → 内容寻址对象库 |
+| `migrate-memory-tenant.ts` | 记忆区补租户层（多租户隔离迁移） |
+| `purge-orphaned-volumes.ts` | 清理「锚已被删」的脱锚记忆卷（配合手动删 `.memory` 锚） |
 
 ## import-json 契约
 
-`db import-json <tree.json> <源文件> [--dry-run] [--allow-gaps] [--embed]`
+`db import-json <tree.json> <源文件> [--dry-run] [--embed]`
 
 JSON 结构与 `db push` 同构：
 
@@ -140,8 +140,7 @@ JSON 结构与 `db push` 同构：
 校验规则与报告字段：
 
 - **顺序铁律**：树的前序遍历顺序必须与正文在源文中的出现顺序一致。
-- `errors`：`missing`（正文在源文中不存在）、`out_of_order`（位置在已消费区间之前）、`address_*`（地址不连续 / 前缀错）、`virtual_source_position`（虚拟容器缺半步句位）。
-- `gaps`：源文未被覆盖的区间，附 `preview`；默认拒绝导入，确认合理后 `--allow-gaps` 放行。
+- `errors`：`missing`（正文在源文中不存在）、`out_of_order`（位置在已消费区间之前）、`uncovered`（源文有正文未被任何节点覆盖，附 `textPreview`——系统不补不放行，漏了就改脚本或入库后进系统补）、`address_*`（地址不连续 / 前缀错）、`virtual_source_position`（虚拟容器缺半步句位）。
 - 全部通过返回 `ok: true`；`--dry-run` 只出报告不入库。
 
 ## 配置与环境变量
@@ -177,4 +176,4 @@ JSON 结构与 `db push` 同构：
 | `IFTREE_MCP_TIER` | MCP 权限档：`read` / `edit` / `full` / `human`（别名 `yolo`） |
 | `IFTREE_DEBUG_LOGGING` | `1` 强制开 debug 日志（等价于配置文件 `debugLogging: true`） |
 | `ELECTRON_START_URL` | 开发模式让 Electron 加载 Vite dev server |
-| `ELECTRON_RUN_AS_NODE` | 以 node 方式运行 Electron（MCP / CLI 脚本需要） |
+| `ELECTRON_RUN_AS_NODE` | 让 Electron 以 node 模式运行 js 入口（`npm run mcp` 等 electron 外壳路径用；纯 node CLI 与 `mcp:node` 不需要） |

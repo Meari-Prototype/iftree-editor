@@ -1,3 +1,4 @@
+// @ts-nocheck
 export async function openSettingsAction({
   settingsRepository,
   normalizeNodeLayoutSettingsByView,

@@ -1,9 +1,12 @@
+// @ts-nocheck
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { agentMessagesFromSession, appendReasoningToSegments, appendTextToSegments, appendToolToSegments, upsertAgentToolEvent } from '../lib/agent-utils.mjs';
+import { agentMessagesFromSession, appendReasoningToSegments, appendTextToSegments, appendToolToSegments, upsertAgentToolEvent } from '../lib/agent-utils.js';
 import { agentRepository } from '../data/repositories.js';
+import { useAppUIContext } from './useAppUI.js';
 
-export function useAgentChat({ setNotice }: any = {}) {
+export function useAgentChat() {
+  const { setNotice } = useAppUIContext();
   const [agentSettings, setAgentSettings] = useState(null);
   const [agentMessages, setAgentMessages] = useState([]);
   const [agentDiffs, setAgentDiffs] = useState([]);
@@ -35,6 +38,8 @@ export function useAgentChat({ setNotice }: any = {}) {
         let segments = message.segments;
         if (entry.reasoning) segments = appendReasoningToSegments(segments, entry.reasoning);
         if (entry.text) segments = appendTextToSegments(segments, entry.text);
+        // 流式同时累积两份投影：segments 给界面渲染（交错结构）、answer 给历史回传（纯文本）。
+        // 收尾时 answer 会被后端的最终回答覆盖校准（见 done 分支），segments 保留——两者本就不强求逐字一致。
         return {
           ...message,
           answer: `${message.answer || ''}${entry.text || ''}`,
@@ -93,6 +98,10 @@ export function useAgentChat({ setNotice }: any = {}) {
           };
         }
         if (event.type === 'done') {
+          // answer 与 segments 是两个有意的不同投影，别当成"漏回写 segments"的 bug：
+          // segments 给界面渲染（流式已累积完整、含全过程交错），done 不动它；
+          // answer 给「下一轮回传模型的历史」，这里用后端的最终回答（模型真实最后一步输出）覆盖前端流式拼的版本，
+          // 让历史逐字节稳定、命中 prompt 前缀缓存。只覆盖 answer 不回写 segments 是刻意的。
           return {
             ...message,
             answer: event.answer || message.answer || '',

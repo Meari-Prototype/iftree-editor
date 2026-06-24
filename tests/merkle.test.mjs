@@ -7,7 +7,7 @@ import {
   contentHash,
   computeSubtreeHashes,
   CONTENT_FIELDS
-} from '../src/core/merkle.mjs';
+} from '../dist/src/core/merkle.js';
 
 const baseNode = {
   id: 'n1',

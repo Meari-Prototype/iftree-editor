@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { diffTextSegments } from '../src/core/text-diff.mjs';
+import { diffTextSegments } from '../dist/src/core/text-diff.js';
 
 // 片段级文本 diff：diff 对比视图的删除红遮罩/新增绿遮罩数据源。
 

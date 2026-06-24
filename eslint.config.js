@@ -136,6 +136,23 @@ export default [
     }
   },
   {
+    // electron 主进程 / scripts 的 TS 文件：no-undef 交给 tsc（同 src TS 组），
+    // tsParser 下该规则会对类型标注误报。
+    files: ['electron/**/*.ts', 'scripts/**/*.ts'],
+    plugins: { 'unused-imports': unusedImports },
+    languageOptions: {
+      parser: tsParser,
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: nodeGlobals
+    },
+    rules: {
+      'no-unused-vars': 'off',
+      'unused-imports/no-unused-imports': 'error',
+      'unused-imports/no-unused-vars': ['warn', { vars: 'all', varsIgnorePattern: '^_', args: 'none' }]
+    }
+  },
+  {
     files: ['electron/**/*.cjs', 'scripts/**/*.cjs', 'tests/**/*.cjs'],
     languageOptions: {
       ecmaVersion: 'latest',

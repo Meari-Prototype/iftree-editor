@@ -1,7 +1,8 @@
+// @ts-nocheck
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 
-import { depthOf, hasKnownChildren } from '../lib/doc-utils.mjs';
+import { depthOf, hasKnownChildren } from '../lib/doc-utils.js';
 
 // 父节点驻留靠原生 position: sticky：每个节点一个 wrapper（行 + 子树），
 // 展开的父行按深度阶梯钉在容器顶部，子树滚完由 wrapper 底边把行推走，

@@ -1,11 +1,12 @@
-﻿
+﻿// @ts-nocheck
+
 import { useEffect, useState } from 'react';
 
 
 import {
   DEFAULT_SUMMARY_STRATEGIES, normalizeSummaryStrategy,
   summarySkipBelowCount, summaryStrategyLabel
-} from '../lib/summary-utils.mjs';
+} from '../lib/summary-utils.js';
 
 
 export function SummaryConfirmDialog({ request, onCancel, onConfirm }) {

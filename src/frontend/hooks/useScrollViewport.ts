@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 export function useScrollViewport(defaultHeight = 800) {
@@ -54,4 +55,4 @@ export function useScrollViewport(defaultHeight = 800) {
   return { scrollRef, viewport, onScroll };
 }
 
-export { buildVirtualRange, buildFixedVirtualRange, lowerBound } from '../lib/ui-utils.mjs';
+export { buildVirtualRange, buildFixedVirtualRange, lowerBound } from '../lib/ui-utils.js';

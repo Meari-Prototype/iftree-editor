@@ -1,8 +1,9 @@
+// @ts-nocheck
 import {
   DEFAULT_DOC_FOLDER_NAME,
   isSupportedLibraryImport,
   normalizeFsPath
-} from '../../lib/doc-utils.mjs';
+} from '../../lib/doc-utils.js';
 
 export function createLibraryActions({
   busy,
@@ -13,22 +14,14 @@ export function createLibraryActions({
   refreshDocs,
   openDoc,
   confirmLeaveEditMode,
-  persistActiveDocId,
+  showLibraryFileOnly,
   setBusy,
   setNotice,
   setDocFolders,
   setDocs,
   setLibraryTree,
   setLibraryCutPath,
-  setSelectedLibraryEntry,
-  setCurrentDoc,
-  setSelectedNodeId,
-  setMultiSelectedNodeIds,
-  setCollapsed,
-  setExpanded,
-  clearHistoryStacks,
-  setSearchResults,
-  setLocateRequest
+  setSelectedLibraryEntry
 }) {
   async function createDocFolder(parentId = null) {
     if (busy) return null;
@@ -120,19 +113,12 @@ export function createLibraryActions({
     try {
       const nextDocs = await documentRepository.deleteDoc({ docId: importedDoc.id });
       setDocs(nextDocs);
-      setSelectedLibraryEntry(item);
       if (currentDoc?.doc?.id === importedDoc.id) {
-        setCurrentDoc(null);
-        persistActiveDocId(null);
-        setSelectedNodeId(null);
-        setMultiSelectedNodeIds(new Set());
-        setCollapsed(new Set());
-        setExpanded(new Set());
-        clearHistoryStacks();
-        setSearchResults([]);
-        setLocateRequest({ seq: 0, nodeId: null });
+        showLibraryFileOnly(item, '已删除导入数据，原文件已保留');
+      } else {
+        setSelectedLibraryEntry(item);
+        setNotice('已删除导入数据，原文件已保留');
       }
-      setNotice('已删除导入数据，原文件已保留');
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -152,17 +138,7 @@ export function createLibraryActions({
       setNotice(`不支持导入格式：${item.extension || '未知格式'}`);
       return;
     }
-    setSelectedLibraryEntry(item);
-    setCurrentDoc(null);
-    persistActiveDocId(null);
-    setSelectedNodeId(null);
-    setMultiSelectedNodeIds(new Set());
-    setCollapsed(new Set());
-    setExpanded(new Set());
-    clearHistoryStacks();
-    setSearchResults([]);
-    setLocateRequest({ seq: 0, nodeId: null });
-    setNotice('未导入原始文件，请先手动导入');
+    showLibraryFileOnly(item);
   }
 
   return {

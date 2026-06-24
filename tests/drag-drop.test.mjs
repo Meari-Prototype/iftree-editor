@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { findSiblingInsertionTarget } from '../src/core/drag-drop.mjs';
+import { findSiblingInsertionTarget } from '../dist/src/core/drag-drop.js';
 
 const nodes = [
   { id: 10, x: 40, y: 80, width: 220, height: 90 },

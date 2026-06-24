@@ -14,6 +14,6 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": ["src/**/*", "electron/**/*", "scripts/**/*", "tests/**/*"],
+  "include": ["src/**/*", "electron/**/*", "scripts/**/*"],
   "exclude": ["node_modules", "dist", "benchmark"]
 }

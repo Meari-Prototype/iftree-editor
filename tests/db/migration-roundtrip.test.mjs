@@ -6,10 +6,10 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../../src/backend/store/index.mjs';
-import { TABLES_SQL, SCHEMA_VERSION } from '../../src/backend/db/schema.mjs';
-import { exportDatabase } from '../../src/backend/db/db-export.mjs';
-import { importDatabase } from '../../src/backend/db/db-import.mjs';
+import { IftreeStore } from '../../dist/src/backend/store/index.js';
+import { TABLES_SQL, SCHEMA_VERSION } from '../../dist/src/backend/db/schema.js';
+import { exportDatabase } from '../../dist/src/backend/db/db-export.js';
+import { importDatabase } from '../../dist/src/backend/db/db-import.js';
 
 // 导入式迁移的全链路 oracle：导出 → 导入新空库 → 语义保持 + 引用自洽 + 历史可逐版本重建。
 // 不比逐表哈希（id 可能个别重生），比语义（正文/类型/树形/历史版本数）。

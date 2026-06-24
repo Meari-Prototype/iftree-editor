@@ -6,8 +6,8 @@ import test from 'node:test';
 import {
   collapsedForDepthLimit,
   summaryTargetsForMode
-} from '../src/core/tree-ui.mjs';
-import { buildTree } from '../src/core/tree.mjs';
+} from '../dist/src/core/tree-ui.js';
+import { buildTree } from '../dist/src/core/tree.js';
 
 function sampleTree() {
   return buildTree([

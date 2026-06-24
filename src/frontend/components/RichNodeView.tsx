@@ -1,9 +1,10 @@
+// @ts-nocheck
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { plainNodeNote } from '../../core/node-notes.mjs';
-import { flattenTree } from '../../core/tree.mjs';
-import { depthOf, docDisplayTitle } from '../lib/doc-utils.mjs';
-import { buildVirtualRange } from '../lib/ui-utils.mjs';
+import { plainNodeNote } from '../../core/node-notes.js';
+import { flattenTree } from '../../core/tree.js';
+import { depthOf, docDisplayTitle } from '../lib/doc-utils.js';
+import { buildVirtualRange } from '../lib/ui-utils.js';
 import { useScrollViewport } from '../hooks/useScrollViewport.js';
 import { RichMarkdown } from './RichMarkdown';
 

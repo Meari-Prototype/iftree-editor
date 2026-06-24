@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store/index.mjs';
-import { computeSubtreeHashes } from '../src/core/merkle.mjs';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { computeSubtreeHashes } from '../dist/src/core/merkle.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-hash-'));

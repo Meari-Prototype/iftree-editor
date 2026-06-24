@@ -1,15 +1,16 @@
-﻿import { ChevronDown, ChevronRight
+﻿// @ts-nocheck
+import { ChevronDown, ChevronRight
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { plainNodeNote } from '../../core/node-notes.mjs';
+import { plainNodeNote } from '../../core/node-notes.js';
 import {
   depthOf, hasKnownChildren, nodeTypeLabel
-} from '../lib/doc-utils.mjs';
+} from '../lib/doc-utils.js';
 
 
 import {
   DEFAULT_IDE_COLUMN_WIDTHS, IDE_COLUMN_LIMITS, buildVirtualRange, clampIdeColumnWidth, readIdeColumnWidthFromDom, readIdeColumnWidths
-} from '../lib/ui-utils.mjs';
+} from '../lib/ui-utils.js';
 import { useScrollViewport } from '../hooks/useScrollViewport.js';
 import { parseSourceNodeText, renderSyntaxLine } from './SourceBlocks.jsx';
 export const IDE_HEADER_HEIGHT = 22;

@@ -7,7 +7,7 @@ import {
   clampCenterScrollTop,
   measureButtonTops,
   measureConnectorLines
-} from '../src/frontend/components/c2d-measure.mjs';
+} from '../dist/src/frontend/components/c2d-measure.js';
 
 function element({ left = 0, top = 0, right = 0, bottom = 0, offsetTop = 0, offsetHeight = 0, scrollWidth = 0, clientHeight = 0, scrollHeight = 0 } = {}) {
   return {

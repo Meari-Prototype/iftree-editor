@@ -11,13 +11,13 @@ import {
   VECTOR_COMPUTE_OPTIONS,
   VECTOR_MODEL_OPTIONS,
   normalizeVectorConfig
-} from '../src/vector/embeddings.mjs';
+} from '../dist/src/vector/embeddings.js';
 import {
   huggingFaceResolveUrl,
   huggingFaceTreeUrl,
   modelOnnxFileName,
   selectTransformerModelFiles
-} from '../src/vector/model-download.mjs';
+} from '../dist/src/vector/model-download.js';
 
 test('vector model options only expose database-safe dimensions', () => {
   assert.equal(VECTOR_MODEL_OPTIONS.length >= 2, true);

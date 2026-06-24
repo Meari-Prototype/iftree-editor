@@ -2,7 +2,7 @@ import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseBranchEntryCounts, formatBranchLine } from '../../src/backend/branch-status.mjs';
+import { parseBranchEntryCounts, formatBranchLine } from '../../dist/src/backend/branch-status.js';
 
 // 纯函数（不碰 DB）；但本项目统一用 electron 跑测试、禁用 node（见 ../_assert-electron.mjs）。问题 3：changes/branch list 此前只数笼统 active/undone，
 // 现按 op-log kind 分类（改/增/删/移/其他），并标当前 switch 分支。

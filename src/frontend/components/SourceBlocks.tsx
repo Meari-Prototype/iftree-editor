@@ -1,9 +1,10 @@
-﻿
+﻿// @ts-nocheck
+
 import { type ElementType, memo } from 'react';
-import { renderTexMathToText } from '../../core/markdown.mjs';
-import { plainNodeNote } from '../../core/node-notes.mjs';
-import { formatSentenceIndexes } from '../../core/source-ranges.mjs';
-import { debugPerfBegin, debugPerfEnd } from '../lib/debug-log.mjs';
+import { renderTexMathToText } from '../../core/markdown.js';
+import { plainNodeNote } from '../../core/node-notes.js';
+import { formatSentenceIndexes } from '../../core/source-ranges.js';
+import { debugPerfBegin, debugPerfEnd } from '../lib/debug-log.js';
 
 
 

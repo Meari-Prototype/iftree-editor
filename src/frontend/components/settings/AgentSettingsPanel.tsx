@@ -1,6 +1,7 @@
+// @ts-nocheck
 
 import { normalizeAgentToolSettings
-} from '../../lib/summary-utils.mjs';
+} from '../../lib/summary-utils.js';
 import { LlmSummarySettingsPanel } from './LlmSummarySettingsPanel.jsx';
 import { SummaryStrategySettingsPanel } from './SummaryStrategySettingsPanel.jsx';
 

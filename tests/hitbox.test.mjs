@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { measuredNodeHeightFromElement } from '../src/core/hitbox.mjs';
+import { measuredNodeHeightFromElement } from '../dist/src/core/hitbox.js';
 
 test('measuredNodeHeightFromElement ignores transformed screen height', () => {
   const element = {

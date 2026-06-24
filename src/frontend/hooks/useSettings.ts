@@ -1,14 +1,17 @@
+// @ts-nocheck
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { DEFAULT_NODE_LAYOUT } from '../../core/mindmap.mjs';
-import { normalizeNodeLayoutSettingsByView } from '../lib/doc-utils.mjs';
+import { DEFAULT_NODE_LAYOUT } from '../../core/mindmap.js';
+import { normalizeNodeLayoutSettingsByView } from '../lib/doc-utils.js';
 import { settingsRepository } from '../data/repositories.js';
+import { useAppUIContext } from './useAppUI.js';
 
-export function useSettings({ setNotice }) {
+export function useSettings() {
+  const { setNotice } = useAppUIContext();
   const [vectorSettings, setVectorSettings] = useState({ enabled: true, disabledReason: '' });
   const [memorySettings, setMemorySettings] = useState({ enabled: false });
   const [llmSummarySettings, setLlmSummarySettings] = useState(null);
-  const [nodeLayoutSettings, setNodeLayoutSettings] = useState(() => normalizeNodeLayoutSettingsByView());
+  const [nodeLayoutSettings, setNodeLayoutSettings] = useState(() => normalizeNodeLayoutSettingsByView({}));
   const llmSummarySaveSeqRef = useRef(0);
 
   const saveVectorSettings = useCallback(async (patch) => {

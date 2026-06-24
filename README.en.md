@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.2%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.3%20alpha-orange)
 
-> **Project status: 0.6.2, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.6.3, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -103,7 +103,7 @@ In-depth documentation lives in `docs/` (currently in Chinese):
 ## Requirements
 
 - **OS**: Windows 10 / 11 (development and verification are done on Windows; scripts are mainly PowerShell).
-- **Node.js**: 20 LTS or newer recommended. Native modules are built for Electron's ABI and run inside Electron; they are rebuilt automatically when the app starts (see [Development & Testing](#development--testing) for the ABI note).
+- **Node.js**: 20 LTS or newer recommended (verified on Node 24). Native modules (better-sqlite3) are prebuilt for the **node ABI** (downloaded via `prebuild-install`, no build toolchain needed); tests, CLI, MCP, and the backend all run on plain node (see [Development & Testing](#development--testing) for the ABI note).
 - **Package manager**: npm.
 - **GPU (optional)**: a WebGPU-capable GPU accelerates semantic vectors; without WebGPU you can switch to CPU on the settings page.
 
@@ -122,7 +122,7 @@ npm run build
 npm run app
 ```
 
-> `npm run app` first recompiles native modules (better-sqlite3, LanceDB, etc.) for Electron's ABI. After changing the main process or preload, restart the Electron window.
+> `npm run app` first builds, then prebuilds better-sqlite3 for the node ABI. The desktop shell is Electron, but the frontend no longer uses native modules in-process — the main process spawns a separate node backend. After changing the main process or preload, restart the Electron window.
 
 Development mode (start the Vite dev server first, then have Electron load it):
 
@@ -224,8 +224,8 @@ Client configuration example (with the project root as working directory):
   "mcpServers": {
     "iftree-library": {
       "command": "npm",
-      "args": ["run", "--silent", "mcp"],
-      "env": { "ELECTRON_RUN_AS_NODE": "1", "IFTREE_MCP_TIER": "read" }
+      "args": ["run", "--silent", "mcp:node"],
+      "env": { "IFTREE_MCP_TIER": "read" }
     }
   }
 }
@@ -238,8 +238,8 @@ The app, MCP, and CLI share one backend process per database and can stay online
 ```text
 .
 ├── electron/
-│   ├── main.mjs          # Main process: window, IPC, SQLite/LanceDB/file access, LLM dispatch
-│   └── preload.cjs       # Secure bridge exposing the window.iftree API to the renderer
+│   ├── main.ts           # Main process: window, IPC, SQLite/LanceDB/file access, LLM dispatch
+│   └── preload.ts        # Secure bridge exposing the window.iftree API to the renderer
 ├── index.html            # Renderer entry HTML
 ├── src/
 │   ├── renderer/
@@ -260,11 +260,11 @@ The app, MCP, and CLI share one backend process per database and can stay online
 │   │   ├── handlers/     # Read / write command handlers
 │   │   └── llm/          # Agent runtime, shared backend SDK (named pipe), headless agent, LLM settings
 │   ├── core/             # Pure logic (no Electron dependency)
-│   │   ├── tree.mjs      # Tree building, dynamic addresses, Markdown/JSON export
-│   │   ├── mindmap.mjs   # Tree-view projection, depth control, layout
-│   │   ├── merkle.mjs / merkle-diff.mjs / merkle-merge.mjs # Tree hashing, diff, three-way merge
-│   │   ├── source-text.mjs / source-docx.mjs / source-chm.mjs # Works with import-formats/ to parse txt/md/csv/xlsx/docx/chm
-│   │   ├── source-markdown.mjs # Source parsing and sentence offset mapping
+│   │   ├── tree.ts       # Tree building, dynamic addresses, Markdown/JSON export
+│   │   ├── mindmap.ts    # Tree-view projection, depth control, layout
+│   │   ├── merkle.ts / merkle-diff.ts / merkle-merge.ts # Tree hashing, diff, three-way merge
+│   │   ├── source-text.ts / source-docx.ts / source-chm.ts # Works with import-formats/ to parse txt/md/csv/xlsx/docx/chm
+│   │   ├── source-markdown.ts # Source parsing and sentence offset mapping
 │   │   └── ...           # viewport, hitbox, drag-drop, markdown, etc.
 │   ├── vector/           # Semantic vectors: embeddings, vector-store, worker, model download
 │   └── agent/            # Agent config and session storage
@@ -283,15 +283,16 @@ The app, MCP, and CLI share one backend process per database and can stay online
 
 ```powershell
 npm run lint          # ESLint static checks (src / electron / scripts / tests)
-npm run check:types   # TypeScript type check (TS files under migration)
-npm run build         # production build
-npm run check:native  # verify native modules match the Electron ABI
-npm test              # run unit tests on the Electron runtime
+npm run check:types   # TypeScript type check (core typed; other modules still migrating)
+npm run build         # production build (esbuild compiles runtime .ts into dist/)
+npm run check:native  # verify native modules match the node ABI
+npm test              # run unit tests with node --test
+npm run test:verbs    # run the db verb-contract suite with node --test
 ```
 
-> Some end-to-end / sample verification scripts (e.g. `verify:samples`, `verify:chm`) depend on local sample data; prepare the corresponding files before running them. Verification involving the database, import, LanceDB, or native modules should use the Electron ABI (e.g. `npm run check:native`).
+> Some end-to-end / sample verification scripts (e.g. `verify:samples`, `verify:chm`) depend on local sample data; prepare the corresponding files before running them. Verification involving the database, import, LanceDB, or native modules runs on plain node (e.g. `npm run check:native`).
 
-> **Native module ABI**: native modules (better-sqlite3, LanceDB) are binaries compiled for a specific runtime ABI. This project is built and verified against **Electron 39 (ABI 140)**; `npm run app` first rebuilds them for Electron's ABI. **Paths that depend on native modules are currently not tested against system Node (Node 24, ABI 137)** — after rebuilding for the Electron ABI, running those tests directly with system `node` fails with a `NODE_MODULE_VERSION` mismatch.
+> **Native module ABI**: native modules (better-sqlite3, LanceDB) are binaries compiled for a specific runtime ABI. Since 0.6.2 the project is unified on the **node ABI** — better-sqlite3 pulls a node prebuilt via `prebuild-install` (no build toolchain), and `@lancedb/lancedb` is an N-API prebuilt usable from both node and Electron. Tests, CLI, MCP, and the backend all run on system `node` (`npm test` / `node dist/scripts/<script>.js` / `npm run mcp:node`). The desktop `npm run app` is still an Electron shell, but the frontend no longer uses native modules in-process — the main process spawns a separate node backend, and Electron itself rebuilds nothing. `npm run check:native` verifies better-sqlite3 against the node ABI.
 
 ## License
 

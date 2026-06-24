@@ -28,7 +28,7 @@ export async function runDb(dbPath, args, options = {}) {
     IFTREE_HOME: options.homePath || isolatedHomeForDb(dbPath)
   };
   try {
-    const result = await execFileAsync(process.execPath, ['scripts/db.mjs', ...args], {
+    const result = await execFileAsync(process.execPath, ['dist/scripts/db.js', ...args], {
       cwd: process.cwd(),
       env,
       maxBuffer: 16 * 1024 * 1024,

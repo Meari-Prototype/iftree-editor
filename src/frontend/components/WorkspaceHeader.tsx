@@ -1,3 +1,4 @@
+// @ts-nocheck
 import {
   ChevronDown,
   ChevronsDownUp,
@@ -13,43 +14,27 @@ import {
   Unlock
 } from 'lucide-react';
 import * as Tabs from '@radix-ui/react-tabs';
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import { DepthCollapseOneIcon, DepthExpandOneIcon, IconButton } from './common.jsx';
 import { SummaryConfirmDialog } from './SummaryConfirmDialog.jsx';
+import { useFloatingMenu } from '../hooks/useFloatingMenu.js';
 
-const SUMMARY_MENU_WIDTH = 150;
-const SUMMARY_MENU_HEIGHT = 132;
 const VIEW_MENU_WIDTH = 190;
 const VIEW_MENU_HEIGHT = 156;
 const DIFF_MENU_WIDTH = 176;
 const DIFF_MENU_HEIGHT = 92;
+const SUMMARY_MENU_WIDTH = 150;
+const SUMMARY_MENU_HEIGHT = 132;
+const MENU_OFFSET = 6;
 
-function menuPositionFromButton(button, width, height) {
-  const rect = button.getBoundingClientRect();
-  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || width;
-  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || height;
-  const left = Math.max(8, Math.min(rect.right - width, viewportWidth - width - 8));
-  const below = rect.bottom + 6;
-  const above = rect.top - height - 6;
-  const top = below + height <= viewportHeight - 8
-    ? below
-    : Math.max(8, above);
-  return { left, top, width };
-}
-
-function summaryMenuPositionFromButton(button) {
-  return menuPositionFromButton(button, SUMMARY_MENU_WIDTH, SUMMARY_MENU_HEIGHT);
-}
-
-function viewMenuPositionFromButton(button) {
-  return menuPositionFromButton(button, VIEW_MENU_WIDTH, VIEW_MENU_HEIGHT);
-}
-
-function diffMenuPositionFromButton(button) {
-  return menuPositionFromButton(button, DIFF_MENU_WIDTH, DIFF_MENU_HEIGHT);
-}
+// 三套浮层菜单 id→{className,width,height} 映射。一次只开一个，单一 useFloatingMenu 实例互斥。
+const MENU_SPECS = {
+  summary: { className: 'summary-menu', width: SUMMARY_MENU_WIDTH, height: SUMMARY_MENU_HEIGHT },
+  view: { className: 'view-options-menu', width: VIEW_MENU_WIDTH, height: VIEW_MENU_HEIGHT },
+  diff: { className: 'diff-branch-menu', width: DIFF_MENU_WIDTH, height: DIFF_MENU_HEIGHT }
+};
 
 export function WorkspaceHeader({
   title,
@@ -79,169 +64,44 @@ export function WorkspaceHeader({
   onOpenEntityMaintenance,
   children
 }) {
-  const [summaryMenuOpen, setSummaryMenuOpen] = useState(false);
-  const [summaryMenuPosition, setSummaryMenuPosition] = useState(null);
   const [summaryConfirm, setSummaryConfirm] = useState(null);
-  const [viewMenuOpen, setViewMenuOpen] = useState(false);
-  const [viewMenuPosition, setViewMenuPosition] = useState(null);
-  const [diffMenuOpen, setDiffMenuOpen] = useState(false);
-  const [diffMenuPosition, setDiffMenuPosition] = useState(null);
   const [viewShowLeftInfo, setViewShowLeftInfo] = useState(true);
   const [viewShowTitles, setViewShowTitles] = useState(true);
   const [viewShowAxioms, setViewShowAxioms] = useState(true);
-  const summaryControlRef = useRef(null);
-  const viewOptionsButtonRef = useRef(null);
-  const diffButtonRef = useRef(null);
+
   const normalizedDiffBranches = Array.isArray(diffBranches) ? diffBranches : [];
   const enabledDiffBranches = normalizedDiffBranches.filter((branch) => (
     !branch?.disabled && Number(branch?.activeEntryCount) > 0
   ));
   const diffButtonDisabled = !hasTree || enabledDiffBranches.length === 0;
 
-  useEffect(() => {
-    if (!summaryMenuOpen) return undefined;
-    const close = () => {
-      setSummaryMenuOpen(false);
-      setSummaryMenuPosition(null);
-    };
-    const closeOnPointerDown = (event) => {
-      if (summaryControlRef.current?.contains(event.target)) return;
-      if (event.target?.closest?.('.summary-menu')) return;
-      close();
-    };
-    const closeOnEscape = (event) => {
-      if (event.key === 'Escape') close();
-    };
-    window.addEventListener('pointerdown', closeOnPointerDown);
-    window.addEventListener('keydown', closeOnEscape);
-    window.addEventListener('resize', close);
-    return () => {
-      window.removeEventListener('pointerdown', closeOnPointerDown);
-      window.removeEventListener('keydown', closeOnEscape);
-      window.removeEventListener('resize', close);
-    };
-  }, [summaryMenuOpen]);
-
-  useEffect(() => {
-    if (!viewMenuOpen) return undefined;
-    const close = () => {
-      setViewMenuOpen(false);
-      setViewMenuPosition(null);
-    };
-    const closeOnPointerDown = (event) => {
-      if (viewOptionsButtonRef.current?.contains(event.target)) return;
-      if (event.target?.closest?.('.view-options-menu')) return;
-      close();
-    };
-    const closeOnEscape = (event) => {
-      if (event.key === 'Escape') close();
-    };
-    window.addEventListener('pointerdown', closeOnPointerDown);
-    window.addEventListener('keydown', closeOnEscape);
-    window.addEventListener('resize', close);
-    return () => {
-      window.removeEventListener('pointerdown', closeOnPointerDown);
-      window.removeEventListener('keydown', closeOnEscape);
-      window.removeEventListener('resize', close);
-    };
-  }, [viewMenuOpen]);
-
-  useEffect(() => {
-    if (!diffMenuOpen) return undefined;
-    const close = () => {
-      setDiffMenuOpen(false);
-      setDiffMenuPosition(null);
-    };
-    const closeOnPointerDown = (event) => {
-      if (diffButtonRef.current?.contains(event.target)) return;
-      if (event.target?.closest?.('.diff-branch-menu')) return;
-      close();
-    };
-    const closeOnEscape = (event) => {
-      if (event.key === 'Escape') close();
-    };
-    window.addEventListener('pointerdown', closeOnPointerDown);
-    window.addEventListener('keydown', closeOnEscape);
-    window.addEventListener('resize', close);
-    return () => {
-      window.removeEventListener('pointerdown', closeOnPointerDown);
-      window.removeEventListener('keydown', closeOnEscape);
-      window.removeEventListener('resize', close);
-    };
-  }, [diffMenuOpen]);
-
-  function toggleSummaryMenu(event) {
-    event.stopPropagation();
-    if (summaryMenuOpen) {
-      setSummaryMenuOpen(false);
-      setSummaryMenuPosition(null);
-      return;
-    }
-    setViewMenuOpen(false);
-    setViewMenuPosition(null);
-    setDiffMenuOpen(false);
-    setDiffMenuPosition(null);
-    setSummaryMenuPosition(summaryMenuPositionFromButton(event.currentTarget));
-    setSummaryMenuOpen(true);
-  }
-
-  function toggleViewMenu(event) {
-    event.stopPropagation();
-    if (viewMenuOpen) {
-      setViewMenuOpen(false);
-      setViewMenuPosition(null);
-      return;
-    }
-    setSummaryMenuOpen(false);
-    setSummaryMenuPosition(null);
-    setDiffMenuOpen(false);
-    setDiffMenuPosition(null);
-    setViewMenuPosition(viewMenuPositionFromButton(event.currentTarget));
-    setViewMenuOpen(true);
-  }
+  // summary / view / diff 三套浮层菜单合一：单一 id-keyed 互斥。
+  const menu = useFloatingMenu({
+    specs: (id) => MENU_SPECS[id] || null,
+    offset: MENU_OFFSET
+  });
 
   function openDiffBranch(branch) {
-    setDiffMenuOpen(false);
-    setDiffMenuPosition(null);
+    menu.close();
     onOpenDiff?.(branch);
   }
 
-  function toggleDiffMenu(event) {
-    event.stopPropagation();
-    if (diffButtonDisabled) return;
-    if (enabledDiffBranches.length === 1) {
-      openDiffBranch(enabledDiffBranches[0]);
-      return;
-    }
-    if (diffMenuOpen) {
-      setDiffMenuOpen(false);
-      setDiffMenuPosition(null);
-      return;
-    }
-    setSummaryMenuOpen(false);
-    setSummaryMenuPosition(null);
-    setViewMenuOpen(false);
-    setViewMenuPosition(null);
-    setDiffMenuPosition(diffMenuPositionFromButton(event.currentTarget));
-    setDiffMenuOpen(true);
-  }
-
-  async function chooseSummaryMode(mode) {
-    setSummaryMenuOpen(false);
-    setSummaryMenuPosition(null);
-    const request = await onGenerateSummary?.(mode);
-    if (request) setSummaryConfirm(request);
+  function chooseSummaryMode(mode) {
+    menu.close();
+    onGenerateSummary?.(mode).then((request) => {
+      if (request) setSummaryConfirm(request);
+    });
   }
 
   function renderSummaryMenu() {
-    if (!summaryMenuOpen || !summaryMenuPosition) return null;
+    if (menu.openId !== 'summary' || !menu.position) return null;
     return createPortal(
       <div
         className="summary-menu"
         style={{
-          left: `${summaryMenuPosition.left}px`,
-          top: `${summaryMenuPosition.top}px`,
-          width: `${summaryMenuPosition.width}px`
+          left: `${menu.position.left}px`,
+          top: `${menu.position.top}px`,
+          width: `${menu.position.width}px`
         }}
         onClick={(event) => event.stopPropagation()}
       >
@@ -255,14 +115,14 @@ export function WorkspaceHeader({
   }
 
   function renderViewMenu() {
-    if (!viewMenuOpen || !viewMenuPosition || !['ide', 'rich'].includes(activeTab)) return null;
+    if (menu.openId !== 'view' || !menu.position || !['ide', 'rich'].includes(activeTab)) return null;
     return createPortal(
       <div
         className="view-options-menu"
         style={{
-          left: `${viewMenuPosition.left}px`,
-          top: `${viewMenuPosition.top}px`,
-          width: `${viewMenuPosition.width}px`
+          left: `${menu.position.left}px`,
+          top: `${menu.position.top}px`,
+          width: `${menu.position.width}px`
         }}
         onClick={(event) => event.stopPropagation()}
       >
@@ -302,14 +162,14 @@ export function WorkspaceHeader({
   }
 
   function renderDiffMenu() {
-    if (!diffMenuOpen || !diffMenuPosition || enabledDiffBranches.length <= 1) return null;
+    if (menu.openId !== 'diff' || !menu.position || enabledDiffBranches.length <= 1) return null;
     return createPortal(
       <div
         className="diff-branch-menu"
         style={{
-          left: `${diffMenuPosition.left}px`,
-          top: `${diffMenuPosition.top}px`,
-          width: `${diffMenuPosition.width}px`
+          left: `${menu.position.left}px`,
+          top: `${menu.position.top}px`,
+          width: `${menu.position.width}px`
         }}
         onClick={(event) => event.stopPropagation()}
       >
@@ -326,6 +186,24 @@ export function WorkspaceHeader({
       </div>,
       document.body
     );
+  }
+
+  function toggleDiffMenu(event) {
+    event.stopPropagation();
+    if (diffButtonDisabled) return;
+    if (enabledDiffBranches.length === 1) {
+      openDiffBranch(enabledDiffBranches[0]);
+      return;
+    }
+    menu.toggle('diff', event);
+  }
+
+  function toggleSummaryMenu(event) {
+    menu.toggle('summary', event);
+  }
+
+  function toggleViewMenu(event) {
+    menu.toggle('view', event);
   }
 
   const renderedChildren = typeof children === 'function'
@@ -376,7 +254,7 @@ export function WorkspaceHeader({
                 <span>{treeEditMode ? '编' : '锁'}</span>
               </button>
             )}
-            <div className="diff-branch-control" ref={diffButtonRef}>
+            <div className="diff-branch-control">
               <button
                 type="button"
                 className="tree-lock-button diff-branch-button"
@@ -407,7 +285,7 @@ export function WorkspaceHeader({
           >
             {showSecondaryTools && (
               <div className="depth-controls">
-                <div className="summary-control" ref={summaryControlRef}>
+                <div className="summary-control">
                   <button
                     type="button"
                     className={`summary-button summary-toggle ${summaryNotesVisible ? 'active' : ''}`}
@@ -460,7 +338,7 @@ export function WorkspaceHeader({
                 <button className="depth-icon-button depth-step-button" title="展开一层" aria-label="展开一层" onClick={() => setVisibleDepth(visibleDepthLimit + 1, { clearAll: true, action: 'expandOne' })}><DepthExpandOneIcon size={16} /></button>
                 <button className="depth-icon-button" title="全部展开" aria-label="全部展开" onClick={() => setVisibleDepth(actualMaxDepth, { clearAll: true, action: 'expandAll' })}><ChevronsUpDown size={16} /></button>
                 {['ide', 'rich'].includes(activeTab) && (
-                  <div className="view-options-control" ref={viewOptionsButtonRef}>
+                  <div className="view-options-control">
                     <button
                       className="depth-icon-button"
                       title="显示选项"

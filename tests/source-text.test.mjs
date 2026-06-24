@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { decodeXmlEntities, recordsFromPythonSource } from '../src/core/source-text.mjs';
+import { decodeXmlEntities, recordsFromPythonSource } from '../dist/src/core/source-text.js';
 
 test('decodeXmlEntities decodes named, decimal, and hex entities', () => {
   assert.equal(decodeXmlEntities('# &#36861; &#x4E66; &amp; tree'), '# 追 书 & tree');

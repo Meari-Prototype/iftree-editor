@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { callIftree } from './iftree-api.js';
 import { documentRepository } from './document-repository.js';
 

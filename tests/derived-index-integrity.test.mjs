@@ -6,11 +6,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store/index.mjs';
-import { createDerivedIndexReconciler } from '../src/backend/derived-index-reconciler.mjs';
-import { VectorStore } from '../src/vector/vector-store.mjs';
-import { MIN_VECTOR_DIMENSIONS } from '../src/vector/embeddings.mjs';
-import { computeSubtreeHashes } from '../src/core/merkle.mjs';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createDerivedIndexReconciler } from '../dist/src/backend/derived-index-reconciler.js';
+import { VectorStore } from '../dist/src/vector/vector-store.js';
+import { MIN_VECTOR_DIMENSIONS } from '../dist/src/vector/embeddings.js';
+import { computeSubtreeHashes } from '../dist/src/core/merkle.js';
 
 // 向量完整性检验（projectneed 15-8-1 / 14-2）与 BM25 增量同步（4-6-2）：
 // 有效性绑 node id + 节点自有正文——缺失补嵌、正文变更删旧重嵌、删除残留清理；

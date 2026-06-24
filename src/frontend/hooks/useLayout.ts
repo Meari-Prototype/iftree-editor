@@ -1,6 +1,7 @@
+// @ts-nocheck
 import { useCallback, useMemo, useRef, useState } from 'react';
 
-import { clampVerticalSplitSize } from '../../core/sidebar-split.mjs';
+import { clampVerticalSplitSize } from '../../core/sidebar-split.js';
 import {
   clamp,
   DEFAULT_SIDEBAR_WIDTH,
@@ -11,8 +12,8 @@ import {
   MIN_OUTLINE_PANEL_HEIGHT,
   MIN_RIGHT_WIDTH,
   PANEL_SPLIT_RAIL_SIZE
-} from '../lib/doc-utils.mjs';
-import { startResizeRailGesture } from '../lib/mindmap-utils.mjs';
+} from '../lib/doc-utils.js';
+import { startResizeRailGesture } from '../lib/mindmap-utils.js';
 
 const RAIL_ANIMATION_MS = 220;
 

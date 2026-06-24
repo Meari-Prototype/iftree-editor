@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyTreeDiff } from '../src/core/merkle-diff.mjs';
+import { classifyTreeDiff } from '../dist/src/core/merkle-diff.js';
 
 const n = (id, parentId, sortOrder, text, extra = {}) => ({
   id,

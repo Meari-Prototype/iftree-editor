@@ -1,17 +1,19 @@
+// @ts-nocheck
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { appendGeneratedNote, hasGeneratedNote, plainNodeNote } from '../../core/node-notes.mjs';
-import { flattenTree } from '../../core/tree.mjs';
-import { summaryTargetsForMode as buildSummaryTargetsForMode } from '../../core/tree-ui.mjs';
+import { appendGeneratedNote, hasGeneratedNote, plainNodeNote } from '../../core/node-notes.js';
+import { flattenTree } from '../../core/tree.js';
+import { summaryTargetsForMode as buildSummaryTargetsForMode } from '../../core/tree-ui.js';
 import {
-  depthOf, mergeDocView, patchNodeInDoc,
+  depthOf,
   readPersistedSummaryNotesVisible, persistSummaryNotesVisible
-} from '../lib/doc-utils.mjs';
+} from '../lib/doc-utils.js';
 import {
   normalizeSummaryStrategy, normalizeSummaryConcurrency, normalizeSummaryStrategySettings,
   summaryStrategyForMode, applySummarySkipStrategy, summarySkipBelowCount
-} from '../lib/summary-utils.mjs';
+} from '../lib/summary-utils.js';
 import { documentRepository, nodeRepository, summaryService } from '../data/repositories.js';
+import { useAppUIContext } from './useAppUI.js';
 
 function summaryNodeLabel(node) {
   if (!node) return '未选中节点';
@@ -34,7 +36,9 @@ async function cancelSummaryRunRequests(run) {
 
 // 摘要生成编排：确认请求构造（generateSummary）→ 并发 worker 生成 + writeChain 串行写入
 // （runSummaryGeneration）→ 取消传播。摘要备注显隐也归这里。
-// 写入路径经注入的 resolveWriteDoc/syncEditBranchHistoryStacks 走 App 统一管道。
+// 逐次写回走注入的 dispatch 轻档（undo:'none' / docsRefresh:'none' / busy:false）——
+// N 次并发生成 + 串行写入，每次都走 dispatch 重档（capture + listDocs）会 N 次快照 + N 次列表拉取；
+// 摘要末尾自己刷一次 listDocs。
 export function useSummaryRun({
   currentDoc = null,
   treeEditMode = false,
@@ -42,15 +46,10 @@ export function useSummaryRun({
   selectedNodeId = null,
   multiSelectedNodeIds = new Set(),
   llmSummarySettings = null,
-  setBusy,
-  setNotice,
-  setProgress,
   setDocs,
-  setCurrentDoc,
-  resolveWriteDoc,
-  syncEditBranchHistoryStacks,
-  activeEditBranch
+  dispatch
 }: any = {}) {
+  const { setBusy, setNotice, setProgress } = useAppUIContext();
   const [summaryNotesVisible, setSummaryNotesVisible] = useState(true);
   const summaryRunRef = useRef(null);
 
@@ -78,7 +77,7 @@ export function useSummaryRun({
       : selectedNodeId
         ? [selectedNodeId]
         : [];
-    return buildSummaryTargetsForMode({
+    return (buildSummaryTargetsForMode as any)({
       tree: currentDoc?.tree,
       selectedNodeId,
       selectedNodeIds,
@@ -224,26 +223,16 @@ export function useSummaryRun({
         const writeTask = writeChain.then(async () => {
           if (run.canceled || firstError) return;
           const nextNote = appendGeneratedNote(work.item.target.node.note || '', summary);
-          const next = await nodeRepository.updateNode({
-            docId: currentDoc.doc.id,
-            nodeId: work.item.target.node.id,
-            patch: { node_note: nextNote },
-            includeDoc: false
-          });
-          if (next?.refresh?.kind === 'node' && next.node) {
-            setCurrentDoc((current) => {
-              const patched = patchNodeInDoc(current, next.node);
-              return next.editBranch ? { ...patched, editBranch: next.editBranch } : patched;
-            });
-            if (treeEditMode) syncEditBranchHistoryStacks(next.editBranch || activeEditBranch());
-          } else {
-            const nextDoc = await resolveWriteDoc(next);
-            if (nextDoc) {
-              setCurrentDoc((current) => mergeDocView(current, nextDoc));
-              if (treeEditMode) syncEditBranchHistoryStacks(nextDoc.editBranch || next.editBranch || activeEditBranch());
-            }
-          }
-          generated += 1;
+          const result = await dispatch(
+            () => nodeRepository.updateNode({
+              docId: currentDoc.doc.id,
+              nodeId: work.item.target.node.id,
+              patch: { node_note: nextNote },
+              includeDoc: false
+            }),
+            { effects: { undo: 'none', docsRefresh: 'none', busy: false } }
+          );
+          if (result !== null && result !== undefined) generated += 1;
         }).catch(async (error) => {
           if (!firstError) firstError = { error, index: work.index };
           run.canceled = true;

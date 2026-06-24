@@ -1,11 +1,12 @@
-﻿import { PanelLeftClose, PanelRightOpen
+﻿// @ts-nocheck
+import { PanelLeftClose, PanelRightOpen
 } from 'lucide-react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.mjs?url';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { canvas2dContextOptions } from '../../core/hardware-strategy.mjs';
-import { plainNodeNote } from '../../core/node-notes.mjs';
+import { canvas2dContextOptions } from '../../core/hardware-strategy.js';
+import { plainNodeNote } from '../../core/node-notes.js';
 
 
 
@@ -13,7 +14,7 @@ import { plainNodeNote } from '../../core/node-notes.mjs';
 import { collectNodeAndDescendantIds } from './RichTextView.jsx';
 import { base64ToUint8Array, formatSourceSentenceLabel, sourceRangeForSpans, sourceRangesForSpans, sourceSpanAbsoluteStart, sourceSpanKey } from './SourceBlocks.jsx';
 import { readSourcePdfData, readSourcePdfHighlights, readSourcePdfSpanRects } from '../data/source-repository.js';
-import { depthOf, hasKnownChildren } from '../lib/doc-utils.mjs';
+import { depthOf, hasKnownChildren } from '../lib/doc-utils.js';
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 

@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { buildMarkdownStructureRecords, buildSourceDocument } from '../src/core/source-markdown.mjs';
-import { IftreeStore } from '../src/backend/store/index.mjs';
+import { buildMarkdownStructureRecords, buildSourceDocument } from '../dist/src/core/source-markdown.js';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-store-'));

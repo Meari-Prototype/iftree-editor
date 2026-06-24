@@ -1,9 +1,10 @@
+// @ts-nocheck
 import { ImagePlus, Plus, RotateCcw, Search as SearchIcon, Unlink } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { plainNodeNote } from '../../core/node-notes.mjs';
-import { clampVerticalSplitSize } from '../../core/sidebar-split.mjs';
-import { NODE_TYPES } from '../../core/tree.mjs';
+import { plainNodeNote } from '../../core/node-notes.js';
+import { clampVerticalSplitSize } from '../../core/sidebar-split.js';
+import { NODE_TYPES } from '../../core/tree.js';
 import {
   DEFAULT_AGENT_PANEL_BASIS,
   MAX_AGENT_PANEL_HEIGHT,
@@ -14,9 +15,9 @@ import {
   depthOf,
   isFactAxiomRef,
   nodeTypeLabel
-} from '../lib/doc-utils.mjs';
-import { startResizeRailGesture } from '../lib/mindmap-utils.mjs';
-import { formatDate } from '../lib/ui-utils.mjs';
+} from '../lib/doc-utils.js';
+import { startResizeRailGesture } from '../lib/mindmap-utils.js';
+import { formatDate } from '../lib/ui-utils.js';
 import { AgentPanel } from './AgentPanel.jsx';
 import { IconButton, LocateNodeButton } from './common.jsx';
 

@@ -8,7 +8,7 @@ import {
   markdownToPlainText,
   parseMarkdownBlocks,
   renderTexMathToText
-} from '../src/core/markdown.mjs';
+} from '../dist/src/core/markdown.js';
 
 test('parseMarkdownBlocks identifies headings, paragraphs, images, and math blocks', () => {
   const blocks = parseMarkdownBlocks('# 标题\n\n正文 **重点** `code`\n\n![图](assets/a.png)\n\n$$x^2$$');

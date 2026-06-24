@@ -1,4 +1,5 @@
-﻿import { ArrowUp, Bot, Brain, Check, ChevronDown, ChevronRight, Trash2, X
+﻿// @ts-nocheck
+import { ArrowUp, Bot, Brain, Check, ChevronDown, ChevronRight, Trash2, X
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
@@ -8,7 +9,7 @@ import {
   AGENT_REASONING_OPTIONS, agentBranchDocLabel, agentBranchEntries, agentBranchOwnerLabel, agentContextUsageView, agentModeLabel, agentReasoningLabel, agentReasoningShortLabel,
   agentSessionTime, agentSessionTitle, agentToolArgsSummary, agentToolNameText, agentToolStatusText, buildAgentModelOptions, compactAgentModelLabel,
   defaultAgentModelKey, formatAgentElapsed
-} from '../lib/agent-utils.mjs';
+} from '../lib/agent-utils.js';
 
 
 
@@ -322,6 +323,8 @@ export function AgentPanel({
             <div className="agent-message-list">
               {messages.map((message) => {
                 const role = message.role === 'user' ? 'user' : 'assistant';
+                // text 是纯文本投影：user 消息正文，或 assistant 没有 segments 时的回退（旧会话）。
+                // 正常 assistant 走下面的 segments 渲染——segments 才是展示主真相，answer 只兜底 + 供历史回传。
                 const text = role === 'user' ? message.content : message.answer;
                 const meta = `${message.status || '智能体'}${message.elapsedMs ? ` · ${formatAgentElapsed(message.elapsedMs)}` : ''}`;
                 if (role === 'user') {

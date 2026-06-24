@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { writeDatabase } from './database-client.js';
 
 export const historyRepository = {

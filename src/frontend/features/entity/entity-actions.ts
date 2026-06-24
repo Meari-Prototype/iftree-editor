@@ -1,3 +1,4 @@
+// @ts-nocheck
 function normalizedTerms(query = '') {
   return String(query || '').trim().split(/\s+/).filter(Boolean);
 }

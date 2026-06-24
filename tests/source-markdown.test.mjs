@@ -8,7 +8,7 @@ import {
   buildMarkdownStructureRecords,
   parseSourceMarkdownBlocks,
   sourceSpansFromMarkdown
-} from '../src/core/source-markdown.mjs';
+} from '../dist/src/core/source-markdown.js';
 
 test('buildSourceDocument keeps raw markdown and emits offset sentence spans', () => {
   const rawMarkdown = [

@@ -3,7 +3,7 @@ import './_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { clampVerticalSplitSize } from '../src/core/sidebar-split.mjs';
+import { clampVerticalSplitSize } from '../dist/src/core/sidebar-split.js';
 
 test('clampVerticalSplitSize resizes a vertical split and preserves both panel minimums', () => {
   assert.equal(clampVerticalSplitSize({

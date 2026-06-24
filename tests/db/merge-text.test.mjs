@@ -2,7 +2,7 @@ import '../_assert-electron.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formatThreeWayMergeText } from '../../src/backend/merge-text.mjs';
+import { formatThreeWayMergeText } from '../../dist/src/backend/merge-text.js';
 
 // formatThreeWayMergeText 是纯函数：把三方合并预览折叠成人读文本——未改节点折叠进计数行、
 // 只列有裁决/冲突的节点。覆盖三类：无冲突可落库、有冲突待裁、非预览形状回退裸 JSON。

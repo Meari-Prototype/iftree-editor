@@ -2,8 +2,8 @@
 // Event handling logic for C2DMapView.
 // Each function takes explicit context — no closures over React state.
 
-import { clamp, clampCenterScrollTop } from './c2d-measure.mjs';
-import { parentAddress } from '../../core/node-model.mjs';
+import { clamp, clampCenterScrollTop } from './c2d-measure.js';
+import { parentAddress } from '../../core/node-model.js';
 import type { C2DBlock, C2DColumn } from './c2d-types';
 
 type ColEls = Map<number, HTMLElement>;

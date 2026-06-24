@@ -1,10 +1,11 @@
-﻿
+﻿// @ts-nocheck
+
 import { useMemo } from 'react';
-import { plainNodeNote } from '../../core/node-notes.mjs';
-import { flattenTree } from '../../core/tree.mjs';
+import { plainNodeNote } from '../../core/node-notes.js';
+import { flattenTree } from '../../core/tree.js';
 import {
   depthOf
-} from '../lib/doc-utils.mjs';
+} from '../lib/doc-utils.js';
 
 
 

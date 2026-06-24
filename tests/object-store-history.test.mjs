@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store/index.mjs';
-import { runDatabaseWrite } from '../src/backend/mutation-api.mjs';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { runDatabaseWrite } from '../dist/src/backend/mutation-api.js';
 
 // 第 4 步内容寻址历史的 A 层回归：commit 把快照拆进对象库（blob/tree/source）+ 内联 meta，
 // restore/重建从对象库展开回来。核心断言是「拆进去再展开 == 原样」（内容 + 结构），外加去重与字段处置。

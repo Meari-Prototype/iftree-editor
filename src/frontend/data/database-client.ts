@@ -1,5 +1,6 @@
+// @ts-nocheck
 import { hasIftreeMethod, rawIftreeApi } from './iftree-api.js';
-import { debugElapsedMs, debugLog, debugStartedAt, summarizePayload, summarizeResult } from '../lib/debug-log.mjs';
+import { debugElapsedMs, debugLog, debugStartedAt, summarizePayload, summarizeResult } from '../lib/debug-log.js';
 
 export function canReadDatabase() {
   return hasIftreeMethod('readDatabase');

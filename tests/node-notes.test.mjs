@@ -9,7 +9,7 @@ import {
   mergeNodeNotes,
   parseNodeNote,
   plainNodeNote
-} from '../src/core/node-notes.mjs';
+} from '../dist/src/core/node-notes.js';
 
 test('generated node notes are stored in one field and parsed into display segments', () => {
   const note = appendGeneratedNote('Manual note', 'AI summary');

@@ -11,7 +11,7 @@ function Root() {
   return <App />;
 }
 
-createRoot(document.getElementById('root')).render(
+createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <Root />
   </React.StrictMode>

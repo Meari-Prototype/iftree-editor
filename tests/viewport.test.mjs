@@ -11,7 +11,7 @@ import {
   panCamera,
   screenToWorld,
   zoomCamera
-} from '../src/core/viewport.mjs';
+} from '../dist/src/core/viewport.js';
 
 test('zoomCamera keeps the world point under the cursor fixed', () => {
   const viewport = { width: 800, height: 600 };

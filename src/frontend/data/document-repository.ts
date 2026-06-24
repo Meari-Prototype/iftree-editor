@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { callIftree } from './iftree-api.js';
 import { canReadDatabase, readDatabase, writeDatabase } from './database-client.js';
 

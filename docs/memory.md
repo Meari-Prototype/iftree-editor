@@ -82,8 +82,8 @@
 
 只有真用 MCP / CLI 动手才会撞到，schema 自述不会写：
 
-- **CLI 要用 electron 跑，不是纯 node**。`db.mjs` / `query-db.mjs` 等加载 `better-sqlite3`，它按 Electron ABI 编译——`node scripts/db.mjs …` 会报 `NODE_MODULE_VERSION` 不匹配。正确：`ELECTRON_RUN_AS_NODE=1` 经 `.\node_modules\.bin\electron.cmd scripts/db.mjs …`（`npm run mcp` 就是这么起的）。
-- **改动生效边界**：改后端代码（store/handlers/db-shell…）后端是 headless 子进程、惰性启动 → `restart_backend` 放掉旧子进程、下次调用才加载新代码；改 `scripts/mcp-server.mjs`（工具注册/schema）→ 须**重连 MCP**，`restart_backend` 不够；`db.mjs`/CLI 每次 spawn 新进程，改完即时生效。
+- **CLI 用 node 跑**。`db` / `query-db` 等加载的 `better-sqlite3` 是 node ABI（`prebuild-install` 下预编译，无需编译工具链）：先 `npm run build:runtime`，再 `node dist/scripts/db.js …` / `node dist/scripts/query-db.js …`。
+- **改动生效边界**：改后端代码（store/handlers/db-shell…）后端是 headless 子进程、惰性启动 → `restart_backend` 放掉旧子进程、下次调用才加载新代码；改 `scripts/mcp-server.ts`（工具注册/schema）→ 须**重连 MCP**，`restart_backend` 不够；`db.ts`/CLI 每次 spawn 新进程，改完即时生效。
 - **`edit` 的两类 id 别混**：`baseDocId` 要 **doc id**，`parentId` / `nodeId` 要 **节点 id**。同篇文档这俩前缀常相同、尾号不同，混用直接 `FOREIGN KEY constraint failed`。
 - **reparent / move 按 uuid，不按地址**：地址会随每次结构改动重投影漂移；用稳定节点 id 作 `nodeId` / `newParentId`，叠多少次都不错位。
 - **草稿幂等复用**：同 owner 在同文档已有活跃草稿时，`draft new` / 后续 `edit` 复用它而非新建——连续动作自动叠在一份草稿上。

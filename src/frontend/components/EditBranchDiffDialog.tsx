@@ -1,8 +1,9 @@
+// @ts-nocheck
 import { X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
-import { diffTextSegments } from '../../core/text-diff.mjs';
-import { nodeTypeLabel } from '../lib/doc-utils.mjs';
+import { diffTextSegments } from '../../core/text-diff.js';
+import { nodeTypeLabel } from '../lib/doc-utils.js';
 
 const FIELD_LABELS = {
   text: '正文',

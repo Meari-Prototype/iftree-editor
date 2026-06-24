@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store/index.mjs';
-import { stageEntityWrite } from '../src/backend/entities/write.mjs';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { stageEntityWrite } from '../dist/src/backend/entities/write.js';
 
 // 回归：编辑分支提交时，diff 里的 entity 条目必须经 applyEntityEntry 真实落库。
 //

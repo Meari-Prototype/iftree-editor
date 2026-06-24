@@ -1,7 +1,8 @@
+// @ts-nocheck
 import { Gauge, Lock,
   RotateCcw, SlidersHorizontal, Unlock
 } from 'lucide-react';
-import { DEFAULT_NODE_LAYOUT } from '../../../core/mindmap.mjs';
+import { DEFAULT_NODE_LAYOUT } from '../../../core/mindmap.js';
 
 
 export function NodeLayoutSettingsPanel({

@@ -1,7 +1,8 @@
+// @ts-nocheck
 import { ArrowLeft, Bot, Brain, Cpu, Database, ExternalLink, Gauge, HardDrive, Power, Settings, SlidersHorizontal, Upload, Zap } from 'lucide-react';
 import { useState } from 'react';
-import { normalizeNodeLayoutSettingsByView } from '../lib/doc-utils.mjs';
-import { progressCountText } from '../lib/ui-utils.mjs';
+import { normalizeNodeLayoutSettingsByView } from '../lib/doc-utils.js';
+import { progressCountText } from '../lib/ui-utils.js';
 import { IconButton } from './common.jsx';
 import { AgentSettingsPanel } from './settings/AgentSettingsPanel.jsx';
 import { NodeLayoutSettingsPanel } from './settings/NodeLayoutSettingsPanel.jsx';

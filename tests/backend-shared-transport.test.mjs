@@ -14,9 +14,9 @@ import {
   removeBackendDescriptorIfOwn,
   resolveBackendDbPath,
   writeBackendDescriptor
-} from '../src/backend/llm/backend-discovery.mjs';
-import { createSharedBackendServer, probeBackendPipe } from '../src/backend/llm/backend-shared-server.mjs';
-import { createPipeBackendClient } from '../src/backend/llm/backend-pipe-client.mjs';
+} from '../dist/src/backend/llm/backend-discovery.js';
+import { createSharedBackendServer, probeBackendPipe } from '../dist/src/backend/llm/backend-shared-server.js';
+import { createPipeBackendClient } from '../dist/src/backend/llm/backend-pipe-client.js';
 
 let pipeSeq = 0;
 function testPipeName(dir) {

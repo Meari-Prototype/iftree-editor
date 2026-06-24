@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { useCallback, useRef, useState } from 'react';
 
 // 把「弹确认框 -> 等用户点选 -> resolve 一个 Promise」这套命令式弹窗统一成一个 hook。

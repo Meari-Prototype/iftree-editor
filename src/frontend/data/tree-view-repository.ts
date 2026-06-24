@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { canWriteDatabase, writeDatabase } from './database-client.js';
 
 function normalizeTreeViewResult(result) {

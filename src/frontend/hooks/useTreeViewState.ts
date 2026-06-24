@@ -1,30 +1,43 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+// @ts-nocheck
+import { useCallback, useMemo, useRef, useState } from 'react';
 
 import {
   clampDepthLimit,
   docDepthStats,
   fullDepthForDoc,
-  loadedDepthForDoc,
-  normalizeDocId,
-  promoteTreeViewDepthIfLayerExpanded,
-  sameDocId,
-  treeViewStateFromDoc,
-  treeViewStatePayload
-} from '../lib/doc-utils.mjs';
-import { treeViewRepository } from '../data/repositories.js';
+  parseTreeViewState,
+  promoteTreeViewDepthIfLayerExpanded
+} from '../lib/doc-utils.js';
 
-export function useTreeViewState({ currentDoc = null, setCurrentDoc, setNotice, setProgress, setOperationLock, loadTreeDepth }: any = {}) {
-  const [depthLimit, setDepthLimit] = useState(1);
-  const [axiomsCollapsed, setAxiomsCollapsed] = useState(false);
-  const [collapsed, setCollapsed] = useState(() => new Set());
-  const [expanded, setExpanded] = useState(() => new Set());
-  const [collapsedOutlineNodeIds, setCollapsedOutlineNodeIds] = useState(() => new Set());
+const EMPTY_SET = new Set();
+
+function idArray(value) {
+  return [...(value instanceof Set ? value : (value || []))];
+}
+
+// 退化为 session 转发壳：折叠/展开/深度/outline 的真相在 session.view（经 documentState 投影/动词）。
+// 本 hook 不再持有它们的 useState，只保留两类本地态：
+//   - axiomsCollapsed 从 doc.axioms_collapsed 派生（真相在 doc，写走 patchDocMeta / 写管道）；
+//   - c2dDepthControlSeq/Action 是 C2D 地图视图的命令脉冲（非文档真相），本地自持。
+// setVisibleDepth/persist/promote 等编排转发到 documentState.setViewSnapshot/setVisibleDepth。
+export function useTreeViewState(documentState) {
+  const currentDoc = documentState?.currentDoc ?? null;
+  const view = documentState?.view ?? null;
+
+  const depthLimit = view?.depthLimit ?? 1;
+  const collapsed = view?.collapsed ?? EMPTY_SET;
+  const expanded = view?.expanded ?? EMPTY_SET;
+  const collapsedOutlineNodeIds = view?.outlineCollapsed ?? EMPTY_SET;
+  const axiomsCollapsed = Boolean(currentDoc?.doc?.axioms_collapsed);
+
   const outlineCollapseDocRef = useRef(null);
-  // C2D 深度控制脉冲：seq 自增触发地图视图执行一次 action（setDepth/collapseOne）。
   const [c2dDepthControlSeq, setC2dDepthControlSeq] = useState(0);
   const [c2dDepthControlAction, setC2dDepthControlAction] = useState('setDepth');
 
-  const treeDepthStats = useMemo(() => docDepthStats(currentDoc), [currentDoc?.doc?.id, currentDoc?.tree, currentDoc?.treeDepthStats]);
+  const treeDepthStats = useMemo(
+    () => docDepthStats(currentDoc),
+    [currentDoc?.doc?.id, currentDoc?.tree, currentDoc?.treeDepthStats]
+  );
   const actualMaxDepth = treeDepthStats.maxDepth;
   const depthOptions = useMemo(() => (
     [...new Set((treeDepthStats.depths.length > 0
@@ -35,129 +48,85 @@ export function useTreeViewState({ currentDoc = null, setCurrentDoc, setNotice, 
       .sort((left, right) => Number(left) - Number(right))
   ), [actualMaxDepth, treeDepthStats]);
 
-  useEffect(() => {
-    setDepthLimit((value) => clampDepthLimit(value, actualMaxDepth));
-  }, [actualMaxDepth, currentDoc?.tree]);
+  const setCollapsed = useCallback((next) => {
+    const resolved = typeof next === 'function' ? next(view?.collapsed ?? EMPTY_SET) : next;
+    documentState?.setViewSnapshot?.({ collapsedNodeIds: idArray(resolved) });
+  }, [documentState, view]);
 
-  function applyState(doc) {
-    const maxDepth = fullDepthForDoc(doc);
-    const state = treeViewStateFromDoc(doc, maxDepth);
-    setDepthLimit(state.depthLimit);
-    setCollapsed(state.collapsed);
-    setExpanded(state.expanded);
-    setCollapsedOutlineNodeIds(state.outlineCollapsed || new Set());
-  }
+  const setExpanded = useCallback((next) => {
+    const resolved = typeof next === 'function' ? next(view?.expanded ?? EMPTY_SET) : next;
+    documentState?.setViewSnapshot?.({ expandedNodeIds: idArray(resolved) });
+  }, [documentState, view]);
 
-  function persist(nextDepthLimit, nextCollapsed, nextExpanded, targetDocId = currentDoc?.doc?.id, nextOutlineCollapsed = collapsedOutlineNodeIds) {
-    const docId = normalizeDocId(targetDocId);
-    if (!docId || !treeViewRepository.canSaveTreeViewState()) return;
-    const state = treeViewStatePayload(nextDepthLimit, nextCollapsed, nextExpanded, nextOutlineCollapsed);
-    treeViewRepository.saveTreeViewState({
-      docId,
-      state
-    }).then((updated) => {
-      if (!updated?.doc) return;
-      setCurrentDoc?.((current) => (
-        normalizeDocId(current?.doc?.id) === normalizeDocId(docId)
-          ? { ...current, doc: { ...current.doc, tree_view_state: updated.doc.tree_view_state } }
-          : current
-      ));
-    }).catch((error) => setNotice?.(error.message));
-  }
+  const setDepthLimit = useCallback((next) => {
+    const resolved = typeof next === 'function' ? next(view?.depthLimit ?? 1) : next;
+    documentState?.setViewSnapshot?.({ depthLimit: resolved });
+  }, [documentState, view]);
 
-  function persistOutline(outlineCollapsed) {
-    persist(depthLimit, collapsed, expanded, currentDoc?.doc?.id, outlineCollapsed);
-  }
+  const setCollapsedOutlineNodeIds = useCallback((next) => {
+    const resolved = typeof next === 'function' ? next(view?.outlineCollapsed ?? EMPTY_SET) : next;
+    documentState?.setViewSnapshot?.({ outlineCollapsedNodeIds: idArray(resolved) });
+  }, [documentState, view]);
 
-  function setPersisted(nextDepthLimit, nextCollapsed, nextExpanded, targetDocId = currentDoc?.doc?.id) {
-    setDepthLimit(nextDepthLimit);
-    setCollapsed(new Set(nextCollapsed));
-    setExpanded(new Set(nextExpanded));
-    persist(nextDepthLimit, nextCollapsed, nextExpanded, targetDocId);
-  }
+  const setAxiomsCollapsed = useCallback((value) => {
+    const doc = documentState?.currentDoc?.doc;
+    if (doc) documentState?.patchDocMeta?.({ doc: { ...doc, axioms_collapsed: Boolean(value) } });
+  }, [documentState]);
 
-  function setPersistedAfterExpansion(nextDepthLimit, nextCollapsed, nextExpanded) {
+  // 从 doc.tree_view_state 恢复（loadComplete 打开时已做；这里供编排显式恢复）。
+  const applyState = useCallback((doc) => {
+    documentState?.applyDocViewState?.(parseTreeViewState(doc?.doc?.tree_view_state));
+  }, [documentState]);
+
+  const persist = useCallback((nextDepthLimit, nextCollapsed, nextExpanded, _docId = undefined, nextOutline = undefined) => {
+    documentState?.setViewSnapshot?.({
+      depthLimit: nextDepthLimit,
+      collapsedNodeIds: idArray(nextCollapsed),
+      expandedNodeIds: idArray(nextExpanded),
+      ...(nextOutline !== undefined ? { outlineCollapsedNodeIds: idArray(nextOutline) } : {})
+    }, { persist: true });
+  }, [documentState]);
+
+  const setPersisted = persist;
+
+  const setPersistedAfterExpansion = useCallback((nextDepthLimit, nextCollapsed, nextExpanded) => {
+    // 保留 promote（展开整层自动提深度），与旧行为一致；用已投影 tree 判断。
     const promoted = promoteTreeViewDepthIfLayerExpanded(
-      currentDoc?.tree,
-      nextDepthLimit,
-      nextCollapsed,
-      nextExpanded,
-      fullDepthForDoc(currentDoc)
+      currentDoc?.tree, nextDepthLimit, nextCollapsed, nextExpanded, fullDepthForDoc(currentDoc)
     );
-    if (promoted) {
-      setPersisted(promoted.depthLimit, promoted.collapsed, promoted.expanded);
-      return;
+    const target = promoted || { depthLimit: nextDepthLimit, collapsed: nextCollapsed, expanded: nextExpanded };
+    documentState?.setViewSnapshot?.({
+      depthLimit: target.depthLimit,
+      collapsedNodeIds: idArray(target.collapsed),
+      expandedNodeIds: idArray(target.expanded)
+    }, { persist: true });
+  }, [documentState, currentDoc]);
+
+  const persistOutline = useCallback((outline) => {
+    documentState?.setViewSnapshot?.({ outlineCollapsedNodeIds: idArray(outline) }, { persist: true });
+  }, [documentState]);
+
+  const setVisibleDepth = useCallback(async (nextValue, { clearAll = false, action = 'setDepth' }: any = {}) => {
+    const nextDepth = clampDepthLimit(Number(nextValue) || 1, actualMaxDepth);
+    if (clearAll) {
+      documentState?.setViewSnapshot?.({ depthLimit: nextDepth, collapsedNodeIds: [], expandedNodeIds: [] }, { persist: true });
+    } else {
+      await documentState?.setVisibleDepth?.(nextDepth);
     }
-    setPersisted(nextDepthLimit, nextCollapsed, nextExpanded);
-  }
+    setC2dDepthControlAction(action || 'setDepth');
+    setC2dDepthControlSeq((seq) => seq + 1);
+  }, [documentState, actualMaxDepth]);
 
-  async function resolveVisibleDepth(nextValue) {
-    const requestedDepth = Math.max(1, Math.floor(Number(nextValue) || 1));
-    return clampDepthLimit(requestedDepth, actualMaxDepth);
-  }
-
-  async function setVisibleDepth(nextValue, { clearAll = false, restoreLocalFirst = false, action = 'setDepth' } = {}) {
-    try {
-      const hasLocalTreeState = !clearAll && (collapsed.size > 0 || expanded.size > 0);
-      if (restoreLocalFirst && hasLocalTreeState) {
-        setPersisted(depthLimit, new Set(), new Set());
-        return;
-      }
-      const nextDepth = await resolveVisibleDepth(nextValue);
-      if (!nextDepth) {
-        if (hasLocalTreeState) setPersisted(depthLimit, new Set(), new Set());
-        return;
-      }
-      const nextExpanded = new Set();
-      const nextCollapsed = new Set();
-      applyVisibleTreeDepth(nextDepth, nextCollapsed, nextExpanded, action).catch((error) => {
-        setNotice?.(error.message);
-        setProgress?.(null);
-        setOperationLock?.(null);
-      });
-    } catch (error) {
-      setNotice?.(error.message);
-      setProgress?.(null);
-      setOperationLock?.(null);
-    }
-  }
-
-  async function applyVisibleTreeDepth(nextDepth, nextCollapsed, nextExpanded, action = 'setDepth') {
-    const unlockOnDone = () => {
-      setProgress?.(null);
-      setOperationLock?.(null);
-    };
-    try {
-      const doc = await loadTreeDepth(nextDepth);
-      const resolvedDoc = sameDocId(doc?.doc?.id, currentDoc?.doc?.id)
-        ? {
-            ...currentDoc,
-            ...doc,
-            tree: loadedDepthForDoc(doc) >= loadedDepthForDoc(currentDoc) ? doc?.tree : currentDoc?.tree,
-            nodes: doc?.nodes?.length ? doc.nodes : currentDoc?.nodes
-          }
-        : (doc || currentDoc);
-      if (resolvedDoc) setCurrentDoc?.(resolvedDoc);
-      setPersisted(nextDepth, nextCollapsed, nextExpanded);
-      setC2dDepthControlAction(action || 'setDepth');
-      setC2dDepthControlSeq((seq) => seq + 1);
-      unlockOnDone();
-    } catch (error) {
-      unlockOnDone();
-      throw error;
-    }
-  }
-
-  function collapseVisibleDepthOne() {
+  const collapseVisibleDepthOne = useCallback(() => {
     setVisibleDepth(depthLimit - 1, { clearAll: true, action: 'collapseOne' });
-  }
+  }, [setVisibleDepth, depthLimit]);
 
   const syncC2dVisibleDepth = useCallback((nextDepth) => {
-    const resolvedDepth = clampDepthLimit(nextDepth, actualMaxDepth);
-    setDepthLimit((current) => (current === resolvedDepth ? current : resolvedDepth));
-  }, [actualMaxDepth, setDepthLimit]);
+    const resolved = clampDepthLimit(nextDepth, actualMaxDepth);
+    documentState?.setViewSnapshot?.({ depthLimit: resolved });
+  }, [documentState, actualMaxDepth]);
 
-  const base = useMemo(() => ({
+  return useMemo(() => ({
     depthLimit,
     axiomsCollapsed,
     collapsed,
@@ -169,30 +138,25 @@ export function useTreeViewState({ currentDoc = null, setCurrentDoc, setNotice, 
     setExpanded,
     setCollapsedOutlineNodeIds,
     outlineCollapseDocRef,
+    actualMaxDepth,
+    depthOptions,
+    treeDepthStats,
+    c2dDepthControlSeq,
+    c2dDepthControlAction,
+    setVisibleDepth,
+    collapseVisibleDepthOne,
+    syncC2dVisibleDepth,
     applyState,
     persist,
     persistOutline,
     setPersisted,
     setPersistedAfterExpansion
   }), [
-    axiomsCollapsed,
-    collapsed,
-    collapsedOutlineNodeIds,
-    depthLimit,
-    expanded,
-    currentDoc
+    depthLimit, axiomsCollapsed, collapsed, expanded, collapsedOutlineNodeIds,
+    setDepthLimit, setAxiomsCollapsed, setCollapsed, setExpanded, setCollapsedOutlineNodeIds,
+    actualMaxDepth, depthOptions, treeDepthStats,
+    c2dDepthControlSeq, c2dDepthControlAction,
+    setVisibleDepth, collapseVisibleDepthOne, syncC2dVisibleDepth,
+    applyState, persist, persistOutline, setPersistedAfterExpansion
   ]);
-
-  // 深度控制函数每渲染重建（闭包始终取最新 currentDoc/loadTreeDepth），不进 memo。
-  return {
-    ...base,
-    treeDepthStats,
-    actualMaxDepth,
-    depthOptions,
-    c2dDepthControlSeq,
-    c2dDepthControlAction,
-    setVisibleDepth,
-    collapseVisibleDepthOne,
-    syncC2dVisibleDepth
-  };
 }

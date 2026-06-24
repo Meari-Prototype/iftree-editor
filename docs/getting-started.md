@@ -18,7 +18,7 @@ npm run build
 npm run app
 ```
 
-也可以直接双击仓库根目录的 `start.bat`，它会自动完成「安装依赖 → 构建 → 启动」。首次启动前会按 Electron 的 ABI 重编原生模块（better-sqlite3、LanceDB），需要等一会。
+也可以直接双击仓库根目录的 `start.bat`，它会自动完成「安装依赖 → 构建 → 启动」。首次启动前会按 node ABI 预编译原生模块（better-sqlite3，`prebuild-install`），需要等一会。
 
 应用先打开的是**启动器**：
 
@@ -72,9 +72,8 @@ npm run app
   "mcpServers": {
     "iftree-library": {
       "command": "npm",
-      "args": ["run", "--silent", "mcp"],
+      "args": ["run", "--silent", "mcp:node"],
       "env": {
-        "ELECTRON_RUN_AS_NODE": "1",
         "IFTREE_MCP_TIER": "read"
       }
     }

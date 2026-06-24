@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 
-import { resolveMarkdownImageUrl } from '../src/core/image-paths.mjs';
+import { resolveMarkdownImageUrl } from '../dist/src/core/image-paths.js';
 
 async function withTempDir(fn) {
   const dir = join(tmpdir(), `iftree-images-${Date.now()}-${Math.random().toString(16).slice(2)}`);

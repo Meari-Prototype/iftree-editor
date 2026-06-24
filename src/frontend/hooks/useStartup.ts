@@ -1,7 +1,8 @@
+// @ts-nocheck
 import { useCallback, useEffect, useRef } from 'react';
 
-import { normalizeDocId, normalizeNodeLayoutSettingsByView, readPersistedActiveDocId, persistActiveDocId, sameDocId } from '../lib/doc-utils.mjs';
-import { debugLog, setDebugLoggingEnabled } from '../lib/debug-log.mjs';
+import { normalizeDocId, normalizeNodeLayoutSettingsByView, readPersistedActiveDocId, persistActiveDocId, sameDocId } from '../lib/doc-utils.js';
+import { debugLog, setDebugLoggingEnabled } from '../lib/debug-log.js';
 import {
   captureE2EWindow,
   getStartupOptions,
@@ -14,6 +15,7 @@ import {
   documentRepository,
   settingsRepository
 } from '../data/repositories.js';
+import { useAppUIContext } from './useAppUI.js';
 
 // Keep these gates aligned with electron/main.mjs analyzeE2ECapture.
 const E2E_PROBE_LIMIT = 30;
@@ -133,25 +135,11 @@ async function moveStartupCameraProbe() {
 
 // 启动编排：心跳上报、启动文档打开（含待恢复编辑分支三选）、首帧渲染解锁、
 // E2E 像素探针（e2eChm 模式）。App 只消费 handleMindMapRenderReady / armRenderUnlock。
-/** @param {{
- *   currentDoc?: any, activeTab?: string, lockedProgress?: any, progress?: any,
- *   lastUiActionRef?: any, startupOpenRequestedRef?: any,
- *   setNotice?: any, setProgress?: any, setOperationLock?: any,
- *   setDocs?: any, setDocFolders?: any, setLibraryTree?: any,
- *   setVectorSettings?: any, setLlmSummarySettings?: any, setNodeLayoutSettings?: any,
- *   setAgentSettings?: any, setAgentDiffs?: any, refreshAgentSessions?: any,
- *   openDoc?: any, promptStartupEditBranchChoice?: any, editBranchBaseDocId?: any
- * }} [options] */
+// UI 横切态（activeTab/progress/lockedProgress/setNotice/setProgress/setOperationLock）从 useAppUIContext 读。
 export function useStartup({
   currentDoc = null,
-  activeTab = '',
-  lockedProgress = null,
-  progress = null,
   lastUiActionRef = null,
   startupOpenRequestedRef = null,
-  setNotice,
-  setProgress,
-  setOperationLock,
   setDocs,
   setDocFolders,
   setLibraryTree,
@@ -165,6 +153,7 @@ export function useStartup({
   promptStartupEditBranchChoice,
   editBranchBaseDocId
 }: any = {}) {
+  const { activeTab, lockedProgress, progress, setNotice, setProgress, setOperationLock } = useAppUIContext();
   const startupSuccessReportedRef = useRef(false);
   const startupPendingDocRef = useRef(null);
   const startupOptionsRef = useRef({ startupDocId: null, renderMode: 'hardware', e2eChm: false, forceHardwareAcceleration: false, debugLogging: false });

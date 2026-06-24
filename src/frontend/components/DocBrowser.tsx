@@ -1,3 +1,4 @@
+// @ts-nocheck
 import {
   ChevronDown,
   ChevronRight,
@@ -29,8 +30,9 @@ import {
   MAX_DOC_FOLDER_NAME_LENGTH,
   normalizeDocFolderName,
   normalizeFsPath
-} from '../lib/doc-utils.mjs';
+} from '../lib/doc-utils.js';
 import { IconButton } from './common.jsx';
+import { useFloatingMenu } from '../hooks/useFloatingMenu.js';
 
 export function DocBrowser({
   busy,
@@ -58,8 +60,6 @@ export function DocBrowser({
   onPasteLibraryItem,
   onDeleteLibraryImport
 }) {
-  const [docMenuId, setDocMenuId] = useState(null);
-  const [docMenuPosition, setDocMenuPosition] = useState(null);
   const [collapsedDocFolders, setCollapsedDocFolders] = useState(() => new Set());
   const [renamingFolderDraft, setRenamingFolderDraft] = useState(null);
   const [docSearchOpen, setDocSearchOpen] = useState(false);
@@ -95,22 +95,14 @@ export function DocBrowser({
     });
   }, [libraryTree]);
 
-  useEffect(() => {
-    if (!docMenuId) return undefined;
-    const close = () => {
-      setDocMenuId(null);
-      setDocMenuPosition(null);
-    };
-    const closeOnEscape = (event) => {
-      if (event.key === 'Escape') close();
-    };
-    window.addEventListener('click', close);
-    window.addEventListener('keydown', closeOnEscape);
-    return () => {
-      window.removeEventListener('click', close);
-      window.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [docMenuId]);
+  // 文档/文件夹行的右键浮层菜单：单一 hook 实例，id 即 menuKey。
+  // 高度随 menuKey 与 libraryCutPath 变化，所以 specs 每次渲染重算（hook 内用 specsRef 拿最新）。
+  const docMenuSpecFor = (menuKey) => ({
+    className: 'doc-menu',
+    width: DOC_MENU_WIDTH,
+    height: docMenuHeightFor(menuKey)
+  });
+  const docMenu = useFloatingMenu({ specs: docMenuSpecFor, offset: 4 });
 
   useEffect(() => {
     if (!renamingFolderDraft) return;
@@ -140,11 +132,6 @@ export function DocBrowser({
     };
   }, [docSearchOpen]);
 
-  function closeDocMenu() {
-    setDocMenuId(null);
-    setDocMenuPosition(null);
-  }
-
   function docMenuHeightFor(menuKey) {
     if (String(menuKey).startsWith('library-file:')) return libraryCutPath ? 160 : 128;
     if (String(menuKey).startsWith('library-folder:') || menuKey === 'folder:root') return libraryCutPath ? 150 : 118;
@@ -152,40 +139,15 @@ export function DocBrowser({
     return 150;
   }
 
-  function docMenuPositionFromButton(button, menuKey) {
-    const rect = button.getBoundingClientRect();
-    const width = DOC_MENU_WIDTH;
-    const height = docMenuHeightFor(menuKey);
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || width;
-    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || height;
-    const left = Math.max(8, Math.min(rect.right - width, viewportWidth - width - 8));
-    const below = rect.bottom + 4;
-    const above = rect.top - height - 4;
-    const top = below + height <= viewportHeight - 8
-      ? below
-      : Math.max(8, above);
-    return { left, top, width };
-  }
-
-  function toggleDocMenu(menuKey, event) {
-    event.stopPropagation();
-    if (docMenuId === menuKey) {
-      closeDocMenu();
-      return;
-    }
-    setDocMenuPosition(docMenuPositionFromButton(event.currentTarget, menuKey));
-    setDocMenuId(menuKey);
-  }
-
   function renderDocMenu(menuKey, children) {
-    if (docMenuId !== menuKey || !docMenuPosition) return null;
+    if (docMenu.openId !== menuKey || !docMenu.position) return null;
     return createPortal(
       <div
         className="doc-menu"
         style={{
-          left: `${docMenuPosition.left}px`,
-          top: `${docMenuPosition.top}px`,
-          width: `${docMenuPosition.width}px`
+          left: `${docMenu.position.left}px`,
+          top: `${docMenu.position.top}px`,
+          width: `${docMenu.position.width}px`
         }}
         onClick={(event) => event.stopPropagation()}
       >
@@ -396,7 +358,7 @@ export function DocBrowser({
 
   async function handleCreateFolder(parentId = null) {
     if (busy) return;
-    closeDocMenu();
+    docMenu.close();
     skipFolderSaveRef.current = false;
     setRenamingFolderDraft(null);
     if (parentId !== null && parentId !== undefined) {
@@ -414,7 +376,7 @@ export function DocBrowser({
 
   function startRenameDocFolder(folder) {
     if (!folder) return;
-    closeDocMenu();
+    docMenu.close();
     skipFolderSaveRef.current = false;
     setRenamingFolderDraft({ folderId: folder.id, name: folder.name || DEFAULT_DOC_FOLDER_NAME });
   }
@@ -436,24 +398,24 @@ export function DocBrowser({
     setRenamingFolderDraft(null);
     try {
       await onRenameFolder?.(draft.folderId, name);
-      closeDocMenu();
+      docMenu.close();
     } finally {
       renamingFolderRef.current = false;
     }
   }
 
   function handleCreateDoc(title, folderId = null) {
-    closeDocMenu();
+    docMenu.close();
     onCreateDoc?.(title, folderId);
   }
 
   function handleCutLibraryItem(item) {
-    closeDocMenu();
+    docMenu.close();
     onCutLibraryItem?.(item);
   }
 
   function handlePasteLibraryItem(targetFolderRelativePath = '') {
-    closeDocMenu();
+    docMenu.close();
     onPasteLibraryItem?.(targetFolderRelativePath);
   }
 
@@ -474,7 +436,7 @@ export function DocBrowser({
     return (
       <div className="doc-folder-block doc-root-block">
         <div
-          className={`doc-row doc-folder-row doc-root-row ${docMenuId === menuKey ? 'menu-open' : ''} ${docDragState?.overFolderPath === '' ? 'drop-target' : ''} ${docSearchOpen ? 'search-open' : ''}`}
+          className={`doc-row doc-folder-row doc-root-row ${docMenu.openId === menuKey ? 'menu-open' : ''} ${docDragState?.overFolderPath === '' ? 'drop-target' : ''} ${docSearchOpen ? 'search-open' : ''}`}
           data-library-folder-path=""
         >
           <div
@@ -523,13 +485,13 @@ export function DocBrowser({
             className="doc-menu-button"
             title="主文件夹操作"
             aria-label="主文件夹操作"
-            onClick={(event) => toggleDocMenu(menuKey, event)}
+            onClick={(event) => docMenu.toggle(menuKey, event)}
           >
             <MoreHorizontal size={12} />
           </button>
           {renderDocMenu(menuKey, (
             <>
-              <button type="button" onClick={() => { closeDocMenu(); onRefreshLibrary?.(); }}>
+              <button type="button" onClick={() => { docMenu.close(); onRefreshLibrary?.(); }}>
                 <RotateCcw size={13} />
                 刷新文件夹
               </button>
@@ -540,7 +502,7 @@ export function DocBrowser({
                 </button>
               )}
               {docSearchQuery && (
-                <button type="button" onClick={() => { closeDocMenu(); setDocSearchQuery(''); }}>
+                <button type="button" onClick={() => { docMenu.close(); setDocSearchQuery(''); }}>
                   <SearchIcon size={13} />
                   清空搜索
                 </button>
@@ -563,7 +525,7 @@ export function DocBrowser({
           style={{ paddingLeft: `${depth * 10 + 16}px` }}
           title="导航"
           onClick={() => {
-            closeDocMenu();
+            docMenu.close();
             onOpenLibraryNavigation?.();
           }}
         >
@@ -581,7 +543,7 @@ export function DocBrowser({
     return (
       <div key={menuKey} className="doc-folder-block">
         <div
-          className={`doc-row doc-folder-row ${docMenuId === menuKey ? 'menu-open' : ''} ${docDragState?.overFolderPath === item.relativePath ? 'drop-target' : ''} ${libraryCutPath === item.relativePath ? 'cut-source' : ''}`}
+          className={`doc-row doc-folder-row ${docMenu.openId === menuKey ? 'menu-open' : ''} ${docDragState?.overFolderPath === item.relativePath ? 'drop-target' : ''} ${libraryCutPath === item.relativePath ? 'cut-source' : ''}`}
           data-library-folder-path={item.relativePath}
         >
           <button
@@ -608,7 +570,7 @@ export function DocBrowser({
             className="doc-menu-button"
             title="文件夹操作"
             aria-label="文件夹操作"
-            onClick={(event) => toggleDocMenu(menuKey, event)}
+            onClick={(event) => docMenu.toggle(menuKey, event)}
           >
             <MoreHorizontal size={12} />
           </button>
@@ -640,7 +602,7 @@ export function DocBrowser({
     return (
       <div
         key={menuKey}
-        className={`doc-row doc-file-row ${active ? 'active' : ''} ${!importedDoc ? 'unimported' : ''} ${!importedDoc && !supportedImport ? 'unsupported-file' : ''} ${docMenuId === menuKey ? 'menu-open' : ''} ${docDragState?.docId === item.relativePath ? 'dragging-source' : ''} ${libraryCutPath === item.relativePath ? 'cut-source' : ''}`}
+        className={`doc-row doc-file-row ${active ? 'active' : ''} ${!importedDoc ? 'unimported' : ''} ${!importedDoc && !supportedImport ? 'unsupported-file' : ''} ${docMenu.openId === menuKey ? 'menu-open' : ''} ${docDragState?.docId === item.relativePath ? 'dragging-source' : ''} ${libraryCutPath === item.relativePath ? 'cut-source' : ''}`}
       >
         <button
           type="button"
@@ -654,7 +616,7 @@ export function DocBrowser({
               event.stopPropagation();
               return;
             }
-            closeDocMenu();
+            docMenu.close();
             onSelectLibraryFile?.(item);
           }}
         >
@@ -667,14 +629,14 @@ export function DocBrowser({
           className="doc-menu-button"
           title="文件操作"
           aria-label="文件操作"
-          onClick={(event) => toggleDocMenu(menuKey, event)}
+          onClick={(event) => docMenu.toggle(menuKey, event)}
         >
           <MoreHorizontal size={12} />
         </button>
         {renderDocMenu(menuKey, (
           <>
             {importedDoc && (
-              <button type="button" onClick={() => { closeDocMenu(); onOpenDoc?.(importedDoc.id); }}>
+              <button type="button" onClick={() => { docMenu.close(); onOpenDoc?.(importedDoc.id); }}>
                 <FileText size={13} />
                 打开导入文档
               </button>
@@ -684,7 +646,7 @@ export function DocBrowser({
               剪切
             </button>
             {importedDoc && (
-              <button type="button" className="doc-menu-danger" onClick={() => { closeDocMenu(); onDeleteLibraryImport?.(item, importedDoc); }}>
+              <button type="button" className="doc-menu-danger" onClick={() => { docMenu.close(); onDeleteLibraryImport?.(item, importedDoc); }}>
                 <Trash2 size={13} />
                 删除导入
               </button>
@@ -704,7 +666,7 @@ export function DocBrowser({
     return (
       <div key={menuKey} className="doc-folder-block">
         <div
-          className={`doc-row doc-folder-row ${docMenuId === menuKey ? 'menu-open' : ''} ${docDragState?.overFolderId === folder.id ? 'drop-target' : ''}`}
+          className={`doc-row doc-folder-row ${docMenu.openId === menuKey ? 'menu-open' : ''} ${docDragState?.overFolderId === folder.id ? 'drop-target' : ''}`}
           data-doc-folder-id={folder.id}
         >
           {renamingFolder ? (
@@ -759,7 +721,7 @@ export function DocBrowser({
             className="doc-menu-button"
             title="文件夹操作"
             aria-label="文件夹操作"
-            onClick={(event) => toggleDocMenu(menuKey, event)}
+            onClick={(event) => docMenu.toggle(menuKey, event)}
           >
             <MoreHorizontal size={12} />
           </button>
@@ -777,7 +739,7 @@ export function DocBrowser({
                 <Pencil size={13} />
                 重命名
               </button>
-              <button type="button" className="doc-menu-danger" onClick={() => { closeDocMenu(); onDeleteFolder?.(folder); }}>
+              <button type="button" className="doc-menu-danger" onClick={() => { docMenu.close(); onDeleteFolder?.(folder); }}>
                 <Trash2 size={13} />
                 删除文件夹
               </button>
@@ -794,7 +756,7 @@ export function DocBrowser({
     return (
       <div
         key={menuKey}
-        className={`doc-row doc-file-row ${doc.id === currentDocId ? 'active' : ''} ${docMenuId === menuKey ? 'menu-open' : ''} ${docDragState?.docId === doc.id ? 'dragging-source' : ''}`}
+        className={`doc-row doc-file-row ${doc.id === currentDocId ? 'active' : ''} ${docMenu.openId === menuKey ? 'menu-open' : ''} ${docDragState?.docId === doc.id ? 'dragging-source' : ''}`}
       >
         <button
           type="button"
@@ -808,7 +770,7 @@ export function DocBrowser({
               event.stopPropagation();
               return;
             }
-            closeDocMenu();
+            docMenu.close();
             onOpenDoc?.(doc.id);
           }}
         >
@@ -821,7 +783,7 @@ export function DocBrowser({
           className="doc-menu-button"
           title="文档操作"
           aria-label="文档操作"
-          onClick={(event) => toggleDocMenu(menuKey, event)}
+          onClick={(event) => docMenu.toggle(menuKey, event)}
         >
           <MoreHorizontal size={12} />
         </button>
@@ -831,7 +793,7 @@ export function DocBrowser({
               <span>移动到</span>
               <select
                 value={doc.folder_id ?? ''}
-                onChange={(event) => { closeDocMenu(); onMoveDoc?.(doc, event.target.value ? Number(event.target.value) : null); }}
+                onChange={(event) => { docMenu.close(); onMoveDoc?.(doc, event.target.value ? Number(event.target.value) : null); }}
               >
                 <option value="">主文件夹</option>
                 {docBrowser.flatFolders.map((folder) => (
@@ -841,7 +803,7 @@ export function DocBrowser({
                 ))}
               </select>
             </label>
-            <button type="button" className="doc-menu-danger" onClick={() => { closeDocMenu(); onDeleteDoc?.(doc); }}>
+            <button type="button" className="doc-menu-danger" onClick={() => { docMenu.close(); onDeleteDoc?.(doc); }}>
               <Trash2 size={13} />
               删除文档
             </button>

@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { callIftree, hasIftreeMethod } from './iftree-api.js';
 import { readDatabase } from './database-client.js';
 

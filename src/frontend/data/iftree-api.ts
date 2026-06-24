@@ -1,4 +1,5 @@
-import { debugElapsedMs, debugLog, debugStartedAt, summarizeArgs, summarizeResult } from '../lib/debug-log.mjs';
+// @ts-nocheck
+import { debugElapsedMs, debugLog, debugStartedAt, summarizeArgs, summarizeResult } from '../lib/debug-log.js';
 
 export function getIftreeApi() {
   if (typeof window === 'undefined') return {};

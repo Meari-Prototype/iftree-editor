@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../src/backend/store/index.mjs';
-import { createDatabaseService } from '../src/backend/database-service.mjs';
+import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createDatabaseService } from '../dist/src/backend/database-service.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-3way-'));
