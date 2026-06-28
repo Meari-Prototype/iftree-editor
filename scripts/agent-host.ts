@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { createInterface } from 'node:readline';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,47 +16,90 @@ import {
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SHARED_MODE = process.argv.includes('--shared');
 
-function writeJson(message) {
+type JsonMessage = Record<string, unknown> & {
+  id?: unknown;
+  type?: unknown;
+  payload?: Record<string, unknown>;
+};
+type ErrorLike = {
+  name?: string;
+  message?: string;
+  stack?: string;
+  code?: string;
+};
+type HostFetcher = (target: Parameters<typeof fetch>[0], init?: RequestInit) => Promise<Response>;
+
+interface HeadlessHostLike {
+  handleRequest(request: JsonMessage): Promise<unknown>;
+  close(): void;
+}
+
+interface SharedBackendServerLike {
+  listen(pipeName: string): Promise<unknown>;
+  close(): void;
+  sendEvent(event: unknown): void;
+  enqueue(task: () => Promise<unknown> | unknown): Promise<unknown>;
+}
+
+const createHeadlessAgentHostTyped = createHeadlessAgentHost as unknown as (options: {
+  projectRoot: string;
+  fetchers: () => HostFetcher[];
+  sendEvent: (event: unknown) => void;
+  enqueueWrite?: (fn: () => Promise<unknown> | unknown) => Promise<unknown>;
+}) => HeadlessHostLike;
+
+const createSharedBackendServerTyped = createSharedBackendServer as unknown as (options: {
+  handleRequest: (request: JsonMessage) => Promise<unknown>;
+  onShutdown: () => void;
+}) => SharedBackendServerLike;
+
+function writeJson(message: unknown) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
-function errorPayload(error) {
+function errorLike(error: unknown): ErrorLike {
+  return error && typeof error === 'object' ? error as ErrorLike : { message: String(error) };
+}
+
+function errorPayload(error: unknown) {
+  const failure = errorLike(error);
   return {
-    name: error?.name || 'Error',
-    message: error?.message || String(error),
-    stack: error?.stack || ''
+    name: failure.name || 'Error',
+    message: failure.message || String(error),
+    stack: failure.stack || ''
   };
 }
 
-function fetchers() {
+function fetchers(): HostFetcher[] {
   return typeof fetch === 'function' ? [(target, init) => fetch(target, init)] : [];
 }
 
 async function main() {
-  let host = null;
-  let queue = Promise.resolve();
+  let host: HeadlessHostLike | null = null;
+  let queue: Promise<unknown> = Promise.resolve();
   let shuttingDown = false;
   let stdinClosed = false;
-  const bufferedLines = [];
+  const bufferedLines: string[] = [];
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   process.stdin.resume();
 
   function finishIfClosed() {
     if (!stdinClosed || shuttingDown || !host) return;
+    const activeHost = host;
     queue = queue.finally(() => {
-      host.close();
+      activeHost.close();
       process.exit(0);
     });
   }
 
-  async function processRequest(request) {
+  async function processRequest(request: JsonMessage) {
     try {
-      const result = await host.handleRequest(request);
+      const result = await host!.handleRequest(request);
       writeJson({ id: request.id, type: 'result', result });
       if (request.type === 'shutdown') {
         shuttingDown = true;
         rl.close();
-        host.close();
+        host!.close();
         process.exit(0);
       }
     } catch (error) {
@@ -65,7 +107,7 @@ async function main() {
     }
   }
 
-  function handleLine(line) {
+  function handleLine(line: string) {
     const raw = String(line || '').trim();
     if (!raw || shuttingDown) return;
     if (!host) {
@@ -74,8 +116,8 @@ async function main() {
     }
     let request = null;
     try {
-      request = JSON.parse(raw);
-    } catch (error) {
+        request = JSON.parse(raw) as JsonMessage;
+    } catch (error: unknown) {
       writeJson({ id: null, type: 'error', error: errorPayload(error) });
       return;
     }
@@ -94,10 +136,12 @@ async function main() {
     finishIfClosed();
   });
 
-  host = createHeadlessAgentHost({
+  host = createHeadlessAgentHostTyped({
     projectRoot: PROJECT_ROOT,
     fetchers,
-    sendEvent: (event) => writeJson(event)
+    sendEvent: (event: unknown) => writeJson(event),
+    // 后台维护经同一条写 queue 串行（与请求写互斥）。
+    enqueueWrite: (fn) => { const p = queue.then(() => fn(), () => fn()); queue = p.catch(() => {}); return p; }
   });
   writeJson({ id: null, type: 'ready', pid: process.pid });
   for (const line of bufferedLines.splice(0)) handleLine(line);
@@ -110,7 +154,7 @@ async function mainShared() {
   const dbPath = resolveBackendDbPath(PROJECT_ROOT);
   const pipeName = backendPipeName(dbPath);
   const descriptorPath = backendDescriptorPath(dbPath);
-  let host = null;
+  let host: HeadlessHostLike | null = null;
 
   const exitCleanly = () => {
     removeBackendDescriptorIfOwn(descriptorPath, process.pid);
@@ -118,26 +162,29 @@ async function mainShared() {
     process.exit(0);
   };
 
-  const server = createSharedBackendServer({
-    handleRequest: (request) => host.handleRequest(request),
+  const server = createSharedBackendServerTyped({
+    handleRequest: (request: JsonMessage) => host!.handleRequest(request),
     onShutdown: () => {
       server.close();
       exitCleanly();
     }
   });
-  host = createHeadlessAgentHost({
+  host = createHeadlessAgentHostTyped({
     projectRoot: PROJECT_ROOT,
     fetchers,
-    sendEvent: (event) => server.sendEvent(event)
+    sendEvent: (event: unknown) => server.sendEvent(event),
+    // 后台维护经共享后端单写队列串行（与请求写互斥）。
+    enqueueWrite: (fn) => server.enqueue(fn)
   });
 
   try {
     await server.listen(pipeName);
-  } catch (error) {
-    if (error?.code === 'IFTREE_BACKEND_EXISTS') {
+  } catch (error: unknown) {
+    const failure = errorLike(error);
+    if (failure.code === 'IFTREE_BACKEND_EXISTS') {
       // 会合让位：已有共享后端在跑（双写实例同时启动只活一个）。stderr 是 detached
       // 模式下唯一落日志的通道，留一行痕迹供排查「为什么起过第二个后端」。
-      process.stderr.write(`[agent-host] ${error.message}；本进程(pid=${process.pid})让位退出\n`);
+      process.stderr.write(`[agent-host] ${failure.message || String(error)}；本进程(pid=${process.pid})让位退出\n`);
       host.close();
       process.exit(0);
     }
@@ -155,10 +202,11 @@ async function mainShared() {
   process.on('SIGTERM', exitCleanly);
 }
 
-(SHARED_MODE ? mainShared() : main()).catch((error) => {
+(SHARED_MODE ? mainShared() : main()).catch((error: unknown) => {
   // 错误双写：共享模式 detached 拉起时 stdout 被丢弃、只有 stderr 接进日志文件，
   // 不双写的话致命错误会无声消失。
-  process.stderr.write(`[agent-host] fatal: ${error?.stack || error?.message || error}\n`);
+  const failure = errorLike(error);
+  process.stderr.write(`[agent-host] fatal: ${failure.stack || failure.message || error}\n`);
   writeJson({ id: null, type: 'error', error: errorPayload(error) });
   process.exit(1);
 });

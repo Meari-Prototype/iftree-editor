@@ -1,4 +1,6 @@
-interface SnapshotRow {
+import { bodyCharCount } from './char-count.js';
+
+export interface SnapshotRow {
   id?: unknown;
   nodeId?: unknown;
   node_id?: unknown;
@@ -22,7 +24,7 @@ interface SnapshotRow {
   [key: string]: unknown;
 }
 
-interface SnapshotReadNodeResult {
+export interface SnapshotReadNodeResult {
   id: unknown;
   docId: unknown;
   parentId: unknown;
@@ -65,7 +67,7 @@ export function snapshotChildrenByParent(rows: SnapshotRow[] = []): Map<string, 
 }
 
 export function snapshotTextChars(row: SnapshotRow = {}): number {
-  return String(row.text || '').length;
+  return bodyCharCount(row.text);
 }
 
 export function snapshotSubtreeTextChars(row: SnapshotRow, byParent: Map<string, SnapshotRow[]>): number {

@@ -1,5 +1,9 @@
 // 文档树 → markdown 序列化器，与导入侧 core/tree.mjs（markdown → 树）对称
 // 纯函数：接收文档行 doc 与「已按地址排序」的节点行数组 nodes，重建父子关系后 DFS 渲染。不碰 db。
+//
+// 未启用（待重新设计）：本渲染经 doc.exportMarkdown 入口已停用——存在「无标题容器把地址当标题（满屏
+// ### 1-1-1）」「node_note 混入正文不可区分」「无标题节点首行在 heading 与 body 重复」等功能错误；
+// 且导出语义应是「写文件」、与 import 的幂等/对称尚未设计。代码暂留作重做参考，无入口可达。详见 NOW.md。
 
 interface DocMeta {
   id?: unknown;

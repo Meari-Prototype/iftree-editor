@@ -1,8 +1,8 @@
-// @ts-nocheck
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 
+import type { DocListItem } from '../../backend/query-api.js';
 import { appendGeneratedNote, hasGeneratedNote, plainNodeNote } from '../../core/node-notes.js';
-import { flattenTree } from '../../core/tree.js';
+import { flattenTree, type TreeNodeLike } from '../../core/tree.js';
 import { summaryTargetsForMode as buildSummaryTargetsForMode } from '../../core/tree-ui.js';
 import {
   depthOf,
@@ -10,26 +10,94 @@ import {
 } from '../lib/doc-utils.js';
 import {
   normalizeSummaryStrategy, normalizeSummaryConcurrency, normalizeSummaryStrategySettings,
-  summaryStrategyForMode, applySummarySkipStrategy, summarySkipBelowCount
+  summaryStrategyForMode, applySummarySkipStrategy, summarySkipBelowCount,
+  type SummaryStrategy,
+  type SummaryItem as LibSummaryItem
 } from '../lib/summary-utils.js';
 import { documentRepository, nodeRepository, summaryService } from '../data/repositories.js';
 import { useAppUIContext } from './useAppUI.js';
 
-function summaryNodeLabel(node) {
+type AnyRecord = Record<string, unknown>;
+type SummaryMode = 'selected' | 'subtree' | 'depth' | 'article' | string;
+
+interface NodeLike {
+  id?: unknown;
+  address?: string;
+  title?: string;
+  text?: string;
+  note?: string;
+  [extra: string]: unknown;
+}
+
+interface SummaryTarget {
+  node: NodeLike;
+  text?: string;
+  summaryMode?: string;
+  [extra: string]: unknown;
+}
+
+interface SummaryItem extends LibSummaryItem {
+  target: SummaryTarget;
+  text: string;
+  skip: 'generated' | 'short' | null;
+}
+
+interface CurrentDocLike {
+  tree?: TreeNodeLike | null;
+  doc?: { id?: unknown; title?: string; [extra: string]: unknown } | null;
+  [extra: string]: unknown;
+}
+
+interface SummaryRunState {
+  id: string;
+  canceled: boolean;
+  requestIds: Set<string>;
+}
+
+interface DispatchOptions {
+  effects?: AnyRecord;
+}
+
+interface SummaryRequest {
+  mode?: SummaryMode;
+  scopeLabel?: string;
+  selectedLabel?: string;
+  targetLabel?: string;
+  summaryItems?: SummaryItem[];
+  skippedShort?: number;
+  skippedGenerated?: number;
+  strategy?: SummaryStrategy;
+  strategyIndex?: number;
+  strategyOptions?: SummaryStrategy[];
+}
+
+export interface UseSummaryRunOptions {
+  currentDoc?: CurrentDocLike | null;
+  treeEditMode?: boolean;
+  selectedNode?: unknown;
+  selectedNodeId?: unknown;
+  multiSelectedNodeIds?: Set<unknown>;
+  llmSummarySettings?: AnyRecord | null;
+  setDocs: Dispatch<SetStateAction<DocListItem[]>>;
+  dispatch: (action: () => Promise<unknown> | unknown, options?: DispatchOptions) => Promise<unknown>;
+}
+
+function summaryNodeLabel(node: NodeLike | null | undefined): string {
   if (!node) return '未选中节点';
   const title = String(node.title || node.text || '').replace(/\s+/g, ' ').trim();
   return `${node.address}${title ? ` ${title.slice(0, 32)}` : ''}`;
 }
 
-function summaryStrategyModeForScope(mode) {
-  return mode === 'article' ? 'node' : mode;
+function summaryStrategyModeForScope(mode: unknown): string {
+  return mode === 'article' ? 'node' : String(mode || '');
 }
 
-function isSummaryAbortError(error) {
-  return error?.name === 'AbortError' || /aborted|abort|cancel|取消/i.test(String(error?.message || error || ''));
+function isSummaryAbortError(error: unknown): boolean {
+  return (error as { name?: string } | null)?.name === 'AbortError'
+    || /aborted|abort|cancel|取消/i.test(String((error as { message?: string } | null)?.message || error || ''));
 }
 
-async function cancelSummaryRunRequests(run) {
+async function cancelSummaryRunRequests(run: SummaryRunState | null | undefined): Promise<void> {
   const requestIds = [...(run?.requestIds || [])];
   await Promise.allSettled(requestIds.map((requestId) => summaryService.cancelNodeSummary?.({ requestId })));
 }
@@ -44,24 +112,24 @@ export function useSummaryRun({
   treeEditMode = false,
   selectedNode = null,
   selectedNodeId = null,
-  multiSelectedNodeIds = new Set(),
+  multiSelectedNodeIds = new Set<unknown>(),
   llmSummarySettings = null,
   setDocs,
   dispatch
-}: any = {}) {
+}: UseSummaryRunOptions) {
   const { setBusy, setNotice, setProgress } = useAppUIContext();
-  const [summaryNotesVisible, setSummaryNotesVisible] = useState(true);
-  const summaryRunRef = useRef(null);
+  const [summaryNotesVisible, setSummaryNotesVisible] = useState<boolean>(true);
+  const summaryRunRef = useRef<SummaryRunState | null>(null);
 
   const currentDocHasSummaryNotes = useMemo(() => (
-    flattenTree(currentDoc?.tree).some((node) => plainNodeNote(node?.note || '').trim())
+    flattenTree(currentDoc?.tree).some((node) => plainNodeNote(String((node as { note?: unknown }).note || '')).trim())
   ), [currentDoc?.tree]);
 
   useEffect(() => {
     setSummaryNotesVisible(readPersistedSummaryNotesVisible(currentDoc?.doc?.id));
   }, [currentDoc?.doc?.id]);
 
-  function toggleSummaryNotesVisible() {
+  function toggleSummaryNotesVisible(): void {
     if (!currentDocHasSummaryNotes) {
       setNotice('请先生成摘要');
       return;
@@ -71,21 +139,22 @@ export function useSummaryRun({
     persistSummaryNotesVisible(currentDoc?.doc?.id, next);
   }
 
-  function summaryTargetsForMode(mode) {
+  function summaryTargetsForMode(mode: SummaryMode): SummaryTarget[] {
     const selectedNodeIds = (mode === 'selected' || mode === 'subtree') && multiSelectedNodeIds.size > 0
       ? [...multiSelectedNodeIds]
       : selectedNodeId
         ? [selectedNodeId]
         : [];
-    return (buildSummaryTargetsForMode as any)({
+    // 源 SummaryTarget.node.address 是 unknown，本地 NodeLike.address 是 string（避免内部消费点散落 String() narrow）；运行时数据来源相同，边界 narrow cast。
+    return buildSummaryTargetsForMode({
       tree: currentDoc?.tree,
       selectedNodeId,
       selectedNodeIds,
       mode
-    });
+    }) as SummaryTarget[];
   }
 
-  async function generateSummary(mode) {
+  async function generateSummary(mode: SummaryMode): Promise<SummaryRequest | undefined> {
     if (!treeEditMode) {
       setNotice('请先进入编辑模式');
       return;
@@ -106,7 +175,7 @@ export function useSummaryRun({
 
     const targets = summaryTargetsForMode(mode);
     if (targets.length === 0) {
-      const selectedDepth = selectedNode ? depthOf(selectedNode.address || '1') : 1;
+      const selectedDepth = selectedNode ? depthOf((selectedNode as NodeLike).address || '1') : 1;
       setNotice(mode === 'depth' ? `当前第 ${selectedDepth} 层没有节点。` : '没有可生成摘要的目标节点。');
       return;
     }
@@ -115,7 +184,7 @@ export function useSummaryRun({
     const strategyMode = summaryStrategyModeForScope(mode);
     const strategyIndex = strategyMode === 'article' ? 0 : 1;
     const strategy = summaryStrategyForMode(llmSummarySettings, strategyMode);
-    const summaryItems = [];
+    const summaryItems: SummaryItem[] = [];
     let skippedGenerated = 0;
     for (const target of targets) {
       const text = String(target.text || '').trim();
@@ -133,19 +202,19 @@ export function useSummaryRun({
       return;
     }
 
-    const scopeLabel = {
+    const scopeLabel = ({
       selected: '当前选中节点',
       subtree: '当前选中节点及其子树',
-      depth: `当前第 ${selectedNode ? depthOf(selectedNode.address || '1') : 1} 层节点`,
+      depth: `当前第 ${selectedNode ? depthOf((selectedNode as NodeLike).address || '1') : 1} 层节点`,
       article: '全文'
-    }[mode] || '节点';
+    } as Record<string, string>)[mode] || '节点';
     const targetLabel = writableItems.length === 1
       ? summaryNodeLabel(writableItems[0].target.node)
       : `${writableItems.length} 个节点`;
     return {
       mode,
       scopeLabel,
-      selectedLabel: selectedNode ? summaryNodeLabel(selectedNode) : '无',
+      selectedLabel: selectedNode ? summaryNodeLabel(selectedNode as NodeLike) : '无',
       targetLabel,
       summaryItems,
       skippedShort: summarySkipBelowCount(summaryItems, strategy, strategyIndex),
@@ -156,7 +225,7 @@ export function useSummaryRun({
     };
   }
 
-  async function cancelSummaryGeneration() {
+  async function cancelSummaryGeneration(): Promise<void> {
     const run = summaryRunRef.current;
     if (!run || run.canceled) return;
     run.canceled = true;
@@ -164,14 +233,20 @@ export function useSummaryRun({
     await cancelSummaryRunRequests(run);
   }
 
-  async function runSummaryGeneration(request, summaryStrategy) {
+  interface WorkItem {
+    item: SummaryItem;
+    index: number;
+    nodeLabel: string;
+  }
+
+  async function runSummaryGeneration(request: SummaryRequest, summaryStrategy: SummaryStrategy): Promise<void> {
     // 与 generateSummary 的入口约束保持一致：摘要写入只允许落在编辑分支上。
     if (!treeEditMode) {
       setNotice('请先进入编辑模式');
       return;
     }
     const strategyIndex = Number.isInteger(request?.strategyIndex)
-      ? request.strategyIndex
+      ? request.strategyIndex!
       : (summaryStrategyModeForScope(request?.mode) === 'article' ? 0 : 1);
     const normalizedStrategy = normalizeSummaryStrategy(summaryStrategy, strategyIndex);
     const summaryItems = applySummarySkipStrategy(request?.summaryItems || [], normalizedStrategy, strategyIndex);
@@ -182,31 +257,31 @@ export function useSummaryRun({
       setNotice(`没有需要生成摘要的节点：短文本跳过 ${skippedShort} 个，已有 AI 摘要跳过 ${skippedGenerated} 个。`);
       return;
     }
-    const concurrency = normalizeSummaryConcurrency(llmSummarySettings?.summaryConcurrency);
-    const run = {
+    const concurrency = normalizeSummaryConcurrency((llmSummarySettings as { summaryConcurrency?: unknown } | null)?.summaryConcurrency);
+    const run: SummaryRunState = {
       id: `summary-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       canceled: false,
-      requestIds: new Set()
+      requestIds: new Set<string>()
     };
     summaryRunRef.current = run;
     setBusy(true);
     let generated = 0;
     let processed = 0;
-    let firstError = /** @type {{ index: number, error: any } | null} */ (null);
+    let firstError: { index: number; error: unknown } | null = null;
     try {
       const total = summaryItems.length;
-      const progressFor = (label) => ({
+      const progressFor = (label: string) => ({
         label,
         step: processed,
         total,
         countLabel: `${processed} / ${total}`,
         cancelable: true
       });
-      const markProcessed = (label) => {
+      const markProcessed = (label: string): void => {
         processed += 1;
         setProgress(progressFor(label));
       };
-      const workItems = [];
+      const workItems: WorkItem[] = [];
       for (const [index, item] of summaryItems.entries()) {
         const nodeLabel = summaryNodeLabel(item.target.node);
         if (item.skip) {
@@ -217,23 +292,23 @@ export function useSummaryRun({
       }
 
       let cursor = 0;
-      let writeChain = Promise.resolve();
-      const writeTasks = [];
-      const enqueueSummaryWrite = (work, summary) => {
+      let writeChain: Promise<void> = Promise.resolve();
+      const writeTasks: Array<Promise<void>> = [];
+      const enqueueSummaryWrite = (work: WorkItem, summary: string): void => {
         const writeTask = writeChain.then(async () => {
           if (run.canceled || firstError) return;
           const nextNote = appendGeneratedNote(work.item.target.node.note || '', summary);
           const result = await dispatch(
             () => nodeRepository.updateNode({
-              docId: currentDoc.doc.id,
-              nodeId: work.item.target.node.id,
+              docId: String(currentDoc!.doc!.id ?? ''),
+              nodeId: String(work.item.target.node.id ?? ''),
               patch: { node_note: nextNote },
               includeDoc: false
             }),
             { effects: { undo: 'none', docsRefresh: 'none', busy: false } }
           );
           if (result !== null && result !== undefined) generated += 1;
-        }).catch(async (error) => {
+        }).catch(async (error: unknown) => {
           if (!firstError) firstError = { error, index: work.index };
           run.canceled = true;
           await cancelSummaryRunRequests(run);
@@ -243,7 +318,7 @@ export function useSummaryRun({
         writeChain = writeTask.catch(() => {});
       };
 
-      const worker = async () => {
+      const worker = async (): Promise<void> => {
         for (;;) {
           if (run.canceled || firstError) return;
           const work = workItems[cursor];
@@ -256,12 +331,12 @@ export function useSummaryRun({
             const result = await summaryService.generateNodeSummary({
               requestId,
               mode: work.item.target.summaryMode,
-              title: currentDoc.doc.title,
-              address: work.item.target.node.address,
+              title: String(currentDoc!.doc!.title || ''),
+              address: String(work.item.target.node.address || ''),
               nodeTitle: work.item.target.node.title || '',
               text: work.item.text,
               summaryStrategy: normalizedStrategy
-            });
+            }) as { summary?: string } | null | undefined;
             if (run.canceled || firstError) return;
             const summary = String(result?.summary || '').trim();
             if (summary) enqueueSummaryWrite(work, summary);
@@ -284,16 +359,16 @@ export function useSummaryRun({
       const workerCount = Math.min(concurrency, workItems.length);
       await Promise.all(Array.from({ length: workerCount }, () => worker()));
       await Promise.all(writeTasks);
-      if (firstError) throw firstError.error;
-      if (generated > 0) setDocs(await documentRepository.listDocs());
+      if (firstError) throw (firstError as { error: unknown }).error;
+      if (generated > 0) setDocs(await documentRepository.listDocs() as DocListItem[]);
       if (run.canceled) {
         setNotice(`摘要生成已取消，已保存 ${generated} 个；再次选择同一范围会跳过已有摘要继续生成。`);
       } else {
         setNotice(`已生成摘要 ${generated} 个；短文本跳过 ${skippedShort} 个，已有 AI 摘要跳过 ${skippedGenerated} 个。`);
       }
     } catch (error) {
-      const failedAt = Math.min((firstError?.index ?? processed) + 1, summaryItems.length);
-      setNotice(`摘要生成失败（${failedAt} / ${summaryItems.length}）：${error.message}`);
+      const failedAt = Math.min(((firstError as { index?: number } | null)?.index ?? processed) + 1, summaryItems.length);
+      setNotice(`摘要生成失败（${failedAt} / ${summaryItems.length}）：${(error as { message?: string }).message}`);
     } finally {
       setBusy(false);
       setProgress(null);

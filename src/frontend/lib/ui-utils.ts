@@ -1,4 +1,3 @@
-// @ts-nocheck
 export const DEFAULT_IDE_COLUMN_WIDTHS = { node: 150, sentence: 82 };
 
 export const IDE_COLUMN_LIMITS = {
@@ -13,23 +12,23 @@ export const SOURCE_VIRTUAL_OVERSCAN = 1200;
 export const IDE_NODE_INDENT_WIDTH = 24;
 export const IDE_NODE_BASE_WIDTH = 52;
 
-export function formatDate(value) {
+export function formatDate(value: unknown): string {
   if (!value) return '';
   return String(value).replace('T', ' ').slice(0, 19);
 }
 
-export function formatProgressNumber(value) {
+export function formatProgressNumber(value: unknown): string {
   const number = Number(value);
   if (!Number.isFinite(number)) return '0';
   return Number.isInteger(number) ? String(number) : number.toFixed(1);
 }
 
-export function progressCountText(progress) {
+export function progressCountText(progress: { countLabel?: string; step?: unknown; total?: unknown } | null | undefined): string {
   if (progress?.countLabel) return progress.countLabel;
   return `${formatProgressNumber(progress?.step)} / ${formatProgressNumber(progress?.total)}`;
 }
 
-export function readIdeColumnWidths() {
+export function readIdeColumnWidths(): typeof DEFAULT_IDE_COLUMN_WIDTHS {
   if (typeof window === 'undefined') return DEFAULT_IDE_COLUMN_WIDTHS;
   try {
     const saved = JSON.parse(window.localStorage.getItem('iftree.ideColumnWidths') || '{}');
@@ -42,20 +41,28 @@ export function readIdeColumnWidths() {
   }
 }
 
-export function clampIdeColumnWidth(value, min, max, fallback) {
+export function clampIdeColumnWidth(value: unknown, min: number, max: number, fallback: number): number {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, number));
 }
 
-export function readIdeColumnWidthFromDom(element, property, fallback) {
+export function readIdeColumnWidthFromDom(element: HTMLElement | null | undefined, property: string, fallback: number): number {
   if (!element || typeof window === 'undefined') return fallback;
   const raw = element.style.getPropertyValue(property) || window.getComputedStyle(element).getPropertyValue(property);
   const number = Number.parseFloat(raw);
   return Number.isFinite(number) ? number : fallback;
 }
 
-export function buildVirtualRange(heights, scrollTop, viewportHeight, overscan) {
+interface VirtualRange {
+  start: number;
+  end: number;
+  top: number;
+  bottom: number;
+  totalHeight: number;
+}
+
+export function buildVirtualRange(heights: unknown[], scrollTop: number, viewportHeight: number, overscan: number): VirtualRange {
   const offsets = [0];
   let totalHeight = 0;
   for (const height of heights) {
@@ -76,7 +83,7 @@ export function buildVirtualRange(heights, scrollTop, viewportHeight, overscan) 
   };
 }
 
-export function buildFixedVirtualRange(count, rowHeight, scrollTop, viewportHeight, overscan) {
+export function buildFixedVirtualRange(count: unknown, rowHeight: unknown, scrollTop: unknown, viewportHeight: unknown, overscan: unknown): VirtualRange {
   const safeCount = Math.max(0, Math.floor(Number(count) || 0));
   const safeRowHeight = Math.max(1, Number(rowHeight) || 1);
   const safeScrollTop = Math.max(0, Number(scrollTop) || 0);
@@ -96,7 +103,7 @@ export function buildFixedVirtualRange(count, rowHeight, scrollTop, viewportHeig
   };
 }
 
-export function lowerBound(values, target) {
+export function lowerBound(values: number[], target: number): number {
   let left = 0;
   let right = values.length;
   while (left < right) {

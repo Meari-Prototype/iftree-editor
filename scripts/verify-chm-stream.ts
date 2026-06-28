@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // CHM → 流式写入端到端验证（projectneed 4-16）。
 //
 // 同一个 CHM 用同一解析器（readChmSourceDocument）产 records，走两条写入路径：
@@ -29,7 +28,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { readChmSourceDocument } from '../src/core/source-chm.js';
+import { readChmSourceDocument, type ChmRecord } from '../src/core/source-chm.js';
 import { normalizeImportBaseName } from '../src/core/source-markdown.js';
 import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
 import { KeywordStore } from '../src/vector/keyword-store.js';
@@ -37,26 +36,108 @@ import { KeywordStore } from '../src/vector/keyword-store.js';
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TRUST_LEVEL = '不受控'; // CHM 外部语料；流式契约要求显式给值（直写基线为 null，对账时不比较此列）。
 
-function log(event) {
+// ── 本地 IPC 边界投影 / 业务领域类型 ──────────────────────────
+interface ChmTreeNode {
+  address: string;
+  text: string;
+  node_type: string;
+  source_position: unknown;
+  trust_level: string;
+  children: ChmTreeNode[];
+  id?: string;
+}
+
+interface CliArgs {
+  file: string;
+  batch: number;
+}
+
+interface VerifyEvent {
+  type: string;
+  [extra: string]: unknown;
+}
+
+// stream.push / stream.attachSource 等 IPC 返回的形态（字段全 optional，使用点就近 narrow）。
+interface PushResult {
+  docId?: string;
+  deduped?: boolean;
+  createdCount?: unknown;
+  created?: Array<{ id?: string; children?: unknown[] }>;
+  [extra: string]: unknown;
+}
+
+interface AttachResult {
+  spanCount?: unknown;
+  [extra: string]: unknown;
+}
+
+interface SearchResult {
+  results?: unknown[];
+  nodes?: unknown[];
+  rows?: unknown[];
+  [extra: string]: unknown;
+}
+
+interface DivergenceReport {
+  index: number;
+  baseline: string;
+  stream: string;
+}
+
+// 外部形态：streamChunkedPush 返回后 docId 必定非 null（首批 push 后回填，否则函数已 fail）。
+interface PushState {
+  docId: string;
+  pushSeq: number;
+  pushes: number;
+  bareParentPushes: number;
+  maxPushNodes: number;
+  flatIds: string[];
+  lastPushPayload: Record<string, unknown> | null;
+  lastPushResult: PushResult | null;
+}
+
+// 内部 mutable 形态（pushNodes 首次调用前 docId 未生成）。
+type PushStateInternal = Omit<PushState, 'docId'> & { docId: string | null };
+
+// better-sqlite3 prepare/get 返回的行形态（字段对齐 SQL 列）。
+interface ChildRow { id: string; text: string; source_position: unknown; childCount: number }
+interface RootIdRow { id: string }
+interface CountRow { c: number }
+interface DocEditModeRow { edit_mode: string }
+interface SourceDocRow { source_type: string; rawLen: number }
+interface SpanStatsRow { total: number; bound: number }
+
+interface BetterSqliteDatabase {
+  prepare(sql: string): {
+    get(...params: unknown[]): unknown;
+    all(...params: unknown[]): unknown[];
+  };
+  close(): void;
+}
+
+type HeadlessAgentClient = ReturnType<typeof createHeadlessAgentClient>;
+
+function log(event: VerifyEvent): void {
   console.log(JSON.stringify({ at: new Date().toISOString(), ...event }));
 }
 
-function fail(message) {
+function fail(message: string): never {
   log({ type: 'verify-fail', message });
   throw new Error(message);
 }
 
-function parseArgs(argv) {
-  const args = { file: null, batch: 800 };
+function parseArgs(argv: string[]): CliArgs {
+  let file: string | null = null;
+  let batch = 800;
   for (let i = 0; i < argv.length; i += 1) {
-    if (argv[i] === '--file') args.file = argv[++i];
-    else if (argv[i] === '--batch') args.batch = Number(argv[++i]);
+    if (argv[i] === '--file') file = argv[++i] ?? null;
+    else if (argv[i] === '--batch') batch = Number(argv[++i]);
   }
-  if (!args.file) throw new Error('--file <path.chm> is required');
-  return args;
+  if (!file) throw new Error('--file <path.chm> is required');
+  return { file, batch };
 }
 
-function compareRecordAddress(left, right) {
+function compareRecordAddress(left: ChmRecord, right: ChmRecord): number {
   const a = String(left.address || '').split('-').map(Number);
   const b = String(right.address || '').split('-').map(Number);
   for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
@@ -69,7 +150,7 @@ function compareRecordAddress(left, right) {
 
 // 与 import-chm-doc.mjs 同款：record 自带 index/indexes 时只认显式句位，
 // 否则按记录序号兜底（整批一致，避免两套规则混用）。
-function recordSentenceIndexes(record, fallbackIndex, hasExplicitIndex) {
+function recordSentenceIndexes(record: ChmRecord | null | undefined, fallbackIndex: number, hasExplicitIndex: boolean): number[] {
   if (Array.isArray(record?.indexes)) {
     return record.indexes
       .map((value) => Number(value))
@@ -84,17 +165,17 @@ function recordSentenceIndexes(record, fallbackIndex, hasExplicitIndex) {
 
 // 扁平 records（带原始 address）→ 顶层嵌套子树数组（结构取自地址父子关系）。
 // 同时返回与树先序遍历同序的 sortedRecords，供句位映射对位。
-function buildTopSubtrees(records) {
-  const byAddr = new Map();
-  const tops = [];
+function buildTopSubtrees(records: ChmRecord[]): { tops: ChmTreeNode[]; sortedRecords: ChmRecord[] } {
+  const byAddr = new Map<string, ChmTreeNode>();
+  const tops: ChmTreeNode[] = [];
   const sortedRecords = [...records].sort(compareRecordAddress);
   for (const record of sortedRecords) {
     const addr = String(record.address || '').trim();
     if (!addr) fail('record 缺少 address');
-    const node = {
+    const node: ChmTreeNode = {
       address: '',
       text: record.text || '',
-      node_type: record.nodeType ?? record.node_type ?? 'TEXT',
+      node_type: String(record.nodeType ?? record.node_type ?? 'TEXT'),
       source_position: record.sourcePosition ?? record.source_position ?? null,
       trust_level: TRUST_LEVEL,
       children: []
@@ -113,9 +194,9 @@ function buildTopSubtrees(records) {
 }
 
 // 递归赋连续地址，满足 _validateStreamAddresses 纯追加契约；返回本层已分配的末序号。
-function assignAddresses(topNodes, baseAddress, startOrder) {
+function assignAddresses(topNodes: ChmTreeNode[], baseAddress: string, startOrder: number): number {
   let order = startOrder;
-  const visit = (node, address) => {
+  const visit = (node: ChmTreeNode, address: string): void => {
     node.address = address;
     for (let i = 0; i < node.children.length; i += 1) {
       visit(node.children[i], `${address}-${i + 1}`);
@@ -128,9 +209,9 @@ function assignAddresses(topNodes, baseAddress, startOrder) {
   return order;
 }
 
-function countNodes(topNodes) {
+function countNodes(topNodes: ChmTreeNode[]): number {
   let count = 0;
-  const visit = (node) => {
+  const visit = (node: ChmTreeNode): void => {
     count += 1;
     node.children.forEach(visit);
   };
@@ -139,23 +220,26 @@ function countNodes(topNodes) {
 }
 
 // stream.push 返回的 created 树先序展平：与 sortedRecords 顺序一一对应。
-function collectCreatedIds(created, out) {
+function collectCreatedIds(created: Array<{ id?: string; children?: unknown[] }> | null | undefined, out: string[]): void {
   for (const node of created || []) {
-    out.push(node.id);
-    if (Array.isArray(node.children) && node.children.length) collectCreatedIds(node.children, out);
+    if (node?.id) out.push(node.id);
+    if (Array.isArray(node.children) && node.children.length) {
+      collectCreatedIds(node.children as Array<{ id?: string; children?: unknown[] }>, out);
+    }
   }
 }
 
 // 有序遍历 (childCount, source_position, text) 序列：两棵树同构判据。
-function treeSignature(db, docId) {
+function treeSignature(db: BetterSqliteDatabase, docId: string): string[] {
   const childrenStmt = db.prepare(
     'SELECT id, text, source_position, (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id) AS childCount FROM nodes n WHERE doc_id = ? AND parent_id = ? ORDER BY sort_order, id'
   );
-  const root = db.prepare('SELECT id FROM nodes WHERE doc_id = ? AND parent_id IS NULL').get(docId);
+  const root = db.prepare('SELECT id FROM nodes WHERE doc_id = ? AND parent_id IS NULL').get(docId) as RootIdRow | undefined;
   if (!root) fail(`doc ${docId} 没有根节点`);
-  const lines = [];
-  const walk = (parentId) => {
-    for (const row of childrenStmt.all(docId, parentId)) {
+  const lines: string[] = [];
+  const walk = (parentId: string | null): void => {
+    for (const raw of childrenStmt.all(docId, parentId)) {
+      const row = raw as ChildRow;
       lines.push(`${row.childCount} ${row.source_position ?? ''} ${row.text}`);
       walk(row.id);
     }
@@ -164,7 +248,7 @@ function treeSignature(db, docId) {
   return lines;
 }
 
-function firstDivergence(a, b) {
+function firstDivergence(a: string[], b: string[]): DivergenceReport {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i += 1) {
     if (a[i] !== b[i]) return { index: i, baseline: a[i].slice(0, 120), stream: b[i].slice(0, 120) };
@@ -173,8 +257,8 @@ function firstDivergence(a, b) {
 }
 
 // 从 records 里挑一个高频 CJK 双字词做 FTS 探针（动态选词，不依赖具体文档内容）。
-function pickSearchTerm(records) {
-  const freq = new Map();
+function pickSearchTerm(records: ChmRecord[]): { term: string; count: number } | null {
+  const freq = new Map<string, number>();
   for (const record of records) {
     const text = String(record.text || '');
     for (const match of text.matchAll(/[\p{Script=Han}]{2}/gu)) {
@@ -182,7 +266,7 @@ function pickSearchTerm(records) {
     }
     if (freq.size > 5000) break;
   }
-  let best = null;
+  let best: { term: string; count: number } | null = null;
   for (const [term, count] of freq) {
     if (!best || count > best.count) best = { term, count };
   }
@@ -191,31 +275,36 @@ function pickSearchTerm(records) {
 
 // 分块流式推送引擎：子树 ≤ batchLimit 整棵入批；超限子树「先推空父节点，
 // 再以其 id 为挂载点递归推 children」。证明任意大子树可逐级、逐批、逐节点推。
-async function streamChunkedPush({ client, title, tops, batchLimit }) {
-  const state = {
+async function streamChunkedPush({ client, title, tops, batchLimit }: {
+  client: HeadlessAgentClient;
+  title: string;
+  tops: ChmTreeNode[];
+  batchLimit: number;
+}): Promise<PushState> {
+  const state: PushStateInternal = {
     docId: null,
     pushSeq: 0,
     pushes: 0,
     bareParentPushes: 0,
     maxPushNodes: 0,
-    flatIds: /** @type {string[]} */ ([]),
-    lastPushPayload: /** @type {Record<string, any> | null} */ (null),
-    lastPushResult: /** @type {Record<string, any> | null} */ (null)
+    flatIds: [],
+    lastPushPayload: null,
+    lastPushResult: null
   };
 
-  const pushNodes = async (parentId, batch) => {
+  const pushNodes = async (parentId: string | null, batch: ChmTreeNode[]): Promise<PushResult> => {
     state.pushSeq += 1;
     const size = countNodes(batch);
-    const payload = /** @type {Record<string, any>} */ ({
+    const payload: Record<string, unknown> = {
       action: 'stream.push',
       nodes: batch,
       idempotencyKey: `chm-stream-verify-${state.pushSeq}`
-    });
+    };
     if (state.docId) payload.docId = state.docId;
     else payload.title = title;
     if (parentId) payload.parentId = parentId;
-    const res = await client.request('database.write', { payload });
-    if (!state.docId) state.docId = res.docId;
+    const res = await client.request('database.write', { payload }) as PushResult;
+    if (!state.docId && res.docId) state.docId = res.docId;
     if (res.deduped) fail(`push#${state.pushSeq} 不应命中幂等缓存`);
     if (Number(res.createdCount) !== size) fail(`push#${state.pushSeq} createdCount=${res.createdCount} != ${size}`);
     collectCreatedIds(res.created, state.flatIds);
@@ -226,11 +315,11 @@ async function streamChunkedPush({ client, title, tops, batchLimit }) {
     return res;
   };
 
-  const placeChildren = async (parentId, mountAddr, children) => {
+  const placeChildren = async (parentId: string | null, mountAddr: string, children: ChmTreeNode[]): Promise<void> => {
     let assigned = 0;
-    let buffer = [];
+    let buffer: ChmTreeNode[] = [];
     let bufferCount = 0;
-    const flush = async () => {
+    const flush = async (): Promise<void> => {
       if (!buffer.length) return;
       assigned = assignAddresses(buffer, mountAddr, assigned);
       await pushNodes(parentId, buffer);
@@ -241,11 +330,13 @@ async function streamChunkedPush({ client, title, tops, batchLimit }) {
       const size = countNodes([child]);
       if (size > batchLimit) {
         await flush();
-        const bare = { ...child, children: [] };
+        const bare: ChmTreeNode = { ...child, children: [] };
         assigned = assignAddresses([bare], mountAddr, assigned);
         const res = await pushNodes(parentId, [bare]);
         state.bareParentPushes += 1;
-        await placeChildren(res.created[0].id, bare.address, child.children);
+        const createdId = res.created?.[0]?.id ?? null;
+        if (!createdId) fail(`push#${state.pushSeq} 空父节点未返回 id`);
+        await placeChildren(createdId, bare.address, child.children);
       } else {
         if (bufferCount + size > batchLimit) await flush();
         buffer.push(child);
@@ -256,7 +347,8 @@ async function streamChunkedPush({ client, title, tops, batchLimit }) {
   };
 
   await placeChildren(null, '1', tops);
-  return state;
+  if (!state.docId) fail('streamChunkedPush 未生成 docId');
+  return state as PushState;
 }
 
 async function main() {
@@ -334,11 +426,11 @@ async function main() {
   const clientOptions = {
     cwd: PROJECT_ROOT,
     scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
-    onStderr: (text) => process.stderr.write(text)
+    onStderr: (text: string) => process.stderr.write(text)
   };
 
   const session1 = createHeadlessAgentClient(clientOptions);
-  let push;
+  let push: PushState | null = null;
   try {
     const tB = Date.now();
     await session1.request('database.write', { payload: { action: 'stream.bulkBegin' } });
@@ -347,7 +439,7 @@ async function main() {
     if (push.maxPushNodes > args.batch) fail(`单批峰值 ${push.maxPushNodes} 超过 --batch ${args.batch}`);
 
     // 幂等重推：同 key 同 payload → deduped，且不再追加节点。
-    const dedupRes = await session1.request('database.write', { payload: { ...push.lastPushPayload, docId: push.docId } });
+    const dedupRes = await session1.request('database.write', { payload: { ...(push.lastPushPayload ?? {}), docId: push.docId } }) as PushResult;
     if (dedupRes.deduped !== true) fail('同 idempotencyKey 重推未返回 deduped=true');
     if (Number(dedupRes.createdCount) !== Number(push.lastPushResult?.createdCount)) {
       fail(`幂等重推 createdCount 漂移：${dedupRes.createdCount} != ${push.lastPushResult?.createdCount}`);
@@ -367,7 +459,7 @@ async function main() {
       });
     } catch (error) {
       rejected = true;
-      const message = error?.message || String(error);
+      const message = (error as { message?: string } | null | undefined)?.message || String(error);
       if (!message.includes('地址不连续')) fail(`乱序地址报错文案异常：${message}`);
     }
     if (!rejected) fail('乱序地址追加未被拒绝');
@@ -384,10 +476,11 @@ async function main() {
     });
 
     // 源文档层挂载：句位 → 节点 id 映射按推送先序与 sortedRecords 对位自建。
-    const sentenceMapB = /** @type {Record<string, string>} */ ({});
+    const sentenceMapB: Record<string, string> = {};
+    const pushHandle = push;  // narrow for inner closure
     sortedRecords.forEach((record, index) => {
       for (const sentenceIndex of recordSentenceIndexes(record, index + 1, hasExplicitIndex)) {
-        sentenceMapB[sentenceIndex] = push.flatIds[index];
+        sentenceMapB[String(sentenceIndex)] = pushHandle.flatIds[index];
       }
     });
     const tAttach = Date.now();
@@ -403,12 +496,13 @@ async function main() {
         pdfChars: sourceDocument.pdfChars || [],
         nodeIdsBySentenceIndex: sentenceMapB
       }
-    });
+    }) as AttachResult;
     log({ type: 'attach-ok', spanCount: attach.spanCount, attachMs: Date.now() - tAttach });
   } finally {
     await session1.shutdown();
     session1.close();
   }
+  if (!push) fail('流式 session 未产出 push 状态');
 
   // ── FTS 完整性：重建只在「索引行数 < SQL 行数」时触发；在任何查询发生前
   // 直接数 LanceDB 行数，证明根节点行在位、首查不会触发整库重建。──────
@@ -426,11 +520,11 @@ async function main() {
   if (probe) {
     const session2 = createHeadlessAgentClient(clientOptions);
     try {
-      const timedSearch = async (label) => {
+      const timedSearch = async (label: string): Promise<number> => {
         const t = Date.now();
         const search = await session2.request('database.read', {
-          payload: { action: 'content.searchKeyword', docId: push.docId, keyword: probe.term, limit: 5 }
-        });
+          payload: { action: 'content.searchKeyword', docId: push!.docId, keyword: probe.term, limit: 5 }
+        }) as SearchResult;
         const hits = Array.isArray(search?.results) ? search.results.length
           : Array.isArray(search?.nodes) ? search.nodes.length
             : Array.isArray(search?.rows) ? search.rows.length : 0;
@@ -449,31 +543,31 @@ async function main() {
   }
 
   // ── 对账：结构/计数/一致性/源文档层 ────────────────────────
-  const dbA = new Database(dbPathA, { readonly: true });
-  const dbB = new Database(join(homeB, 'store.sqlite'), { readonly: true });
+  const dbA = new Database(dbPathA, { readonly: true }) as BetterSqliteDatabase;
+  const dbB = new Database(join(homeB, 'store.sqlite'), { readonly: true }) as BetterSqliteDatabase;
   try {
-    const countB = Number(dbB.prepare('SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ?').get(push.docId)?.c) || 0;
+    const countB = Number((dbB.prepare('SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ?').get(push.docId) as CountRow | undefined)?.c) || 0;
     if (countB !== records.length + 1) fail(`流式节点数 ${countB} != records+根 ${records.length + 1}`);
 
-    const editMode = dbB.prepare('SELECT edit_mode FROM docs WHERE id = ?').get(push.docId)?.edit_mode;
+    const editMode = (dbB.prepare('SELECT edit_mode FROM docs WHERE id = ?').get(push.docId) as DocEditModeRow | undefined)?.edit_mode;
     if (editMode !== 'incremental') fail(`流式文档 edit_mode=${editMode}，期望 incremental`);
 
-    const badDepth = Number(dbB.prepare(
+    const badDepth = Number((dbB.prepare(
       "SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ? AND depth != (LENGTH(address) - LENGTH(REPLACE(address, '-', '')) + 1)"
-    ).get(push.docId)?.c) || 0;
+    ).get(push.docId) as CountRow | undefined)?.c) || 0;
     if (badDepth !== 0) fail(`depth 与 address 段数不一致的节点：${badDepth}`);
 
-    const badParent = Number(dbB.prepare(`
+    const badParent = Number((dbB.prepare(`
       SELECT COUNT(*) AS c FROM nodes child
       JOIN nodes parent ON parent.id = child.parent_id
       WHERE child.doc_id = ? AND parent.parent_id IS NOT NULL
         AND child.address NOT LIKE parent.address || '-%'
-    `).get(push.docId)?.c) || 0;
+    `).get(push.docId) as CountRow | undefined)?.c) || 0;
     if (badParent !== 0) fail(`address 与父地址前缀不自洽的节点：${badParent}`);
 
-    const dupAddr = Number(dbB.prepare(
+    const dupAddr = Number((dbB.prepare(
       'SELECT COUNT(*) AS c FROM (SELECT address FROM nodes WHERE doc_id = ? GROUP BY address HAVING COUNT(*) > 1)'
-    ).get(push.docId)?.c) || 0;
+    ).get(push.docId) as CountRow | undefined)?.c) || 0;
     if (dupAddr !== 0) fail(`重复地址：${dupAddr}`);
 
     const sigA = treeSignature(dbA, baselineDocId);
@@ -485,15 +579,15 @@ async function main() {
     log({ type: 'isomorphic-ok', nodes: sigA.length });
 
     // 源文档层对账：源文本、span 总数、span→节点绑定数与基线一致。
-    const srcA = dbA.prepare('SELECT source_type, LENGTH(raw_markdown) AS rawLen FROM source_documents WHERE doc_id = ?').get(baselineDocId);
-    const srcB = dbB.prepare('SELECT source_type, LENGTH(raw_markdown) AS rawLen FROM source_documents WHERE doc_id = ?').get(push.docId);
+    const srcA = dbA.prepare('SELECT source_type, LENGTH(raw_markdown) AS rawLen FROM source_documents WHERE doc_id = ?').get(baselineDocId) as SourceDocRow | undefined;
+    const srcB = dbB.prepare('SELECT source_type, LENGTH(raw_markdown) AS rawLen FROM source_documents WHERE doc_id = ?').get(push.docId) as SourceDocRow | undefined;
     if (!srcB) fail('流式文档缺 source_documents 行');
     if (!srcA || srcA.rawLen !== srcB.rawLen || srcA.source_type !== srcB.source_type) {
       fail(`source_documents 不一致：基线=${JSON.stringify(srcA)} 流式=${JSON.stringify(srcB)}`);
     }
-    const spanStats = (db, docId) => db.prepare(
+    const spanStats = (db: BetterSqliteDatabase, docId: string): SpanStatsRow => db.prepare(
       'SELECT COUNT(*) AS total, SUM(CASE WHEN node_id IS NOT NULL THEN 1 ELSE 0 END) AS bound FROM source_spans WHERE doc_id = ?'
-    ).get(docId);
+    ).get(docId) as SpanStatsRow;
     const spansA = spanStats(dbA, baselineDocId);
     const spansB = spanStats(dbB, push.docId);
     if (Number(spansB.total) !== Number(spansA.total) || Number(spansB.bound) !== Number(spansA.bound)) {
@@ -508,7 +602,7 @@ async function main() {
   log({ type: 'result', ok: true, records: records.length, baselineDocId, streamDocId: push.docId, pushes: push.pushes, runRoot });
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number): Promise<void> {
   if (process.versions.electron) {
     try {
       const { app } = await import('electron');
@@ -521,6 +615,6 @@ async function exitProcess(code) {
 main()
   .then(() => exitProcess(0))
   .catch(async (error) => {
-    log({ type: 'result', ok: false, error: error?.stack || String(error) });
+    log({ type: 'result', ok: false, error: (error as { stack?: string } | null | undefined)?.stack || String(error) });
     await exitProcess(1);
   });

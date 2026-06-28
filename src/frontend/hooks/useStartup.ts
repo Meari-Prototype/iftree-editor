@@ -1,6 +1,8 @@
-// @ts-nocheck
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, type MutableRefObject, type Dispatch, type SetStateAction } from 'react';
 
+import type { DocListItem } from '../../backend/query-api.js';
+import type { DocFolderRow } from '../../backend/db/schema.js';
+import type { LibraryEntry } from '../../backend/library-fs.js';
 import { normalizeDocId, normalizeNodeLayoutSettingsByView, readPersistedActiveDocId, persistActiveDocId, sameDocId } from '../lib/doc-utils.js';
 import { debugLog, setDebugLoggingEnabled } from '../lib/debug-log.js';
 import {
@@ -24,17 +26,128 @@ const E2E_TEXT_MIN_HEIGHT = 6;
 const E2E_EDGE_MIN_WIDTH = 12;
 const E2E_EDGE_MIN_HEIGHT = 6;
 
-function waitForPaintAfterUiUpdate() {
-  return new Promise((resolve) => {
+type AnyRecord = Record<string, unknown>;
+
+interface CurrentDoc {
+  doc?: { id?: unknown; node_count?: unknown; [extra: string]: unknown } | null;
+  tree?: unknown;
+  flatTree?: unknown;
+  editBranch?: unknown;
+  [extra: string]: unknown;
+}
+
+interface DocSummary {
+  id?: unknown;
+  node_count?: unknown;
+  nodeCount?: unknown;
+  [extra: string]: unknown;
+}
+
+interface PendingBranchSummary {
+  id?: unknown;
+  base_doc_id?: unknown;
+  shadow_doc_id?: unknown;
+  node_count?: unknown;
+  owner?: string;
+  [extra: string]: unknown;
+}
+
+interface StartupRenderReadyInfo {
+  docId?: unknown;
+  renderBackend?: string | null;
+  nodeCount?: unknown;
+  visual?: AnyRecord;
+  [extra: string]: unknown;
+}
+
+interface StartupOptions {
+  startupDocId: string | null;
+  renderMode: 'hardware' | 'compatible';
+  e2eChm: boolean;
+  forceHardwareAcceleration: boolean;
+  debugLogging: boolean;
+}
+
+interface StartupPendingDoc {
+  docId: unknown;
+  reportDocId?: unknown;
+  nodeCount: unknown;
+}
+
+interface RenderUnlockPending {
+  docId: string;
+  reason: string;
+}
+
+interface OpenDocOptions {
+  includeEditBranch?: boolean;
+  onComplete?: (doc: unknown) => void;
+  onFailure?: (error: unknown) => void;
+}
+
+export interface UseStartupOptions {
+  currentDoc?: CurrentDoc | null;
+  lastUiActionRef?: MutableRefObject<unknown> | null;
+  startupOpenRequestedRef?: MutableRefObject<boolean> | null;
+  // setter 字段直接对齐上游真签名（useDocumentState / useSettings / useAgentChat），让 AppBody 传 Dispatch 进来天然兼容。
+  setDocs: Dispatch<SetStateAction<DocListItem[]>>;
+  setDocFolders: Dispatch<SetStateAction<DocFolderRow[]>>;
+  setLibraryTree: Dispatch<SetStateAction<LibraryEntry | null>>;
+  setVectorSettings: Dispatch<SetStateAction<Record<string, unknown>>>;
+  setLlmSummarySettings: Dispatch<SetStateAction<Record<string, unknown> | null>>;
+  setNodeLayoutSettings: Dispatch<SetStateAction<Record<string, unknown>>>;
+  setAgentSettings: Dispatch<SetStateAction<Record<string, unknown> | null>>;
+  setAgentDiffs: Dispatch<SetStateAction<Record<string, unknown>[]>>;
+  refreshAgentSessions: () => Promise<unknown>;
+  openDoc: (docId: unknown, options?: OpenDocOptions) => Promise<unknown>;
+  promptStartupEditBranchChoice: (branch: unknown) => Promise<unknown>;
+  editBranchBaseDocId: (editBranch?: unknown) => unknown;
+}
+
+interface HeartbeatExtra extends AnyRecord {
+  docId?: unknown;
+  nodeCount?: unknown;
+  progress?: unknown;
+  renderBackend?: string | null;
+  e2e?: AnyRecord;
+}
+
+interface StartupReportPayload extends AnyRecord {
+  stage?: string;
+  docId?: unknown;
+  nodeCount?: unknown;
+  progress?: unknown;
+  renderBackend?: string | null;
+  e2e?: AnyRecord;
+}
+
+interface RectLike {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+function waitForPaintAfterUiUpdate(): Promise<void> {
+  return new Promise<void>((resolve) => {
     window.setTimeout(() => {
       window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(resolve);
+        window.requestAnimationFrame(() => resolve());
       });
     }, 0);
   });
 }
 
-function viewportRectPayload(rect) {
+interface ViewportRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function viewportRectPayload(rect: { left?: unknown; top?: unknown; width?: unknown; height?: unknown }): ViewportRect {
   return {
     x: Math.max(0, Number(rect?.left) || 0),
     y: Math.max(0, Number(rect?.top) || 0),
@@ -43,19 +156,23 @@ function viewportRectPayload(rect) {
   };
 }
 
-function rectIntersectsViewport(rect, minWidth = 1, minHeight = 1) {
+function rectIntersectsViewport(rect: RectLike | null | undefined, minWidth: number = 1, minHeight: number = 1): boolean {
   if (!rect || rect.width < minWidth || rect.height < minHeight) return false;
   return rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;
 }
 
-function visibleElements(selector, minWidth = 1, minHeight = 1) {
+function visibleElements(selector: string, minWidth: number = 1, minHeight: number = 1): Element[] {
   return Array.from(document.querySelectorAll(selector)).filter((element) => {
     const rect = element.getBoundingClientRect();
     return rectIntersectsViewport(rect, minWidth, minHeight);
   });
 }
 
-function edgeProbeRect(edge, svgRect) {
+interface EdgeElement extends Element {
+  dataset?: DOMStringMap;
+}
+
+function edgeProbeRect(edge: EdgeElement, svgRect: RectLike): RectLike {
   const pad = Math.ceil(E2E_EDGE_MIN_HEIGHT / 2);
   const dataLeft = Number(edge.dataset?.edgeLeft);
   const dataTop = Number(edge.dataset?.edgeTop);
@@ -85,11 +202,25 @@ function edgeProbeRect(edge, svgRect) {
   };
 }
 
-function collectStartupVisualProbe() {
+interface StartupVisualProbe {
+  visual: {
+    visibleNodeCount: number;
+    visibleEdgeCount: number;
+    gpuCardCount: number;
+    gpuEdgeCount: number;
+    hasText: boolean;
+    hasEdges: boolean;
+    overlayClear: boolean;
+  };
+  textProbeRects: ViewportRect[];
+  edgeProbeRects: ViewportRect[];
+}
+
+function collectStartupVisualProbe(): StartupVisualProbe {
   const cards = visibleElements('.c2d-node-card', E2E_TEXT_MIN_WIDTH, E2E_TEXT_MIN_WIDTH);
   const textProbeRects = cards
     .map((card) => card.querySelector('.c2d-node-title, .c2d-node-body, .c2d-node-note, .c2d-node-meta'))
-    .filter(Boolean)
+    .filter((element): element is Element => Boolean(element))
     .map((element) => element.getBoundingClientRect())
     .filter((rect) => rectIntersectsViewport(rect, E2E_TEXT_MIN_WIDTH, E2E_TEXT_MIN_HEIGHT))
     .slice(0, E2E_PROBE_LIMIT)
@@ -99,7 +230,7 @@ function collectStartupVisualProbe() {
   const svgRect = svg?.getBoundingClientRect?.();
   const edgeProbeRects = svg && svgRect
     ? Array.from(svg.querySelectorAll('.c2d-connector-line'))
-        .map((line) => edgeProbeRect(line, svgRect))
+        .map((line) => edgeProbeRect(line as EdgeElement, svgRect))
         .filter((rect) => rectIntersectsViewport(rect, E2E_EDGE_MIN_WIDTH, E2E_EDGE_MIN_HEIGHT))
         .slice(0, E2E_PROBE_LIMIT)
         .map(viewportRectPayload)
@@ -121,8 +252,8 @@ function collectStartupVisualProbe() {
   };
 }
 
-async function moveStartupCameraProbe() {
-  const surface = document.querySelector('.c2d-map-surface');
+async function moveStartupCameraProbe(): Promise<number> {
+  const surface = document.querySelector('.c2d-map-surface') as HTMLElement | null;
   if (!surface) return 0;
   const before = Number(surface.scrollLeft) || 0;
   const maxScroll = Math.max(0, Number(surface.scrollWidth) - Number(surface.clientWidth));
@@ -152,16 +283,19 @@ export function useStartup({
   openDoc,
   promptStartupEditBranchChoice,
   editBranchBaseDocId
-}: any = {}) {
+}: UseStartupOptions): {
+  armRenderUnlock: (docId: unknown, reason?: string) => boolean;
+  handleMindMapRenderReady: (info?: StartupRenderReadyInfo) => void;
+} {
   const { activeTab, lockedProgress, progress, setNotice, setProgress, setOperationLock } = useAppUIContext();
-  const startupSuccessReportedRef = useRef(false);
-  const startupPendingDocRef = useRef(null);
-  const startupOptionsRef = useRef({ startupDocId: null, renderMode: 'hardware', e2eChm: false, forceHardwareAcceleration: false, debugLogging: false });
-  const renderReadyLogSignatureRef = useRef('');
-  const renderUnlockPendingRef = useRef(null);
-  const e2eDragRequestedRef = useRef(false);
+  const startupSuccessReportedRef = useRef<boolean>(false);
+  const startupPendingDocRef = useRef<StartupPendingDoc | null>(null);
+  const startupOptionsRef = useRef<StartupOptions>({ startupDocId: null, renderMode: 'hardware', e2eChm: false, forceHardwareAcceleration: false, debugLogging: false });
+  const renderReadyLogSignatureRef = useRef<string>('');
+  const renderUnlockPendingRef = useRef<RenderUnlockPending | null>(null);
+  const e2eDragRequestedRef = useRef<boolean>(false);
 
-  const sendStartupHeartbeat = useCallback((stage, extra: any = {}) => {
+  const sendStartupHeartbeat = useCallback((stage: string, extra: HeartbeatExtra = {}) => {
     startupHeartbeat({
       ...extra,
       stage,
@@ -170,7 +304,7 @@ export function useStartup({
       progress: extra.progress || null
     });
   }, [currentDoc?.doc?.id, currentDoc?.doc?.node_count]);
-  const completeStartup = useCallback((payload = {}) => {
+  const completeStartup = useCallback((payload: StartupReportPayload = {}) => {
     if (startupSuccessReportedRef.current) return;
     startupSuccessReportedRef.current = true;
     startupPendingDocRef.current = null;
@@ -178,30 +312,30 @@ export function useStartup({
     debugLog('frontend.startup.complete', payload);
     reportStartupSuccess(payload).catch(() => {});
   }, []);
-  const failStartup = useCallback((error, payload: any = {}) => {
+  const failStartup = useCallback((error: unknown, payload: StartupReportPayload = {}) => {
     if (startupSuccessReportedRef.current) return;
     startupSuccessReportedRef.current = true;
     startupPendingDocRef.current = null;
     renderUnlockPendingRef.current = null;
     debugLog('frontend.startup.failure', {
       ...payload,
-      error: error?.message || String(error || 'startup-failure')
+      error: (error as { message?: string } | null | undefined)?.message || String(error || 'startup-failure')
     });
     reportStartupFailure({
-      message: error?.message || String(error || '启动失败'),
+      message: (error as { message?: string } | null | undefined)?.message || String(error || '启动失败'),
       stage: payload.stage || 'startup-failure',
       docId: payload.docId ?? null,
       nodeCount: payload.nodeCount ?? null,
       progress: payload.progress || null
     }).catch(() => {});
   }, []);
-  const armRenderUnlock = useCallback((docId, reason = 'open-doc') => {
+  const armRenderUnlock = useCallback((docId: unknown, reason: string = 'open-doc'): boolean => {
     const normalizedDocId = normalizeDocId(docId);
     if (!normalizedDocId || activeTab !== 'tree') return false;
     renderUnlockPendingRef.current = { docId: normalizedDocId, reason };
     return true;
   }, [activeTab]);
-  const releaseRenderUnlock = useCallback((docId) => {
+  const releaseRenderUnlock = useCallback((docId: unknown): boolean => {
     const pending = renderUnlockPendingRef.current;
     if (!pending || !sameDocId(docId, pending.docId)) return false;
     renderUnlockPendingRef.current = null;
@@ -209,7 +343,7 @@ export function useStartup({
     setOperationLock(null);
     return true;
   }, [setOperationLock, setProgress]);
-  const runStartupE2ECheck = useCallback(async (info: any = {}, pending: any = {}) => {
+  const runStartupE2ECheck = useCallback(async (info: StartupRenderReadyInfo = {}, pending: StartupPendingDoc): Promise<void> => {
     if (e2eDragRequestedRef.current) return;
     e2eDragRequestedRef.current = true;
     const reportDocId = pending.reportDocId || pending.docId;
@@ -221,7 +355,7 @@ export function useStartup({
     });
     const cameraDeltaX = await moveStartupCameraProbe();
     const { visual, textProbeRects, edgeProbeRects } = collectStartupVisualProbe();
-    const screenshot = await captureE2EWindow({ textProbeRects, edgeProbeRects });
+    const screenshot = await captureE2EWindow({ textProbeRects, edgeProbeRects }) as { ok?: boolean } | null | undefined;
     const ok = Boolean(
       visual.visibleNodeCount > 1 &&
       visual.gpuCardCount > 1 &&
@@ -247,9 +381,9 @@ export function useStartup({
       }
     });
   }, [completeStartup, sendStartupHeartbeat]);
-  const handleMindMapRenderReady = useCallback((info: any = {}) => {
+  const handleMindMapRenderReady = useCallback((info: StartupRenderReadyInfo = {}): void => {
     const pending = startupPendingDocRef.current;
-    const visual = info.visual || {};
+    const visual = (info.visual || {}) as { visibleNodeCount?: unknown; visibleEdgeCount?: unknown };
     const signature = [
       info.docId ?? '',
       info.renderBackend || '',
@@ -280,7 +414,7 @@ export function useStartup({
         nodeCount: pending.nodeCount,
         renderBackend: info.renderBackend || null
       });
-    })().catch((error) => {
+    })().catch((error: unknown) => {
       failStartup(error, {
         stage: 'startup-render-ready-failed',
         docId: pending.reportDocId || pending.docId,
@@ -295,13 +429,13 @@ export function useStartup({
     const heartbeatTimer = window.setInterval(() => {
       startupHeartbeat({ stage: 'renderer-alive' });
     }, 1000);
-    const rendererErrorPayload = (error, extra = {}) => ({
-      message: String(error?.message || error || '').slice(0, 240),
-      stack: String(error?.stack || '').slice(0, 800),
+    const rendererErrorPayload = (error: unknown, extra: AnyRecord = {}): AnyRecord => ({
+      message: String((error as { message?: string } | null | undefined)?.message || error || '').slice(0, 240),
+      stack: String((error as { stack?: string } | null | undefined)?.stack || '').slice(0, 800),
       lastUiAction: lastUiActionRef?.current ?? null,
       ...extra
     });
-    const reportWindowError = (event) => {
+    const reportWindowError = (event: ErrorEvent): void => {
       const error = event?.error || event?.message || 'renderer-error';
       debugLog('renderer.window.error', rendererErrorPayload(error, {
         sourceId: String(event?.filename || '').slice(0, 200),
@@ -310,7 +444,7 @@ export function useStartup({
       }));
       failStartup(error, { stage: 'renderer-error' });
     };
-    const reportUnhandledRejection = (event) => {
+    const reportUnhandledRejection = (event: PromiseRejectionEvent): void => {
       const reason = event?.reason || 'renderer-unhandled-rejection';
       debugLog('renderer.window.unhandledrejection', rendererErrorPayload(reason));
       failStartup(reason, { stage: 'renderer-unhandled-rejection' });
@@ -319,25 +453,27 @@ export function useStartup({
     window.addEventListener('unhandledrejection', reportUnhandledRejection);
     startupHeartbeat({ stage: 'startup-list-db-docs' });
     documentRepository.listDocFolders()
-      .then((folders) => { if (alive) setDocFolders(Array.isArray(folders) ? folders : []); })
-      .catch((error) => { if (alive) setNotice(error.message); });
+      .then((folders) => { if (alive) setDocFolders((Array.isArray(folders) ? folders : []) as DocFolderRow[]); })
+      .catch((error) => { if (alive) setNotice((error as { message?: string }).message || ''); });
     documentRepository.readLibraryTree()
-      .then((tree) => { if (alive && tree) setLibraryTree(tree); })
-      .catch((error) => { if (alive) setNotice(error.message); });
+      .then((tree) => { if (alive && tree) setLibraryTree(tree as LibraryEntry); })
+      .catch((error) => { if (alive) setNotice((error as { message?: string }).message || ''); });
     Promise.all([
       documentRepository.listDocs(),
       getStartupOptions().catch(() => ({ startupDocId: null, renderMode: 'hardware', e2eChm: false, debugLogging: false })),
       // 审核通道统一：不限 owner——llm 待审分支同样在启动时被发现、提示恢复审阅。
       documentRepository.getPendingEditBranches({}).catch(() => ({ branches: [] }))
     ]).then(async ([list = [], startupOptions = {}, pendingEdit = {}]) => {
-      const docsList = Array.isArray(list) ? list : [];
+      // listDocs IPC 返回 unknown，本 hook 把它当 DocListItem[]（真行类型，DocSummary 是历史 minimal 子集）。
+      const docsList = (Array.isArray(list) ? list : []) as DocListItem[];
       setDocs(docsList);
+      const options = startupOptions as Partial<StartupOptions>;
       startupOptionsRef.current = {
-        startupDocId: startupOptions.startupDocId || null,
-        renderMode: startupOptions.renderMode === 'compatible' ? 'compatible' : 'hardware',
-        e2eChm: startupOptions.e2eChm === true,
-        forceHardwareAcceleration: startupOptions.forceHardwareAcceleration === true,
-        debugLogging: startupOptions.debugLogging === true
+        startupDocId: options.startupDocId || null,
+        renderMode: options.renderMode === 'compatible' ? 'compatible' : 'hardware',
+        e2eChm: options.e2eChm === true,
+        forceHardwareAcceleration: options.forceHardwareAcceleration === true,
+        debugLogging: options.debugLogging === true
       };
       setDebugLoggingEnabled(startupOptionsRef.current.debugLogging);
       const requestedDocId = startupOptionsRef.current.startupDocId || readPersistedActiveDocId();
@@ -353,7 +489,9 @@ export function useStartup({
       const persistedDoc = requestedDocId
         ? docsList.find((doc) => normalizeDocId(doc.id) === normalizeDocId(requestedDocId))
         : null;
-      const pendingBranches = Array.isArray(pendingEdit?.branches) ? pendingEdit.branches : [];
+      const pendingBranches: PendingBranchSummary[] = Array.isArray((pendingEdit as { branches?: unknown }).branches)
+        ? (pendingEdit as { branches: PendingBranchSummary[] }).branches
+        : [];
       debugLog('frontend.startup.options', {
         ...startupOptionsRef.current,
         requestedDocId,
@@ -370,10 +508,10 @@ export function useStartup({
         : null;
       if (!alive) return;
       const pendingBaseDoc = pendingBranch
-        ? (docsList.find((doc) => sameDocId(doc.id, pendingBranch.base_doc_id)) || {
+        ? (docsList.find((doc) => sameDocId(doc.id, pendingBranch.base_doc_id)) || ({
             id: pendingBranch.base_doc_id,
             node_count: pendingBranch.node_count
-          })
+          } as DocSummary))
         : null;
       if (pendingBranch && pendingBranchChoice === 'discard') {
         try {
@@ -383,13 +521,13 @@ export function useStartup({
             includeDoc: false
           });
         } catch (error) {
-          setNotice(error.message);
+          setNotice((error as { message?: string }).message || '');
           failStartup(error, { stage: 'startup-discard-edit-branch-failed' });
           return;
         }
       }
       const openTargetDocId = pendingBranchChoice === 'restore'
-        ? pendingBranch.shadow_doc_id
+        ? pendingBranch?.shadow_doc_id
         : (pendingBranch ? pendingBranch.base_doc_id : persistedDoc?.id);
       const openBaseDoc = pendingBranchChoice === 'restore'
         ? pendingBaseDoc
@@ -404,7 +542,7 @@ export function useStartup({
         }
         persistActiveDocId(null);
       }
-      if (!alive || startupOpenRequestedRef.current) return;
+      if (!alive || (startupOpenRequestedRef && startupOpenRequestedRef.current)) return;
       if (!openTargetDocId) {
         debugLog('frontend.startup.open.skip', {
           reason: 'no-open-target',
@@ -415,10 +553,10 @@ export function useStartup({
         return;
       }
       e2eDragRequestedRef.current = false;
-      startupOpenRequestedRef.current = true;
+      if (startupOpenRequestedRef) startupOpenRequestedRef.current = true;
       window.setTimeout(() => {
         if (!alive) return;
-        const openStartupDoc = (targetDocId, baseDoc, choice) => {
+        const openStartupDoc = (targetDocId: unknown, baseDoc: DocSummary | null | undefined, choice: string | null): void => {
           const pendingNodeCount = baseDoc?.node_count ?? baseDoc?.nodeCount ?? pendingBranch?.node_count ?? 0;
           startupPendingDocRef.current = {
             docId: targetDocId,
@@ -436,7 +574,8 @@ export function useStartup({
           });
           openDoc(targetDocId, {
             includeEditBranch: pendingBranch ? choice === 'restore' : undefined,
-            onComplete(doc) {
+            onComplete(rawDoc) {
+              const doc = rawDoc as CurrentDoc | null | undefined;
               const renderDocId = doc?.doc?.id || targetDocId;
               const docId = editBranchBaseDocId(doc?.editBranch) || renderDocId;
               const nodeCount = doc?.doc?.node_count ?? baseDoc?.node_count ?? baseDoc?.nodeCount ?? 0;
@@ -447,7 +586,7 @@ export function useStartup({
                 hasTree: Boolean(doc?.tree),
                 flatTree: Boolean(doc?.flatTree)
               });
-              persistActiveDocId(docId);
+              persistActiveDocId(docId as string);
               if (!startupSuccessReportedRef.current) {
                 startupPendingDocRef.current = { docId: renderDocId, reportDocId: docId, nodeCount };
                 if (!e2eDragRequestedRef.current) {
@@ -459,23 +598,23 @@ export function useStartup({
                 }
               }
             }
-          }).catch((error) => {
+          }).catch((error: unknown) => {
             if (!alive) return;
             if (choice === 'restore' && pendingBranch?.base_doc_id && !sameDocId(targetDocId, pendingBranch.base_doc_id)) {
-              setNotice(`恢复编辑状态失败，已暂存：${error.message}`);
+              setNotice(`恢复编辑状态失败，已暂存：${(error as { message?: string }).message}`);
               debugLog('frontend.startup.restore.fallback-stash', {
                 shadowDocId: targetDocId,
                 baseDocId: pendingBranch.base_doc_id,
-                error: error?.message || String(error || 'open-doc-failed')
+                error: (error as { message?: string } | null | undefined)?.message || String(error || 'open-doc-failed')
               });
               openStartupDoc(pendingBranch.base_doc_id, pendingBaseDoc, 'stash');
               return;
             }
-            setNotice(error.message);
+            setNotice((error as { message?: string }).message || '');
             debugLog('frontend.startup.open.failure', {
               docId: targetDocId,
               nodeCount: baseDoc?.node_count ?? baseDoc?.nodeCount ?? null,
-              error: error?.message || String(error || 'open-doc-failed')
+              error: (error as { message?: string } | null | undefined)?.message || String(error || 'open-doc-failed')
             });
             failStartup(error, {
               stage: 'startup-open-active-doc-failed',
@@ -484,34 +623,34 @@ export function useStartup({
             });
           });
         };
-        openStartupDoc(openTargetDocId, openBaseDoc, pendingBranchChoice || 'open');
+        openStartupDoc(openTargetDocId, openBaseDoc, (pendingBranchChoice as string) || 'open');
       }, 0);
-    }).catch((error) => {
+    }).catch((error: unknown) => {
       if (alive) {
-        setNotice(error.message);
+        setNotice((error as { message?: string }).message || '');
         failStartup(error, { stage: 'startup-list-docs-failed' });
       }
     });
     settingsRepository.readVectorSettings()
-      .then((settings) => setVectorSettings(settings || { enabled: true, disabledReason: '' }))
+      .then((settings) => setVectorSettings((settings || { enabled: true, disabledReason: '' }) as Record<string, unknown>))
       .catch((error) => {
-        if (alive) setNotice(error.message);
+        if (alive) setNotice((error as { message?: string }).message || '');
       });
     settingsRepository.readLlmSummarySettings()
-      .then((settings) => setLlmSummarySettings(settings || null))
-      .catch((error) => setNotice(error.message));
+      .then((settings) => setLlmSummarySettings((settings || null) as Record<string, unknown> | null))
+      .catch((error) => setNotice((error as { message?: string }).message || ''));
     settingsRepository.readAgentSettings()
-      .then((settings) => setAgentSettings(settings || null))
-      .catch((error) => setNotice(error.message));
+      .then((settings) => setAgentSettings((settings || null) as Record<string, unknown> | null))
+      .catch((error) => setNotice((error as { message?: string }).message || ''));
     const agentTimer = window.setTimeout(() => {
       agentRepository.listDiffs()
-        .then((diffs) => setAgentDiffs(Array.isArray(diffs) ? diffs : []))
-        .catch((error) => setNotice(error.message));
-      refreshAgentSessions().catch((error) => setNotice(error.message));
+        .then((diffs) => setAgentDiffs((Array.isArray(diffs) ? diffs : []) as Record<string, unknown>[]))
+        .catch((error) => setNotice((error as { message?: string }).message || ''));
+      refreshAgentSessions().catch((error) => setNotice((error as { message?: string }).message || ''));
     }, 300);
     settingsRepository.readNodeLayoutSettings()
-      .then((settings) => setNodeLayoutSettings(normalizeNodeLayoutSettingsByView(settings)))
-      .catch((error) => setNotice(error.message));
+      .then((settings) => setNodeLayoutSettings(normalizeNodeLayoutSettingsByView(settings) as Record<string, unknown>))
+      .catch((error) => setNotice((error as { message?: string }).message || ''));
     return () => {
       alive = false;
       window.clearInterval(heartbeatTimer);
@@ -524,7 +663,7 @@ export function useStartup({
   useEffect(() => {
     const data = lockedProgress || progress;
     if (!data) return;
-    sendStartupHeartbeat(String(data.label || 'startup-progress'), { progress: data });
+    sendStartupHeartbeat(String((data as { label?: unknown }).label || 'startup-progress'), { progress: data });
   }, [lockedProgress, progress, sendStartupHeartbeat]);
 
   return {

@@ -1,22 +1,35 @@
-// @ts-nocheck
-
 import { normalizeAgentToolSettings
 } from '../../lib/summary-utils.js';
 import { LlmSummarySettingsPanel } from './LlmSummarySettingsPanel.jsx';
 import { SummaryStrategySettingsPanel } from './SummaryStrategySettingsPanel.jsx';
+
+type SettingsObject = Record<string, unknown>;
+type InputValue = string | number | readonly string[] | undefined;
+interface AgentSettings extends SettingsObject {
+  personalPrompt?: string;
+  toolSettings?: Partial<Record<'searchResultLimit' | 'searchBlockMaxChars' | 'fetchContentMaxChars' | 'webSearchResultLimit' | 'webOpenCharLimit', InputValue>>;
+}
+type SettingsChange = (settings: SettingsObject) => void;
+
+interface AgentSettingsPanelProps {
+  agentSettings?: AgentSettings | null;
+  onAgentChange?: SettingsChange;
+  llmSummarySettings?: (SettingsObject & { independent?: boolean }) | null;
+  onLlmSummaryChange?: SettingsChange;
+}
 
 export function AgentSettingsPanel({
   agentSettings,
   onAgentChange,
   llmSummarySettings,
   onLlmSummaryChange
-}) {
+}: AgentSettingsPanelProps) {
   const summaryIndependent = llmSummarySettings?.independent === true;
   const toolSettings = normalizeAgentToolSettings(agentSettings?.toolSettings || {});
-  const setSummaryIndependent = (enabled) => {
+  const setSummaryIndependent = (enabled: boolean) => {
     onLlmSummaryChange?.({ ...(llmSummarySettings || {}), independent: enabled });
   };
-  const updateToolSettings = (patch) => {
+  const updateToolSettings = (patch: SettingsObject) => {
     onAgentChange?.({
       ...(agentSettings || {}),
       toolSettings: normalizeAgentToolSettings({ ...toolSettings, ...patch })

@@ -1,7 +1,6 @@
-// @ts-nocheck
 import { safeDebugLabel } from '../../lib/debug-log.js';
 
-export function debugElementTarget(target) {
+export function debugElementTarget(target: EventTarget | null): Record<string, string> | null {
   if (typeof Element === 'undefined' || !(target instanceof Element)) return null;
   const control = target.closest([
     '[data-debug-label]',
@@ -37,7 +36,7 @@ export function debugElementTarget(target) {
   return descriptor;
 }
 
-export function debugShouldLogKey(event) {
+export function debugShouldLogKey(event: KeyboardEvent): boolean {
   if (event.ctrlKey || event.metaKey || event.altKey) return true;
   return ['Escape', 'Enter', 'Delete', 'Backspace'].includes(event.key);
 }

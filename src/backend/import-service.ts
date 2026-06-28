@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { statSync } from 'node:fs';
 import { join, parse, resolve } from 'node:path';
 
@@ -6,23 +5,34 @@ import { importRecordsForFile } from '../core/import-formats/router.js';
 import { normalizeImportMode } from '../core/import-formats/shared.js';
 import { isSameOrChildPath, normalizeLibraryRelativePath } from './library-fs.js';
 import { normalizeStableId, sameStableId } from './db/ids.js';
+import type Database from 'better-sqlite3';
 
-function parseDocMetaJson(meta) {
-  if (meta && typeof meta === 'object' && !Array.isArray(meta)) return meta;
+type RoutedImport = Awaited<ReturnType<typeof importRecordsForFile>>;
+
+interface DocMeta {
+  sourcePath?: string;
+  importedAt?: string;
+  direct?: boolean;
+  textChars?: unknown;
+  [extra: string]: unknown;
+}
+
+function parseDocMetaJson(meta: unknown): DocMeta {
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) return meta as DocMeta;
   try {
-    return meta ? JSON.parse(meta) : {};
+    return meta ? JSON.parse(meta as string) as DocMeta : {};
   } catch {
     return {};
   }
 }
 
-function pathKey(value) {
+function pathKey(value: unknown): string {
   return resolve(String(value || '')).toLowerCase();
 }
 
 // 路径前缀替换（库文件移动/改名后重写源绑定用）：target 落在 fromPath 下时把前缀换成 toPath，
 // target 恰为 fromPath 时整体替换为 toPath。
-function replacePathPrefix(target, fromPath, toPath) {
+function replacePathPrefix(target: string, fromPath: string, toPath: string): string {
   const targetResolved = resolve(target);
   const fromResolved = resolve(fromPath);
   if (pathKey(targetResolved) === pathKey(fromResolved)) return resolve(toPath);
@@ -30,40 +40,85 @@ function replacePathPrefix(target, fromPath, toPath) {
   return join(resolve(toPath), suffix);
 }
 
-function sourcePathKey(value) {
+function sourcePathKey(value: unknown): string {
   const raw = String(value || '').trim();
   return raw ? pathKey(raw) : '';
 }
 
-function docSourcePathKeys(row) {
+interface DocLookupRow {
+  id: string;
+  title: string;
+  meta: string | null;
+  created_at: string;
+  updated_at: string;
+  original_path: string | null;
+}
+
+function docSourcePathKeys(row: DocLookupRow): string[] {
   const meta = parseDocMetaJson(row.meta);
   return [meta.sourcePath, row.original_path].map(sourcePathKey).filter(Boolean);
 }
 
-function sortExistingDocs(left, right) {
-  return String(right.updated_at || '').localeCompare(String(left.updated_at || '')) || String(right.id || '').localeCompare(String(left.id || ''));
+function sortExistingDocs(left: DocLookupRow, right: DocLookupRow): number {
+  return String(right.updated_at || '').localeCompare(String(left.updated_at || ''))
+    || String(right.id || '').localeCompare(String(left.id || ''));
 }
 
-function findExistingImportedDocForSourcePaths(store, sourcePaths = []) {
+interface ImportStore {
+  db: Database;
+  createDoc(payload: { title: string; rootText: string; meta: string }): { id: string; rootNodeId: string; [extra: string]: unknown };
+  createDocFromStructuredRecords(payload: { title: string; sourcePath: string; records: unknown[] }): CreatedDoc;
+  createDocFromSentenceRecords(payload: { title: string; sourcePath: string; records: unknown[] }): CreatedDoc;
+  saveSourceDocument(payload: {
+    docId: string;
+    sourcePath: string | undefined;
+    sourceType: string | undefined;
+    rawMarkdown: string;
+    spans: unknown[] | undefined;
+    pdfPages: unknown[];
+    pdfChars: unknown[];
+    docBlocks: unknown[];
+    nodeIdsBySentenceIndex: Map<number, string>;
+  }): unknown;
+  deleteDoc(docId: string): unknown;
+  listDocs(): Array<{ id: unknown; title?: string; node_count?: number; [extra: string]: unknown }>;
+}
+
+interface CreatedDoc {
+  id: string;
+  rootNodeId: string;
+  importedNodeIds: string[];
+  importedNodeIdsByRecordIndex?: Record<number, string>;
+  [extra: string]: unknown;
+}
+
+function findExistingImportedDocForSourcePaths(store: ImportStore, sourcePaths: string[] = []): DocLookupRow | null {
   const normalizedKeys = new Set(sourcePaths.map(sourcePathKey).filter(Boolean));
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     SELECT docs.id, docs.title, docs.meta, docs.created_at, docs.updated_at, source_documents.original_path
     FROM docs
     LEFT JOIN source_documents ON source_documents.doc_id = docs.id
-  `).all();
+  `).all<DocLookupRow>();
   return rows
     .filter((row) => docSourcePathKeys(row).some((key) => normalizedKeys.has(key)))
     .sort(sortExistingDocs)[0] || null;
 }
 
-function throwDuplicateImportError(existingDoc) {
+function throwDuplicateImportError(existingDoc: DocLookupRow | null): void {
   if (!existingDoc) return;
   throw new Error(`导入失败：该真实文本路径已对应数据库文档 doc ${existingDoc.id}「${existingDoc.title || ''}」。如需重新导入，请先删除旧数据库文档。`);
 }
 
-function importRecordSentenceIndexes(record, fallbackIndex, hasExplicitIndex) {
+interface ImportRecordLike {
+  text?: unknown;
+  index?: unknown;
+  indexes?: unknown[];
+  [extra: string]: unknown;
+}
+
+function importRecordSentenceIndexes(record: ImportRecordLike | null | undefined, fallbackIndex: number, hasExplicitIndex: boolean): number[] {
   if (Array.isArray(record?.indexes)) {
-    return record.indexes
+    return record!.indexes!
       .map((value) => Number(value))
       .filter((value) => Number.isFinite(value) && value > 0);
   }
@@ -74,7 +129,7 @@ function importRecordSentenceIndexes(record, fallbackIndex, hasExplicitIndex) {
   return hasExplicitIndex ? [] : [fallbackIndex];
 }
 
-function cleanupFailedImport(store, docId) {
+function cleanupFailedImport(store: ImportStore, docId: string | undefined | null): void {
   if (!docId) return;
   try {
     store.deleteDoc(docId);
@@ -84,7 +139,43 @@ function cleanupFailedImport(store, docId) {
   // 失败回滚只删文档；导入时不建向量（向量由 host 返回后统一 reconcile），无向量可清。
 }
 
-export async function importFilePathsToStore(options = {}) {
+interface ProgressEvent {
+  label?: string;
+  step?: number;
+  total?: number;
+  done?: boolean;
+}
+
+export interface ImportFilePathsOptions {
+  store: ImportStore;
+  filePaths?: string[];
+  mode?: unknown;
+  chunkSize?: number;
+  overlap?: number;
+  sendProgress?: (event: ProgressEvent) => void;
+  refreshDoc?: ((docId: string) => Record<string, unknown>) | null;
+}
+
+interface ImportedEntry {
+  docId: string;
+  title: string;
+  degraded?: { from?: string; reason?: string } | null;
+  notice?: string;
+  [extra: string]: unknown;
+}
+
+interface SourceDocumentLike {
+  sourcePath?: string;
+  sourceType?: string;
+  rawMarkdown?: string;
+  rawText?: string;
+  spans?: Array<Record<string, unknown>>;
+  pdfPages?: unknown[];
+  pdfChars?: unknown[];
+  docBlocks?: unknown[];
+}
+
+export async function importFilePathsToStore(options: ImportFilePathsOptions): Promise<ImportedEntry[]> {
   const {
     store,
     filePaths = [],
@@ -96,7 +187,7 @@ export async function importFilePathsToStore(options = {}) {
   } = options;
   if (!store?.db) throw new Error('importFilePathsToStore requires an initialized store');
 
-  const imported = [];
+  const imported: ImportedEntry[] = [];
   const total = filePaths.length;
   for (const [fileIndex, filePath] of filePaths.entries()) {
     const filename = parse(filePath).base;
@@ -104,10 +195,16 @@ export async function importFilePathsToStore(options = {}) {
 
     throwDuplicateImportError(findExistingImportedDocForSourcePaths(store, [filePath]));
 
-    let doc = null;
+    let doc: CreatedDoc | null = null;
     try {
-      const routedImport = await importRecordsForFile(filePath, { mode: normalizeImportMode(mode), chunkSize, overlap });
-      const structured = routedImport.structured;
+      const routedImport = await importRecordsForFile(filePath, { mode: normalizeImportMode(mode), chunkSize, overlap }) as RoutedImport & {
+        structured?: ImportRecordLike[] | null;
+        records: ImportRecordLike[];
+        sourceDocument?: SourceDocumentLike | null;
+        direct?: boolean;
+        degraded?: { from?: string; reason?: string } | null;
+      };
+      const structured = routedImport.structured ?? undefined;
       const records = routedImport.records;
       const sourceDocument = routedImport.sourceDocument;
       const direct = routedImport.direct === true;
@@ -117,29 +214,35 @@ export async function importFilePathsToStore(options = {}) {
 
       sendProgress({ label: '构建文档结构...', step: 0, total: 0 });
       if (direct) {
-        doc = store.createDoc({
+        const created = store.createDoc({
           title,
-          rootText: records[0]?.text || title,
+          rootText: String(records[0]?.text ?? '') || title,
           meta: JSON.stringify({ sourcePath: filePath, importedAt: new Date().toISOString(), direct: true })
         });
-        doc = { ...doc, importedNodeIds: [doc.rootNodeId], importedNodeIdsByRecordIndex: { 1: doc.rootNodeId } };
+        doc = {
+          ...(created as CreatedDoc),
+          importedNodeIds: [created.rootNodeId],
+          importedNodeIdsByRecordIndex: { 1: created.rootNodeId }
+        };
       } else if (structured) {
         doc = store.createDocFromStructuredRecords({ title, sourcePath: filePath, records: structured });
       } else {
         doc = store.createDocFromSentenceRecords({ title, sourcePath: filePath, records });
       }
 
-      if (sourceDocument) {
-        const nodeIdsBySentenceIndex = new Map();
+      if (sourceDocument && doc) {
+        const nodeIdsBySentenceIndex = new Map<number, string>();
         if (direct) {
           for (const span of sourceDocument.spans || []) {
-            const sentenceIndex = Number(span.sentence_index ?? span.sentenceIndex ?? span.index);
+            const sentenceIndex = Number((span as { sentence_index?: unknown; sentenceIndex?: unknown; index?: unknown }).sentence_index
+              ?? (span as { sentenceIndex?: unknown }).sentenceIndex
+              ?? (span as { index?: unknown }).index);
             if (Number.isFinite(sentenceIndex) && sentenceIndex > 0) {
               nodeIdsBySentenceIndex.set(sentenceIndex, doc.rootNodeId);
             }
           }
         } else {
-          const sourceRecords = structured || records;
+          const sourceRecords: ImportRecordLike[] = structured || records;
           const hasExplicitIndex = sourceRecords.some((record) => record.index != null || Array.isArray(record.indexes));
           for (const [index, record] of sourceRecords.entries()) {
             for (const sentenceIndex of importRecordSentenceIndexes(record, index + 1, hasExplicitIndex)) {
@@ -161,9 +264,13 @@ export async function importFilePathsToStore(options = {}) {
         });
       }
 
+      if (!doc) continue;
+
       // 派生索引（BM25/向量）不在导入落库时建：本函数只解析+落库+存源文档，返回后由 host 对每篇
       // 文档调派生索引模块的统一维护入口（与流式导入 bulkEnd 收尾同一口径）。
-      const entry = typeof refreshDoc === 'function' ? refreshDoc(doc.id) : { docId: doc.id, title };
+      const entry: ImportedEntry = typeof refreshDoc === 'function'
+        ? { ...(refreshDoc(doc.id) as Record<string, unknown>), docId: doc.id, title }
+        : { docId: doc.id, title };
       if (routedImport.degraded?.from === 'simple') {
         entry.degraded = routedImport.degraded;
         entry.notice = `simple 模式未识别到可用目录结构（${routedImport.degraded.reason}），已按整篇单节点导入；要按标题切分请补全标题层级或改用其它 mode。`;
@@ -192,7 +299,7 @@ export async function importFilePathsToStore(options = {}) {
 // 经 db import-json 校验后原子入库（不走影子分支审批；入库前的脚本/修整副本是 agent 在工作区的过程
 // 产物，不进我们的版本管理）。正文逐字节切片由 skill 纪律 + 校验器逐字节比对双重保证。
 // 源文用绝对路径：agent 跑 db import-json 时按后端进程 cwd 解析，相对路径会落到项目根而非 library。
-function buildSmartImportPromptText(relativePath, absolutePath) {
+function buildSmartImportPromptText(relativePath: string, absolutePath: string): string {
   const rel = String(relativePath || '').trim();
   const abs = String(absolutePath || '').trim();
   return [
@@ -214,7 +321,26 @@ function buildSmartImportPromptText(relativePath, absolutePath) {
   ].join('\n');
 }
 
-export function createLibraryDocumentService(deps = {}) {
+export interface LibraryDocumentDeps {
+  getStore: () => ImportStore;
+  runWrite: (payload: Record<string, unknown>) => Promise<{ ok?: boolean; changed?: unknown; [extra: string]: unknown } | null | undefined>;
+  maintainDerivedAfterWrite: (docId: string, options: { embed?: boolean }) => Promise<unknown>;
+  refreshDoc: (docId: string, options?: Record<string, unknown>) => Record<string, unknown>;
+  notifyLibraryChanged: () => void;
+  libraryPath: (relativePath: string) => string;
+  treeSliceDepth?: number;
+}
+
+type Payload = Record<string, unknown>;
+
+interface ImportedDocSummary {
+  docId: string | null;
+  title: string;
+  sourcePath: string;
+  nodeCount: number;
+}
+
+export function createLibraryDocumentService(deps: LibraryDocumentDeps) {
   const {
     getStore,
     runWrite,
@@ -225,18 +351,20 @@ export function createLibraryDocumentService(deps = {}) {
     treeSliceDepth = 1
   } = deps;
 
-  function importedDocSummary(item = {}, fallbackSourcePath = '') {
-    const doc = item.doc || item.created || item;
-    const meta = parseDocMetaJson(doc?.meta);
+  function importedDocSummary(item: Record<string, unknown> = {}, fallbackSourcePath = ''): ImportedDocSummary {
+    const docCandidate = (item.doc as Record<string, unknown> | undefined)
+      ?? (item.created as Record<string, unknown> | undefined)
+      ?? item;
+    const meta = parseDocMetaJson(docCandidate?.meta);
     return {
-      docId: normalizeStableId(doc?.id ?? item.docId, null),
-      title: doc?.title || item.title || '',
+      docId: normalizeStableId(docCandidate?.id ?? item.docId, null),
+      title: String(docCandidate?.title || item.title || ''),
       sourcePath: meta.sourcePath || fallbackSourcePath,
-      nodeCount: Number(doc?.node_count ?? doc?.nodeCount ?? item.nodeCount) || 0
+      nodeCount: Number(docCandidate?.node_count ?? docCandidate?.nodeCount ?? item.nodeCount) || 0
     };
   }
 
-  async function importLibraryDocument(payload = {}) {
+  async function importLibraryDocument(payload: Payload = {}): Promise<Record<string, unknown>> {
     const relativePath = normalizeLibraryRelativePath(
       payload.relativePath ?? payload.relative_path ?? payload.path ?? payload.libraryPath
     );
@@ -252,8 +380,8 @@ export function createLibraryDocumentService(deps = {}) {
       store: getStore(),
       filePaths: [filePath],
       mode: payload.mode,
-      chunkSize: payload.chunkSize,
-      overlap: payload.overlap,
+      chunkSize: payload.chunkSize as number | undefined,
+      overlap: payload.overlap as number | undefined,
       refreshDoc: (docId) => refreshDoc(docId, {
         maxTreeDepth: treeSliceDepth,
         includeNodes: false,
@@ -262,7 +390,7 @@ export function createLibraryDocumentService(deps = {}) {
       })
     });
     notifyLibraryChanged();
-    const docs = imported.map((item) => importedDocSummary(item, filePath));
+    const docs = imported.map((item) => importedDocSummary(item as unknown as Record<string, unknown>, filePath));
     // 文件导入直接落库、不走流式：落库后对每篇文档调派生索引模块的统一维护入口——BM25 整篇重建，
     // embed:true 当场全量建向量、否则失活留显式补（vectors 动词 / completeness 闸）。与流式导入
     // bulkEnd 收尾同一口径。这与「向量式导入」（mode:'vector' 按字数切块）正交：怎么切归 mode，
@@ -270,14 +398,14 @@ export function createLibraryDocumentService(deps = {}) {
     // 建向量与切分方式正交：所有 mode（含向量式导入）默认不建 embedding、留 embed:true 手动触发
     //（4-6-1「文档导入时不得自动执行 embedding」）。向量式导入只管按字数切块，不因名字带「向量」就默认建。
     const wantVectors = payload.embed === true;
-    let vectorWarning = null;
+    let vectorWarning: string | null = null;
     for (const doc of docs) {
       if (!doc?.docId) continue;
       try {
         await maintainDerivedAfterWrite(doc.docId, { embed: wantVectors });
       } catch (error) {
         // 派生索引可重建、SQL 已落库 → 不让导入失败；显式建向量时把错误冒泡成 warning。
-        if (wantVectors) vectorWarning = error?.message || String(error);
+        if (wantVectors) vectorWarning = (error as { message?: string } | null | undefined)?.message || String(error);
       }
     }
     return {
@@ -294,7 +422,7 @@ export function createLibraryDocumentService(deps = {}) {
 
   // 智能导入只产「发给 agent 的任务」、不在后端落库：由前端以 full 档发起 agent 会话，agent 自主跑
   // skill 工作流（观察 / 写脚本 / 校验 / 入库），过程在 AgentPanel 可监控。这里只做定位 + 构造 prompt。
-  function smartImportTask(payload = {}) {
+  function smartImportTask(payload: Payload = {}): Record<string, unknown> {
     const relativePath = normalizeLibraryRelativePath(
       payload.relativePath ?? payload.relative_path ?? payload.path ?? payload.libraryPath
     );
@@ -310,7 +438,7 @@ export function createLibraryDocumentService(deps = {}) {
     };
   }
 
-  async function deleteImportedDocument(payload = {}) {
+  async function deleteImportedDocument(payload: Payload = {}): Promise<Record<string, unknown>> {
     const docId = normalizeStableId(payload.docId ?? payload.doc_id, null);
     if (!docId) throw new Error('delete_library_document requires docId');
     const existing = getStore().listDocs().find((doc) => sameStableId(doc.id, docId)) || null;
@@ -326,9 +454,9 @@ export function createLibraryDocumentService(deps = {}) {
     };
   }
 
-  function updateImportedSourcePaths(fromPath, toPath, isDirectory) {
+  function updateImportedSourcePaths(fromPath: string, toPath: string, isDirectory: boolean): void {
     const db = getStore().db;
-    const docs = db.prepare('SELECT id, meta FROM docs').all();
+    const docs = db.prepare('SELECT id, meta FROM docs').all<{ id: string; meta: string | null }>();
     const updateDoc = db.prepare('UPDATE docs SET meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?');
     for (const doc of docs) {
       const meta = parseDocMetaJson(doc.meta);
@@ -340,7 +468,8 @@ export function createLibraryDocumentService(deps = {}) {
         sourcePath: replacePathPrefix(meta.sourcePath, fromPath, toPath)
       }), doc.id);
     }
-    const sourceDocs = db.prepare('SELECT doc_id, original_path FROM source_documents WHERE original_path IS NOT NULL').all();
+    const sourceDocs = db.prepare('SELECT doc_id, original_path FROM source_documents WHERE original_path IS NOT NULL')
+      .all<{ doc_id: string; original_path: string }>();
     const updateSourceDoc = db.prepare('UPDATE source_documents SET original_path = ? WHERE doc_id = ?');
     for (const row of sourceDocs) {
       const matched = isDirectory ? isSameOrChildPath(row.original_path, fromPath) : pathKey(row.original_path) === pathKey(fromPath);

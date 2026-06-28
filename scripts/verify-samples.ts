@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, parse } from 'node:path';
@@ -30,26 +29,26 @@ const store = new IftreeStore(dbPath);
 store.init();
 
 try {
-  const rows = [];
+  const rows: Array<{ file: string; sentences: number; nodes: number; firstAddress: unknown }> = [];
 
   for (const sample of sourceSamples) {
     const filePath = join(verifyDir, sample.file);
     const sentences = await readSentences(filePath);
     const title = parse(filePath).name.replace(/_sentences$/i, '');
     const doc = store.createDocFromSentences({ title, sourcePath: filePath, sentences });
-    const loaded = store.getDoc(doc.id);
+    const loaded = store.getDoc(doc.id)!;
 
     rows.push({
       file: basename(filePath),
       sentences: sentences.length,
       nodes: loaded.nodes.length,
-      firstAddress: loaded.tree.children[0]?.children[0]?.address || ''
+      firstAddress: loaded.tree!.children![0]?.children?.[0]?.address || ''
     });
   }
 
   console.table(rows);
-  const docs = store.listDocs();
-  const totalNodes = docs.reduce((sum, doc) => sum + Number(doc.node_count || 0), 0);
+  const docs = store.listDocs() as Array<{ node_count?: unknown }>;
+  const totalNodes = docs.reduce((sum: number, doc) => sum + Number(doc.node_count || 0), 0);
   console.log(`Imported ${docs.length} docs into ${dbPath}`);
   console.log(`Total nodes: ${totalNodes}`);
 } finally {

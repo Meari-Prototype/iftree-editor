@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 把 better-sqlite3 构建成 node ABI——headless 后端 / docker / 桌面统一的构建路径。
 // 前端去 native 后桌面 electron 不再 in-process 用 better-sqlite3，全仓库只剩 node 一套 ABI。projectneed `18` 解耦。
 //
@@ -27,7 +26,7 @@ import {
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-function sleep(ms) {
+function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
@@ -39,8 +38,8 @@ async function releaseSharedBackend() {
   try {
     process.kill(pid);
     console.log(`[rebuild:node] 关停现役共享后端 pid=${pid}（释放 better_sqlite3.node 锁）`);
-  } catch (error) {
-    console.log(`[rebuild:node] 共享后端 pid=${pid} 已不在（${error.code || error.message}）`);
+  } catch (error: unknown) {
+    console.log(`[rebuild:node] 共享后端 pid=${pid} 已不在（${(error as { code?: string }).code || (error as { message?: string }).message}）`);
     removeBackendDescriptorIfOwn(descriptorPath, pid);
     return;
   }
@@ -53,7 +52,7 @@ async function releaseSharedBackend() {
   removeBackendDescriptorIfOwn(descriptorPath, pid);
 }
 
-function rebuild() {
+function rebuild(): Promise<number> {
   return new Promise((resolveCode) => {
     // Windows: .cmd 须经 shell（直接 spawn 会 EINVAL）；整条命令走 command 串、args 留空，避免
     // DEP0190（shell + args 拼接告警）。linux/docker 正常 spawn npm、不用 shell。
@@ -64,8 +63,8 @@ function rebuild() {
       { cwd: PROJECT_ROOT, stdio: 'inherit', windowsHide: true, shell: isWin }
     );
     child.on('exit', (code) => resolveCode(code ?? 1));
-    child.on('error', (error) => {
-      console.error(error?.message || error);
+    child.on('error', (error: unknown) => {
+      console.error((error as { message?: string } | null | undefined)?.message || error);
       resolveCode(1);
     });
   });

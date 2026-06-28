@@ -1,12 +1,20 @@
-// @ts-nocheck
-export function chatCompletionUrl(baseUrl, fullUrl = false) {
+export type LlmFetcher = (target: Parameters<typeof fetch>[0], init?: RequestInit) => Promise<Response>;
+
+interface FetchLlmConfig {
+  fetchers?: LlmFetcher[];
+  signal?: AbortSignal | null;
+  timeoutMs?: unknown;
+  errorPrefix?: unknown;
+}
+
+export function chatCompletionUrl(baseUrl: unknown, fullUrl = false) {
   const base = String(baseUrl || 'https://api.deepseek.com').trim().replace(/\/+$/, '');
   if (fullUrl) return base;
   if (base.endsWith('/chat/completions')) return base;
   return `${base}/chat/completions`;
 }
 
-export function anthropicMessagesUrl(baseUrl, fullUrl = false) {
+export function anthropicMessagesUrl(baseUrl: unknown, fullUrl = false) {
   const base = String(baseUrl || 'https://api.deepseek.com/anthropic').trim().replace(/\/+$/, '');
   if (fullUrl) return base;
   if (base.endsWith('/messages')) return base;
@@ -14,12 +22,12 @@ export function anthropicMessagesUrl(baseUrl, fullUrl = false) {
   return `${base}/v1/messages`;
 }
 
-function defaultFetchers() {
+function defaultFetchers(): LlmFetcher[] {
   if (typeof fetch !== 'function') return [];
   return [(target, init) => fetch(target, init)];
 }
 
-function cleanUrlForError(url) {
+function cleanUrlForError(url: unknown) {
   return String(url || '').replace(/\?.*$/, '');
 }
 
@@ -29,11 +37,11 @@ function abortError(message = '请求已取消') {
   return error;
 }
 
-export async function fetchLlmResponse(url, options = {}, config = {}) {
+export async function fetchLlmResponse(url: string, options: RequestInit = {}, config: FetchLlmConfig = {}) {
   const fetchers = Array.isArray(config.fetchers) && config.fetchers.length > 0
     ? config.fetchers
     : defaultFetchers();
-  const errors = [];
+  const errors: unknown[] = [];
   const externalSignal = config.signal || options.signal || null;
 
   for (const fetcher of fetchers) {
@@ -52,7 +60,7 @@ export async function fetchLlmResponse(url, options = {}, config = {}) {
     externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
     try {
       return await fetcher(url, { ...options, signal: controller.signal });
-    } catch (error) {
+    } catch (error: unknown) {
       if (externalAbort || externalSignal?.aborted) throw abortError();
       if (timeoutAbort) errors.push(new Error('请求超时'));
       else errors.push(error);
@@ -63,14 +71,18 @@ export async function fetchLlmResponse(url, options = {}, config = {}) {
   }
 
   const detail = errors
-    .map((error) => error?.cause?.message || error?.message || String(error))
+    .map((error) => (error as { cause?: { message?: string } } | null | undefined)?.cause?.message || (error as { message?: string } | null | undefined)?.message || String(error))
     .filter(Boolean)
     .join('; ');
   const prefix = config.errorPrefix || 'LLM 请求失败';
   throw new Error(`${prefix}: 无法连接 ${cleanUrlForError(url)}。${detail || '网络请求未成功'}`);
 }
 
-export async function readJsonSseStream(response, onChunk, options = {}) {
+export async function readJsonSseStream(
+  response: Response,
+  onChunk: (chunk: unknown) => void,
+  options: { signal?: AbortSignal | null } = {}
+) {
   const signal = options.signal || null;
   const assertNotAborted = () => {
     if (signal?.aborted) throw abortError();
@@ -78,7 +90,7 @@ export async function readJsonSseStream(response, onChunk, options = {}) {
   const decoder = new TextDecoder();
   let buffer = '';
 
-  const handleLine = (line) => {
+  const handleLine = (line: string) => {
     assertNotAborted();
     const trimmed = line.trim();
     if (!trimmed.startsWith('data:')) return;
@@ -91,7 +103,7 @@ export async function readJsonSseStream(response, onChunk, options = {}) {
     }
   };
 
-  const pushText = (text) => {
+  const pushText = (text: string) => {
     assertNotAborted();
     buffer += text;
     const lines = buffer.split(/\r?\n/);
@@ -108,7 +120,7 @@ export async function readJsonSseStream(response, onChunk, options = {}) {
       pushText(decoder.decode(value, { stream: true }));
     }
   } else if (response.body) {
-    for await (const chunk of response.body) {
+    for await (const chunk of response.body as AsyncIterable<BufferSource>) {
       assertNotAborted();
       pushText(decoder.decode(chunk, { stream: true }));
     }

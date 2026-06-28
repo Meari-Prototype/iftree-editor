@@ -2,7 +2,7 @@
 // 只服务类型检查（tsconfig.check.json），不参与构建。React 增强见 react-augment.d.ts。
 
 interface Window {
-  iftree?: Record<string, any>;
+  iftree?: Record<string, unknown>;
 }
 
 declare module '*.css';

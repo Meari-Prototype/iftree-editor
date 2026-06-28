@@ -1,5 +1,23 @@
+interface MarkdownToken {
+  type: string;
+  text?: string;
+  alt?: string;
+  src?: string;
+  href?: string;
+  [key: string]: unknown;
+}
+interface MarkdownBlock {
+  type: string;
+  text?: string;
+  level?: number;
+  alt?: string;
+  src?: string;
+  children?: MarkdownToken[];
+  [key: string]: unknown;
+}
+
 export function parseMarkdownBlocks(markdown: unknown) {
-  const blocks: Array<Record<string, any>> = [];
+  const blocks: MarkdownBlock[] = [];
   const lines = String(markdown || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
   let paragraph: string[] = [];
   let mathLines: string[] | null = null;
@@ -70,7 +88,7 @@ export function parseMarkdownBlocks(markdown: unknown) {
 }
 
 export function parseInline(text: string) {
-  const tokens: Array<Record<string, any>> = [];
+  const tokens: MarkdownToken[] = [];
   const pattern = /(!?\[[^\]]*]\([^)]+\)|\*\*[^*]+\*\*|`[^`]+`|\$[^$]+\$)/g;
   let index = 0;
 
@@ -118,18 +136,18 @@ export function markdownToPlainText(markdown: unknown, options: Record<string, u
   return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-export function markdownBlockToPlainText(block: Record<string, any>, options: Record<string, unknown> = {}) {
+export function markdownBlockToPlainText(block: Record<string, unknown>, options: Record<string, unknown> = {}) {
   if (!block) return '';
   if (block.type === 'heading') return String(block.text || '').trim();
   if (block.type === 'image') return options.images === 'omit' ? '' : (block.alt ? `[image: ${block.alt}]` : '[image]');
   if (block.type === 'math') return renderTexMathToText(block.text);
-  if (block.type === 'paragraph') return markdownInlineToPlainText(block.children, options);
+  if (block.type === 'paragraph') return markdownInlineToPlainText(block.children as MarkdownToken[] | undefined, options);
   return '';
 }
 
-export function markdownInlineToPlainText(tokens: Array<Record<string, any>> = [], options: Record<string, unknown> = {}) {
+export function markdownInlineToPlainText(tokens: Array<Record<string, unknown>> = [], options: Record<string, unknown> = {}) {
   return (Array.isArray(tokens) ? tokens : [])
-    .map((token: Record<string, any>) => {
+    .map((token: Record<string, unknown>) => {
       if (token?.type === 'image' && options.images === 'omit') return '';
       if (token?.type === 'math') return renderTexMathToText(token.text);
       return String(token?.text || '');

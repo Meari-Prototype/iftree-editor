@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -11,8 +10,34 @@ import { normalizeImportBaseName } from '../src/core/source-markdown.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-function parseArgs(argv) {
-  const result = {
+interface ChmImportArgs {
+  file: string | null;
+  home: string;
+  reset: boolean;
+  help: boolean;
+}
+
+interface ChmRecord {
+  index?: unknown;
+  indexes?: unknown[];
+}
+
+interface ChmSourceDocument {
+  sourcePath: string;
+  sourceType: string;
+  structureSource?: unknown;
+  intermediateFormat?: unknown;
+  rawText: string;
+  spans: SourceSpanRecord[];
+  records: ChmRecord[];
+  pdfPages?: unknown[];
+  pdfChars?: unknown[];
+}
+
+type SourceSpanRecord = Record<string, unknown>;
+
+function parseArgs(argv: string[]): ChmImportArgs {
+  const result: ChmImportArgs = {
     file: null,
     home: process.env.IFTREE_HOME || join(PROJECT_ROOT, 'database'),
     reset: false,
@@ -47,11 +72,11 @@ function printHelp() {
   ].join('\n'));
 }
 
-function importRecordSentenceIndexes(record, fallbackIndex, hasExplicitIndex) {
+function importRecordSentenceIndexes(record: ChmRecord, fallbackIndex: number, hasExplicitIndex: boolean) {
   if (Array.isArray(record?.indexes)) {
     return record.indexes
-      .map((value) => Number(value))
-      .filter((value) => Number.isFinite(value) && value > 0);
+      .map((value: unknown) => Number(value))
+      .filter((value: number) => Number.isFinite(value) && value > 0);
   }
   if (record?.index != null) {
     const index = Number(record.index);
@@ -60,11 +85,11 @@ function importRecordSentenceIndexes(record, fallbackIndex, hasExplicitIndex) {
   return hasExplicitIndex ? [] : [fallbackIndex];
 }
 
-function print(event) {
+function print(event: Record<string, unknown>) {
   console.log(JSON.stringify({ at: new Date().toISOString(), ...event }));
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.versions.electron) {
     const { app } = await import('electron');
     app.exit(code);
@@ -73,7 +98,7 @@ async function exitProcess(code) {
   process.exit(code);
 }
 
-function assertResetPath(home) {
+function assertResetPath(home: string) {
   const target = resolve(home);
   const tempRoot = resolve(tmpdir());
   const workspaceTmp = resolve(PROJECT_ROOT, 'tmp');
@@ -111,7 +136,7 @@ try {
 
   stage = 'read-chm';
   print({ type: 'import-stage', stage, filePath, home });
-  const sourceDocument = await readChmSourceDocument(filePath, { granularity: 'sentence' });
+  const sourceDocument = await readChmSourceDocument(filePath, { granularity: 'sentence' }) as unknown as ChmSourceDocument;
 
   stage = 'build-records';
   print({
@@ -125,7 +150,19 @@ try {
 
   stage = 'write-sqlite';
   print({ type: 'import-stage', stage, records: records.length });
-  const store = new IftreeStore(dbPath);
+  // 本脚本只用 IftreeStore 的几个方法表面，定 minimal 桥接接口避开拉整套 store 真类型（IftreeStore 已收紧，但 saveSourceDocument 形参形态是 record-shape，桥接更省签名）。
+  interface StoreBridge {
+    init(options?: unknown): void;
+    createDocFromStructuredRecords(payload: { title: string; sourcePath: string; records: unknown[] }): {
+      id: unknown;
+      importedNodeIds: unknown[];
+      importedNodeIdsByRecordIndex?: Record<number, unknown>;
+    };
+    saveSourceDocument(payload: Record<string, unknown>): unknown;
+    db: { prepare(sql: string): { get(...args: unknown[]): unknown } };
+    close(): void;
+  }
+  const store = new IftreeStore(dbPath) as unknown as StoreBridge;
   store.init();
   try {
     const title = normalizeImportBaseName(filePath);
@@ -133,7 +170,7 @@ try {
 
     stage = 'write-source-spans';
     print({ type: 'import-stage', stage, docId: doc.id, spanCount: sourceDocument.spans.length });
-    const nodeIdsBySentenceIndex = new Map();
+    const nodeIdsBySentenceIndex = new Map<number, unknown>();
     const hasExplicitIndex = records.some((record) => record.index != null || Array.isArray(record.indexes));
     for (const [index, record] of records.entries()) {
       for (const sentenceIndex of importRecordSentenceIndexes(record, index + 1, hasExplicitIndex)) {
@@ -152,7 +189,7 @@ try {
       nodeIdsBySentenceIndex
     });
 
-    const info = store.db.prepare('SELECT COUNT(*) AS node_count FROM nodes WHERE doc_id = ?').get(doc.id);
+    const info = store.db.prepare('SELECT COUNT(*) AS node_count FROM nodes WHERE doc_id = ?').get(doc.id) as { node_count?: number } | undefined;
     print({
       type: 'import-result',
       ok: true,
@@ -174,14 +211,14 @@ try {
   }
   clearInterval(heartbeat);
   await exitProcess(0);
-} catch (error) {
+} catch (error: unknown) {
   clearInterval(heartbeat);
   print({
     type: 'import-result',
     ok: false,
     stage,
     elapsedMs: Date.now() - startedAt,
-    error: error?.stack || error?.message || String(error)
+    error: (error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || String(error)
   });
   await exitProcess(1);
 }

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,7 +12,7 @@ function defaultDbPath() {
   return process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite');
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.env.ELECTRON_RUN_AS_NODE === '1') {
     process.exit(code);
     return;
@@ -47,7 +46,7 @@ async function main() {
     const result = await client.request('db.shell', {
       argv,
       currentDocId: process.env.IFTREE_CURRENT_DOC_ID
-    });
+    }) as { text?: unknown };
     console.log(result.text || '');
   } finally {
     await client.shutdown();
@@ -57,7 +56,7 @@ async function main() {
 
 main()
   .then(() => exitProcess(0))
-  .catch(async (error) => {
-    console.error(error?.stack || error?.message || String(error));
+  .catch(async (error: unknown) => {
+    console.error((error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || String(error));
     await exitProcess(1);
   });

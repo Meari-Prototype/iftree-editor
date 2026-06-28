@@ -1,4 +1,3 @@
-// @ts-nocheck
 // 库级导出：把「真实数据」表整表导成 json（逐表 columns + rows），带 schema 版本头。
 // 导入端按 columns 对齐字段，故导出不依赖列序、可跨 schema 演进。
 //
@@ -7,22 +6,50 @@
 // - nodes 的哈希 / 字数缓存列：派生量，导入后由触发器（字数）和脏标记 + 首次访问（哈希）现场重算。
 //   历史对象库的哈希不在此列——它是内容寻址的存储本体（objects.hash），整表照搬。
 
-const EMPTY_SET = new Set();
+type SqlValue = string | number | bigint | Buffer | null;
+type SqlRow = Record<string, SqlValue>;
 
-export const DERIVED_COLUMNS = {
+interface SqliteDatabase {
+  prepare(sql: string): {
+    all(...params: unknown[]): SqlRow[];
+  };
+}
+
+interface ExportDatabaseOptions {
+  schemaVersion?: unknown;
+  exportedAt?: string | null;
+}
+
+export interface DatabaseTableDump {
+  columns: string[];
+  rows: SqlValue[][];
+}
+
+export interface DatabaseDump {
+  schema_version: unknown;
+  exported_at: string | null;
+  tables: Record<string, DatabaseTableDump>;
+}
+
+const EMPTY_SET = new Set<string>();
+
+export const DERIVED_COLUMNS: Record<string, Set<string>> = {
   nodes: new Set(['content_hash', 'subtree_hash', 'title_chars', 'text_chars', 'note_chars'])
 };
 
 // 读出库里所有真实数据表（排除 sqlite 内部表），逐表导出。
 // 返回 { schema_version, exported_at, tables: { <name>: { columns, rows } } }，rows 为按 columns 取值的数组。
-export function exportDatabase(db, { schemaVersion = null, exportedAt = null } = {}) {
+export function exportDatabase(
+  db: SqliteDatabase,
+  { schemaVersion = null, exportedAt = null }: ExportDatabaseOptions = {}
+): DatabaseDump {
   const tableNames = db.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-  ).all().map((row) => row.name);
+  ).all().map((row) => String(row.name));
 
-  const tables = {};
+  const tables: Record<string, DatabaseTableDump> = {};
   for (const name of tableNames) {
-    const allColumns = db.prepare(`PRAGMA table_info("${name}")`).all().map((col) => col.name);
+    const allColumns = db.prepare(`PRAGMA table_info("${name}")`).all().map((col) => String(col.name));
     const derived = DERIVED_COLUMNS[name] || EMPTY_SET;
     const columns = allColumns.filter((col) => !derived.has(col));
     const selectList = columns.map((col) => `"${col}"`).join(', ');

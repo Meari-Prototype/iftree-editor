@@ -1,14 +1,23 @@
-// @ts-nocheck
 import {
   DEFAULT_SUMMARY_STRATEGIES,
   normalizeSummaryStrategy
 } from './defaults.js';
 import { anthropicMessagesUrl, chatCompletionUrl, fetchLlmResponse } from './chat-client.js';
+import type { LlmFetcher } from './chat-client.js';
 import {
   configuredMaxOutputTokens,
   llmProtocol
 } from '../../agent/llm-api-config.js';
 import { renderPrompt } from '../../lang/index.js';
+
+type SummaryPayload = Record<string, unknown>;
+type SummaryApi = Record<string, unknown>;
+type SummaryDeps = {
+  activeLlmSummaryApi?: () => SummaryApi;
+  getPromptCatalog?: () => Record<string, string>;
+  fetchers?: () => LlmFetcher[];
+};
+type SummaryRequestOptions = { fetchers?: LlmFetcher[]; signal?: AbortSignal };
 
 // 摘要子系统（从 headless-agent-host 闭包下沉，解耦第 1b 步）：summary 不是独立后端域，是
 // 「语言提示词 + 外部接口一次调用 + 薄编排」三件事，这里把它们从 host 收口成一处、让 host 变薄。
@@ -19,16 +28,16 @@ import { renderPrompt } from '../../lang/index.js';
 //   · activeLlmSummaryApi() —— 读当前摘要 API 配置（provider/model/baseUrl/key）；
 //   · getPromptCatalog() —— 提示词目录（system_prompt.md 解析产物，供 renderPrompt 取段）；
 //   · fetchers() —— 外部 fetch 注入（默认空）。
-export function createSummaryService(deps = {}) {
-  const activeLlmSummaryApi = deps.activeLlmSummaryApi;
-  const getPromptCatalog = deps.getPromptCatalog;
+export function createSummaryService(deps: SummaryDeps = {}) {
+  const activeLlmSummaryApi = deps.activeLlmSummaryApi as () => SummaryApi;
+  const getPromptCatalog = deps.getPromptCatalog as () => Record<string, string>;
   const defaultFetchers = typeof deps.fetchers === 'function' ? deps.fetchers : () => [];
 
-  const summaryRequests = new Map();
+  const summaryRequests = new Map<string, AbortController>();
 
-  const systemPromptSection = (name, fallback = '') => renderPrompt(getPromptCatalog(), name, {}, fallback);
+  const systemPromptSection = (name: string, fallback = '') => renderPrompt(getPromptCatalog(), name, {}, fallback);
 
-  function summaryPrompt(payload) {
+  function summaryPrompt(payload: SummaryPayload) {
     const mode = payload?.mode === 'article' ? 'article' : 'node';
     const text = String(payload?.text || '').trim();
     const address = String(payload?.address || '').trim();
@@ -78,7 +87,7 @@ export function createSummaryService(deps = {}) {
     ].filter(Boolean).join('\n');
   }
 
-  async function generateDeepseekSummary(payload, options = {}) {
+  async function generateDeepseekSummary(payload: SummaryPayload, options: SummaryRequestOptions = {}) {
     const api = activeLlmSummaryApi();
     const model = api.model || 'deepseek-v4-pro';
     const system = systemPromptSection(
@@ -89,11 +98,11 @@ export function createSummaryService(deps = {}) {
     if (llmProtocol(api) === 'anthropic-compatible') {
       const maxTokens = configuredMaxOutputTokens(api);
       if (!maxTokens) throw new Error('Anthropic-compatible 摘要 API 需要在 API 配置中填写最大输出 token。');
-      const response = await fetchLlmResponse(anthropicMessagesUrl(api.baseUrl, api.fullUrl), {
+      const response = await fetchLlmResponse(anthropicMessagesUrl(api.baseUrl, Boolean(api.fullUrl)), {
         method: 'POST',
         headers: {
-          'x-api-key': api.apiKey,
-          'anthropic-version': api.anthropicVersion || '2023-06-01',
+          'x-api-key': String(api.apiKey || ''),
+          'anthropic-version': String(api.anthropicVersion || '2023-06-01'),
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -115,7 +124,7 @@ export function createSummaryService(deps = {}) {
         const detail = await response.text().catch(() => '');
         throw new Error(`摘要生成失败：${response.status} ${response.statusText}${detail ? ` ${detail.slice(0, 300)}` : ''}`);
       }
-      const json = await response.json();
+      const json = await response.json() as { content?: Array<{ type?: string; text?: string }> };
       const summary = (Array.isArray(json?.content) ? json.content : [])
         .filter((block) => block?.type === 'text')
         .map((block) => block.text || '')
@@ -124,7 +133,7 @@ export function createSummaryService(deps = {}) {
       if (!summary) throw new Error('摘要生成失败：模型返回为空。');
       return summary;
     }
-    const response = await fetchLlmResponse(chatCompletionUrl(api.baseUrl, api.fullUrl), {
+    const response = await fetchLlmResponse(chatCompletionUrl(api.baseUrl, Boolean(api.fullUrl)), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${api.apiKey}`,
@@ -153,7 +162,7 @@ export function createSummaryService(deps = {}) {
     return summary;
   }
 
-  async function generateNodeSummary(payload = {}) {
+  async function generateNodeSummary(payload: SummaryPayload = {}) {
     const requestId = String(payload.requestId || '').trim();
     const controller = new AbortController();
     if (requestId) summaryRequests.set(requestId, controller);
@@ -168,7 +177,7 @@ export function createSummaryService(deps = {}) {
     }
   }
 
-  function cancelNodeSummary(payload = {}) {
+  function cancelNodeSummary(payload: SummaryPayload = {}) {
     const requestId = String(payload.requestId || '').trim();
     if (!requestId) return { ok: false, canceled: false, reason: 'missing requestId' };
     const controller = summaryRequests.get(requestId);

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 第 4 步存量迁移：把旧 commit 的整篇 snapshot 转进内容寻址对象库。
 //   backfill：逐个旧 commit（root_tree_hash 为空）→ 解析旧 snapshot/diff → writeTree + writeSource +
 //             buildCommitMeta（与 createCommit 同一套函数，产出逐字节一致）→ 回填 root_*/source_hash/meta。
@@ -22,13 +21,33 @@ import {
   writeSource,
   writeTree
 } from '../src/backend/db/object-store.js';
+import type { MerkleNode } from '../src/core/merkle.js';
+import type { CommitRow as CommitRowSchema } from '../src/backend/db/rows.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DB_PATH = process.env.IFTREE_DB || join(ROOT, 'database', 'store.sqlite');
 const APPLY = process.argv.includes('--apply');
 const DROP = process.argv.includes('--drop');
 
-function oldSnapshot(row) {
+type LegacyNode = MerkleNode;
+type LegacySnapshot = Record<string, unknown> & {
+  nodes?: LegacyNode[];
+  sourceDocument?: { raw_markdown?: string };
+  axioms?: unknown[];
+  refs?: unknown[];
+};
+// 迁移期读 commits：含迁完即删的 legacy 列 snapshot/diff；各 SELECT 取部分列，故字段按可选处理。
+type CommitRow = Partial<CommitRowSchema> & { snapshot?: string | null; diff?: string | null };
+type ProjectedNode = {
+  parent: string | null;
+  text: string;
+  node_title: string;
+  node_note: string;
+  node_type: string;
+  trust_level: unknown;
+};
+
+function oldSnapshot(row: CommitRow): LegacySnapshot | null {
   try { const s = JSON.parse(row.snapshot || 'null'); if (s?.nodes) return s; } catch { /* fall through */ }
   try {
     const d = JSON.parse(row.diff || '{}');
@@ -38,32 +57,32 @@ function oldSnapshot(row) {
   return null;
 }
 
-function oldEntries(row) {
+function oldEntries(row: CommitRow): unknown[] | null {
   try { const d = JSON.parse(row.diff || '{}'); if (Array.isArray(d.entries)) return d.entries; } catch { /* ignore */ }
   return null;
 }
 
 // 内容+结构投影：按稳定 id 取内容字段 + parent + 父下子序（rank）；忽略 address/depth/source_position/时间戳。
-function contentStructure(nodes = []) {
-  const byId = new Map();
-  const childrenByParent = new Map();
+function contentStructure(nodes: LegacyNode[] = []) {
+  const byId = new Map<string, ProjectedNode>();
+  const childrenByParent = new Map<string, LegacyNode[]>();
   for (const n of nodes) {
     const id = String(n.id);
     const parent = n.parent_id == null ? null : String(n.parent_id);
     byId.set(id, {
       parent,
-      text: n.text ?? '',
-      node_title: n.node_title ?? '',
-      node_note: n.node_note ?? '',
-      node_type: n.node_type ?? 'TEXT',
+      text: String(n.text ?? ''),
+      node_title: String(n.node_title ?? ''),
+      node_note: String(n.node_note ?? ''),
+      node_type: String(n.node_type ?? 'TEXT'),
       trust_level: n.trust_level == null || n.trust_level === '' ? null : n.trust_level
     });
     const key = parent == null ? '__root__' : parent;
     if (!childrenByParent.has(key)) childrenByParent.set(key, []);
-    childrenByParent.get(key).push(n);
+    childrenByParent.get(key)!.push(n);
   }
   // 每个父下按 sort_order 排出有序子 id 列表（绝对值不比，只比次序）。
-  const order = new Map();
+  const order = new Map<string, string[]>();
   for (const [key, list] of childrenByParent) {
     const sorted = [...list].sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0));
     order.set(key, sorted.map((n) => String(n.id)));
@@ -71,15 +90,15 @@ function contentStructure(nodes = []) {
   return { byId, order };
 }
 
-function diffTree(oldNodes, newNodes) {
+function diffTree(oldNodes: LegacyNode[], newNodes: LegacyNode[]) {
   const a = contentStructure(oldNodes);
   const b = contentStructure(newNodes);
-  const problems = [];
+  const problems: string[] = [];
   if (a.byId.size !== b.byId.size) problems.push(`节点数 ${a.byId.size}→${b.byId.size}`);
   for (const [id, av] of a.byId) {
     const bv = b.byId.get(id);
     if (!bv) { problems.push(`缺失节点 ${id}`); continue; }
-    for (const f of ['parent', 'text', 'node_title', 'node_note', 'node_type', 'trust_level']) {
+    for (const f of ['parent', 'text', 'node_title', 'node_note', 'node_type', 'trust_level'] as const) {
       if (av[f] !== bv[f]) problems.push(`节点 ${id} 字段 ${f}: ${JSON.stringify(av[f])}→${JSON.stringify(bv[f])}`);
     }
   }
@@ -90,10 +109,19 @@ function diffTree(oldNodes, newNodes) {
   return problems;
 }
 
-function verifyCommit(db, row) {
+interface VerifyResult {
+  skipped?: boolean;
+  reason?: string;
+  ok?: boolean;
+  reconstructedOnly?: boolean;
+  nodeCount?: number;
+  problems?: string[];
+}
+
+function verifyCommit(db: Database, row: CommitRow): VerifyResult {
   const snap = oldSnapshot(row);
   if (!row.root_tree_hash) return { skipped: true, reason: 'no_root_tree_hash' };
-  const nodes = materializeTree(db, row.root_tree_hash, row.root_node_id);
+  const nodes = materializeTree(db, row.root_tree_hash, row.root_node_id ?? null);
   if (!snap) return { ok: nodes.length > 0, reconstructedOnly: true, nodeCount: nodes.length };
   const problems = diffTree(snap.nodes || [], nodes);
   // raw_markdown
@@ -124,9 +152,9 @@ async function main() {
   }
   db.exec("CREATE TABLE IF NOT EXISTS objects (hash TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('blob','tree','source')), data TEXT NOT NULL)");
 
-  const total = db.prepare('SELECT COUNT(*) AS n FROM commits').get().n;
+  const total = (db.prepare('SELECT COUNT(*) AS n FROM commits').get() as { n: number }).n;
   // 未迁移 = 无 tree 且无 meta（迁过的 entries-only commit 有 meta、root_tree_hash 仍空，不再重复计）。
-  const pending = db.prepare('SELECT COUNT(*) AS n FROM commits WHERE root_tree_hash IS NULL AND meta IS NULL').get().n;
+  const pending = (db.prepare('SELECT COUNT(*) AS n FROM commits WHERE root_tree_hash IS NULL AND meta IS NULL').get() as { n: number }).n;
   console.log(`[tree-objects] commit 总数 ${total}；待迁移 ${pending}`);
 
   if (!APPLY) {
@@ -135,7 +163,7 @@ async function main() {
     let entriesOnly = 0;
     let empty = 0;
     if (hasSnapshotCol) {
-      for (const row of db.prepare('SELECT id, snapshot, diff FROM commits WHERE root_tree_hash IS NULL AND meta IS NULL').all()) {
+      for (const row of db.prepare('SELECT id, snapshot, diff FROM commits WHERE root_tree_hash IS NULL AND meta IS NULL').all<CommitRow>()) {
         if (oldSnapshot(row)) withSnapshot += 1;
         else if ((oldEntries(row) || []).length) entriesOnly += 1;
         else empty += 1;
@@ -163,7 +191,7 @@ async function main() {
   const selectPending = db.prepare('SELECT id, root_tree_hash, snapshot, diff FROM commits WHERE root_tree_hash IS NULL AND meta IS NULL');
   const update = db.prepare('UPDATE commits SET root_node_id = ?, root_tree_hash = ?, source_hash = ?, meta = ? WHERE id = ?');
   const backfill = db.transaction(() => {
-    for (const row of hasSnapshotCol ? selectPending.all() : []) {
+    for (const row of hasSnapshotCol ? selectPending.all<CommitRow>() : []) {
       const snap = oldSnapshot(row);
       const entries = oldEntries(row);
       if (!snap) {
@@ -187,7 +215,7 @@ async function main() {
   });
   backfill();
   console.log(`[tree-objects] backfill 完成：迁移 ${migrated}，仅条目 ${entriesOnly}，跳过 ${skipped}`);
-  const objCount = db.prepare('SELECT COUNT(*) AS n FROM objects').get().n;
+  const objCount = (db.prepare('SELECT COUNT(*) AS n FROM objects').get() as { n: number }).n;
   console.log(`[tree-objects] objects 表对象数 ${objCount}`);
 
   // verify（逐 commit 重建比对）。
@@ -197,14 +225,14 @@ async function main() {
   const verifySelect = allCols.has('snapshot')
     ? db.prepare('SELECT id, root_node_id, root_tree_hash, source_hash, meta, snapshot, diff FROM commits')
     : db.prepare('SELECT id, root_node_id, root_tree_hash, source_hash, meta FROM commits');
-  for (const row of verifySelect.all()) {
+  for (const row of verifySelect.all<CommitRow>()) {
     let r;
     try {
       r = verifyCommit(db, row);
-    } catch (error) {
+    } catch (error: unknown) {
       // 对象缺失等重建异常：记一条 failed、不中断整轮，让"verify 全过才删列"的安全闸照常拦住删列。
       failed += 1;
-      console.error(`[verify x] commit ${row.id}：重建异常 ${error.message}`);
+      console.error(`[verify x] commit ${row.id}：重建异常 ${(error as { message?: string }).message}`);
       continue;
     }
     if (r.skipped) continue;

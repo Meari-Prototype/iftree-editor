@@ -1,25 +1,36 @@
-// @ts-nocheck
 // library 目录枚举与 LLM 工作区测量的唯一权威实现。
 // main 进程与 headless 进程此前各持一份手抄副本（逐字相同但随时可能漂移）。
 // 进程特异的只有根路径来自哪里——用 create* 工厂注入，其余全部共享。
 import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import { extname, join, parse, relative, resolve, sep } from 'node:path';
 
 export const DEFAULT_LLM_WORKSPACE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
 // 工作区产物（智能导入的一次性脚本与 JSON 等）默认保留 30 天（projectneed 4-3-2-1）。
 const LLM_WORKSPACE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
-export function pathKey(value) {
+export interface LibraryEntry {
+  type: string;
+  name: string;
+  relativePath: string;
+  fullPath: string;
+  extension?: string;
+  size?: number;
+  mtimeMs?: number;
+  children?: LibraryEntry[];
+}
+
+export function pathKey(value: unknown) {
   return resolve(String(value || '')).toLowerCase();
 }
 
-export function isSameOrChildPath(target, parent) {
+export function isSameOrChildPath(target: unknown, parent: unknown) {
   const targetKey = pathKey(target);
   const parentKey = pathKey(parent);
   return targetKey === parentKey || targetKey.startsWith(`${parentKey}${sep}`);
 }
 
-export function normalizeLibraryRelativePath(value = '') {
+export function normalizeLibraryRelativePath(value: unknown = ''): string {
   const normalized = String(value || '')
     .replace(/\\/g, '/')
     .split('/')
@@ -32,7 +43,7 @@ export function normalizeLibraryRelativePath(value = '') {
   return normalized;
 }
 
-export function sortLibraryEntries(left, right) {
+export function sortLibraryEntries(left: LibraryEntry, right: LibraryEntry) {
   if (left.type !== right.type) return left.type === 'folder' ? -1 : 1;
   return String(left.name || '').localeCompare(String(right.name || ''), 'zh-Hans-CN', { numeric: true });
 }
@@ -41,14 +52,14 @@ export function sortLibraryEntries(left, right) {
 // 系统垃圾文件始终忽略；. 开头隐藏项默认忽略，includeHidden=true 时保留。
 const ALWAYS_IGNORED_ENTRIES = new Set(['.DS_Store', 'Thumbs.db']);
 
-export function shouldIgnoreLibraryEntry(name, { includeHidden = false } = {}) {
+export function shouldIgnoreLibraryEntry(name: unknown, { includeHidden = false }: { includeHidden?: boolean } = {}) {
   const entryName = String(name || '');
   if (ALWAYS_IGNORED_ENTRIES.has(entryName)) return true;
   if (!includeHidden && entryName.startsWith('.')) return true;
   return false;
 }
 
-export function measureWorkspaceEntry(entryPath) {
+export function measureWorkspaceEntry(entryPath: string) {
   const stat = statSync(entryPath);
   let sizeBytes = stat.size;
   if (stat.isDirectory()) {
@@ -60,7 +71,7 @@ export function measureWorkspaceEntry(entryPath) {
   return { sizeBytes, mtimeMs: stat.mtimeMs };
 }
 
-export function createLibraryFs({ ensureRoot }) {
+export function createLibraryFs({ ensureRoot }: { ensureRoot: () => string }) {
   function libraryPath(relativePath = '') {
     const root = ensureRoot();
     const rel = normalizeLibraryRelativePath(relativePath);
@@ -73,11 +84,11 @@ export function createLibraryFs({ ensureRoot }) {
     return target;
   }
 
-  function libraryEntry(relativePath, dirent) {
+  function libraryEntry(relativePath: string, dirent?: Dirent): LibraryEntry {
     const abs = libraryPath(relativePath);
     const stat = statSync(abs);
     const type = dirent?.isDirectory?.() || stat.isDirectory() ? 'folder' : 'file';
-    const entry = {
+    const entry: LibraryEntry = {
       type,
       name: parse(abs).base,
       relativePath: normalizeLibraryRelativePath(relativePath),
@@ -111,7 +122,17 @@ export function createLibraryFs({ ensureRoot }) {
   return { libraryPath, libraryEntry, listLibraryChildren, libraryRelativePathForAgent };
 }
 
-export function createLlmWorkspace({ workspaceRoot, workspaceBin, projectRoot, readProjectConfig }) {
+export function createLlmWorkspace({
+  workspaceRoot,
+  workspaceBin,
+  projectRoot,
+  readProjectConfig
+}: {
+  workspaceRoot: string;
+  workspaceBin: string;
+  projectRoot: string;
+  readProjectConfig: () => any;
+}) {
   function llmWorkspaceLimitBytes() {
     const configured = Number(
       process.env.IFTREE_LLM_WORKSPACE_LIMIT_BYTES
@@ -169,7 +190,7 @@ export function createLlmWorkspace({ workspaceRoot, workspaceBin, projectRoot, r
   // .bin 工具目录除外；占用中的条目删除失败留给下次启动。
   function cleanupExpiredWorkspaceEntries(now = Date.now()) {
     const root = ensureLlmWorkspaceRoot();
-    const removed = [];
+    const removed: string[] = [];
     for (const entry of readdirSync(root, { withFileTypes: true })) {
       if (entry.name === '.bin' || entry.isSymbolicLink()) continue;
       const fullPath = join(root, entry.name);

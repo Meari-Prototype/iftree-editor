@@ -1,8 +1,20 @@
-// @ts-nocheck
 import { X } from 'lucide-react';
+import type { MouseEventHandler } from 'react';
 import { progressCountText } from '../lib/ui-utils.js';
 
-function ProgressBar({ progress, onCancel }) {
+interface ProgressState {
+  label: string;
+  total: number;
+  step: number;
+  cancelable?: boolean;
+}
+
+interface ProgressBarProps {
+  progress?: ProgressState | null;
+  onCancel?: MouseEventHandler<HTMLButtonElement> | null;
+}
+
+function ProgressBar({ progress, onCancel }: ProgressBarProps) {
   if (!progress) return null;
   return (
     <>
@@ -12,7 +24,7 @@ function ProgressBar({ progress, onCancel }) {
           <span className="progress-count">{progressCountText(progress)}</span>
         )}
         {progress.cancelable && (
-          <button type="button" className="progress-cancel-button" onClick={onCancel} title="取消" aria-label="取消">
+          <button type="button" className="progress-cancel-button" onClick={onCancel || undefined} title="取消" aria-label="取消">
             <X size={14} />
             <span>取消</span>
           </button>
@@ -28,7 +40,14 @@ function ProgressBar({ progress, onCancel }) {
   );
 }
 
-export function ProgressOverlay({ progress, lockedProgress, locked = false, onCancel = null }) {
+interface ProgressOverlayProps {
+  progress?: ProgressState | null;
+  lockedProgress?: ProgressState | null;
+  locked?: boolean;
+  onCancel?: MouseEventHandler<HTMLButtonElement> | null;
+}
+
+export function ProgressOverlay({ progress, lockedProgress, locked = false, onCancel = null }: ProgressOverlayProps) {
   if (locked && lockedProgress) {
     return (
       <div className="operation-lock-overlay" aria-live="polite" aria-busy="true">

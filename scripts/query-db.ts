@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +24,8 @@ const ACTION_ALIASES = Object.freeze({
   'search-all': 'content.searchAll'
 });
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+type QueryPayload = Record<string, unknown> & { help?: boolean; action?: string; type?: string };
+const ACTION_ALIAS_MAP = ACTION_ALIASES as Record<string, string>;
 
 function defaultDbPath() {
   return process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite');
@@ -34,7 +35,7 @@ function defaultLibraryRoot() {
   return process.env.IFTREE_LIBRARY_ROOT || join(PROJECT_ROOT, 'library');
 }
 
-function parseValue(value) {
+function parseValue(value: unknown): unknown {
   const raw = String(value ?? '');
   if (raw === 'true') return true;
   if (raw === 'false') return false;
@@ -46,7 +47,7 @@ function parseValue(value) {
   return raw;
 }
 
-function parseArgs(argv) {
+function parseArgs(argv: string[]): QueryPayload {
   if (argv.length === 0) return { action: 'debug.overview' };
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
     return { help: true };
@@ -54,7 +55,7 @@ function parseArgs(argv) {
   if (argv[0] === 'actions') return { action: 'query.actions' };
   if (argv[0]?.startsWith('{')) return JSON.parse(argv.join(' '));
 
-  const payload = { action: ACTION_ALIASES[argv[0]] || argv[0] || 'debug.overview' };
+  const payload: QueryPayload = { action: ACTION_ALIAS_MAP[argv[0]] || argv[0] || 'debug.overview' };
   for (let index = 1; index < argv.length; index += 1) {
     const key = argv[index];
     if (!key.startsWith('--')) continue;
@@ -100,7 +101,7 @@ function printHelp() {
   ].join('\n'));
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.versions.electron) {
     try {
       const { app } = await import('electron');
@@ -153,9 +154,9 @@ async function main() {
     initOptions: { readonly: true, migrate: false }
   });
   try {
-    const result = await database.run({ operation: 'read', payload }, 'read');
+    const result = await database.run({ operation: 'read', payload }, 'read') as Record<string, unknown>;
     if (result?.format === 'ascii_tree' && typeof result.text === 'string') console.log(result.text);
-    else console.log(JSON.stringify({ dbPath, ...result }, null, 2));
+    else console.log(JSON.stringify({ dbPath, ...(result || {}) }, null, 2));
   } finally {
     database.close();
   }
@@ -163,7 +164,7 @@ async function main() {
 
 main()
   .then(() => exitProcess(0))
-  .catch(async (error) => {
-    console.error(error?.stack || error?.message || String(error));
+  .catch(async (error: unknown) => {
+    console.error((error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || String(error));
     await exitProcess(1);
   });

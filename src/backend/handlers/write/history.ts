@@ -1,17 +1,27 @@
-// @ts-nocheck
 import {
   docRefresh,
   maybeRefreshDoc,
   plain,
   requireDocId,
   requireId,
-  rowById
+  rowById,
+  type WriteContext
 } from './shared.js';
+import type { IftreeStore } from '../../store/index.js';
 
-export async function handleHistoryMutation(store, payload, ctx, action, effects) {
+type WritePayload = Record<string, unknown>;
+type EffectList = Array<Record<string, unknown>>;
+
+type HistoryStore = IftreeStore;
+type HistoryContext = WriteContext;
+
+export async function handleHistoryMutation(store: HistoryStore, payload: WritePayload, ctx: HistoryContext, action: string, effects: EffectList) {
   if (action === 'history.save') {
     const docId = requireDocId(payload);
-    const history = store.saveHistorySnapshot(payload);
+    // payload 是 WritePayload（Record<string, unknown> 索引签名）；SaveHistorySnapshotPayload
+    // 是精确字段集（docId/summary/owner 全 unknown）。结构上后者是前者的子集，但 TS 索引签名
+    // 不能自动收窄成精确字段，边界 cast。
+    const history = store.saveHistorySnapshot(payload as unknown as Parameters<typeof store.saveHistorySnapshot>[0]);
     return docRefresh(action, docId, { history: plain(history), sideEffects: effects });
   }
   if (action === 'history.restore') {
@@ -45,7 +55,7 @@ export async function handleHistoryMutation(store, payload, ctx, action, effects
   throw new Error(`Unhandled database_write action: ${action}`);
 }
 
-export async function handleEditorHistoryMutation(store, payload, ctx, action, effects) {
+export async function handleEditorHistoryMutation(store: HistoryStore, payload: WritePayload, ctx: HistoryContext, action: string, effects: EffectList) {
   if (action === 'editorHistory.capture') {
     const docId = requireDocId(payload);
     const token = store.createEditorSnapshotToken(docId);

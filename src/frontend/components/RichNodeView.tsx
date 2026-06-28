@@ -1,5 +1,5 @@
-// @ts-nocheck
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { RefObject } from 'react';
 
 import { plainNodeNote } from '../../core/node-notes.js';
 import { flattenTree } from '../../core/tree.js';
@@ -14,26 +14,39 @@ import { RichMarkdown } from './RichMarkdown';
 // 显示深度 ≤ depthLimit 的节点,且 depthLimit 处的节点完整展开其子树。
 const NODE_OVERSCAN = 1200;
 
-function visibleNodesForDepth(tree, depthLimit) {
-  const flat = flattenTree(tree);
+type RichTreeNode = Record<string, unknown> & {
+  id?: unknown;
+  address?: unknown;
+  children?: RichTreeNode[];
+  text?: string;
+  node_title?: string;
+  node_note?: string;
+};
+export type LocateRequest = { seq?: unknown; nodeId?: unknown } | null;
+
+interface AxiomView { id?: unknown; label?: unknown; content?: unknown; }
+type RichNodeDoc = { tree?: RichTreeNode | null; doc?: unknown; axioms?: AxiomView[] };
+
+function visibleNodesForDepth(tree: RichTreeNode, depthLimit: unknown) {
+  const flat = flattenTree(tree as unknown) as RichTreeNode[];
   const targetDepth = Math.max(1, Number(depthLimit) || 1);
-  const targetNodes = flat.filter((node) => depthOf(node.address || '1') === targetDepth);
+  const targetNodes = flat.filter((node) => depthOf(String(node.address || '1')) === targetDepth);
   if (targetNodes.length === 0) return flat;
-  const allowed = new Set();
+  const allowed = new Set<string>();
   for (const node of flat) {
-    if (depthOf(node.address || '1') <= targetDepth) allowed.add(String(node.id));
+    if (depthOf(String(node.address || '1')) <= targetDepth) allowed.add(String(node.id));
   }
   for (const node of targetNodes) collectSubtreeIds(node, allowed);
   return flat.filter((node) => allowed.has(String(node.id)));
 }
 
-function collectSubtreeIds(node, out) {
+function collectSubtreeIds(node: RichTreeNode, out: Set<string>) {
   out.add(String(node.id));
   for (const child of node.children || []) collectSubtreeIds(child, out);
 }
 
 // 虚拟滚动的高度预估（仅未渲染过的块用;渲染后 ResizeObserver 量回真实高度覆盖）。
-function estimateNodeHeight(node) {
+function estimateNodeHeight(node: RichTreeNode) {
   const textLength = String(node.text || '').length;
   const titleHeight = node.node_title ? 30 : 0;
   const noteHeight = node.node_note ? 26 : 0;
@@ -52,12 +65,23 @@ export function RichNodeView({
   showAxioms = true,
   onAddAxiom,
   locateRequest = null
+}: {
+  currentDoc?: RichNodeDoc | null;
+  docId?: unknown;
+  selectedNodeId?: unknown;
+  setSelectedNodeId?: (nodeId: unknown) => void;
+  depthLimit?: unknown;
+  showTitles?: boolean;
+  showNotes?: boolean;
+  showAxioms?: boolean;
+  onAddAxiom?: () => void;
+  locateRequest?: LocateRequest;
 }) {
   const tree = currentDoc?.tree;
   const nodes = useMemo(() => (tree ? visibleNodesForDepth(tree, depthLimit) : []), [tree, depthLimit]);
   const { scrollRef, viewport, onScroll } = useScrollViewport();
-  const readerRef = useRef(null);
-  const measuredHeightsRef = useRef(new Map());
+  const readerRef = useRef<HTMLDivElement | null>(null);
+  const measuredHeightsRef = useRef(new Map<string, number>());
   const [measureVersion, setMeasureVersion] = useState(0);
 
   useEffect(() => {
@@ -84,9 +108,9 @@ export function RichNodeView({
       if (children.length !== visibleNodes.length + 2) return;
       let changed = false;
       for (let index = 0; index < visibleNodes.length; index += 1) {
-        const height = children[index + 2].offsetTop - children[index + 1].offsetTop;
+        const height = (children[index + 2] as HTMLElement).offsetTop - (children[index + 1] as HTMLElement).offsetTop;
         if (height <= 0) continue;
-        const key = String(visibleNodes[index].id);
+        const key = String(visibleNodes[index]!.id);
         const previous = measuredHeightsRef.current.get(key);
         if (previous === undefined || Math.abs(previous - height) > 0.5) {
           measuredHeightsRef.current.set(key, height);
@@ -97,13 +121,13 @@ export function RichNodeView({
     };
     measure();
     const observer = new ResizeObserver(measure);
-    for (let index = 1; index < reader.children.length - 1; index += 1) observer.observe(reader.children[index]);
+    for (let index = 1; index < reader.children.length - 1; index += 1) observer.observe(reader.children[index]!);
     return () => observer.disconnect();
   }, [nodes, virtual]);
 
   const lastLocateSeqRef = useRef(0);
   useEffect(() => {
-    const seq = locateRequest?.seq || 0;
+    const seq = Number(locateRequest?.seq || 0);
     const targetId = locateRequest?.nodeId;
     if (!seq || seq === lastLocateSeqRef.current || targetId == null) return;
     lastLocateSeqRef.current = seq;
@@ -119,18 +143,18 @@ export function RichNodeView({
   if (!tree) return <div className="empty-state">未打开文档</div>;
 
   return (
-    <div className="rich-surface source-rich-surface" ref={scrollRef} onScroll={onScroll}>
+    <div className="rich-surface source-rich-surface" ref={scrollRef as RefObject<HTMLDivElement | null>} onScroll={onScroll}>
       <article className="source-document rich-node-document">
         <header className="source-title">
-          <h1>{docDisplayTitle(currentDoc?.doc) || tree.text}</h1>
+          <h1>{docDisplayTitle(currentDoc?.doc as Parameters<typeof docDisplayTitle>[0]) || tree.text}</h1>
           <span>{nodes.length} 个节点</span>
         </header>
         {showAxioms ? <RichNodeAxioms axioms={currentDoc?.axioms} onAddAxiom={onAddAxiom} /> : null}
         <div className="rich-node-reader" ref={readerRef}>
-          <div className="source-virtual-spacer" style={{ height: virtual.top }} />
+          <div className="source-virtual-spacer" style={{ height: Number(virtual.top) || 0 }} />
           {visibleNodes.map((node) => (
             <RichNodeBlock
-              key={node.id}
+              key={String(node.id)}
               node={node}
               docId={docId}
               selected={String(node.id) === String(selectedNodeId)}
@@ -146,7 +170,14 @@ export function RichNodeView({
   );
 }
 
-function RichNodeBlock({ node, docId, selected, onSelect, showTitles, showNotes }) {
+function RichNodeBlock({ node, docId, selected, onSelect, showTitles, showNotes }: {
+  node: RichTreeNode;
+  docId?: unknown;
+  selected?: boolean;
+  onSelect?: (nodeId: unknown) => void;
+  showTitles?: boolean;
+  showNotes?: boolean;
+}) {
   const note = showNotes ? plainNodeNote(node.node_note || '') : '';
   return (
     <section
@@ -154,10 +185,10 @@ function RichNodeBlock({ node, docId, selected, onSelect, showTitles, showNotes 
       className={`rich-node ${selected ? 'selected' : ''}`}
       onClick={() => onSelect?.(node.id)}
     >
-      <button type="button" className="rich-node-gutter" title={node.address || ''}>{node.address}</button>
+      <button type="button" className="rich-node-gutter" title={String(node.address || '')}>{String(node.address || '')}</button>
       <div className="rich-node-body">
         {showTitles && node.node_title ? <div className="rich-node-title">{node.node_title}</div> : null}
-        {node.text ? <RichMarkdown markdown={node.text} docId={docId} /> : null}
+        {node.text ? <RichMarkdown markdown={String(node.text)} docId={docId == null ? null : String(docId)} /> : null}
         {note ? (
           <div className="rich-node-note">
             <span className="rich-node-note-label">摘要备注</span>
@@ -170,11 +201,11 @@ function RichNodeBlock({ node, docId, selected, onSelect, showTitles, showNotes 
 }
 
 // 事实前提:与 RichTextView 的 RichAxiomProperties 同形,内联一份避免两个富文本视图互相 import 成环。
-function RichNodeAxioms({ axioms = [], onAddAxiom }) {
+function RichNodeAxioms({ axioms = [], onAddAxiom }: { axioms?: AxiomView[]; onAddAxiom?: () => void }) {
   const rows = Array.isArray(axioms)
     ? axioms
       .map((axiom) => ({
-        key: axiom.id || axiom.label,
+        key: String(axiom.id || axiom.label || ''),
         label: String(axiom.label || '').trim(),
         content: String(axiom.content || '').trim()
       }))

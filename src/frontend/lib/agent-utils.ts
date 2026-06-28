@@ -1,20 +1,19 @@
-// @ts-nocheck
 export const AGENT_REASONING_OPTIONS = [
   { value: 'auto', label: '自动' },
   { value: 'low', label: '低' },
   { value: 'medium', label: '中' },
   { value: 'high', label: '高' },
   { value: 'xhigh', label: '超高' }
-];
+] as const;
 
-const AGENT_REASONING_VALUES = new Set(AGENT_REASONING_OPTIONS.map((option) => option.value));
+const AGENT_REASONING_VALUES = new Set<string>(AGENT_REASONING_OPTIONS.map((option) => option.value));
 
-export function normalizeAgentReasoningEfforts(value) {
+export function normalizeAgentReasoningEfforts(value: unknown): string[] {
   const source = Array.isArray(value)
     ? value
     : String(value || '').split(/[,，\s/]+/);
-  const seen = new Set();
-  const result = [];
+  const seen = new Set<string>();
+  const result: string[] = [];
   for (const item of source) {
     const raw = String(item || '').trim().toLowerCase();
     const effort = raw === 'max' ? 'xhigh' : raw;
@@ -26,7 +25,7 @@ export function normalizeAgentReasoningEfforts(value) {
   return result;
 }
 
-export function formatAgentElapsed(value) {
+export function formatAgentElapsed(value: unknown): string {
   const ms = Number(value || 0);
   if (!Number.isFinite(ms)) return '';
   const seconds = Math.max(1, Math.round(ms / 1000));
@@ -34,9 +33,76 @@ export function formatAgentElapsed(value) {
   return `已处理 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
 }
 
-export function agentHistoryForRequest(messages = []) {
+export interface AgentToolEvent {
+  id?: string;
+  name?: string;
+  status?: string;
+  argsPreview?: string;
+  resultPreview?: string;
+  displayPreview?: string;
+  error?: string;
+  [extra: string]: unknown;
+}
+
+export interface AgentUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
+  cacheMissTokens?: number;
+  reasoningTokens?: number;
+  contextLimit?: number;
+  ratio?: number;
+  [extra: string]: unknown;
+}
+
+export interface AgentMessageLike {
+  id?: string;
+  sessionId?: number;
+  role?: string;
+  mode?: string;
+  content?: string;
+  answer?: string;
+  status?: string;
+  diffCount?: number;
+  usage?: AgentUsage | null;
+  toolEvents?: AgentToolEvent[];
+  segments?: AgentSegment[];
+  error?: boolean;
+  streaming?: boolean;
+  createdAt?: number | string;
+  [extra: string]: unknown;
+}
+
+export interface AgentSession {
+  id?: number;
+  prompt?: string;
+  mode?: string;
+  created_at?: string;
+  updated_at?: string;
+  pending_diff_count?: number;
+  result?: {
+    messages?: AgentMessageLike[];
+    answer?: string;
+    error?: string;
+    pendingDiffCount?: number;
+    usage?: AgentUsage | null;
+    toolEvents?: AgentToolEvent[];
+    [extra: string]: unknown;
+  };
+  [extra: string]: unknown;
+}
+
+export interface AgentRequestMessage {
+  role: 'user' | 'assistant';
+  mode?: string;
+  content: unknown;
+  toolEvents?: Array<{ name?: string; status?: string; argsPreview?: string }>;
+}
+
+export function agentHistoryForRequest(messages: AgentMessageLike[] = []): AgentRequestMessage[] {
   return messages
-    .map((message) => ({
+    .map((message): AgentRequestMessage => ({
       role: message.role === 'assistant' ? 'assistant' : 'user',
       mode: message.mode,
       // assistant 历史回传用纯文本 answer（= 模型真实最终输出）：逐轮稳定、能命中 prompt 前缀缓存；
@@ -55,11 +121,11 @@ export function agentHistoryForRequest(messages = []) {
     .filter((message) => String(message.content || '').trim());
 }
 
-export function agentSessionTitle(session) {
+export function agentSessionTitle(session: AgentSession | null | undefined): string {
   return clipText(session?.prompt || `会话 ${session?.id || ''}`, 26);
 }
 
-export function agentSessionTime(session) {
+export function agentSessionTime(session: AgentSession | null | undefined): string {
   const value = session?.updated_at || session?.created_at;
   const date = parseAgentSessionDate(value);
   if (!date || Number.isNaN(date.getTime())) return '';
@@ -71,7 +137,7 @@ export function agentSessionTime(session) {
   });
 }
 
-export function parseAgentSessionDate(value) {
+export function parseAgentSessionDate(value: unknown): Date | null {
   const text = String(value || '').trim();
   if (!text) return null;
   if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(text)) {
@@ -80,11 +146,11 @@ export function parseAgentSessionDate(value) {
   return new Date(text);
 }
 
-export function agentMessagesFromSession(session) {
+export function agentMessagesFromSession(session: AgentSession | null | undefined): AgentMessageLike[] {
   if (!session) return [];
   const result = session.result || {};
   if (Array.isArray(result.messages) && result.messages.length > 0) {
-    return result.messages.map((message, index) => {
+    return result.messages.map((message, index): AgentMessageLike => {
       const role = message.role === 'assistant' ? 'assistant' : 'user';
       return {
         id: `session-${session.id}-${index}`,
@@ -100,7 +166,7 @@ export function agentMessagesFromSession(session) {
         segments: Array.isArray(message.segments) ? message.segments : [],
         error: Boolean(message.error),
         streaming: false,
-        createdAt: Date.parse(message.createdAt || '') || Date.parse(session.updated_at || '') || Date.now()
+        createdAt: Date.parse(String(message.createdAt || '')) || Date.parse(session.updated_at || '') || Date.now()
       };
     });
   }
@@ -132,10 +198,46 @@ export function agentMessagesFromSession(session) {
   ];
 }
 
-export function buildAgentModelOptions(settings = {}) {
+export interface AgentModelOption {
+  key: string;
+  providerId: string;
+  apiId: string;
+  model: string;
+  protocol: string;
+  reasoningEfforts: string[];
+  label: string;
+  title: string;
+}
+
+export interface ProviderApiConfig {
+  id?: string;
+  name?: string;
+  model?: string;
+  apiKey?: string;
+  enabled?: boolean;
+  protocol?: string;
+  reasoningEfforts?: unknown;
+  reasoning_efforts?: unknown;
+  [extra: string]: unknown;
+}
+
+export interface ProviderConfig {
+  id?: string;
+  name?: string;
+  apis?: ProviderApiConfig[];
+}
+
+export interface AgentSettingsLike {
+  providers?: ProviderConfig[];
+  activeProviderId?: string;
+  activeApiId?: string;
+  [extra: string]: unknown;
+}
+
+export function buildAgentModelOptions(settings: AgentSettingsLike = {}): AgentModelOption[] {
   const config = settings || {};
   const providers = Array.isArray(config.providers) ? config.providers : [];
-  const options = [];
+  const options: AgentModelOption[] = [];
   for (const provider of providers) {
     const apis = Array.isArray(provider.apis) ? provider.apis : [];
     for (const apiItem of apis) {
@@ -144,8 +246,8 @@ export function buildAgentModelOptions(settings = {}) {
       const model = String(apiItem.model || '').trim();
       options.push({
         key: `${provider.id}:${apiItem.id}`,
-        providerId: provider.id,
-        apiId: apiItem.id,
+        providerId: String(provider.id || ''),
+        apiId: String(apiItem.id || ''),
         model,
         protocol: apiItem.protocol || 'openai-compatible',
         reasoningEfforts: normalizeAgentReasoningEfforts(apiItem.reasoningEfforts || apiItem.reasoning_efforts),
@@ -157,13 +259,13 @@ export function buildAgentModelOptions(settings = {}) {
   return options;
 }
 
-export function defaultAgentModelKey(settings = {}, options = []) {
+export function defaultAgentModelKey(settings: AgentSettingsLike = {}, options: AgentModelOption[] = []): string {
   const config = settings || {};
   const key = `${config.activeProviderId || ''}:${config.activeApiId || ''}`;
   return options.some((option) => option.key === key) ? key : options[0]?.key || 'default';
 }
 
-export function compactAgentModelLabel(value) {
+export function compactAgentModelLabel(value: unknown): string {
   const text = String(value || '').trim();
   if (!text) return '模型';
   const lower = text.toLowerCase();
@@ -178,22 +280,22 @@ export function compactAgentModelLabel(value) {
   return (cleaned || text).slice(0, 2);
 }
 
-export function agentReasoningLabel(value) {
+export function agentReasoningLabel(value: unknown): string {
   return AGENT_REASONING_OPTIONS.find((option) => option.value === value)?.label || '自动';
 }
 
-export function agentReasoningShortLabel(value) {
+export function agentReasoningShortLabel(value: unknown): string {
   if (value === 'xhigh') return '超';
   if (value === 'auto') return '自';
   return agentReasoningLabel(value).slice(0, 1);
 }
 
-export function agentModeLabel(value) {
+export function agentModeLabel(value: unknown): string {
   if (value === 'full') return '完全';
   return value === 'edit' ? '协作' : '问答';
 }
 
-export function formatTokenCount(value) {
+export function formatTokenCount(value: unknown): string {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return '0';
   if (number >= 1000000) return `${(number / 1000000).toFixed(1)}m`;
@@ -201,7 +303,14 @@ export function formatTokenCount(value) {
   return String(Math.round(number));
 }
 
-export function agentContextUsageView(usage) {
+export interface ContextUsageView {
+  label: string;
+  title: string;
+  ratio: number;
+  level: 'empty' | 'ok' | 'warn' | 'danger';
+}
+
+export function agentContextUsageView(usage: AgentUsage | null | undefined): ContextUsageView {
   if (!usage?.promptTokens) return { label: 'ctx --', title: '等待 API usage 字段', ratio: 0, level: 'empty' };
   const prompt = formatTokenCount(usage.promptTokens);
   const contextLimit = Number(usage.contextLimit);
@@ -227,62 +336,69 @@ export function agentContextUsageView(usage) {
   };
 }
 
-export function upsertAgentToolEvent(events = [], tool = {}) {
-  const list = Array.isArray(events) ? events : [];
-  const id = String(tool.id || `${tool.name || 'tool'}-${list.length}`);
-  const next = { ...tool, id };
+// events / tool 接 unknown：上游 useAgentChat 的 message.toolEvents / event.tool 仍未收紧（前端债 #1+#2），边界 narrow 后再走 AgentToolEvent。
+export function upsertAgentToolEvent(events: unknown = [], tool: unknown = {}): AgentToolEvent[] {
+  const list: AgentToolEvent[] = Array.isArray(events) ? events as AgentToolEvent[] : [];
+  const raw: AgentToolEvent = tool && typeof tool === 'object' ? tool as AgentToolEvent : {};
+  const id = String(raw.id || `${raw.name || 'tool'}-${list.length}`);
+  const next: AgentToolEvent = { ...raw, id };
   const index = list.findIndex((event) => event.id === id);
   if (index < 0) return [...list, next];
   return list.map((event, eventIndex) => (eventIndex === index ? { ...event, ...next } : event));
 }
 
+export type AgentSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'reasoning'; text: string }
+  | { kind: 'tool'; toolId: string };
+
 // 有序段（交错渲染）：delta 落到末尾 text 段（无则新建）；tool 事件按 toolId 占位、保持时间线顺序。
 // tool 段只记 toolId，工具数据始终在 toolEvents 单一来源，渲染时按 id 回查。
-export function appendTextToSegments(segments, text) {
-  if (!text) return Array.isArray(segments) ? segments : [];
-  const list = Array.isArray(segments) ? segments.slice() : [];
+export function appendTextToSegments(segments: AgentSegment[] | unknown, text: unknown): AgentSegment[] {
+  if (!text) return Array.isArray(segments) ? segments as AgentSegment[] : [];
+  const list = Array.isArray(segments) ? (segments as AgentSegment[]).slice() : [];
   const last = list[list.length - 1];
   if (last && last.kind === 'text') {
     list[list.length - 1] = { ...last, text: `${last.text}${text}` };
   } else {
-    list.push({ kind: 'text', text });
+    list.push({ kind: 'text', text: String(text) });
   }
   return list;
 }
 
-export function appendToolToSegments(segments, toolId) {
+export function appendToolToSegments(segments: AgentSegment[] | unknown, toolId: unknown): AgentSegment[] {
   const id = String(toolId || '');
-  const list = Array.isArray(segments) ? segments : [];
+  const list = Array.isArray(segments) ? segments as AgentSegment[] : [];
   if (!id || list.some((segment) => segment.kind === 'tool' && segment.toolId === id)) return list;
   return [...list, { kind: 'tool', toolId: id }];
 }
 
-export function appendReasoningToSegments(segments, text) {
-  if (!text) return Array.isArray(segments) ? segments : [];
-  const list = Array.isArray(segments) ? segments.slice() : [];
+export function appendReasoningToSegments(segments: AgentSegment[] | unknown, text: unknown): AgentSegment[] {
+  if (!text) return Array.isArray(segments) ? segments as AgentSegment[] : [];
+  const list = Array.isArray(segments) ? (segments as AgentSegment[]).slice() : [];
   const last = list[list.length - 1];
   if (last && last.kind === 'reasoning') {
     list[list.length - 1] = { ...last, text: `${last.text}${text}` };
   } else {
-    list.push({ kind: 'reasoning', text });
+    list.push({ kind: 'reasoning', text: String(text) });
   }
   return list;
 }
 
-export function agentToolStatusText(status) {
+export function agentToolStatusText(status: unknown): string {
   if (status === 'done') return '完成';
   if (status === 'error') return '失败';
   return '运行中';
 }
 
 // 工具行单行摘要：取参数预览压成一行，剥掉最外层 JSON 花括号，类似 cc 的 Tool(args) 形态。
-export function agentToolArgsSummary(tool, limit = 60) {
+export function agentToolArgsSummary(tool: AgentToolEvent | null | undefined, limit: number = 60): string {
   let text = String(tool?.argsPreview || '').replace(/\s+/g, ' ').trim();
   if (text.startsWith('{') && text.endsWith('}')) text = text.slice(1, -1).trim();
   return clipText(text, limit);
 }
 
-export function agentToolNameText(name) {
+export function agentToolNameText(name: unknown): string {
   if (name === 'default_context') return '默认上下文';
   if (name === 'search_manifest') return '搜索清单';
   if (name === 'fetch_content') return '读取内容';
@@ -296,17 +412,17 @@ export function agentToolNameText(name) {
   if (name === 'admin_override') return '管理员直查';
   if (name === 'database_write') return '数据库写入';
   if (name === 'web_search') return '联网搜索';
-  return name || '工具调用';
+  return String(name || '') || '工具调用';
 }
 
-export function clipText(value, limit = 180) {
+export function clipText(value: unknown, limit: number = 180): string {
   const text = String(value || '');
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }
 
 // A2A 收敛后（projectneed 18-1）agentDiffs = owner=llm:<会话> 编辑分支列表（整批，一分支 = 一组提议）。
 // 下面把分支的 diff.entries 解析成卡片摘要；明细对照走统一 diff 视图。
-const AGENT_ENTRY_LABELS = {
+const AGENT_ENTRY_LABELS: Record<string, string> = {
   'node.update': '改节点', 'node.insert': '增节点', 'node.delete': '删节点',
   'node.move': '移动节点', 'node.promote': '提升节点', 'node.split': '拆分节点',
   'node.mergeInto': '并入节点', 'node.mergePrevious': '并入上一条', 'node.reparent': '改父节点',
@@ -315,8 +431,34 @@ const AGENT_ENTRY_LABELS = {
   'ref.addNodeToNode': '加引用', 'ref.addAxiomToNode': '加前提引用', 'ref.delete': '删引用'
 };
 
-export function agentBranchEntries(branch) {
-  let diff = {};
+export interface AgentBranch {
+  id?: unknown;
+  base_doc_id?: unknown;
+  base_title?: string;
+  owner?: string;
+  diff?: string | { entries?: AgentBranchEntry[] };
+  [extra: string]: unknown;
+}
+
+export interface AgentBranchEntry {
+  kind?: string;
+  createdAt?: string;
+  status?: string;
+  address?: string;
+  parent_ref?: string;
+  target_ref?: string;
+  node_ref?: string;
+  [extra: string]: unknown;
+}
+
+export interface AgentBranchEntrySummary {
+  key: string;
+  label: string;
+  address: string;
+}
+
+export function agentBranchEntries(branch: AgentBranch | null | undefined): AgentBranchEntrySummary[] {
+  let diff: { entries?: AgentBranchEntry[] } = {};
   try {
     diff = typeof branch?.diff === 'string' ? JSON.parse(branch.diff || '{}') : (branch?.diff || {});
   } catch {
@@ -324,25 +466,25 @@ export function agentBranchEntries(branch) {
   }
   const entries = Array.isArray(diff.entries) ? diff.entries : [];
   return entries
-    .filter((entry) => entry && entry.status !== 'undone')
+    .filter((entry): entry is AgentBranchEntry => Boolean(entry) && entry.status !== 'undone')
     .map((entry, index) => ({
       key: entry.createdAt || `${branch?.id ?? 'b'}:${index}`,
-      label: AGENT_ENTRY_LABELS[entry.kind] || entry.kind || '改动',
+      label: AGENT_ENTRY_LABELS[String(entry.kind || '')] || entry.kind || '改动',
       address: entry.address || entry.parent_ref || entry.target_ref || entry.node_ref || ''
     }));
 }
 
-export function agentBranchDocLabel(branch, docs = []) {
+export function agentBranchDocLabel(branch: AgentBranch | null | undefined, docs: Array<{ id?: unknown; title?: string }> = []): string {
   if (branch?.base_title) return branch.base_title;
   const match = Array.isArray(docs)
     ? docs.find((doc) => String(doc?.id) === String(branch?.base_doc_id))
     : null;
-  return match?.title || branch?.base_doc_id || '未知文档';
+  return match?.title || String(branch?.base_doc_id || '未知文档');
 }
 
 // owner 标签：A2A 待审分支 owner 形如 llm:<会话id>（A5-5 写入者身份+会话隔离，每会话一条分支）。
 // 优先映射成该会话的可读标题，找不到会话时回落「会话 <id>」；llm/human/其他原样转友好名。
-export function agentBranchOwnerLabel(branch, sessions = []) {
+export function agentBranchOwnerLabel(branch: AgentBranch | null | undefined, sessions: AgentSession[] = []): string {
   const owner = String(branch?.owner || '').trim();
   if (!owner) return '未知来源';
   const match = owner.match(/^llm:(.+)$/);

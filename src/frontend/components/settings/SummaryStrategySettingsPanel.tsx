@@ -1,15 +1,34 @@
-// @ts-nocheck
 import { Plus, Trash2
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { newSummaryStrategy, normalizeSummaryConcurrency, normalizeSummaryStrategy, normalizeSummaryStrategySettings
 } from '../../lib/summary-utils.js';
 
-export function SummaryStrategySettingsPanel({ settings, onChange }) {
-  const config = normalizeSummaryStrategySettings(settings || {});
+interface SummaryStrategy extends Record<string, unknown> {
+  id: string;
+  name?: string;
+}
+
+interface SummarySettings extends Record<string, unknown> {
+  summaryStrategies: SummaryStrategy[];
+  activeArticleSummaryStrategyId: string;
+  activeNodeSummaryStrategyId: string;
+  summaryConcurrency: number;
+}
+
+type NumberDrafts = Record<string, string>;
+
+export function SummaryStrategySettingsPanel({
+  settings,
+  onChange
+}: {
+  settings?: Record<string, unknown> | null;
+  onChange?: (settings: Record<string, unknown>) => void;
+}) {
+  const config = normalizeSummaryStrategySettings(settings || {}) as SummarySettings;
   const strategies = config.summaryStrategies;
   const [editingId, setEditingId] = useState(config.activeNodeSummaryStrategyId || strategies[0]?.id || '');
-  const [numberDrafts, setNumberDrafts] = useState({});
+  const [numberDrafts, setNumberDrafts] = useState<NumberDrafts>({});
   const editing = strategies.find((strategy) => strategy.id === editingId) || strategies[0] || null;
   useEffect(() => {
     if (!strategies.some((strategy) => strategy.id === editingId)) {
@@ -17,8 +36,8 @@ export function SummaryStrategySettingsPanel({ settings, onChange }) {
     }
   }, [config.activeNodeSummaryStrategyId, editingId, strategies]);
 
-  const save = (patch) => onChange?.({ ...(settings || {}), ...patch });
-  const saveStrategies = (nextStrategies, extra = {}) => {
+  const save = (patch: Record<string, unknown>) => onChange?.({ ...(settings || {}), ...patch });
+  const saveStrategies = (nextStrategies: SummaryStrategy[], extra: Record<string, unknown> = {}) => {
     const fallback = nextStrategies[0]?.id || '';
     save({
       summaryStrategies: nextStrategies,
@@ -48,33 +67,33 @@ export function SummaryStrategySettingsPanel({ settings, onChange }) {
     });
     setEditingId(fallback);
   };
-  const updateStrategy = (patch) => {
+  const updateStrategy = (patch: Record<string, unknown>) => {
     if (!editing) return;
     saveStrategies(strategies.map((strategy, index) => (
       strategy.id === editing.id ? normalizeSummaryStrategy({ ...strategy, ...patch }, index) : strategy
     )));
   };
-  const numberDraftKey = (field) => `${editing?.id || ''}:${field}`;
-  const numberValue = (field) => {
+  const numberDraftKey = (field: string) => `${editing?.id || ''}:${field}`;
+  const numberValue = (field: string): string | number | undefined => {
     const key = numberDraftKey(field);
-    return Object.prototype.hasOwnProperty.call(numberDrafts, key) ? numberDrafts[key] : editing?.[field];
+    return Object.prototype.hasOwnProperty.call(numberDrafts, key) ? numberDrafts[key] : (editing?.[field] as string | number | undefined);
   };
-  const settingsNumberValue = (field) => {
+  const settingsNumberValue = (field: string): string | number | undefined => {
     const key = `settings:${field}`;
-    return Object.prototype.hasOwnProperty.call(numberDrafts, key) ? numberDrafts[key] : config[field];
+    return Object.prototype.hasOwnProperty.call(numberDrafts, key) ? numberDrafts[key] : (config[field] as string | number | undefined);
   };
-  const updateNumber = (field, value) => {
+  const updateNumber = (field: string, value: string) => {
     if (!editing) return;
     const key = numberDraftKey(field);
     setNumberDrafts((drafts) => ({ ...drafts, [key]: value }));
     if (value !== '') updateStrategy({ [field]: value });
   };
-  const updateSettingsNumber = (field, value) => {
+  const updateSettingsNumber = (field: string, value: string) => {
     const key = `settings:${field}`;
     setNumberDrafts((drafts) => ({ ...drafts, [key]: value }));
     if (value !== '') save({ [field]: normalizeSummaryConcurrency(value) });
   };
-  const commitNumberDraft = (field) => {
+  const commitNumberDraft = (field: string) => {
     const key = numberDraftKey(field);
     setNumberDrafts((drafts) => {
       if (!Object.prototype.hasOwnProperty.call(drafts, key)) return drafts;
@@ -83,7 +102,7 @@ export function SummaryStrategySettingsPanel({ settings, onChange }) {
       return next;
     });
   };
-  const commitSettingsNumberDraft = (field) => {
+  const commitSettingsNumberDraft = (field: string) => {
     const key = `settings:${field}`;
     setNumberDrafts((drafts) => {
       if (!Object.prototype.hasOwnProperty.call(drafts, key)) return drafts;

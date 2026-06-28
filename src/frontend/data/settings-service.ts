@@ -1,12 +1,13 @@
-// @ts-nocheck
 import { callIftree } from './iftree-api.js';
+
+type SettingsPatch = Record<string, unknown>;
 
 export const settingsRepository = {
   readVectorSettings() {
     return callIftree('readVectorSettings');
   },
 
-  saveVectorSettings(patch) {
+  saveVectorSettings(patch: SettingsPatch) {
     return callIftree('saveVectorSettings', patch);
   },
 
@@ -14,7 +15,7 @@ export const settingsRepository = {
     return callIftree('readMemorySettings');
   },
 
-  saveMemorySettings(patch) {
+  saveMemorySettings(patch: SettingsPatch) {
     return callIftree('saveMemorySettings', patch);
   },
 
@@ -22,7 +23,7 @@ export const settingsRepository = {
     return callIftree('readLlmSummarySettings');
   },
 
-  saveLlmSummarySettings(settings) {
+  saveLlmSummarySettings(settings: SettingsPatch) {
     return callIftree('saveLlmSummarySettings', settings);
   },
 
@@ -30,7 +31,7 @@ export const settingsRepository = {
     return callIftree('readAgentSettings');
   },
 
-  saveAgentSettings(settings) {
+  saveAgentSettings(settings: SettingsPatch) {
     return callIftree('saveAgentSettings', settings);
   },
 
@@ -38,7 +39,7 @@ export const settingsRepository = {
     return callIftree('readNodeLayoutSettings');
   },
 
-  saveNodeLayoutSettings(settings) {
+  saveNodeLayoutSettings(settings: SettingsPatch) {
     return callIftree('saveNodeLayoutSettings', settings);
   }
 };

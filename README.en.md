@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.3%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.4%20alpha-orange)
 
-> **Project status: 0.6.3, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.6.4, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -206,12 +206,13 @@ The original Markdown reading source is stored in SQLite's `source_documents` / 
 | Markdown `.md` | Builds the hierarchy from headings, paragraphs, and sentences |
 | PDF `.pdf` | PDF import with text-layer mapping |
 | DOCX `.docx` | Detects heading levels from the OOXML paragraph style `<w:pStyle>` |
+| EPUB `.epub` | Parses chapter structure and body text; sentences trace back to the source |
 
 Excel `.xlsx` and CSV `.csv` are relay formats for database export, not ordinary document import.
 
 Sources too irregular for rule-based parsing go through **smart import**: an LLM inspects the source, writes a one-off splitting script that produces JSON, and `db import-json` validates it byte-for-byte before ingestion — body text may only be sliced from the source, never rewritten (see the [how-to guide](docs/how-to.md#用智能导入处理无规则结构的源文)).
 
-**Export**: Markdown document and JSON structure.
+**Export**: JSON structure. (Markdown document export is being redesigned and is temporarily disabled in this release.)
 
 ## MCP & External Agents
 
@@ -263,7 +264,7 @@ The app, MCP, and CLI share one backend process per database and can stay online
 │   │   ├── tree.ts       # Tree building, dynamic addresses, Markdown/JSON export
 │   │   ├── mindmap.ts    # Tree-view projection, depth control, layout
 │   │   ├── merkle.ts / merkle-diff.ts / merkle-merge.ts # Tree hashing, diff, three-way merge
-│   │   ├── source-text.ts / source-docx.ts / source-chm.ts # Works with import-formats/ to parse txt/md/csv/xlsx/docx/chm
+│   │   ├── source-text.ts / source-pdf.ts / source-docx.ts / source-chm.ts / source-epub.ts # Works with import-formats/ to parse txt/md/pdf/docx/chm/epub
 │   │   ├── source-markdown.ts # Source parsing and sentence offset mapping
 │   │   └── ...           # viewport, hitbox, drag-drop, markdown, etc.
 │   ├── vector/           # Semantic vectors: embeddings, vector-store, worker, model download

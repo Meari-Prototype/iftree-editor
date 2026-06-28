@@ -1,19 +1,25 @@
-// @ts-nocheck
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { agentMessagesFromSession, appendReasoningToSegments, appendTextToSegments, appendToolToSegments, upsertAgentToolEvent } from '../lib/agent-utils.js';
 import { agentRepository } from '../data/repositories.js';
 import { useAppUIContext } from './useAppUI.js';
 
+type AgentRecord = Record<string, unknown>;
+type PendingDelta = {
+  text: string;
+  usage: unknown;
+  reasoning?: string;
+};
+
 export function useAgentChat() {
   const { setNotice } = useAppUIContext();
-  const [agentSettings, setAgentSettings] = useState(null);
-  const [agentMessages, setAgentMessages] = useState([]);
-  const [agentDiffs, setAgentDiffs] = useState([]);
-  const [agentSessions, setAgentSessions] = useState([]);
-  const [activeAgentSessionId, setActiveAgentSessionId] = useState(null);
+  const [agentSettings, setAgentSettings] = useState<AgentRecord | null>(null);
+  const [agentMessages, setAgentMessages] = useState<AgentRecord[]>([]);
+  const [agentDiffs, setAgentDiffs] = useState<AgentRecord[]>([]);
+  const [agentSessions, setAgentSessions] = useState<AgentRecord[]>([]);
+  const [activeAgentSessionId, setActiveAgentSessionId] = useState<any>(null);
   const [agentBusy, setAgentBusy] = useState(false);
-  const [agentContextUsage, setAgentContextUsage] = useState(null);
+  const [agentContextUsage, setAgentContextUsage] = useState<any>(null);
   const agentSettingsSaveSeqRef = useRef(0);
 
   useEffect(() => {
@@ -21,13 +27,13 @@ export function useAgentChat() {
     // delta 节流：流式 token 每秒几十个，逐个 setState 会让 App 整树以同频重渲染。
     // 这里把 delta 文本按 requestId 累积，最长 80ms 合并提交一次；
     // 非 delta 事件（status/tool/done）先冲掉积压再处理，保证顺序不乱。
-    const pendingDeltas = new Map();
+    const pendingDeltas = new Map<unknown, PendingDelta>();
     let flushTimer = 0;
     const applyPendingDeltas = () => {
       if (pendingDeltas.size === 0) return;
       const batch = new Map(pendingDeltas);
       pendingDeltas.clear();
-      let usage = null;
+      let usage: unknown = null;
       for (const entry of batch.values()) {
         if (entry.usage) usage = entry.usage;
       }
@@ -49,7 +55,8 @@ export function useAgentChat() {
         };
       }));
     };
-    const unsubscribe = agentRepository.onStream((event) => {
+    const unsubscribe = agentRepository.onStream((rawEvent: unknown) => {
+      const event = rawEvent as AgentRecord;
       if (event?.type === 'delta') {
         const entry = pendingDeltas.get(event.requestId) || { text: '', usage: null };
         entry.text += event.text || '';
@@ -93,7 +100,7 @@ export function useAgentChat() {
           return {
             ...message,
             toolEvents: upsertAgentToolEvent(message.toolEvents, event.tool),
-            segments: appendToolToSegments(message.segments, event.tool?.id),
+            segments: appendToolToSegments(message.segments, (event.tool as { id?: unknown } | undefined)?.id),
             streaming: true
           };
         }
@@ -120,26 +127,26 @@ export function useAgentChat() {
     };
   }, []);
 
-  async function saveSettings(next) {
+  async function saveSettings(next?: AgentRecord | null) {
     const seq = agentSettingsSaveSeqRef.current + 1;
     agentSettingsSaveSeqRef.current = seq;
     const merged = { ...(agentSettings || {}), ...(next || {}) };
     setAgentSettings(merged);
     try {
-      const updated = await agentRepository.saveSettings(merged);
+      const updated = await agentRepository.saveSettings(merged) as AgentRecord;
       if (agentSettingsSaveSeqRef.current !== seq) return null;
       setAgentSettings(updated);
       return updated;
-    } catch (error) {
-      setNotice?.(error.message);
+    } catch (error: unknown) {
+      setNotice?.((error as { message?: string }).message || '');
       return null;
     }
   }
 
   async function refreshSessions() {
     if (!agentRepository.canListSessions()) return [];
-    const sessions = await agentRepository.listSessions({ limit: 60 });
-    const list = Array.isArray(sessions) ? sessions : [];
+    const sessions = await agentRepository.listSessions({ limit: 60 }) as unknown;
+    const list = Array.isArray(sessions) ? sessions as AgentRecord[] : [];
     setAgentSessions(list);
     return list;
   }
@@ -149,29 +156,30 @@ export function useAgentChat() {
     setAgentMessages([]);
   }
 
-  async function loadSession(sessionId) {
+  async function loadSession(sessionId: unknown) {
     if (!agentRepository.canGetSession()) return;
     try {
-      const session = await agentRepository.getSession({ sessionId });
+      const session = await agentRepository.getSession({ sessionId }) as AgentRecord | null;
       if (!session) return;
       setActiveAgentSessionId(session.id);
-      setAgentMessages(agentMessagesFromSession(session));
-      if (session.result?.usage) setAgentContextUsage(session.result.usage);
-    } catch (error) {
-      setNotice?.(error.message);
+      setAgentMessages(agentMessagesFromSession(session) as AgentRecord[]);
+      const sessionUsage = (session.result as { usage?: unknown } | null | undefined)?.usage;
+      if (sessionUsage) setAgentContextUsage(sessionUsage);
+    } catch (error: unknown) {
+      setNotice?.((error as { message?: string }).message || '');
     }
   }
 
-  async function deleteSession(sessionId) {
+  async function deleteSession(sessionId: unknown) {
     if (!agentRepository.canDeleteSession()) return;
     const ok = window.confirm('删除这个 Agent 会话记录？待审变更不会被自动应用。');
     if (!ok) return;
     try {
-      const result = await agentRepository.deleteSession({ sessionId });
+      const result = await agentRepository.deleteSession({ sessionId }) as AgentRecord;
       setAgentSessions(Array.isArray(result?.sessions) ? result.sessions : []);
       if (Number(activeAgentSessionId) === Number(sessionId)) newSession();
-    } catch (error) {
-      setNotice?.(error.message);
+    } catch (error: unknown) {
+      setNotice?.((error as { message?: string }).message || '');
     }
   }
 

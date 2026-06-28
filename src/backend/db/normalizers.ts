@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { parseJsonObject, compareNodeAddress } from '../shared.js';
 import {
   normalizeStableId,
@@ -8,16 +7,19 @@ import {
 const DEFAULT_DOC_FOLDER_NAME = '新建文件夹';
 const MAX_DOC_FOLDER_NAME_LENGTH = 100;
 
-export function normalizeDocFolderName(value) {
+type RowObject = Record<string, unknown>;
+type PdfRect = { page_number: number; x0: number; y0: number; x1: number; y1: number };
+
+export function normalizeDocFolderName(value: unknown): string {
   const trimmed = String(value ?? '').trim();
   const source = trimmed || DEFAULT_DOC_FOLDER_NAME;
   return Array.from(source).slice(0, MAX_DOC_FOLDER_NAME_LENGTH).join('');
 }
 
-function normalizeIdArray(value) {
+function normalizeIdArray(value: unknown): string[] {
   const source = Array.isArray(value) ? value : [];
-  const ids = [];
-  const seen = new Set();
+  const ids: string[] = [];
+  const seen = new Set<string>();
   for (const item of source) {
     const id = normalizeStableId(item);
     if (!id || seen.has(id)) continue;
@@ -27,8 +29,8 @@ function normalizeIdArray(value) {
   return ids;
 }
 
-export function normalizeTreeViewState(value) {
-  const raw = typeof value === 'string' ? parseJsonObject(value) : (value || {});
+export function normalizeTreeViewState(value: unknown): string {
+  const raw = typeof value === 'string' ? parseJsonObject(value) : ((value || {}) as RowObject);
   const depthLimit = Math.max(1, Math.floor(Number(raw.depthLimit) || 1));
   return JSON.stringify({
     depthLimit,
@@ -38,13 +40,13 @@ export function normalizeTreeViewState(value) {
   });
 }
 
-export function normalizeSourcePosition(value) {
+export function normalizeSourcePosition(value: unknown): number | null {
   if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
 
-export function recordSentenceIndexes(record, fallbackIndex = null) {
+export function recordSentenceIndexes(record: { indexes?: unknown[]; index?: unknown } | null | undefined, fallbackIndex: unknown = null): number[] {
   const raw = Array.isArray(record?.indexes)
     ? record.indexes
     : (record?.index != null ? [record.index] : (fallbackIndex != null ? [fallbackIndex] : []));
@@ -53,48 +55,48 @@ export function recordSentenceIndexes(record, fallbackIndex = null) {
       .filter((value) => Number.isFinite(value) && value > 0))];
 }
 
-export function parentAddressOf(address) {
+export function parentAddressOf(address: unknown): string {
   const parts = String(address || '').split('-').filter(Boolean);
   return parts.length > 1 ? parts.slice(0, -1).join('-') : '';
 }
 
-export function areRecordsAddressSorted(records) {
+export function areRecordsAddressSorted(records: Array<{ id?: unknown; address?: unknown }>): boolean {
   for (let index = 1; index < records.length; index += 1) {
     if (compareNodeAddress(records[index - 1], records[index]) > 0) return false;
   }
   return true;
 }
 
-export function normalizePositiveNumber(value) {
+export function normalizePositiveNumber(value: unknown): number | null {
   if (value == null || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-export function normalizePositiveCount(value) {
+export function normalizePositiveCount(value: unknown): number | null {
   if (value == null || value === '') return null;
   const n = Math.round(Number(value));
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-export function normalizePositiveId(value) {
+export function normalizePositiveId(value: unknown): string | null {
   return normalizeStableId(value);
 }
 
-export function normalizeNodeSizeMode(value) {
+export function normalizeNodeSizeMode(value: unknown): 'manual' | 'auto' {
   return value === 'manual' ? 'manual' : 'auto';
 }
 
-export function normalizeNullableText(value) {
+export function normalizeNullableText(value: unknown): string | null {
   if (value == null || value === '') return null;
   return String(value);
 }
 
-export function normalizeNodeIdBatch(value, max = 500) {
+export function normalizeNodeIdBatch(value: unknown, max = 500): string[] {
   return normalizeStableIdBatch(value, max);
 }
 
-export function addressSortKey(address) {
+export function addressSortKey(address: unknown): string {
   return String(address || '')
     .split('-')
     .filter(Boolean)
@@ -102,8 +104,8 @@ export function addressSortKey(address) {
     .join('-');
 }
 
-export function mergePdfCharRects(chars) {
-  const rects = [];
+export function mergePdfCharRects(chars: Array<RowObject> | null | undefined): PdfRect[] {
+  const rects: PdfRect[] = [];
   for (const item of chars || []) {
     const pageNumber = Number(item.page_number);
     const x0 = Number(item.x0);
@@ -130,13 +132,13 @@ export function mergePdfCharRects(chars) {
   return rects;
 }
 
-export function patchValue(patch, snakeKey, camelKey, fallback) {
+export function patchValue(patch: RowObject, snakeKey: string, camelKey: string, fallback: unknown): unknown {
   if (Object.prototype.hasOwnProperty.call(patch, snakeKey)) return patch[snakeKey];
   if (Object.prototype.hasOwnProperty.call(patch, camelKey)) return patch[camelKey];
   return fallback;
 }
 
-export function hasPatchValue(patch, snakeKey, camelKey) {
+export function hasPatchValue(patch: RowObject, snakeKey: string, camelKey: string): boolean {
   return Object.prototype.hasOwnProperty.call(patch, snakeKey) ||
     Object.prototype.hasOwnProperty.call(patch, camelKey);
 }

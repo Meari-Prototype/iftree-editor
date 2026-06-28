@@ -4,13 +4,11 @@ import test from 'node:test';
 
 import { parseJsonStdout, runBashDb, stdoutOf, withImportedFixture } from './_helpers.mjs';
 
-test('db export and delete read then remove an imported document and reject missing doc ids', { timeout: 180000 }, async () => {
+test('db export 已停用（未启用，待重新设计）；delete 正常读删并对缺参报错', { timeout: 180000 }, async () => {
   await withImportedFixture(async ({ dbPath, docId }) => {
-    // —— export：markdown 文本，含根标题与结束标记 ——
-    const exported = stdoutOf(await runBashDb(dbPath, ['export', docId]));
-    assert.match(exported, /# IFTreeEditor数据库读写测试样例/);
-    assert.match(exported, /DBT_END_MARKER/);
-    assert.ok(exported.length > 100, 'export 应返回完整 markdown，不是空串');
+    // —— export：已停用——原实现把 markdown 返回命令行（应导出为文件）且渲染有功能错误，重新设计前一律拒绝。——
+    const exported = await runBashDb(dbPath, ['export', docId], { expectFailure: true });
+    assert.match(exported.stderr || exported.stdout, /已停用（未启用，待重新设计）/);
 
     // —— delete：返回 {ok, action, docId, changed, title, nodeCount} ——
     const deleteResult = parseJsonStdout(await runBashDb(dbPath, ['delete', docId]));
@@ -29,9 +27,9 @@ test('db export and delete read then remove an imported document and reject miss
     const indexAfterDelete = stdoutOf(await runBashDb(dbPath, ['index', '--folder', 'generated']));
     assert.doesNotMatch(indexAfterDelete, /IFTreeEditor数据库读写测试样例/);
 
-    // —— 错误路径：缺 doc_id ——
+    // —— export 停用后即便缺 doc_id 也一律先报停用（重新设计前不再走 doc_id 校验）——
     const exportNoDoc = await runBashDb(dbPath, ['export'], { expectFailure: true });
-    assert.match(exportNoDoc.stderr || exportNoDoc.stdout, /db export requires doc_id/);
+    assert.match(exportNoDoc.stderr || exportNoDoc.stdout, /已停用（未启用，待重新设计）/);
 
     const deleteNoDoc = await runBashDb(dbPath, ['delete'], { expectFailure: true });
     assert.match(deleteNoDoc.stderr || deleteNoDoc.stdout, /db delete requires doc_id/);

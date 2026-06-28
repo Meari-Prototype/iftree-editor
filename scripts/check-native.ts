@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { createRequire } from 'node:module';
 
 // Headless native 自检（projectneed `18` 解耦）：在纯 node runtime 下确认两个 native 依赖可加载、可用——
@@ -7,7 +6,14 @@ import { createRequire } from 'node:module';
 // 只用 node、不依赖 electron / display，docker slim 里能直接验（旧的 electron + app.whenReady() 版已退役）。
 //   node dist/scripts/check-native.js   (= npm run check:native / check:native:node)
 const require = createRequire(import.meta.url);
-const Database = require('better-sqlite3');
+interface BetterSqlite3Database {
+  prepare(sql: string): { get(): { ok?: unknown } };
+  close(): void;
+}
+
+type BetterSqlite3Constructor = new (filename: string) => BetterSqlite3Database;
+
+const Database = require('better-sqlite3') as BetterSqlite3Constructor;
 
 (async () => {
   // 不止 require：实开一次内存库并查询，确认 ABI 真能用（NODE_MODULE_VERSION 对得上，不是只解析到 .node 文件）。

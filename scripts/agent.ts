@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +6,16 @@ import { fileURLToPath } from 'node:url';
 import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+type AgentRequest = Record<string, unknown> & {
+  help?: boolean;
+  type?: string;
+};
+type ErrorLike = { stack?: string; message?: string };
+
+function errorLike(error: unknown): ErrorLike {
+  return error && typeof error === 'object' ? error as ErrorLike : { message: String(error) };
+}
 
 function printHelp() {
   console.log([
@@ -21,7 +30,7 @@ function printHelp() {
   ].join('\n'));
 }
 
-function parseRequest(argv = []) {
+function parseRequest(argv: string[] = []): AgentRequest {
   if (argv.length === 0 || ['help', '--help', '-h'].includes(argv[0])) return { help: true };
   const raw = argv[0] === '--stdin' ? readFileSync(0, 'utf8') : argv.join(' ');
   const parsed = JSON.parse(String(raw || '').trim());
@@ -29,10 +38,10 @@ function parseRequest(argv = []) {
     throw new Error('Agent request must be a JSON object');
   }
   if (!parsed.type) return { type: 'agent.run', payload: parsed };
-  return parsed;
+  return parsed as AgentRequest;
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.env.ELECTRON_RUN_AS_NODE === '1') {
     process.exit(code);
     return;
@@ -60,7 +69,7 @@ async function main() {
     onStderr: (text) => process.stderr.write(text)
   });
   try {
-    const result = await client.request(request.type, request, {
+    const result = await client.request(String(request.type), request, {
       onEvent: (event) => {
         console.log(JSON.stringify({ type: 'agent.stream', event }));
       }
@@ -74,7 +83,8 @@ async function main() {
 
 main()
   .then(() => exitProcess(0))
-  .catch(async (error) => {
-    console.error(error?.stack || error?.message || String(error));
+  .catch(async (error: unknown) => {
+    const failure = errorLike(error);
+    console.error(failure.stack || failure.message || String(error));
     await exitProcess(1);
   });

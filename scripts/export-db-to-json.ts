@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 库级导出：把 live 库的真实数据导成单个 json（带 schema 版本头）。只读、不改源库。
 // 跑法：electron scripts/export-db-to-json.mjs [输出路径]
 //   不传输出路径则写 database/export-<时戳>.json。

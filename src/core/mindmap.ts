@@ -5,7 +5,7 @@ const NOTE_GAP = 0;
 export const MAX_DEPTH_LIMIT = 28;
 export const DEFAULT_DEPTH_LIMIT = MAX_DEPTH_LIMIT;
 
-interface NodeLayout {
+export interface NodeLayout {
   mode: string;
   defaultWidth: number;
   defaultHeight: number;

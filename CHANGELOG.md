@@ -2,6 +2,28 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.4 — 2026-06-29
+
+承接 0.6.3 的运行时 TypeScript 化：本版把 `backend` / `frontend` / `vector` / `agent` 仍带 `@ts-nocheck` 的模块全部补齐类型标注、摘除跳检标记，并把 `tsconfig.check.json` 的 `strict` 从暂关恢复为开启——全仓（`src` / `electron` / `scripts`，含 `checkJs`）在 strict 下 `check:types` 零错误。本轮主体为纯类型基建 / 代码质量收尾；对外另有一处行为变更——markdown 导出（查询动词 `doc.exportMarkdown` 与 CLI `db export`）临时停用、待重新设计（见下），其余对外功能与动词契约不变。
+
+### 工程（类型债收尾）
+
+- **strict 全量重开**：`tsconfig.check.json` 恢复 `strict: true`，`include` 覆盖 `src` / `electron` / `scripts` 全量（`allowJs` + `checkJs`），摘除最后一批 `@ts-nocheck` / `@ts-ignore` 后零类型错误——隐式 `any`、`null` 检查、未初始化访问等在 strict 下全部收口；`check:types` 是关闭 `no-undef` 后未定义名的唯一防线。
+- **行类型公共入口**：新增 `backend/db/rows`，从 `schema` 统一 re-export 各表行类型（`NodeRow` / `DocRow` / `RefRow` / `EntityRow` / `EditBranchRow` / …），调用方从单一入口取行类型，不再各自深引 `schema`。
+- **写返回契约显式化**：新增 `backend/write-result`，把写动词 / 状态回执形状（`CommitSummary` / `BranchCounts` 等）抽成权威类型；字段按 action 子集全可选，且刻意不加索引签名，保留 strict 对「拼错字段名」的检测。
+- **字数口径单一来源**：正文字数（忽略空白）抽成 `core/char-count` 的 `bodyCharCount`，后端各处展示字数与 SQL 侧 UDF 同源调用，保证 JS 与 SQL 计数一致。
+- **三方库类型 shim**：新增 `src/types/better-sqlite3.d.ts` 与 `src/types/huggingface-transformers.d.ts`，手写覆盖项目实际用到的 API 子集（泛型行类型 `get<T>` / `all<T>` + `unknown` 参数），替代无类型互操作。
+- **后台维护调度抽离**：维护触发收口为 `backend/store/maintenance-scheduler`，仅按脏度阈值 + 空闲窗口决定「何时维护」并经共享单写队列串行派发，与各子系统的具体维护逻辑解耦。
+- **cast 中转收敛**：写分发改 store / ctx 直传（`MutationStore` 即 `IftreeStore` 别名、`handlers/*` 直签真类型），不再需要逐处 `as unknown as Parameters<...>` 中转；残留的边界 `as unknown as` 收敛到三处接缝——JS 互操作的签名补全、store 行 ↔ Merkle 节点的结构桥接、agent runtime 的动态方法调用。
+
+### 变更（导出）
+
+- **markdown 导出临时停用**：查询动词 `doc.exportMarkdown` 与 CLI `db export` 暂时停用并抛清晰停用错误（分派入口保留、不再对外通告），原实现存在「markdown 返回命令行而非落文件、渲染把地址当标题 / 混入 node_note」等问题，且幂等与 import/export 对称设计未定，留待重新设计。数据库 → JSON 结构导出（`export-db-to-json`）不受影响。
+
+### 测试
+
+- 顶层套件 268 pass / 2 skip、`test:verbs` 46 pass、`check:types`（strict）/ `lint` 全绿。
+
 ## 0.6.3 — 2026-06-25
 
 本版主线是运行时源码的 TypeScript 化：把 `src` / `scripts` / `electron` 下的运行时 `.mjs` 全量迁移到 `.ts`，并从 `core` 模块起补全类型标注。这是一轮内部代码质量 / 类型基建工作，对外功能与动词契约不变。

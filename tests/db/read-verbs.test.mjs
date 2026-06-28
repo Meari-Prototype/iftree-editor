@@ -56,7 +56,8 @@ test('inspect：身份段 + meta/source/links/axioms 选段（吸收旧 read 镜
     const meta = stdoutOf(await runBashDb(dbPath, ['inspect', docId, '1-1-3-2-1']));
     assert.match(meta, /\[IFTreeEditor数据库读写测试样例 1-1-3-2-1 文本 trust:null/);
     // content_hash 在 simple 导入后未算（hash:null），经 commit/merkle 才有十六进制值——两者都接受。
-    assert.match(meta, /\[meta\] updated:.+created:.+sort:1 chars:86 hash:\S+/);
+    // chars 口径＝忽略空白（core/char-count.bodyCharCount）：该节点正文含 5 个 ASCII 空格，raw 86 去空白后 81。
+    assert.match(meta, /\[meta\] updated:.+created:.+sort:1 chars:81 hash:\S+/);
 
     // --sections source：原文出处 + 该节点 source spans（原 blame）
     const source = stdoutOf(await runBashDb(dbPath, ['inspect', docId, '1-1-3-2-1', '--sections', 'source']));
@@ -97,6 +98,15 @@ test('article：导入原件原文窗口，按字符偏移，可附 source spans
 
     // 按节点地址锚定窗口
     assert.match(stdoutOf(await runBashDb(dbPath, ['article', docId, '1-1-7-2'])), /DBT_CONTEXT/);
+
+    // 回归：按 nodeId/address 锚定的窗口必须真落到该节点的原文位置，而不是静默退回 offset 0。
+    // （旧 bug：startOffset 默认 null、Number(null)===0、isFinite(0)===true，导致未传 offset 时被误判成
+    //  「显式 offset 0」而跳过锚点解析；source_position 为 NULL 的容器节点同理 Math.floor(Number(null))===0
+    //  命中全文首句。两处都让窗口钉死在文档开头。）小 limit + 靠文末节点：startOffset 必须 > 0 才算锚定生效。
+    const endAnchor = parseJsonStdout(await runBashDb(dbPath, ['article', docId, '1-1-8-1', '--limit', '120', '--json']));
+    assert.ok(endAnchor.window, 'article 按地址锚定应含 window 对象');
+    assert.ok(endAnchor.window.startOffset > 0, `按文末节点锚定的 startOffset 应 > 0（锚点未生效会退回 0），实际 ${endAnchor.window.startOffset}`);
+    assert.match(endAnchor.text, /DBT_END_MARKER/);
 
     const missingDoc = await runBashDb(dbPath, ['article'], { expectFailure: true });
     assert.match(missingDoc.stderr || missingDoc.stdout, /db article requires <doc_id>/);

@@ -1,15 +1,31 @@
-// @ts-nocheck
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
+import type { Statement } from 'better-sqlite3';
 
 import { mergeNodeNotes } from '../../core/node-notes.js';
 import { normalizeNodeType } from '../../core/node-model.js';
 import { buildTree, splitSentences } from '../../core/tree.js';
-import { computeSubtreeHashes } from '../../core/merkle.js';
+import { bodyCharCount } from '../../core/char-count.js';
+import { computeSubtreeHashes, type MerkleNode } from '../../core/merkle.js';
 import { compareNodeAddress, editModeMismatchMessage, parseJsonObject, assertNoHumanTagField } from '../shared.js';
 import { memoryVolumeMetaOf } from '../memory/index.js';
-import { AXIOM_ORDER_SQL, TABLES_SQL, SCHEMA_VERSION } from '../db/schema.js';
+import {
+  AXIOM_ORDER_SQL,
+  TABLES_SQL,
+  SCHEMA_VERSION,
+  type AxiomRow,
+  type CommitRow,
+  type DocFolderRow,
+  type DocRow,
+  type NodeRow,
+  type RefRow,
+  type SourceDocBlockRow,
+  type SourceDocumentRow,
+  type SourcePdfCharRow,
+  type SourcePdfPageRow,
+  type SourceSpanRow
+} from '../db/schema.js';
 import {
   compareStableIds,
   newStableId,
@@ -48,19 +64,135 @@ import {
   LIBRARY_NAVIGATION_DOC_META,
   LIBRARY_NAVIGATION_DOC_TITLE
 } from '../virtual-docs.js';
-import {
-  projectEditBranchDoc
-} from '../edit-branch-projection.js';
+import { projectEditBranchDoc } from '../edit-branch-projection.js';
 import { pdfHighlightRects, pdfSpanHitRects } from '../pdf-highlight-geometry.js';
 import { renderDocMarkdown } from '../../core/markdown-export.js';
 import { EditorSnapshotTokens } from '../editor-snapshot-tokens.js';
 import * as history from './history.js';
+import type {
+  CertifyNodesPayload,
+  RevertCommitPayload,
+  SaveHistorySnapshotPayload
+} from './history.js';
 import * as editBranch from './edit-branch.js';
+import { createMaintenanceScheduler } from './maintenance-scheduler.js';
 
 // 文档编辑模式三态（projectneed 4-16-8）：只读 / 增量编辑（流式写入）/ 完整编辑（2way/3way）。
-const EDIT_MODES = Object.freeze(['readonly', 'incremental', 'full']);
+const EDIT_MODES: readonly string[] = Object.freeze(['readonly', 'incremental', 'full']);
 // 流式写入请求级防抖窗口（毫秒）：短时间内携带同一幂等键的重复推送只生效一次（projectneed 4-16-5）。
 const STREAM_PUSH_DEDUPE_MS = 10000;
+
+type RowObject = Record<string, unknown>;
+type StoreInitOptions = { readonly?: boolean };
+type StoreMaintenanceResult = {
+  gc?: unknown;
+  checkpoint?: unknown;
+  vacuum?: unknown;
+};
+type CountRow = { count: number };
+type MaxSortOrderRow = { m: number | null };
+type AxiomRootRefRow = { axiom_id: string; root_id: string };
+type AxiomIdRow = { axiom_id: string };
+type DocListRow = DocRow & { node_count: number };
+type DocDetailRow = DocRow & { node_count: number };
+type NodeWithChildCountRow = NodeRow & { child_count: number; tree_depth?: number };
+type FolderPatch = { name?: unknown; parentId?: unknown };
+type CreateDocInput = {
+  title: string;
+  rootText?: unknown;
+  meta?: unknown;
+  folderId?: unknown;
+  skipInitialCommit?: boolean;
+};
+type CreatedDoc = { id: string; title: string; rootNodeId: string };
+type SaveSourceSpanInput = Partial<SourceSpanRow> & { sentenceIndex?: unknown; index?: unknown; startOffset?: unknown; endOffset?: unknown };
+type SaveSourcePdfPageInput = Partial<SourcePdfPageRow> & { pageNumber?: unknown };
+type SaveSourcePdfCharInput = Partial<SourcePdfCharRow> & { charOffset?: unknown; pageNumber?: unknown; charText?: unknown };
+type SaveSourceDocBlockInput = Partial<SourceDocBlockRow> & { blockIndex?: unknown; startOffset?: unknown; endOffset?: unknown };
+type SourceNodeMap = Map<unknown, unknown> | unknown[] | Record<string, unknown> | null;
+type SourceDocumentInput = {
+  docId: unknown;
+  sourcePath?: unknown;
+  sourceType?: unknown;
+  rawMarkdown?: unknown;
+  // 字段类型放宽到 unknown：调用方常常从 payload 直传（payload.spans 等都是 unknown），内部
+  // Array.isArray 守卫后逐项归一处理。下面 ?? [] 默认值在 unknown 类型上仍合法。
+  spans?: unknown;
+  pdfPages?: unknown;
+  pdfChars?: unknown;
+  docBlocks?: unknown;
+  nodeIdsBySentenceIndex?: SourceNodeMap;
+};
+type ImportRecord = RowObject & { text?: unknown; address?: unknown; index?: unknown; indexes?: unknown[] };
+type ImportedDocInput = {
+  title: string;
+  sourcePath?: unknown;
+  records: ImportRecord[];
+};
+type SentencesDocInput = {
+  title: string;
+  sourcePath?: unknown;
+  sentences: string[];
+};
+type DocDepthPayload = { docId?: unknown; depth?: unknown };
+type DocIdPayload = { docId?: unknown };
+type NodeBatchPayload = { docId?: unknown; nodeIds?: unknown[] };
+type SearchNodesPayload = { docId?: unknown; query?: unknown; limit?: unknown };
+type NodeRefPayload = { docId?: unknown; nodeId?: unknown };
+type InsertNodePayload = {
+  docId?: unknown;
+  parentId?: unknown;
+  text?: unknown;
+  nodeType?: unknown;
+  nodeTitle?: unknown;
+  nodeNote?: unknown;
+  sourcePosition?: unknown;
+  trustLevel?: unknown;
+  afterNodeId?: unknown;
+};
+type SubtreeTextWindowPayload = NodeRefPayload & { offset?: unknown; limit?: unknown; charLimit?: unknown };
+type DocNodesPagePayload = { docId?: unknown; afterId?: unknown; limit?: unknown };
+type SourceWindowPayload = NodeRefPayload & { startOffset?: unknown; limit?: unknown; before?: unknown; spansLimit?: unknown };
+type SourceWindowRow = SourceDocumentRow & { raw_length: number };
+type OrdinalRow = { ordinal: number };
+type SourceParagraphTarget = { node: NodeRow; spans: SourceSpanRow[] };
+type SnapshotHistoryPayload = Parameters<typeof computeSnapshotDiff>[0];
+type SnapshotRow = NonNullable<SnapshotHistoryPayload['nodes']>[number];
+type SnapshotPayload = SnapshotHistoryPayload & {
+  doc?: RowObject | null;
+  sourceDocument?: (Partial<SourceDocumentRow> & { raw_markdown?: unknown }) | null;
+};
+type CommitSnapshotInput = SnapshotPayload;
+type CommitPayload = { docId?: unknown; summary?: unknown; snapshot?: CommitSnapshotInput; entries?: unknown[] | null; committedAt?: unknown; author?: unknown };
+type CommitSnapshotRow = CommitRow & { snapshot?: string | null; diff?: string | null };
+type RestoreEditorSnapshotTokenArgs = { docId: unknown; tokenId: unknown };
+type AddressTreeNode = RowObject & { id?: unknown; address?: unknown; children?: AddressTreeNode[] };
+type CreatedStreamNode = { id: string; address: string; children: CreatedStreamNode[] };
+type NodeHashRow = Pick<
+  NodeRow,
+  | 'id'
+  | 'parent_id'
+  | 'sort_order'
+  | 'text'
+  | 'node_title'
+  | 'node_note'
+  | 'node_type'
+  | 'trust_level'
+  | 'content_hash'
+  | 'subtree_hash'
+> & MerkleNode;
+type NodeAddressRow = Pick<NodeRow, 'id' | 'parent_id' | 'sort_order'>;
+type StreamNodeInput = RowObject & { children?: StreamNodeInput[] };
+// 从子模块函数签名去掉第一个 store 参数，剩下的就是门面壳要透传的参数。
+// 与 ReturnType 配合让 IftreeStore.xxx(...) 自动从 editBranch.xxx 推导出真签名，
+// 不再走 `_callEditBranch(name: string, args)` 字符串 dispatch（字符串 dispatch 永远丢类型）。
+// 第一个参数位置必须用 any（不能 unknown）——conditional type 的参数位是逆变，unknown 不能匹配
+// 子模块函数实际的 EditBranchStore（=IftreeStore）参数类型，会推出 never。
+type TailParameters<T> = T extends (first: any, ...rest: infer R) => any ? R : never;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 // PDF 高亮几何（含入参区间清洗）已移至 ./pdf-highlight-geometry.mjs（后端解耦第 1 步）。
 // 编辑分支的 base-snapshot / empty-diff / entry-trust 判定已移至 ./edit-branch.mjs；
@@ -72,15 +204,58 @@ const STREAM_PUSH_DEDUPE_MS = 10000;
 // store 仅在 getEditBranchDiffView 与编辑分支暂存方法里 import 复用它们。
 
 export class IftreeStore {
-  constructor(dbPath) {
+  dbPath: string;
+  db: Database | null;
+  inTransaction: boolean;
+  readonly: boolean;
+  editorSnapshots: EditorSnapshotTokens;
+  maintenance: ReturnType<typeof createMaintenanceScheduler>;
+  _streamPushCache: Map<string, { at: number; result: RowObject }> | null;
+  _bulkTouchedDocIds: Set<string> | null;
+
+  // 内部访问 db 一律走 conn：构造前 / close 后命中即立即抛，比满地 this.db!.x 真消除 NPE 隐患。
+  // 守卫已在意者（如 _runStoreMaintenance line 241 / close 等）继续用 this.db 直接判 null。
+  private get conn(): Database {
+    if (!this.db) throw new Error('IftreeStore database is not initialized');
+    return this.db;
+  }
+
+  constructor(dbPath: string) {
     this.dbPath = dbPath;
     this.db = null;
     this.inTransaction = false;
     this.readonly = false;
     this.editorSnapshots = new EditorSnapshotTokens(this);
+    this._streamPushCache = null;
+    this._bulkTouchedDocIds = null;
+    // 后台维护调度器（主库位置，4-6）：只派发信号。主库在此注册自己的维护 handler（只碰 SQLite，绝不
+    // 内联向量/lance 逻辑）；向量模块的 handler 由 host 接线时注册（自给自足）。host 启动时 start()。
+    this.maintenance = createMaintenanceScheduler();
+    this.maintenance.register('store', () => this._runStoreMaintenance());
   }
 
-  init(options = {}) {
+  // 主库自身维护（只碰 SQLite，不内联任何向量/lance 逻辑）：对象库 GC、WAL checkpoint 截断、高碎片时 VACUUM。
+  // 由维护调度器在单写队列里串行调用，与正常写互斥。单步失败不影响其它步。
+  _runStoreMaintenance() {
+    if (!this.db || this.readonly) return { ok: true, skipped: 'no-db' };
+    const out: StoreMaintenanceResult = {};
+    try { out.gc = this.gcHistoryObjects(); } catch (error) { out.gc = errorMessage(error); }
+    try { this.conn.pragma('wal_checkpoint(TRUNCATE)'); out.checkpoint = true; } catch (error) { out.checkpoint = errorMessage(error); }
+    // VACUUM 仅在空闲页占比高时做（全量 VACUUM 重建整库、对大库耗时，不每次跑）；VACUUM 不能在事务内。
+    try {
+      const free = Number(this.conn.pragma('freelist_count', { simple: true })) || 0;
+      const total = Number(this.conn.pragma('page_count', { simple: true })) || 1;
+      if (free > 10000 && free / total > 0.2) {
+        this.conn.exec('VACUUM');
+        out.vacuum = { freed: free };
+      } else {
+        out.vacuum = { skipped: `freelist ${free}/${total}` };
+      }
+    } catch (error) { out.vacuum = errorMessage(error); }
+    return { ok: true, ...out };
+  }
+
+  init(options: StoreInitOptions = {}) {
     const readonly = options.readonly === true;
     this.readonly = readonly;
     // WAL 不支持网络文件系统，数据库必须在本地盘（projectneed 18-6-2）；
@@ -90,20 +265,23 @@ export class IftreeStore {
     }
     if (!readonly) mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new Database(this.dbPath, readonly ? { readonly: true, fileMustExist: true } : undefined);
-    this.db.pragma('busy_timeout = 5000');
+    this.conn.pragma('busy_timeout = 5000');
+    // 正文字数 UDF：与 JS 侧 bodyCharCount 同源，供读层聚合（library_index / 子树合计）按「忽略空白」口径计数，
+    // 使切分粒度（simple/complete）不影响字数。只读连接也注册（library_index 等走只读读取也要它）。
+    this.conn.function('body_char_count', { deterministic: true }, (value: unknown) => bodyCharCount(value));
     if (readonly) {
-      this.db.pragma('query_only = ON');
+      this.conn.pragma('query_only = ON');
       return;
     }
     // WAL：写入持续发生（事件卷落库）时只读实例并发读不被阻塞（projectneed 18-6-2）。
     // 切换需要短暂独占；被旧 rollback 模式连接占着时 SQLite 静默返回原模式，必须炸而不是带病运行。
-    const journalMode = String(this.db.pragma('journal_mode = WAL', { simple: true }));
+    const journalMode = String(this.conn.pragma('journal_mode = WAL', { simple: true }));
     if (journalMode.toLowerCase() !== 'wal') {
       throw new Error(`journal_mode 切换 WAL 失败（仍为 ${journalMode}）：关闭其他占用该库的进程后重试`);
     }
     // WAL 标准搭配：NORMAL 在断电时最多丢最近 checkpoint 后的提交，不损坏库。
-    this.db.pragma('synchronous = NORMAL');
-    this.db.exec(TABLES_SQL);
+    this.conn.pragma('synchronous = NORMAL');
+    this.conn.exec(TABLES_SQL);
     this.applySchemaVersion();
     this.ensureVirtualDocs();
   }
@@ -112,7 +290,7 @@ export class IftreeStore {
   // 新空库与现有 0.5.0 live（结构已最新）直接盖章到当前版；更老或结构不符的库拒绝原地启动，
   // 引导走 导出→导入 迁移（本版本不在 init 里做旧库原地升级）。
   applySchemaVersion() {
-    const current = Number(this.db.pragma('user_version', { simple: true }));
+    const current = Number(this.conn.pragma('user_version', { simple: true }));
     if (current === SCHEMA_VERSION) return;
     if (current === 0) {
       if (!this.isLatestStructure()) {
@@ -121,7 +299,7 @@ export class IftreeStore {
           + '更老的库请用 导出→导入 迁移（scripts/export-db-to-json + scripts/import-db-from-json）'
         );
       }
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.conn.pragma(`user_version = ${SCHEMA_VERSION}`);
       return;
     }
     if (current < SCHEMA_VERSION) {
@@ -143,12 +321,12 @@ export class IftreeStore {
   // 读时惰性补算 base 文档的 Merkle 哈希缓存（nodes.content_hash/subtree_hash 列）。
   // doc 未脏 → 直接读列；脏（编辑过 / 新导入 / 旧库迁移）→ 整树重算并回写、清脏标记（即「必要时整树重算」）。
   // 返回 Map<id,{contentHash,subtreeHash}> 供 diff 当 base 侧用，免去每个 session 重算整个 base。
-  ensureNodeHashes(docId) {
-    const rows = this.db.prepare(
+  ensureNodeHashes(docId: unknown) {
+    const rows = this.conn.prepare(
       'SELECT id, parent_id, sort_order, text, node_title, node_note, node_type, trust_level, content_hash, subtree_hash FROM nodes WHERE doc_id = ?'
-    ).all(docId);
+    ).all<NodeHashRow>(docId);
     if (rows.length === 0) return new Map();
-    const doc = this.db.prepare('SELECT nodes_hash_dirty FROM docs WHERE id = ?').get(docId);
+    const doc = this.conn.prepare('SELECT nodes_hash_dirty FROM docs WHERE id = ?').get<Pick<DocRow, 'nodes_hash_dirty'>>(docId);
     const clean = doc && Number(doc.nodes_hash_dirty) === 0
       && rows.every((row) => row.content_hash && row.subtree_hash);
     if (clean) {
@@ -156,17 +334,17 @@ export class IftreeStore {
     }
     const hashes = computeSubtreeHashes(rows);
     if (!this.readonly) {
-      const update = this.db.prepare('UPDATE nodes SET content_hash = ?, subtree_hash = ? WHERE id = ?');
+      const update = this.conn.prepare('UPDATE nodes SET content_hash = ?, subtree_hash = ? WHERE id = ?');
       this.withTransaction(() => {
         for (const [id, hash] of hashes) update.run(hash.contentHash, hash.subtreeHash, id);
-        this.db.prepare('UPDATE docs SET nodes_hash_dirty = 0 WHERE id = ?').run(docId);
+        this.conn.prepare('UPDATE docs SET nodes_hash_dirty = 0 WHERE id = ?').run(docId);
       });
     }
     return hashes;
   }
 
   ensureVirtualDocs() {
-    this.db.prepare(`
+    this.conn.prepare(`
       INSERT INTO docs (id, title, meta, folder_id, doc_sort_order)
       VALUES (?, ?, ?, NULL, 0)
       ON CONFLICT(id) DO UPDATE SET
@@ -179,40 +357,40 @@ export class IftreeStore {
     );
   }
 
-  columnInfo(table, name) {
+  columnInfo(table: string, name: string) {
     try {
-      return this.db.prepare(`PRAGMA table_info(${table})`).all()
+      return this.conn.prepare(`PRAGMA table_info(${table})`).all()
         .find((column) => column.name === name) || null;
     } catch {
       return null;
     }
   }
 
-  columnType(table, name) {
+  columnType(table: string, name: string) {
     return String(this.columnInfo(table, name)?.type || '').trim().toUpperCase();
   }
 
-  hasColumn(table, name) {
+  hasColumn(table: string, name: string) {
     return this.columnInfo(table, name) !== null;
   }
 
-  dropColumnIfExists(table, name) {
+  dropColumnIfExists(table: string, name: string) {
     let columns;
     try {
-      columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
+      columns = this.conn.prepare(`PRAGMA table_info(${table})`).all();
     } catch {
       return false;
     }
     if (!columns.some((column) => column.name === name)) return false;
-    this.db.exec(`ALTER TABLE ${table} DROP COLUMN ${name}`);
+    this.conn.exec(`ALTER TABLE ${table} DROP COLUMN ${name}`);
     return true;
   }
 
-  ensureColumn(table, name, definition) {
+  ensureColumn(table: string, name: string, definition: string) {
     try {
-      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
+      const columns = this.conn.prepare(`PRAGMA table_info(${table})`).all();
       if (!columns.some((column) => column.name === name)) {
-        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+        this.conn.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
         return true;
       }
     } catch { /* table may not exist yet */ }
@@ -221,16 +399,16 @@ export class IftreeStore {
 
   hasNodeColumns(names = []) {
     try {
-      const columns = new Set(this.db.prepare('PRAGMA table_info(nodes)').all().map((column) => column.name));
+      const columns = new Set(this.conn.prepare('PRAGMA table_info(nodes)').all().map((column) => column.name));
       return names.every((name) => columns.has(name));
     } catch {
       return false;
     }
   }
 
-  hasTable(name) {
+  hasTable(name: unknown) {
     try {
-      return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(String(name || '')));
+      return Boolean(this.conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(String(name || '')));
     } catch {
       return false;
     }
@@ -246,7 +424,7 @@ export class IftreeStore {
 
   ensureExistingAxiomRefs() {
     try {
-      const rows = this.db.prepare(`
+      const rows = this.conn.prepare(`
         SELECT axioms.id AS axiom_id, roots.id AS root_id
         FROM axioms
         JOIN nodes roots ON roots.doc_id = axioms.doc_id AND roots.parent_id IS NULL
@@ -258,8 +436,8 @@ export class IftreeStore {
             AND refs.target_id = roots.id
             AND refs.ref_kind = '事实前提'
         )
-      `).all();
-      const insert = this.db.prepare(`
+      `).all<AxiomRootRefRow>();
+      const insert = this.conn.prepare(`
         INSERT INTO refs (id, source_type, source_id, target_type, target_id, ref_kind, note)
         VALUES (?, 'axiom', ?, 'node', ?, '事实前提', NULL)
       `);
@@ -269,11 +447,11 @@ export class IftreeStore {
     } catch { /* table may not exist yet */ }
   }
 
-  ensureAxiomRefsForDoc(docId) {
+  ensureAxiomRefsForDoc(docId: unknown) {
     try {
-      const root = this.db.prepare('SELECT id FROM nodes WHERE doc_id = ? AND parent_id IS NULL ORDER BY id LIMIT 1').get(docId);
+      const root = this.conn.prepare('SELECT id FROM nodes WHERE doc_id = ? AND parent_id IS NULL ORDER BY id LIMIT 1').get<Pick<NodeRow, 'id'>>(docId);
       if (!root) return;
-      const rows = this.db.prepare(`
+      const rows = this.conn.prepare(`
         SELECT axioms.id AS axiom_id
         FROM axioms
         WHERE axioms.doc_id = ?
@@ -285,8 +463,8 @@ export class IftreeStore {
               AND refs.target_id = ?
               AND refs.ref_kind = '事实前提'
           )
-      `).all(docId, root.id);
-      const insert = this.db.prepare(`
+      `).all<AxiomIdRow>(docId, root.id);
+      const insert = this.conn.prepare(`
         INSERT INTO refs (id, source_type, source_id, target_type, target_id, ref_kind, note)
         VALUES (?, 'axiom', ?, 'node', ?, '事实前提', NULL)
       `);
@@ -297,10 +475,10 @@ export class IftreeStore {
   }
 
   refreshAllAddresses() {
-    const docs = this.db.prepare('SELECT id FROM docs ORDER BY id').all();
+    const docs = this.conn.prepare('SELECT id FROM docs ORDER BY id').all<Pick<DocRow, 'id'>>();
     let updated = 0;
     this.withTransaction(() => {
-      const updateStmt = this.db.prepare('UPDATE nodes SET depth = ?, address = ? WHERE doc_id = ? AND id = ?');
+      const updateStmt = this.conn.prepare('UPDATE nodes SET depth = ?, address = ? WHERE doc_id = ? AND id = ?');
       for (const { id: docId } of docs) {
         updated += this.refreshDocAddresses(docId, updateStmt).updated;
       }
@@ -308,52 +486,52 @@ export class IftreeStore {
     return { updated, docs: docs.length };
   }
 
-  refreshDocAddresses(docId, updateStmt = null) {
+  refreshDocAddresses(docId: unknown, updateStmt: Statement | null = null) {
     const normalizedDocId = normalizePositiveId(docId);
     if (normalizedDocId === null) return { updated: 0 };
-    const rows = this.db.prepare(`
+    const rows = this.conn.prepare(`
       SELECT id, parent_id, sort_order
       FROM nodes
       WHERE doc_id = ?
       ORDER BY parent_id IS NOT NULL, parent_id, sort_order, id
-    `).all(normalizedDocId);
+    `).all<NodeAddressRow>(normalizedDocId);
     if (rows.length === 0) return { updated: 0 };
 
-    const childrenByParent = new Map();
+    const childrenByParent = new Map<string | null, NodeAddressRow[]>();
     for (const row of rows) {
       const parentKey = row.parent_id ?? null;
       if (!childrenByParent.has(parentKey)) childrenByParent.set(parentKey, []);
-      childrenByParent.get(parentKey).push(row);
+      childrenByParent.get(parentKey)!.push(row);
     }
     for (const children of childrenByParent.values()) {
       children.sort((left, right) => left.sort_order - right.sort_order || compareStableIds(left.id, right.id));
     }
 
-    const update = updateStmt || this.db.prepare('UPDATE nodes SET depth = ?, address = ? WHERE doc_id = ? AND id = ?');
+    const update = updateStmt || this.conn.prepare('UPDATE nodes SET depth = ?, address = ? WHERE doc_id = ? AND id = ?');
     let updated = 0;
-    const visit = (node, address, depth) => {
+    const visit = (node: NodeAddressRow, address: string, depth: number) => {
       const result = update.run(depth, address, normalizedDocId, node.id);
       updated += result.changes || 0;
       const children = childrenByParent.get(node.id) || [];
       for (let index = 0; index < children.length; index += 1) {
-        visit(children[index], `${address}-${index + 1}`, depth + 1);
+        visit(children[index]!, `${address}-${index + 1}`, depth + 1);
       }
     };
 
     this.withTransaction(() => {
       const roots = childrenByParent.get(null) || [];
       for (let index = 0; index < roots.length; index += 1) {
-        visit(roots[index], String(index + 1), 1);
+        visit(roots[index]!, String(index + 1), 1);
       }
     });
     return { updated };
   }
 
-  refreshAddressScopes(docId, parentIds = []) {
+  refreshAddressScopes(docId: unknown, parentIds: unknown[] | unknown = []) {
     const normalizedDocId = normalizePositiveId(docId);
     if (normalizedDocId === null) return { updated: 0, scopes: 0 };
-    const normalizedParentIds = [];
-    const seen = new Set();
+    const normalizedParentIds: Array<string | null> = [];
+    const seen = new Set<string>();
     for (const value of Array.isArray(parentIds) ? parentIds : [parentIds]) {
       let parentId = null;
       if (value !== null && value !== undefined) {
@@ -372,23 +550,23 @@ export class IftreeStore {
     return { updated, scopes: normalizedParentIds.length };
   }
 
-  refreshAddressScope(docId, parentId = null) {
+  refreshAddressScope(docId: unknown, parentId: unknown = null) {
     const normalizedDocId = normalizePositiveId(docId);
     if (normalizedDocId === null) return { updated: 0 };
     let baseAddress = '';
     let baseDepth = 0;
     if (parentId !== null && parentId !== undefined) {
-      const parent = this.db.prepare(`
+      const parent = this.conn.prepare(`
         SELECT address, depth
         FROM nodes
         WHERE doc_id = ? AND id = ?
-      `).get(normalizedDocId, parentId);
+      `).get<Pick<NodeRow, 'address' | 'depth'>>(normalizedDocId, parentId);
       if (!parent) return { updated: 0 };
       baseAddress = parent.address || '';
       baseDepth = Math.max(1, Math.floor(Number(parent.depth) || 1));
     }
 
-    const rows = this.db.prepare(`
+    const rows = this.conn.prepare(`
       WITH RECURSIVE scoped(id, parent_id, sort_order) AS (
         SELECT id, parent_id, sort_order
         FROM nodes
@@ -402,20 +580,20 @@ export class IftreeStore {
       SELECT id, parent_id, sort_order
       FROM scoped
       ORDER BY parent_id IS NOT NULL, parent_id, sort_order, id
-    `).all(normalizedDocId, parentId ?? null, normalizedDocId);
+    `).all<NodeAddressRow>(normalizedDocId, parentId ?? null, normalizedDocId);
     if (rows.length === 0) return { updated: 0 };
 
-    const childrenByParent = new Map();
+    const childrenByParent = new Map<string | null, NodeAddressRow[]>();
     for (const row of rows) {
       const parentKey = row.parent_id ?? null;
       if (!childrenByParent.has(parentKey)) childrenByParent.set(parentKey, []);
-      childrenByParent.get(parentKey).push(row);
+      childrenByParent.get(parentKey)!.push(row);
     }
     for (const children of childrenByParent.values()) {
       children.sort((left, right) => left.sort_order - right.sort_order || compareStableIds(left.id, right.id));
     }
 
-    const update = this.db.prepare(`
+    const update = this.conn.prepare(`
       UPDATE nodes
       SET depth = ?,
           address = ?
@@ -423,31 +601,32 @@ export class IftreeStore {
         AND (depth IS NOT ? OR address IS NOT ?)
     `);
     let updated = 0;
-    const visit = (node, address, depth) => {
+    const visit = (node: NodeAddressRow, address: string, depth: number) => {
       const result = update.run(depth, address, normalizedDocId, node.id, depth, address);
       updated += result.changes || 0;
       const children = childrenByParent.get(node.id) || [];
       for (let index = 0; index < children.length; index += 1) {
-        visit(children[index], `${address}-${index + 1}`, depth + 1);
+        visit(children[index]!, `${address}-${index + 1}`, depth + 1);
       }
     };
 
-    const roots = childrenByParent.get(parentId ?? null) || [];
+    const rootKey = parentId === null || parentId === undefined ? null : String(parentId);
+    const roots = childrenByParent.get(rootKey) || [];
     for (let index = 0; index < roots.length; index += 1) {
       const address = parentId === null || parentId === undefined
         ? String(index + 1)
         : `${baseAddress}-${index + 1}`;
-      visit(roots[index], address, baseDepth + 1);
+      visit(roots[index]!, address, baseDepth + 1);
     }
     return { updated };
   }
 
-  removeRootAxiomRefs(docId = null) {
+  removeRootAxiomRefs(docId: unknown = null) {
     try {
-      const params = [];
+      const params: unknown[] = [];
       const docFilter = docId ? 'AND axioms.doc_id = ?' : '';
       if (docId) params.push(docId);
-      this.db.prepare(`
+      this.conn.prepare(`
         DELETE FROM refs
         WHERE source_type = 'axiom'
           AND target_type = 'node'
@@ -465,6 +644,7 @@ export class IftreeStore {
   }
 
   close() {
+    this.maintenance?.stop?.();
     if (this.db) this.db.close();
     this.db = null;
   }
@@ -480,40 +660,40 @@ export class IftreeStore {
           AND eb.shadow_doc_id != eb.base_doc_id
       )`
       : '';
-    return this.db.prepare(`
+    return this.conn.prepare(`
       SELECT
         d.*,
         (SELECT COUNT(*) FROM nodes n WHERE n.doc_id = d.id) AS node_count
       FROM docs d
       ${shadowFilter}
       ORDER BY d.folder_id IS NOT NULL, d.folder_id, d.doc_sort_order, d.updated_at DESC, d.id DESC
-    `).all();
+    `).all<DocListRow>();
   }
 
   listDocFolders() {
-    return this.db.prepare(`
+    return this.conn.prepare(`
       SELECT * FROM doc_folders
       ORDER BY parent_id IS NOT NULL, parent_id, sort_order, name, id
-    `).all();
+    `).all<DocFolderRow>();
   }
 
-  createDocFolder({ name, parentId = null }) {
+  createDocFolder({ name, parentId = null }: { name: unknown; parentId?: unknown }) {
     const folderName = normalizeDocFolderName(name);
     const normalizedParentId = this.normalizeFolderId(parentId);
     const sortOrder = this.nextFolderSortOrder(normalizedParentId);
-    const result = this.db.prepare(`
+    const result = this.conn.prepare(`
       INSERT INTO doc_folders (parent_id, name, sort_order)
       VALUES (?, ?, ?)
     `).run(normalizedParentId, folderName, sortOrder);
-    return this.db.prepare('SELECT * FROM doc_folders WHERE id = ?').get(Number(result.lastInsertRowid));
+    return this.conn.prepare('SELECT * FROM doc_folders WHERE id = ?').get<DocFolderRow>(Number(result.lastInsertRowid));
   }
 
-  updateDocFolder(folderId, patch = {}) {
+  updateDocFolder(folderId: unknown, patch: FolderPatch = {}) {
     const folder = this.getDocFolder(folderId);
     if (!folder) throw new Error(`Document folder not found: ${folderId}`);
 
-    const updates = [];
-    const values = [];
+    const updates: string[] = [];
+    const values: unknown[] = [];
     if (Object.prototype.hasOwnProperty.call(patch, 'name')) {
       const name = normalizeDocFolderName(patch.name);
       updates.push('name = ?');
@@ -531,34 +711,34 @@ export class IftreeStore {
     if (updates.length === 0) return folder;
 
     updates.push('updated_at = CURRENT_TIMESTAMP');
-    this.db.prepare(`UPDATE doc_folders SET ${updates.join(', ')} WHERE id = ?`).run(...values, folder.id);
+    this.conn.prepare(`UPDATE doc_folders SET ${updates.join(', ')} WHERE id = ?`).run(...values, folder.id);
     return this.getDocFolder(folder.id);
   }
 
-  deleteDocFolder(folderId) {
+  deleteDocFolder(folderId: unknown) {
     const folder = this.getDocFolder(folderId);
     if (!folder) return false;
 
-    const childCount = Number(this.db.prepare(`
+    const childCount = Number(this.conn.prepare(`
       SELECT COUNT(*) AS count FROM doc_folders WHERE parent_id = ?
-    `).get(folder.id).count);
-    const docCount = Number(this.db.prepare(`
+    `).get<CountRow>(folder.id)?.count);
+    const docCount = Number(this.conn.prepare(`
       SELECT COUNT(*) AS count FROM docs WHERE folder_id = ?
-    `).get(folder.id).count);
+    `).get<CountRow>(folder.id)?.count);
     if (childCount > 0 || docCount > 0) {
       throw new Error('Cannot delete a non-empty folder');
     }
 
-    this.db.prepare('DELETE FROM doc_folders WHERE id = ?').run(folder.id);
+    this.conn.prepare('DELETE FROM doc_folders WHERE id = ?').run(folder.id);
     return true;
   }
 
-  moveDocToFolder({ docId, folderId = null }) {
-    const doc = this.db.prepare('SELECT id FROM docs WHERE id = ?').get(docId);
+  moveDocToFolder({ docId, folderId = null }: { docId: unknown; folderId?: unknown }) {
+    const doc = this.conn.prepare('SELECT id FROM docs WHERE id = ?').get<Pick<DocRow, 'id'>>(docId);
     if (!doc) return false;
     const normalizedFolderId = this.normalizeFolderId(folderId);
     const sortOrder = this.nextDocSortOrder(normalizedFolderId);
-    this.db.prepare(`
+    this.conn.prepare(`
       UPDATE docs
       SET folder_id = ?, doc_sort_order = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
@@ -566,21 +746,21 @@ export class IftreeStore {
     return true;
   }
 
-  createDoc({ title, rootText = title, meta = null, folderId = null, skipInitialCommit = false }) {
+  createDoc({ title, rootText = title, meta = null, folderId = null, skipInitialCommit = false }: CreateDocInput): CreatedDoc {
     return this.withTransaction(() => {
       const normalizedFolderId = this.normalizeFolderId(folderId);
       const sortOrder = this.nextDocSortOrder(normalizedFolderId);
       const docId = newStableId();
       const rootNodeId = newStableId();
-      this.db.prepare(`
+      this.conn.prepare(`
         INSERT INTO docs (id, title, meta, folder_id, doc_sort_order)
         VALUES (?, ?, ?, ?, ?)
       `).run(docId, title, meta, normalizedFolderId, sortOrder);
-      this.db.prepare(`
+      this.conn.prepare(`
         INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text)
         VALUES (?, ?, NULL, 1, 'TEXT', ?)
       `).run(rootNodeId, docId, rootText || title);
-      this.db.prepare(`
+      this.conn.prepare(`
         INSERT INTO doc_heads (doc_id, head_commit_id)
         VALUES (?, NULL)
         ON CONFLICT(doc_id) DO NOTHING
@@ -599,11 +779,11 @@ export class IftreeStore {
 
   // 为记忆卷写库内实体锚的 source 记录（projectneed 15-10-4：非导航文档必有库内实体锚）。
   // original_path 指向 .memory 下的 symlink/占位文件；raw_markdown 留空（正文在 nodes）。
-  setMemoryAnchorSource(docId, originalPath, sourceType = 'memory-anchor') {
+  setMemoryAnchorSource(docId: unknown, originalPath: unknown, sourceType = 'memory-anchor') {
     if (!docId || !originalPath) throw new Error('setMemoryAnchorSource requires docId and originalPath');
     return this.withTransaction(() => {
-      this.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
-      this.db.prepare(`
+      this.conn.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
+      this.conn.prepare(`
         INSERT INTO source_documents (doc_id, source_type, original_path, raw_markdown)
         VALUES (?, ?, ?, ?)
       `).run(docId, sourceType, originalPath, '');
@@ -611,22 +791,22 @@ export class IftreeStore {
     });
   }
 
-  deleteDoc(docId) {
-    const doc = this.db.prepare('SELECT id, meta FROM docs WHERE id = ?').get(docId);
+  deleteDoc(docId: unknown) {
+    const doc = this.conn.prepare('SELECT id, meta FROM docs WHERE id = ?').get<Pick<DocRow, 'id' | 'meta'>>(docId);
     if (!doc) return false;
     // 完整记忆永不删除（projectneed 15-10）：由结构保证而非纪律。
     // 但「永不删除」保的是有合法实体锚的卷；无实体锚的记忆卷属非法残留
     // （违反 3-5/15-10-4「非导航文档必有库内实体锚」），允许清除。
     if (memoryVolumeMetaOf(doc.meta)) {
-      const anchored = this.db.prepare('SELECT 1 FROM source_documents WHERE doc_id = ? LIMIT 1').get(docId);
+      const anchored = this.conn.prepare('SELECT 1 FROM source_documents WHERE doc_id = ? LIMIT 1').get(docId);
       if (anchored) {
         throw new Error(`记忆卷不可删除（完整记忆永不删除，projectneed 15-10）：${docId}`);
       }
     }
 
     this.withTransaction(() => {
-      this.db.prepare('DELETE FROM edit_branches WHERE base_doc_id = ? OR shadow_doc_id = ?').run(docId, docId);
-      this.db.prepare(`
+      this.conn.prepare('DELETE FROM edit_branches WHERE base_doc_id = ? OR shadow_doc_id = ?').run(docId, docId);
+      this.conn.prepare(`
         DELETE FROM refs
         WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
            OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
@@ -634,55 +814,57 @@ export class IftreeStore {
       // 打断 nodes.parent_id 自引用链再删：超深树（如导入的深 heading 链）直接 DELETE 会让
       // ON DELETE CASCADE 沿父链逐层递归，超过 SQLite 触发器递归上限而崩
       // （SqliteError: too many levels of trigger recursion）。置空 parent_id 后 cascade 即变平删。
-      this.db.prepare('UPDATE nodes SET parent_id = NULL WHERE doc_id = ?').run(docId);
-      this.db.prepare('DELETE FROM docs WHERE id = ?').run(docId);
+      this.conn.prepare('UPDATE nodes SET parent_id = NULL WHERE doc_id = ?').run(docId);
+      this.conn.prepare('DELETE FROM docs WHERE id = ?').run(docId);
     });
 
     return true;
   }
 
   // ─── 流式写入与文档编辑模式（projectneed 4-16）──────────────
-  getDocEditMode(docId) {
-    const row = this.db.prepare('SELECT edit_mode FROM docs WHERE id = ?').get(docId);
+  getDocEditMode(docId: unknown) {
+    const row = this.conn.prepare('SELECT edit_mode FROM docs WHERE id = ?').get<Pick<DocRow, 'edit_mode'>>(docId);
     return row ? (row.edit_mode || 'full') : null;
   }
 
-  setDocEditMode(docId, mode) {
+  setDocEditMode(docId: unknown, mode: unknown) {
     const normalized = String(mode || '').trim();
     if (!EDIT_MODES.includes(normalized)) {
       throw new Error(`未知编辑模式：${mode}；只能是 ${EDIT_MODES.join(' / ')}`);
     }
-    const doc = this.db.prepare('SELECT id FROM docs WHERE id = ?').get(docId);
+    const doc = this.conn.prepare('SELECT id FROM docs WHERE id = ?').get<Pick<DocRow, 'id'>>(docId);
     if (!doc) throw new Error(`Doc not found: ${docId}`);
-    this.db.prepare('UPDATE docs SET edit_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(normalized, docId);
-    return this.db.prepare('SELECT id, title, edit_mode FROM docs WHERE id = ?').get(docId);
+    this.conn.prepare('UPDATE docs SET edit_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(normalized, docId);
+    return this.conn.prepare('SELECT id, title, edit_mode FROM docs WHERE id = ?').get<Pick<DocRow, 'id' | 'title' | 'edit_mode'>>(docId);
   }
 
-  _streamPushFromCache(key) {
+  _streamPushFromCache(key: unknown) {
     if (!key || !this._streamPushCache) return null;
-    const hit = this._streamPushCache.get(key);
+    const cacheKey = String(key);
+    const hit = this._streamPushCache.get(cacheKey);
     if (!hit) return null;
     if (Date.now() - hit.at > STREAM_PUSH_DEDUPE_MS) {
-      this._streamPushCache.delete(key);
+      this._streamPushCache.delete(cacheKey);
       return null;
     }
     return hit.result;
   }
 
-  _rememberStreamPush(key, result) {
+  _rememberStreamPush(key: unknown, result: RowObject) {
     if (!key) return;
     if (!this._streamPushCache) this._streamPushCache = new Map();
+    const cacheKey = String(key);
     const now = Date.now();
     for (const [k, v] of this._streamPushCache) {
       if (now - v.at > STREAM_PUSH_DEDUPE_MS) this._streamPushCache.delete(k);
     }
-    this._streamPushCache.set(key, { at: now, result });
+    this._streamPushCache.set(cacheKey, { at: now, result });
   }
 
   // 一条流式节点：调用方按 4-16-7 给齐标准字段；trust_level 必给（4-16-4，不闭眼填），node_type 缺省 TEXT。
   // 流式节点标准字段：trust_level 必给（4-16-4），source_position 可选（配合 stream.attachSource
   // 的源文档层，流式文档同样能做句位对照），其余缺省。
-  _streamNodeFields(item = {}) {
+  _streamNodeFields(item: StreamNodeInput = {}) {
     // 写动词写入信任恒为不受控（projectneed 18-3：trust 字段下线，标受控只走 human 档 certify）；
     // 不再要求/采纳调用方给的 trust_level。事件卷的不受控约束（15-10-3）与此一致。
     return {
@@ -695,7 +877,7 @@ export class IftreeStore {
     };
   }
 
-  _assertVolumeNodesUncontrolled(items) {
+  _assertVolumeNodesUncontrolled(items: StreamNodeInput[] | null | undefined) {
     for (const item of items || []) {
       const trust = item?.trust_level ?? item?.trustLevel ?? null;
       if (trust === '受控') {
@@ -706,13 +888,13 @@ export class IftreeStore {
     }
   }
 
-  _insertStreamNode(docId, parentId, item = {}) {
+  _insertStreamNode(docId: unknown, parentId: unknown, item: StreamNodeInput = {}): Pick<NodeRow, 'id' | 'address'> {
     const f = this._streamNodeFields(item);
-    return this.insertNode({ docId, parentId, text: f.text, nodeType: f.nodeType, nodeTitle: f.nodeTitle, nodeNote: f.nodeNote, sourcePosition: f.sourcePosition, trustLevel: f.trustLevel });
+    return this.insertNode({ docId, parentId, text: f.text, nodeType: f.nodeType, nodeTitle: f.nodeTitle, nodeNote: f.nodeNote, sourcePosition: f.sourcePosition, trustLevel: f.trustLevel }) as Pick<NodeRow, 'id' | 'address'>;
   }
 
   // 校验调用方给的 address 是纯追加（连续、不重复、与父自洽，4-16-2）；违反报错带定位，调用方读结构重算重推。
-  _validateStreamAddresses(items, parentAddress, startOrder) {
+  _validateStreamAddresses(items: StreamNodeInput[], parentAddress: string, startOrder: number) {
     let expected = startOrder + 1;
     for (const item of items) {
       const addr = String(item?.address ?? '').trim();
@@ -739,7 +921,19 @@ export class IftreeStore {
   // 首次省略 docId + 给 title => 新建增量编辑文档并挂根下；之后给 docId + parentId(uuid 挂载点) 追加。
   // 调用方给 address => 校验纯追加 + 批量直写（不重排、不刷结构链），地址/深度由 address 决定（4-16-2）；
   // 不给 address => 自动续号兜底（小流友好，O(n)）。去重是调用方责任，系统只按 idempotencyKey 请求级防抖（4-16-5）。
-  pushStreamNodes({ docId = null, title = null, parentId = null, nodes = [], idempotencyKey = null } = {}) {
+  pushStreamNodes({
+    docId = null,
+    title = null,
+    parentId = null,
+    nodes = [],
+    idempotencyKey = null
+  }: {
+    docId?: unknown;
+    title?: unknown;
+    parentId?: unknown;
+    nodes?: unknown;  // 调用方常传 unknown[]（payload.nodes），函数内部 Array.isArray + 逐项 normalize
+    idempotencyKey?: unknown;
+  } = {}) {
     const list = Array.isArray(nodes) ? nodes : [];
     if (list.length === 0) throw new Error('stream.push 需要至少一个节点');
 
@@ -762,15 +956,15 @@ export class IftreeStore {
           throw new Error(editModeMismatchMessage({ docId: targetDocId, current: mode, required: 'incremental', intent: '流式写入 push' }));
         }
         // 事件卷一律不受控（projectneed 15-10-3）：拒绝而非静默改写，让调用方知道契约被违反。
-        const metaRow = this.db.prepare('SELECT meta FROM docs WHERE id = ?').get(targetDocId);
+        const metaRow = this.conn.prepare('SELECT meta FROM docs WHERE id = ?').get<Pick<DocRow, 'meta'>>(targetDocId);
         if (memoryVolumeMetaOf(metaRow?.meta)) this._assertVolumeNodesUncontrolled(list);
       }
 
       const rootId = createdDoc
         ? createdDoc.rootNodeId
-        : this.db.prepare('SELECT id FROM nodes WHERE doc_id = ? AND parent_id IS NULL').get(targetDocId)?.id;
+        : this.conn.prepare('SELECT id FROM nodes WHERE doc_id = ? AND parent_id IS NULL').get<Pick<NodeRow, 'id'>>(targetDocId)?.id;
       const mountId = parentId ?? rootId;
-      const mount = this.db.prepare('SELECT id, address FROM nodes WHERE id = ? AND doc_id = ?').get(mountId, targetDocId);
+      const mount = this.conn.prepare('SELECT id, address FROM nodes WHERE id = ? AND doc_id = ?').get<Pick<NodeRow, 'id' | 'address'>>(mountId, targetDocId);
       if (!mount) throw new Error(`挂载点 ${mountId} 不在文档 ${targetDocId} 中`);
 
       const useAddresses = list.some((item) => item && item.address != null);
@@ -778,13 +972,13 @@ export class IftreeStore {
       let created;
 
       if (useAddresses) {
-        const maxRow = this.db.prepare('SELECT MAX(sort_order) AS m FROM nodes WHERE doc_id = ? AND parent_id = ?').get(targetDocId, mountId);
+        const maxRow = this.conn.prepare('SELECT MAX(sort_order) AS m FROM nodes WHERE doc_id = ? AND parent_id = ?').get<MaxSortOrderRow>(targetDocId, mountId);
         this._validateStreamAddresses(list, String(mount.address || ''), Number(maxRow?.m) || 0);
-        const insert = this.db.prepare(`
+        const insert = this.conn.prepare(`
           INSERT INTO nodes (id, doc_id, parent_id, sort_order, depth, address, node_type, text, node_title, node_note, source_position, trust_level)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
-        const writeTree = (items, parentDbId) => items.map((item) => {
+        const writeTree = (items: StreamNodeInput[], parentDbId: unknown): CreatedStreamNode[] => items.map((item) => {
           const f = this._streamNodeFields(item);
           const addr = String(item.address).trim();
           const order = Number(addr.slice(addr.lastIndexOf('-') + 1));
@@ -797,7 +991,7 @@ export class IftreeStore {
         created = writeTree(list, mountId);
         this.touchDoc(targetDocId);
       } else {
-        const insertTree = (items, parent) => items.map((item) => {
+        const insertTree = (items: StreamNodeInput[], parent: unknown): CreatedStreamNode[] => items.map((item) => {
           const node = this._insertStreamNode(targetDocId, parent, item);
           createdCount += 1;
           const children = Array.isArray(item.children) ? item.children : [];
@@ -826,10 +1020,10 @@ export class IftreeStore {
   // 由共享服务端的独占闸门兜底（begin 需独占、期间他人写被拒、独占者掉线自动 end，
   // 见 backend-shared-server）。
   beginBulkImport() {
-    this.db.pragma('synchronous = OFF');
-    this.db.pragma('temp_store = MEMORY');
-    this.db.pragma('cache_size = -1048576');
-    this.db.pragma('mmap_size = 1073741824');
+    this.conn.pragma('synchronous = OFF');
+    this.conn.pragma('temp_store = MEMORY');
+    this.conn.pragma('cache_size = -1048576');
+    this.conn.pragma('mmap_size = 1073741824');
     // 记下本批 bulk 写过哪些文档（主库自己的写元信息）：endBulkImport 返回给调用方，
     // 供其触发一次派生索引维护（bulk 期间不逐批维护，避免 O(N²)）。主库不碰派生索引本身。
     this._bulkTouchedDocIds = new Set();
@@ -842,11 +1036,16 @@ export class IftreeStore {
   endBulkImport() {
     // 不再重建索引（begin 不再 drop，索引全程在线，base schema 也已保证其存在）。
     // 先恢复安全写入再 checkpoint(TRUNCATE)：把批导膨胀的 -wal 押回主库并截断，且本次 checkpoint 落盘有 fsync。
-    this.db.pragma('synchronous = NORMAL');
-    this.db.pragma('wal_checkpoint(TRUNCATE)');
+    this.conn.pragma('synchronous = NORMAL');
+    this.conn.pragma('wal_checkpoint(TRUNCATE)');
     const touchedDocIds = this._bulkTouchedDocIds ? [...this._bulkTouchedDocIds] : [];
     this._bulkTouchedDocIds = null;
-    return { ok: true, touchedDocIds };
+    return {
+      ok: true,
+      touchedDocIds,
+      restoredPragmas: { synchronous: 'NORMAL', journal_mode: 'WAL' },
+      checkpoint: 'TRUNCATE'
+    };
   }
 
   // 是否在 bulk 导入会话中：写分发收尾据此判断流式 push 是逐条当场维护（非 bulk）还是
@@ -856,62 +1055,65 @@ export class IftreeStore {
   }
 
   // ===== 编辑分支子系统转调壳（实现在 ./edit-branch.mjs；门面对外面与抽出前逐字一致）=====
-  normalizeEditBranchOwner(...args) { return editBranch.normalizeEditBranchOwner(this, ...args); }
-  activeEditBranchForBaseDoc(...args) { return editBranch.activeEditBranchForBaseDoc(this, ...args); }
-  activeEditBranchForShadowDoc(...args) { return editBranch.activeEditBranchForShadowDoc(this, ...args); }
-  activeEditBranchForDoc(...args) { return editBranch.activeEditBranchForDoc(this, ...args); }
-  listActiveEditBranches(...args) { return editBranch.listActiveEditBranches(this, ...args); }
-  docIdForMutationPayload(...args) { return editBranch.docIdForMutationPayload(this, ...args); }
-  nodePatchForEditBranch(...args) { return editBranch.nodePatchForEditBranch(this, ...args); }
-  _appendEditBranchEntry(...args) { return editBranch._appendEditBranchEntry(this, ...args); }
-  editBranchHistoryState(...args) { return editBranch.editBranchHistoryState(this, ...args); }
-  getEditBranchDiffView(...args) { return editBranch.getEditBranchDiffView(this, ...args); }
-  computeThreeWayMerge(...args) { return editBranch.computeThreeWayMerge(this, ...args); }
-  _trunkNodeRow(...args) { return editBranch._trunkNodeRow(this, ...args); }
-  _trunkSubtreeHash(...args) { return editBranch._trunkSubtreeHash(this, ...args); }
-  _validateEditBranchEntriesAgainstTrunk(...args) { return editBranch._validateEditBranchEntriesAgainstTrunk(this, ...args); }
-  applyThreeWayMerge(...args) { return editBranch.applyThreeWayMerge(this, ...args); }
-  _replaceEditBranchDiff(...args) { return editBranch._replaceEditBranchDiff(this, ...args); }
-  undoEditBranchEntry(...args) { return editBranch.undoEditBranchEntry(this, ...args); }
-  redoEditBranchEntry(...args) { return editBranch.redoEditBranchEntry(this, ...args); }
-  _fetchBaseRefsForDoc(...args) { return editBranch._fetchBaseRefsForDoc(this, ...args); }
-  _baseDocInputsForDoc(...args) { return editBranch._baseDocInputsForDoc(this, ...args); }
-  _projectedDocForBranch(...args) { return editBranch._projectedDocForBranch(this, ...args); }
-  liveDocSnapshot(...args) { return editBranch.liveDocSnapshot(this, ...args); }
-  _findProjectedNode(...args) { return editBranch._findProjectedNode(this, ...args); }
-  _findProjectedAxiom(...args) { return editBranch._findProjectedAxiom(this, ...args); }
-  stageEditBranchNodeUpdate(...args) { return editBranch.stageEditBranchNodeUpdate(this, ...args); }
-  stageEditBranchNodeInsert(...args) { return editBranch.stageEditBranchNodeInsert(this, ...args); }
-  stageEditBranchNodeDelete(...args) { return editBranch.stageEditBranchNodeDelete(this, ...args); }
-  stageEditBranchNodeMove(...args) { return editBranch.stageEditBranchNodeMove(this, ...args); }
-  stageEditBranchNodePromote(...args) { return editBranch.stageEditBranchNodePromote(this, ...args); }
-  stageEditBranchNodeSplit(...args) { return editBranch.stageEditBranchNodeSplit(this, ...args); }
-  stageEditBranchNodeMergeInto(...args) { return editBranch.stageEditBranchNodeMergeInto(this, ...args); }
-  stageEditBranchNodeMergePrevious(...args) { return editBranch.stageEditBranchNodeMergePrevious(this, ...args); }
-  stageEditBranchNodeReparent(...args) { return editBranch.stageEditBranchNodeReparent(this, ...args); }
-  stageEditBranchNodeMoveBefore(...args) { return editBranch.stageEditBranchNodeMoveBefore(this, ...args); }
-  stageEditBranchNodeMoveAfter(...args) { return editBranch.stageEditBranchNodeMoveAfter(this, ...args); }
-  stageEditBranchAxiomAdd(...args) { return editBranch.stageEditBranchAxiomAdd(this, ...args); }
-  stageEditBranchAxiomUpdate(...args) { return editBranch.stageEditBranchAxiomUpdate(this, ...args); }
-  stageEditBranchAxiomDelete(...args) { return editBranch.stageEditBranchAxiomDelete(this, ...args); }
-  stageEditBranchAxiomMove(...args) { return editBranch.stageEditBranchAxiomMove(this, ...args); }
-  stageEditBranchRefAddAxiomToNode(...args) { return editBranch.stageEditBranchRefAddAxiomToNode(this, ...args); }
-  stageEditBranchRefAddNodeToNode(...args) { return editBranch.stageEditBranchRefAddNodeToNode(this, ...args); }
-  stageEditBranchRefDelete(...args) { return editBranch.stageEditBranchRefDelete(this, ...args); }
-  applyEditBranchDiffEntries(...args) { return editBranch.applyEditBranchDiffEntries(this, ...args); }
-  beginEditBranch(...args) { return editBranch.beginEditBranch(this, ...args); }
-  findEditBranch(...args) { return editBranch.findEditBranch(this, ...args); }
-  rebaseEditBranch(...args) { return editBranch.rebaseEditBranch(this, ...args); }
-  cherryPickEditBranchEntries(...args) { return editBranch.cherryPickEditBranchEntries(this, ...args); }
-  _cherryPickSource(...args) { return editBranch._cherryPickSource(this, ...args); }
-  _selectCherryPickEntries(...args) { return editBranch._selectCherryPickEntries(this, ...args); }
-  _copyCherryPickEntry(...args) { return editBranch._copyCherryPickEntry(this, ...args); }
-  saveEditBranch(...args) { return editBranch.saveEditBranch(this, ...args); }
-  _docNodeSignatures(...args) { return editBranch._docNodeSignatures(this, ...args); }
-  _commitEditBranchPayload(...args) { return editBranch._commitEditBranchPayload(this, ...args); }
-  discardEditBranch(...args) { return editBranch.discardEditBranch(this, ...args); }
+  // 每个壳用 TailParameters + ReturnType 从子模块函数签名自动推参/返；直调 editBranch.xxx
+  // 不再经字符串 dispatch（字符串 dispatch 永远丢类型，调用方拿到 unknown）。
 
-  createDocFromSentences({ title, sourcePath, sentences }) {
+  normalizeEditBranchOwner(...args: TailParameters<typeof editBranch.normalizeEditBranchOwner>): ReturnType<typeof editBranch.normalizeEditBranchOwner> { return editBranch.normalizeEditBranchOwner(this, ...args); }
+  activeEditBranchForBaseDoc(...args: TailParameters<typeof editBranch.activeEditBranchForBaseDoc>): ReturnType<typeof editBranch.activeEditBranchForBaseDoc> { return editBranch.activeEditBranchForBaseDoc(this, ...args); }
+  activeEditBranchForShadowDoc(...args: TailParameters<typeof editBranch.activeEditBranchForShadowDoc>): ReturnType<typeof editBranch.activeEditBranchForShadowDoc> { return editBranch.activeEditBranchForShadowDoc(this, ...args); }
+  activeEditBranchForDoc(...args: TailParameters<typeof editBranch.activeEditBranchForDoc>): ReturnType<typeof editBranch.activeEditBranchForDoc> { return editBranch.activeEditBranchForDoc(this, ...args); }
+  listActiveEditBranches(...args: TailParameters<typeof editBranch.listActiveEditBranches>): ReturnType<typeof editBranch.listActiveEditBranches> { return editBranch.listActiveEditBranches(this, ...args); }
+  docIdForMutationPayload(...args: TailParameters<typeof editBranch.docIdForMutationPayload>): ReturnType<typeof editBranch.docIdForMutationPayload> { return editBranch.docIdForMutationPayload(this, ...args); }
+  nodePatchForEditBranch(...args: TailParameters<typeof editBranch.nodePatchForEditBranch>): ReturnType<typeof editBranch.nodePatchForEditBranch> { return editBranch.nodePatchForEditBranch(this, ...args); }
+  _appendEditBranchEntry(...args: TailParameters<typeof editBranch._appendEditBranchEntry>): ReturnType<typeof editBranch._appendEditBranchEntry> { return editBranch._appendEditBranchEntry(this, ...args); }
+  editBranchHistoryState(...args: TailParameters<typeof editBranch.editBranchHistoryState>): ReturnType<typeof editBranch.editBranchHistoryState> { return editBranch.editBranchHistoryState(this, ...args); }
+  getEditBranchDiffView(...args: TailParameters<typeof editBranch.getEditBranchDiffView>): ReturnType<typeof editBranch.getEditBranchDiffView> { return editBranch.getEditBranchDiffView(this, ...args); }
+  computeThreeWayMerge(...args: TailParameters<typeof editBranch.computeThreeWayMerge>): ReturnType<typeof editBranch.computeThreeWayMerge> { return editBranch.computeThreeWayMerge(this, ...args); }
+  _trunkNodeRow(...args: TailParameters<typeof editBranch._trunkNodeRow>): ReturnType<typeof editBranch._trunkNodeRow> { return editBranch._trunkNodeRow(this, ...args); }
+  _trunkSubtreeHash(...args: TailParameters<typeof editBranch._trunkSubtreeHash>): ReturnType<typeof editBranch._trunkSubtreeHash> { return editBranch._trunkSubtreeHash(this, ...args); }
+  _validateEditBranchEntriesAgainstTrunk(...args: TailParameters<typeof editBranch._validateEditBranchEntriesAgainstTrunk>): ReturnType<typeof editBranch._validateEditBranchEntriesAgainstTrunk> { return editBranch._validateEditBranchEntriesAgainstTrunk(this, ...args); }
+  applyThreeWayMerge(...args: TailParameters<typeof editBranch.applyThreeWayMerge>): ReturnType<typeof editBranch.applyThreeWayMerge> { return editBranch.applyThreeWayMerge(this, ...args); }
+  _replaceEditBranchDiff(...args: TailParameters<typeof editBranch._replaceEditBranchDiff>): ReturnType<typeof editBranch._replaceEditBranchDiff> { return editBranch._replaceEditBranchDiff(this, ...args); }
+  undoEditBranchEntry(...args: TailParameters<typeof editBranch.undoEditBranchEntry>): ReturnType<typeof editBranch.undoEditBranchEntry> { return editBranch.undoEditBranchEntry(this, ...args); }
+  redoEditBranchEntry(...args: TailParameters<typeof editBranch.redoEditBranchEntry>): ReturnType<typeof editBranch.redoEditBranchEntry> { return editBranch.redoEditBranchEntry(this, ...args); }
+  _fetchBaseRefsForDoc(...args: TailParameters<typeof editBranch._fetchBaseRefsForDoc>): ReturnType<typeof editBranch._fetchBaseRefsForDoc> { return editBranch._fetchBaseRefsForDoc(this, ...args); }
+  _baseDocInputsForDoc(...args: TailParameters<typeof editBranch._baseDocInputsForDoc>): ReturnType<typeof editBranch._baseDocInputsForDoc> { return editBranch._baseDocInputsForDoc(this, ...args); }
+  _projectedDocForBranch(...args: TailParameters<typeof editBranch._projectedDocForBranch>): ReturnType<typeof editBranch._projectedDocForBranch> { return editBranch._projectedDocForBranch(this, ...args); }
+  liveDocSnapshot(...args: TailParameters<typeof editBranch.liveDocSnapshot>): ReturnType<typeof editBranch.liveDocSnapshot> { return editBranch.liveDocSnapshot(this, ...args); }
+  _findProjectedNode(...args: TailParameters<typeof editBranch._findProjectedNode>): ReturnType<typeof editBranch._findProjectedNode> { return editBranch._findProjectedNode(this, ...args); }
+  _findProjectedAxiom(...args: TailParameters<typeof editBranch._findProjectedAxiom>): ReturnType<typeof editBranch._findProjectedAxiom> { return editBranch._findProjectedAxiom(this, ...args); }
+  stageEditBranchNodeUpdate(...args: TailParameters<typeof editBranch.stageEditBranchNodeUpdate>): ReturnType<typeof editBranch.stageEditBranchNodeUpdate> { return editBranch.stageEditBranchNodeUpdate(this, ...args); }
+  stageEditBranchNodeInsert(...args: TailParameters<typeof editBranch.stageEditBranchNodeInsert>): ReturnType<typeof editBranch.stageEditBranchNodeInsert> { return editBranch.stageEditBranchNodeInsert(this, ...args); }
+  stageEditBranchNodeDelete(...args: TailParameters<typeof editBranch.stageEditBranchNodeDelete>): ReturnType<typeof editBranch.stageEditBranchNodeDelete> { return editBranch.stageEditBranchNodeDelete(this, ...args); }
+  stageEditBranchNodeMove(...args: TailParameters<typeof editBranch.stageEditBranchNodeMove>): ReturnType<typeof editBranch.stageEditBranchNodeMove> { return editBranch.stageEditBranchNodeMove(this, ...args); }
+  stageEditBranchNodePromote(...args: TailParameters<typeof editBranch.stageEditBranchNodePromote>): ReturnType<typeof editBranch.stageEditBranchNodePromote> { return editBranch.stageEditBranchNodePromote(this, ...args); }
+  stageEditBranchNodeSplit(...args: TailParameters<typeof editBranch.stageEditBranchNodeSplit>): ReturnType<typeof editBranch.stageEditBranchNodeSplit> { return editBranch.stageEditBranchNodeSplit(this, ...args); }
+  stageEditBranchNodeMergeInto(...args: TailParameters<typeof editBranch.stageEditBranchNodeMergeInto>): ReturnType<typeof editBranch.stageEditBranchNodeMergeInto> { return editBranch.stageEditBranchNodeMergeInto(this, ...args); }
+  stageEditBranchNodeMergePrevious(...args: TailParameters<typeof editBranch.stageEditBranchNodeMergePrevious>): ReturnType<typeof editBranch.stageEditBranchNodeMergePrevious> { return editBranch.stageEditBranchNodeMergePrevious(this, ...args); }
+  stageEditBranchNodeReparent(...args: TailParameters<typeof editBranch.stageEditBranchNodeReparent>): ReturnType<typeof editBranch.stageEditBranchNodeReparent> { return editBranch.stageEditBranchNodeReparent(this, ...args); }
+  stageEditBranchNodeMoveBefore(...args: TailParameters<typeof editBranch.stageEditBranchNodeMoveBefore>): ReturnType<typeof editBranch.stageEditBranchNodeMoveBefore> { return editBranch.stageEditBranchNodeMoveBefore(this, ...args); }
+  stageEditBranchNodeMoveAfter(...args: TailParameters<typeof editBranch.stageEditBranchNodeMoveAfter>): ReturnType<typeof editBranch.stageEditBranchNodeMoveAfter> { return editBranch.stageEditBranchNodeMoveAfter(this, ...args); }
+  stageEditBranchAxiomAdd(...args: TailParameters<typeof editBranch.stageEditBranchAxiomAdd>): ReturnType<typeof editBranch.stageEditBranchAxiomAdd> { return editBranch.stageEditBranchAxiomAdd(this, ...args); }
+  stageEditBranchAxiomUpdate(...args: TailParameters<typeof editBranch.stageEditBranchAxiomUpdate>): ReturnType<typeof editBranch.stageEditBranchAxiomUpdate> { return editBranch.stageEditBranchAxiomUpdate(this, ...args); }
+  stageEditBranchAxiomDelete(...args: TailParameters<typeof editBranch.stageEditBranchAxiomDelete>): ReturnType<typeof editBranch.stageEditBranchAxiomDelete> { return editBranch.stageEditBranchAxiomDelete(this, ...args); }
+  stageEditBranchAxiomMove(...args: TailParameters<typeof editBranch.stageEditBranchAxiomMove>): ReturnType<typeof editBranch.stageEditBranchAxiomMove> { return editBranch.stageEditBranchAxiomMove(this, ...args); }
+  stageEditBranchRefAddAxiomToNode(...args: TailParameters<typeof editBranch.stageEditBranchRefAddAxiomToNode>): ReturnType<typeof editBranch.stageEditBranchRefAddAxiomToNode> { return editBranch.stageEditBranchRefAddAxiomToNode(this, ...args); }
+  stageEditBranchRefAddNodeToNode(...args: TailParameters<typeof editBranch.stageEditBranchRefAddNodeToNode>): ReturnType<typeof editBranch.stageEditBranchRefAddNodeToNode> { return editBranch.stageEditBranchRefAddNodeToNode(this, ...args); }
+  stageEditBranchRefDelete(...args: TailParameters<typeof editBranch.stageEditBranchRefDelete>): ReturnType<typeof editBranch.stageEditBranchRefDelete> { return editBranch.stageEditBranchRefDelete(this, ...args); }
+  applyEditBranchDiffEntries(...args: TailParameters<typeof editBranch.applyEditBranchDiffEntries>): ReturnType<typeof editBranch.applyEditBranchDiffEntries> { return editBranch.applyEditBranchDiffEntries(this, ...args); }
+  beginEditBranch(...args: TailParameters<typeof editBranch.beginEditBranch>): ReturnType<typeof editBranch.beginEditBranch> { return editBranch.beginEditBranch(this, ...args); }
+  findEditBranch(...args: TailParameters<typeof editBranch.findEditBranch>): ReturnType<typeof editBranch.findEditBranch> { return editBranch.findEditBranch(this, ...args); }
+  rebaseEditBranch(...args: TailParameters<typeof editBranch.rebaseEditBranch>): ReturnType<typeof editBranch.rebaseEditBranch> { return editBranch.rebaseEditBranch(this, ...args); }
+  cherryPickEditBranchEntries(...args: TailParameters<typeof editBranch.cherryPickEditBranchEntries>): ReturnType<typeof editBranch.cherryPickEditBranchEntries> { return editBranch.cherryPickEditBranchEntries(this, ...args); }
+  _cherryPickSource(...args: TailParameters<typeof editBranch._cherryPickSource>): ReturnType<typeof editBranch._cherryPickSource> { return editBranch._cherryPickSource(this, ...args); }
+  _selectCherryPickEntries(...args: TailParameters<typeof editBranch._selectCherryPickEntries>): ReturnType<typeof editBranch._selectCherryPickEntries> { return editBranch._selectCherryPickEntries(this, ...args); }
+  _copyCherryPickEntry(...args: TailParameters<typeof editBranch._copyCherryPickEntry>): ReturnType<typeof editBranch._copyCherryPickEntry> { return editBranch._copyCherryPickEntry(this, ...args); }
+  saveEditBranch(...args: TailParameters<typeof editBranch.saveEditBranch>): ReturnType<typeof editBranch.saveEditBranch> { return editBranch.saveEditBranch(this, ...args); }
+  _docNodeSignatures(...args: TailParameters<typeof editBranch._docNodeSignatures>): ReturnType<typeof editBranch._docNodeSignatures> { return editBranch._docNodeSignatures(this, ...args); }
+  _commitEditBranchPayload(...args: TailParameters<typeof editBranch._commitEditBranchPayload>): ReturnType<typeof editBranch._commitEditBranchPayload> { return editBranch._commitEditBranchPayload(this, ...args); }
+  discardEditBranch(...args: TailParameters<typeof editBranch.discardEditBranch>): ReturnType<typeof editBranch.discardEditBranch> { return editBranch.discardEditBranch(this, ...args); }
+
+  createDocFromSentences({ title, sourcePath, sentences }: SentencesDocInput) {
     return this.createDocFromSentenceRecords({
       title,
       sourcePath,
@@ -919,7 +1121,7 @@ export class IftreeStore {
     });
   }
 
-  createDocFromSentenceRecords({ title, sourcePath, records }) {
+  createDocFromSentenceRecords({ title, sourcePath, records }: ImportedDocInput) {
     return this.withTransaction(() => {
       const doc = this.createDoc({
         title,
@@ -933,9 +1135,9 @@ export class IftreeStore {
         text: '原始文本导入',
         nodeType: 'TEXT'
       });
-      const importedNodeIds = [];
-      const importedNodeIdsByRecordIndex = {};
-      const insertNode = this.db.prepare(`
+      const importedNodeIds: string[] = [];
+      const importedNodeIdsByRecordIndex: Record<number, string> = {};
+      const insertNode = this.conn.prepare(`
         INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text)
         VALUES (?, ?, ?, ?, 'TEXT', ?)
       `);
@@ -955,7 +1157,7 @@ export class IftreeStore {
     });
   }
 
-  createDocFromStructuredRecords({ title, sourcePath, records }) {
+  createDocFromStructuredRecords({ title, sourcePath, records }: ImportedDocInput) {
     return this.withTransaction(() => {
       const doc = this.createDoc({
         title,
@@ -965,11 +1167,11 @@ export class IftreeStore {
       });
 
       // Build address → nodeId map as we create nodes
-      const addressToId = new Map();
-      const importedNodeIds = [];
-      const importedNodeIdsByRecordIndex = {};
+      const addressToId = new Map<string, string>();
+      const importedNodeIds: string[] = [];
+      const importedNodeIdsByRecordIndex: Record<number, string> = {};
       const sorted = areRecordsAddressSorted(records) ? records : [...records].sort(compareNodeAddress);
-      const insertNode = this.db.prepare(`
+      const insertNode = this.conn.prepare(`
         INSERT INTO nodes (
           id, doc_id, parent_id, sort_order, node_type, text, node_title, node_note, source_position, trust_level
         )
@@ -1020,27 +1222,27 @@ export class IftreeStore {
     });
   }
 
-  getDoc(docId, options = {}) {
+  getDoc(docId: unknown, options: { includeSourceSpans?: boolean; includeSourceDocumentContent?: boolean; maxTreeDepth?: unknown } = {}) {
     const includeSourceSpans = options.includeSourceSpans !== false;
     const includeSourceDocumentContent = options.includeSourceDocumentContent !== false;
     const maxTreeDepth = Number(options.maxTreeDepth);
     const treeDepthLimit = Number.isInteger(maxTreeDepth) && maxTreeDepth > 0 ? maxTreeDepth : null;
-    const doc = this.db.prepare(`
+    const doc = this.conn.prepare(`
       SELECT
         docs.*,
         (SELECT COUNT(*) FROM nodes WHERE doc_id = docs.id) AS node_count
       FROM docs
       WHERE id = ?
-    `).get(docId);
+    `).get<DocDetailRow>(docId);
     if (!doc) return null;
 
-    const depthRows = this.db.prepare(`
+    const depthRows = this.conn.prepare(`
       SELECT depth, COUNT(*) AS count
       FROM nodes
       WHERE doc_id = ?
       GROUP BY depth
       ORDER BY depth
-    `).all(docId);
+    `).all<Array<{ depth: number; count: number }>[number]>(docId);
     const depths = depthRows
       .map((row) => Math.floor(Number(row.depth) || 0))
       .filter((depth) => depth > 0);
@@ -1065,11 +1267,11 @@ export class IftreeStore {
     // depth slicing kicks back in after projection.
     // 主文档视图只投影人类自己的编辑分支（owner=human）；外部/内置 agent 的分支
     // （owner=llm:<会话>）是 A5-5 待审/并行分支，经 diff 视图单独看，不混入主视图（沿用 15-4 待审语义）。
-    const activeBranch = this.activeEditBranchForBaseDoc(docId, 'human');
+    const activeBranch = this.activeEditBranchForBaseDoc(docId, 'human') as { diff?: string | null } | null;
     const sliceDepthForQuery = activeBranch ? null : treeDepthLimit;
 
     let nodes = sliceDepthForQuery
-      ? this.db.prepare(`
+      ? this.conn.prepare(`
         WITH visible_nodes AS (
           SELECT *
           FROM nodes
@@ -1088,8 +1290,8 @@ export class IftreeStore {
         FROM visible_nodes
         LEFT JOIN child_counts ON child_counts.parent_id = visible_nodes.id
         ORDER BY visible_nodes.parent_id IS NOT NULL, visible_nodes.parent_id, visible_nodes.sort_order, visible_nodes.id
-      `).all(docId, sliceDepthForQuery, docId)
-      : this.db.prepare(`
+      `).all<NodeWithChildCountRow>(docId, sliceDepthForQuery, docId)
+      : this.conn.prepare(`
         WITH child_counts(parent_id, child_count) AS (
           SELECT parent_id, COUNT(*)
           FROM nodes
@@ -1102,15 +1304,22 @@ export class IftreeStore {
         LEFT JOIN child_counts ON child_counts.parent_id = nodes.id
         WHERE nodes.doc_id = ?
         ORDER BY nodes.parent_id IS NOT NULL, nodes.parent_id, nodes.sort_order, nodes.id
-      `).all(docId, docId);
-    let axioms = this.listAxioms(docId);
-    let refs = this._fetchBaseRefsForDoc(docId);
+      `).all<NodeWithChildCountRow>(docId, docId);
+    let axioms = this.listAxioms(docId) as unknown as AxiomRow[];
+    let refs = this._fetchBaseRefsForDoc(docId) as RefRow[];
 
     if (activeBranch) {
       const diff = JSON.parse(activeBranch.diff || '{}');
       const entries = Array.isArray(diff.entries) ? diff.entries : [];
       if (entries.length > 0) {
-        const projected = projectEditBranchDoc({ docId, nodes, axioms, refs }, entries);
+        // ProjectionNode = NodeRow & { child_count; pending_insert? }——结构上 NodeWithChildCountRow
+        // 可直传，projection 返回的 nodes/axioms/refs 也直接接住，无需 cast。
+        const projected = projectEditBranchDoc({
+          docId: docId as string,
+          nodes,
+          axioms,
+          refs
+        }, entries);
         nodes = projected.nodes;
         axioms = projected.axioms;
         refs = projected.refs;
@@ -1129,11 +1338,11 @@ export class IftreeStore {
       }
     }
 
-    const tree = buildTree(nodes);
+    const tree = buildTree(nodes) as AddressTreeNode | null;
     const addressById = new Map();
     const idByAddress = new Map();
 
-    function indexAddresses(node) {
+    function indexAddresses(node: AddressTreeNode | null | undefined) {
       if (!node) return;
       addressById.set(node.id, node.address);
       idByAddress.set(node.address, node.id);
@@ -1154,24 +1363,24 @@ export class IftreeStore {
 
     const history = this.listHistory(docId);
     const sourceDocument = includeSourceDocumentContent
-      ? this.db.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(docId) || null
-      : this.db.prepare(`
+      ? this.conn.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get<SourceDocumentRow>(docId) || null
+      : this.conn.prepare(`
         SELECT doc_id, source_type, original_path, '' AS raw_markdown, created_at
         FROM source_documents
         WHERE doc_id = ?
-      `).get(docId) || null;
-    const sourcePdfPages = this.db.prepare(`
+      `).get<SourceDocumentRow>(docId) || null;
+    const sourcePdfPages = this.conn.prepare(`
       SELECT page_number, width, height
       FROM source_pdf_pages
       WHERE doc_id = ?
       ORDER BY page_number
-    `).all(docId);
+    `).all<SourcePdfPageRow>(docId);
     const sourceSpans = includeSourceSpans
-      ? this.db.prepare(`
+      ? this.conn.prepare(`
         SELECT * FROM source_spans
         WHERE doc_id = ?
         ORDER BY sentence_index, id
-      `).all(docId).map((span) => ({
+      `).all<SourceSpanRow>(docId).map((span) => ({
         ...span,
         node_address: span.node_id ? addressById.get(span.node_id) || null : null
       }))
@@ -1192,19 +1401,19 @@ export class IftreeStore {
     };
   }
 
-  /** @param {{ docId?: any, depth?: number }} [payload] */
-  hasDocTreeDepth({ docId, depth } = {}) {
+  /** @param {{ docId?: unknown, depth?: number }} [payload] */
+  hasDocTreeDepth({ docId, depth }: DocDepthPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const targetDepth = Math.max(1, Math.floor(Number(depth) || 1));
     if (!normalizedDocId) {
       return { docId: null, depth: targetDepth, exists: false };
     }
-    const row = this.db.prepare(`
+    const row = this.conn.prepare(`
       SELECT 1 AS exists_depth
       FROM nodes
       WHERE doc_id = ? AND depth = ?
       LIMIT 1
-    `).get(normalizedDocId, targetDepth);
+    `).get<{ exists_depth: number }>(normalizedDocId, targetDepth);
     return {
       docId: normalizedDocId,
       depth: targetDepth,
@@ -1212,11 +1421,11 @@ export class IftreeStore {
     };
   }
 
-  /** @param {{ docId?: any }} [payload] */
-  getDocStructureRows({ docId } = {}) {
+  /** @param {{ docId?: unknown }} [payload] */
+  getDocStructureRows({ docId }: DocIdPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     if (normalizedDocId === null) return [];
-    return this.db.prepare(`
+    return this.conn.prepare(`
       WITH child_counts(parent_id, child_count) AS (
         SELECT parent_id, COUNT(*)
         FROM nodes
@@ -1234,16 +1443,16 @@ export class IftreeStore {
       LEFT JOIN child_counts ON child_counts.parent_id = nodes.id
       WHERE nodes.doc_id = ?
       ORDER BY nodes.parent_id IS NOT NULL, nodes.parent_id, nodes.sort_order, nodes.id
-    `).all(normalizedDocId, normalizedDocId);
+    `).all<Pick<NodeRow, 'id' | 'doc_id' | 'parent_id' | 'sort_order' | 'depth' | 'address'> & { child_count: number }>(normalizedDocId, normalizedDocId);
   }
 
-  /** @param {{ docId?: any, nodeIds?: any[] }} [payload] */
-  getNodeTextBatch({ docId, nodeIds = [] } = {}) {
+  /** @param {{ docId?: unknown, nodeIds?: unknown[] }} [payload] */
+  getNodeTextBatch({ docId, nodeIds = [] }: NodeBatchPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const ids = normalizeNodeIdBatch(nodeIds, 500);
     if (normalizedDocId === null || ids.length === 0) return [];
     const placeholders = ids.map(() => '?').join(', ');
-    return this.db.prepare(`
+    return this.conn.prepare(`
       WITH requested_nodes AS (
         SELECT *
         FROM nodes
@@ -1273,18 +1482,18 @@ export class IftreeStore {
       FROM requested_nodes
       LEFT JOIN child_counts ON child_counts.parent_id = requested_nodes.id
       ORDER BY requested_nodes.id
-    `).all(normalizedDocId, ...ids, normalizedDocId);
+    `).all<NodeWithChildCountRow>(normalizedDocId, ...ids, normalizedDocId);
   }
 
-  /** @param {{ docId?: any, query?: string, limit?: number }} [payload] */
-  searchNodes({ docId, query, limit = 20 } = {}) {
+  /** @param {{ docId?: unknown, query?: string, limit?: number }} [payload] */
+  searchNodes({ docId, query, limit = 20 }: SearchNodesPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const text = String(query || '').trim();
     if (normalizedDocId === null || !text) return [];
     const safeLimit = Math.min(100, Math.max(1, Math.floor(Number(limit) || 20)));
     const escaped = text.replace(/[\\%_]/g, (match) => `\\${match}`);
     const like = `%${escaped}%`;
-    return this.db.prepare(`
+    return this.conn.prepare(`
       WITH matched AS (
         SELECT *
         FROM nodes
@@ -1344,20 +1553,20 @@ export class IftreeStore {
     );
   }
 
-  getNodeAddress(docId, nodeId) {
-    const stored = this.db.prepare(`
+  getNodeAddress(docId: unknown, nodeId: unknown) {
+    const stored = this.conn.prepare(`
       SELECT address
       FROM nodes
       WHERE doc_id = ? AND id = ?
-    `).get(docId, nodeId);
-    if (String(stored?.address || '').trim()) return String(stored.address);
+    `).get<Pick<NodeRow, 'address'>>(docId, nodeId);
+    if (String(stored?.address || '').trim()) return String(stored?.address);
 
-    const getNode = this.db.prepare(`
+    const getNode = this.conn.prepare(`
       SELECT id, parent_id, sort_order
       FROM nodes
       WHERE doc_id = ? AND id = ?
     `);
-    const getOrdinal = this.db.prepare(`
+    const getOrdinal = this.conn.prepare(`
       SELECT COUNT(*) AS ordinal
       FROM nodes
       WHERE doc_id = ?
@@ -1370,9 +1579,9 @@ export class IftreeStore {
     const parts = [];
     let currentId = nodeId;
     while (currentId !== null && currentId !== undefined) {
-      const node = getNode.get(docId, currentId);
+      const node = getNode.get<Pick<NodeRow, 'id' | 'parent_id' | 'sort_order'>>(docId, currentId);
       if (!node) return null;
-      const ordinal = Number(getOrdinal.get(
+      const ordinal = Number(getOrdinal.get<OrdinalRow>(
         docId,
         node.parent_id ?? null,
         node.sort_order,
@@ -1386,15 +1595,15 @@ export class IftreeStore {
     return parts.reverse().join('-');
   }
 
-  /** @param {{ docId?: any, nodeId?: any }} [payload] */
-  getSubtreeSlotRange({ docId, nodeId } = {}) {
+  /** @param {{ docId?: unknown, nodeId?: unknown }} [payload] */
+  getSubtreeSlotRange({ docId, nodeId }: NodeRefPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const normalizedNodeId = normalizePositiveId(nodeId);
     if (normalizedDocId === null || normalizedNodeId === null) return [];
     const address = this.getNodeAddress(normalizedDocId, normalizedNodeId);
     if (!address) return [];
     const pathKey = addressSortKey(address);
-    return this.db.prepare(`
+    return this.conn.prepare(`
       WITH RECURSIVE subtree(id, doc_id, parent_id, sort_order, depth, address, path_key) AS (
         SELECT id, doc_id, parent_id, sort_order, depth, address, ? AS path_key
         FROM nodes
@@ -1437,21 +1646,21 @@ export class IftreeStore {
       JOIN nodes ON nodes.id = subtree.id AND nodes.doc_id = subtree.doc_id
       LEFT JOIN child_counts ON child_counts.parent_id = subtree.id
       ORDER BY subtree.path_key
-    `).all(pathKey, normalizedDocId, normalizedNodeId, normalizedDocId, normalizedDocId);
+    `).all<Pick<NodeRow, 'id' | 'doc_id' | 'parent_id' | 'sort_order' | 'depth' | 'address'> & { child_count: number }>(pathKey, normalizedDocId, normalizedNodeId, normalizedDocId, normalizedDocId);
   }
 
-  /** @param {{ docId?: any, nodeId?: any, offset?: number, limit?: number, charLimit?: number }} [payload] */
-  getSubtreeTextWindow({ docId, nodeId, offset = 0, limit = 1000, charLimit = 0 } = {}) {
+  /** @param {{ docId?: unknown, nodeId?: unknown, offset?: number, limit?: number, charLimit?: number }} [payload] */
+  getSubtreeTextWindow({ docId, nodeId, offset = 0, limit = 1000, charLimit = 0 }: SubtreeTextWindowPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const normalizedNodeId = normalizePositiveId(nodeId);
     if (normalizedDocId === null || normalizedNodeId === null) {
       return { rows: [], offset: 0, nextOffset: 0, limit: 0, charLimit: 0, textChars: 0, hasMore: false };
     }
-    const root = this.db.prepare(`
+    const root = this.conn.prepare(`
       SELECT id, address, source_position
       FROM nodes
       WHERE doc_id = ? AND id = ?
-    `).get(normalizedDocId, normalizedNodeId);
+    `).get<Pick<NodeRow, 'id' | 'address' | 'source_position'>>(normalizedDocId, normalizedNodeId);
     const rootAddress = String(root?.address || '').trim();
     if (!root || !rootAddress) {
       return { rows: [], offset: 0, nextOffset: 0, limit: 0, charLimit: 0, textChars: 0, hasMore: false };
@@ -1461,8 +1670,16 @@ export class IftreeStore {
     // 0 表示不启用字符预算
     const safeCharLimit = Math.max(0, Math.floor(Number(charLimit) || 0));
     const prefix = `${rootAddress}-%`;
-    const orderBySource = Number.isFinite(Number(root.source_position));
-    const rows = this.db.prepare(`
+    // 子树排序口径：有原文出处的按 source_position 升序在前、无出处（NULL）的垫后再按 id。
+    // 这是有意利用本系统的数据特性——节点 source_position 只有两态：导入文档=字符偏移(数字)、
+    // 容器/标题/手工节点=NULL；而 root 行（上面 SELECT 恒含该列、且 root 必存在）只会是 number|null、
+    // 绝不会是 undefined。故「取到了这列（数字或 NULL）就按出处排序、NULL 经 `source_position IS NULL` 垫后」
+    // 恒成立；只有连列都拿不到（undefined，理论上不发生）才退化为纯 id 序。
+    // 旧写法 `Number.isFinite(Number(root.source_position))` 表达同一判定（依赖 Number(NULL)===0 仍有限→true），
+    // 这里改用 `!== undefined` 直陈「列是否存在」之意，不再借道 Number(null)===0。容器根子树仍按出处排序，
+    // 由 store.test.mjs 的 orderBySource 用例锁定。
+    const orderBySource = root.source_position !== undefined;
+    const rows = this.conn.prepare(`
       WITH selected_nodes AS (
         SELECT *
         FROM nodes
@@ -1499,8 +1716,8 @@ export class IftreeStore {
       ORDER BY ${orderBySource
         ? '(selected_nodes.id = ?) DESC, selected_nodes.source_position IS NULL, selected_nodes.source_position, selected_nodes.id'
         : '(selected_nodes.id = ?) DESC, selected_nodes.id'}
-    `).all(normalizedDocId, rootAddress, prefix, normalizedNodeId, safeLimit + 1, safeOffset, normalizedDocId, normalizedNodeId);
-    const rowTextChars = (row) => String(row.node_title || '').length + String(row.text || '').length + String(row.node_note || '').length;
+    `).all<NodeWithChildCountRow>(normalizedDocId, rootAddress, prefix, normalizedNodeId, safeLimit + 1, safeOffset, normalizedDocId, normalizedNodeId);
+    const rowTextChars = (row: NodeWithChildCountRow) => String(row.node_title || '').length + String(row.text || '').length + String(row.node_note || '').length;
     const fetched = rows.slice(0, safeLimit);
     let pageRows = fetched;
     let textChars = 0;
@@ -1526,12 +1743,12 @@ export class IftreeStore {
     };
   }
 
-  /** @param {{ docId?: any, nodeId?: any }} [payload] */
-  getAncestorChain({ docId, nodeId } = {}) {
+  /** @param {{ docId?: unknown, nodeId?: unknown }} [payload] */
+  getAncestorChain({ docId, nodeId }: NodeRefPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const normalizedNodeId = normalizePositiveId(nodeId);
     if (normalizedDocId === null || normalizedNodeId === null) return [];
-    return this.db.prepare(`
+    return this.conn.prepare(`
       WITH RECURSIVE ancestors(id, doc_id, parent_id, sort_order, depth, address) AS (
         SELECT id, doc_id, parent_id, sort_order, depth, address
         FROM nodes
@@ -1565,7 +1782,7 @@ export class IftreeStore {
     return {};
   }
 
-  getNodeChildren({ docId, parentId = null, offset = 0, limit = 300, anchorId = null, before = 0, after = 0 }) {
+  getNodeChildren({ docId, parentId = null, offset = 0, limit = 300, anchorId = null, before = 0, after = 0 }: RowObject = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     const normalizedParentId = parentId === null || parentId === undefined ? null : normalizePositiveId(parentId);
     const normalizedAnchorId = anchorId === null || anchorId === undefined ? null : normalizePositiveId(anchorId);
@@ -1582,20 +1799,20 @@ export class IftreeStore {
     let safeOffset = Math.max(0, Math.floor(Number(offset) || 0));
     let safeLimit = requestedLimit;
     let anchorOffset = null;
-    const total = Number(this.db.prepare(`
+    const total = Number(this.conn.prepare(`
       SELECT COUNT(*) AS count
       FROM nodes
       WHERE doc_id = ? AND parent_id IS ?
     `).get(normalizedDocId, normalizedParentId)?.count || 0);
     if (normalizedAnchorId !== null) {
-      const anchor = this.db.prepare(`
+      const anchor = this.conn.prepare(`
         SELECT id, parent_id, sort_order
         FROM nodes
         WHERE doc_id = ? AND id = ?
       `).get(normalizedDocId, normalizedAnchorId);
       const anchorParentId = anchor?.parent_id === null || anchor?.parent_id === undefined ? null : normalizePositiveId(anchor.parent_id);
       if (anchor && sameStableId(anchorParentId, normalizedParentId)) {
-        anchorOffset = Number(this.db.prepare(`
+        anchorOffset = Number(this.conn.prepare(`
           SELECT COUNT(*) AS count
           FROM nodes
           WHERE doc_id = ? AND parent_id IS ?
@@ -1613,7 +1830,7 @@ export class IftreeStore {
         safeLimit = Math.min(1000, Math.max(1, safeBefore + 1 + safeAfter, requestedLimit));
       }
     }
-    const rows = this.db.prepare(`
+    const rows = this.conn.prepare(`
       WITH selected_children AS (
         SELECT *
         FROM nodes
@@ -1644,15 +1861,15 @@ export class IftreeStore {
     };
   }
 
-  /** @param {{ docId?: any, afterId?: number, limit?: number }} [payload] */
-  getDocNodesPage({ docId, afterId = 0, limit = 5000 } = {}) {
+  /** @param {{ docId?: unknown, afterId?: number, limit?: number }} [payload] */
+  getDocNodesPage({ docId, afterId = 0, limit = 5000 }: DocNodesPagePayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     if (!normalizedDocId) {
       return { rows: [], afterId: '', nextAfterId: '', limit: 0, hasMore: false };
     }
     const safeAfterId = normalizePositiveId(afterId) || '';
     const safeLimit = Math.min(10000, Math.max(100, Math.floor(Number(limit) || 5000)));
-    const rows = this.db.prepare(`
+    const rows = this.conn.prepare(`
       WITH selected_nodes AS (
         SELECT *
         FROM nodes
@@ -1671,7 +1888,7 @@ export class IftreeStore {
       FROM selected_nodes
       LEFT JOIN child_counts ON child_counts.parent_id = selected_nodes.id
       ORDER BY selected_nodes.id
-    `).all(normalizedDocId, safeAfterId, safeAfterId, safeLimit + 1, normalizedDocId);
+    `).all<NodeWithChildCountRow>(normalizedDocId, safeAfterId, safeAfterId, safeLimit + 1, normalizedDocId);
     const pageRows = rows.slice(0, safeLimit);
     const nextAfterId = pageRows.length > 0 ? pageRows[pageRows.length - 1].id : safeAfterId;
     return {
@@ -1683,16 +1900,16 @@ export class IftreeStore {
     };
   }
 
-  /** @param {{ docId?: any, nodeId?: any, startOffset?: number | null, limit?: number, before?: number, spansLimit?: number }} [payload] */
-  getSourceWindow({ docId, nodeId = null, startOffset = null, limit = 5000, before = null, spansLimit = 8000 } = {}) {
+  /** @param {{ docId?: unknown, nodeId?: unknown, startOffset?: number | null, limit?: number, before?: number, spansLimit?: number }} [payload] */
+  getSourceWindow({ docId, nodeId = null, startOffset = null, limit = 5000, before = null, spansLimit = 8000 }: SourceWindowPayload = {}) {
     const normalizedDocId = normalizePositiveId(docId);
     if (!normalizedDocId) return null;
 
-    const source = this.db.prepare(`
+    const source = this.conn.prepare(`
       SELECT doc_id, source_type, original_path, created_at, LENGTH(raw_markdown) AS raw_length
       FROM source_documents
       WHERE doc_id = ?
-    `).get(normalizedDocId);
+    `).get<SourceWindowRow>(normalizedDocId);
     if (!source) return null;
 
     const totalLength = Math.max(0, Number(source.raw_length) || 0);
@@ -1705,34 +1922,70 @@ export class IftreeStore {
       ? Math.max(0, Math.min(safeLimit, Math.floor(Number(before))))
       : Math.min(1000, Math.floor(safeLimit / 5));
     const safeSpansLimit = Math.min(20000, Math.max(100, Math.floor(Number(spansLimit) || 8000)));
-    let anchor = Number(startOffset);
-    const hasExplicitStartOffset = Number.isFinite(anchor);
+    // 显式 offset 仅当真给了有限数字才算——startOffset 默认 null 而 Number(null)===0、isFinite(0)===true，
+    // 若直接 Number(startOffset) 判定，未传 offset 会被误当成「显式 offset 0」，从而跳过下面的 nodeId 锚点
+    // 解析、让所有按 nodeId 取窗口都静默退回文档开头（含叶子节点）。这里显式排除 null/undefined。
+    const hasExplicitStartOffset = startOffset !== null && startOffset !== undefined && Number.isFinite(Number(startOffset));
+    let anchor = hasExplicitStartOffset ? Number(startOffset) : NaN;
+    // 锚点是否落到了真实原文出处。仅当传了 nodeId 却最终没解析到任何 source span 时为 false——
+    // 据此让出口提示「该节点无原文出处、已从开头返回」，把容器节点静默退回 offset 0 变成可见。
+    let anchorResolved = true;
+
+    const finiteOffset = (row: { start_offset?: unknown } | undefined) =>
+      row?.start_offset !== null && row?.start_offset !== undefined && Number.isFinite(Number(row.start_offset));
 
     const normalizedNodeId = nodeId === null || nodeId === undefined ? null : normalizePositiveId(nodeId);
     if (!hasExplicitStartOffset && normalizedNodeId) {
-      const directSpan = this.db.prepare(`
+      const directSpan = this.conn.prepare(`
         SELECT MIN(start_offset) AS start_offset
         FROM source_spans
         WHERE doc_id = ? AND node_id = ?
-      `).get(normalizedDocId, normalizedNodeId);
-      if (directSpan?.start_offset !== null && directSpan?.start_offset !== undefined && Number.isFinite(Number(directSpan.start_offset))) {
-        anchor = Number(directSpan.start_offset);
+      `).get<{ start_offset: number | null }>(normalizedDocId, normalizedNodeId);
+      if (finiteOffset(directSpan)) {
+        anchor = Number(directSpan!.start_offset);
       } else {
-        const node = this.db.prepare('SELECT source_position FROM nodes WHERE doc_id = ? AND id = ?')
-          .get(normalizedDocId, normalizedNodeId);
-        const sourcePosition = Math.floor(Number(node?.source_position));
-        if (Number.isInteger(sourcePosition)) {
-          const nearSpan = this.db.prepare(`
+        const node = this.conn.prepare('SELECT address, source_position FROM nodes WHERE doc_id = ? AND id = ?')
+          .get<Pick<NodeRow, 'address' | 'source_position'>>(normalizedDocId, normalizedNodeId);
+        // source_position 为 NULL（容器/标题节点）时不能走 nearSpan：Number(null)===0、Math.floor(0)===0、
+        // Number.isInteger(0)===true，会让 sentence_index>=0 命中全文首句而把锚点钉死在 offset 0。显式判空后
+        // 跳过 nearSpan、落到下面的子树下钻。
+        const rawSourcePosition = node?.source_position;
+        const sourcePosition = rawSourcePosition !== null && rawSourcePosition !== undefined && Number.isFinite(Number(rawSourcePosition))
+          ? Math.floor(Number(rawSourcePosition))
+          : null;
+        let resolved = false;
+        if (sourcePosition !== null) {
+          const nearSpan = this.conn.prepare(`
             SELECT start_offset
             FROM source_spans
             WHERE doc_id = ? AND sentence_index >= ?
             ORDER BY sentence_index, id
             LIMIT 1
-          `).get(normalizedDocId, sourcePosition);
-          if (nearSpan?.start_offset !== null && nearSpan?.start_offset !== undefined && Number.isFinite(Number(nearSpan.start_offset))) {
-            anchor = Number(nearSpan.start_offset);
+          `).get<{ start_offset: number | null }>(normalizedDocId, sourcePosition);
+          if (finiteOffset(nearSpan)) {
+            anchor = Number(nearSpan!.start_offset);
+            resolved = true;
           }
         }
+        // 容器节点（章/卷级包裹，自身无直接 span 且无 source_position）：下钻到子树里第一个有
+        // 原文出处的后代，用其 start_offset 当锚点——子树原文区间连续，MIN(start_offset) 即该
+        // 子树的原文起点。避免「拿第一回当锚点却静默返回版权页」。
+        if (!resolved) {
+          const nodeAddress = String(node?.address || '').trim();
+          if (nodeAddress) {
+            const subtreeSpan = this.conn.prepare(`
+              SELECT MIN(ss.start_offset) AS start_offset
+              FROM source_spans ss
+              JOIN nodes n ON n.id = ss.node_id AND n.doc_id = ss.doc_id
+              WHERE ss.doc_id = ? AND (n.address = ? OR n.address LIKE ?)
+            `).get<{ start_offset: number | null }>(normalizedDocId, nodeAddress, `${nodeAddress}-%`);
+            if (finiteOffset(subtreeSpan)) {
+              anchor = Number(subtreeSpan!.start_offset);
+              resolved = true;
+            }
+          }
+        }
+        if (!resolved) anchorResolved = false;
       }
     }
 
@@ -1744,11 +1997,11 @@ export class IftreeStore {
     const actualBefore = anchor - windowStart;
     const windowEnd = Math.min(totalLength, anchor + (safeLimit - actualBefore));
     const rawMarkdown = windowEnd > windowStart
-      ? this.db.prepare('SELECT substr(raw_markdown, ?, ?) AS text FROM source_documents WHERE doc_id = ?')
+      ? this.conn.prepare('SELECT substr(raw_markdown, ?, ?) AS text FROM source_documents WHERE doc_id = ?')
         .get(windowStart + 1, windowEnd - windowStart, normalizedDocId)?.text || ''
       : '';
 
-    const sourceSpans = this.db.prepare(`
+    const sourceSpans = this.conn.prepare(`
       SELECT *
       FROM source_spans
       WHERE doc_id = ? AND end_offset > ? AND start_offset < ?
@@ -1765,6 +2018,7 @@ export class IftreeStore {
     return {
       docId: normalizedDocId,
       anchorNodeId: normalizedNodeId,
+      anchorResolved,
       startOffset: windowStart,
       endOffset: windowEnd,
       totalLength,
@@ -1792,11 +2046,11 @@ export class IftreeStore {
     pdfChars = [],
     docBlocks = [],
     nodeIdsBySentenceIndex = null
-  }) {
-    const doc = this.db.prepare('SELECT id FROM docs WHERE id = ?').get(docId);
+  }: SourceDocumentInput) {
+    const doc = this.conn.prepare('SELECT id FROM docs WHERE id = ?').get<Pick<DocRow, 'id'>>(docId);
     if (!doc) throw new Error(`Document not found: ${docId}`);
 
-    const nodeIdForSentence = (sentenceIndex) => {
+    const nodeIdForSentence = (sentenceIndex: unknown) => {
       const numericIndex = Number(sentenceIndex);
       if (!nodeIdsBySentenceIndex) return null;
       if (nodeIdsBySentenceIndex instanceof Map) {
@@ -1807,22 +2061,28 @@ export class IftreeStore {
     };
 
     return this.withTransaction(() => {
-      this.db.prepare('DELETE FROM source_spans WHERE doc_id = ?').run(docId);
-      this.db.prepare('DELETE FROM source_pdf_chars WHERE doc_id = ?').run(docId);
-      this.db.prepare('DELETE FROM source_pdf_pages WHERE doc_id = ?').run(docId);
-      this.db.prepare('DELETE FROM source_doc_blocks WHERE doc_id = ?').run(docId);
-      this.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
-      this.db.prepare(`
+      this.conn.prepare('DELETE FROM source_spans WHERE doc_id = ?').run(docId);
+      this.conn.prepare('DELETE FROM source_pdf_chars WHERE doc_id = ?').run(docId);
+      this.conn.prepare('DELETE FROM source_pdf_pages WHERE doc_id = ?').run(docId);
+      this.conn.prepare('DELETE FROM source_doc_blocks WHERE doc_id = ?').run(docId);
+      this.conn.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
+      this.conn.prepare(`
         INSERT INTO source_documents (doc_id, source_type, original_path, raw_markdown)
         VALUES (?, ?, ?, ?)
       `).run(docId, sourceType || 'md', sourcePath, rawMarkdown || '');
 
-      const insertSpan = this.db.prepare(`
+      const insertSpan = this.conn.prepare(`
         INSERT INTO source_spans (doc_id, node_id, sentence_index, start_offset, end_offset, text)
         VALUES (?, ?, ?, ?, ?, ?)
       `);
 
-      for (const span of spans || []) {
+      // spans/pdfPages/pdfChars/docBlocks 入参是 unknown（payload 直传），先 narrow 到对应 *Input 数组。
+      const spanList: SaveSourceSpanInput[] = Array.isArray(spans) ? spans : [];
+      const pdfPageList: SaveSourcePdfPageInput[] = Array.isArray(pdfPages) ? pdfPages : [];
+      const pdfCharList: SaveSourcePdfCharInput[] = Array.isArray(pdfChars) ? pdfChars : [];
+      const docBlockList: SaveSourceDocBlockInput[] = Array.isArray(docBlocks) ? docBlocks : [];
+
+      for (const span of spanList) {
         const sentenceIndex = Number(span.sentence_index ?? span.sentenceIndex ?? span.index);
         if (!Number.isFinite(sentenceIndex) || sentenceIndex <= 0) continue;
         const startOffset = Number(span.start_offset ?? span.startOffset);
@@ -1838,11 +2098,11 @@ export class IftreeStore {
         );
       }
 
-      const insertPdfPage = this.db.prepare(`
+      const insertPdfPage = this.conn.prepare(`
         INSERT INTO source_pdf_pages (doc_id, page_number, width, height)
         VALUES (?, ?, ?, ?)
       `);
-      for (const page of pdfPages || []) {
+      for (const page of pdfPageList) {
         const pageNumber = Number(page.page_number ?? page.pageNumber);
         const width = Number(page.width);
         const height = Number(page.height);
@@ -1850,11 +2110,11 @@ export class IftreeStore {
         insertPdfPage.run(docId, pageNumber, width, height);
       }
 
-      const insertPdfChar = this.db.prepare(`
+      const insertPdfChar = this.conn.prepare(`
         INSERT INTO source_pdf_chars (doc_id, char_offset, page_number, x0, y0, x1, y1, char_text)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      for (const item of pdfChars || []) {
+      for (const item of pdfCharList) {
         const charOffset = Number(item.char_offset ?? item.charOffset);
         const pageNumber = Number(item.page_number ?? item.pageNumber);
         const x0 = Number(item.x0);
@@ -1872,11 +2132,11 @@ export class IftreeStore {
         insertPdfChar.run(docId, charOffset, pageNumber, x0, y0, x1, y1, item.char_text ?? item.charText ?? '');
       }
 
-      const insertDocBlock = this.db.prepare(`
+      const insertDocBlock = this.conn.prepare(`
         INSERT INTO source_doc_blocks (doc_id, block_index, start_offset, end_offset)
         VALUES (?, ?, ?, ?)
       `);
-      for (const block of docBlocks || []) {
+      for (const block of docBlockList) {
         const blockIndex = Number(block.block_index ?? block.blockIndex);
         const startOffset = Number(block.start_offset ?? block.startOffset);
         const endOffset = Number(block.end_offset ?? block.endOffset);
@@ -1885,49 +2145,49 @@ export class IftreeStore {
       }
 
       this.touchDoc(docId);
-      return this.db.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(docId);
+      return this.conn.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get<SourceDocumentRow>(docId);
     });
   }
 
-  updateSourceBinding({ docId, sourcePath, sourceType = 'file', rawMarkdown = '' }) {
+  updateSourceBinding({ docId, sourcePath, sourceType = 'file', rawMarkdown = '' }: { docId?: unknown; sourcePath?: unknown; sourceType?: unknown; rawMarkdown?: unknown }) {
     const normalizedDocId = normalizePositiveId(docId);
     const pathText = String(sourcePath || '').trim();
     if (!normalizedDocId || !pathText) throw new Error('Source binding requires docId and sourcePath');
     return this.withTransaction(() => {
-      const doc = this.db.prepare('SELECT id, meta FROM docs WHERE id = ?').get(normalizedDocId);
+      const doc = this.conn.prepare('SELECT id, meta FROM docs WHERE id = ?').get<Pick<DocRow, 'id' | 'meta'>>(normalizedDocId);
       if (!doc) throw new Error(`Document not found: ${normalizedDocId}`);
       const meta = parseJsonObject(doc.meta);
-      this.db.prepare('UPDATE docs SET meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      this.conn.prepare('UPDATE docs SET meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(JSON.stringify({ ...meta, sourcePath: pathText }), normalizedDocId);
-      const existing = this.db.prepare('SELECT doc_id FROM source_documents WHERE doc_id = ?').get(normalizedDocId);
+      const existing = this.conn.prepare('SELECT doc_id FROM source_documents WHERE doc_id = ?').get<Pick<SourceDocumentRow, 'doc_id'>>(normalizedDocId);
       if (existing) {
-        this.db.prepare('UPDATE source_documents SET source_type = ?, original_path = ? WHERE doc_id = ?')
+        this.conn.prepare('UPDATE source_documents SET source_type = ?, original_path = ? WHERE doc_id = ?')
           .run(sourceType || 'file', pathText, normalizedDocId);
       } else {
-        this.db.prepare(`
+        this.conn.prepare(`
           INSERT INTO source_documents (doc_id, source_type, original_path, raw_markdown)
           VALUES (?, ?, ?, ?)
         `).run(normalizedDocId, sourceType || 'file', pathText, rawMarkdown || '');
       }
-      return this.db.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(normalizedDocId);
+      return this.conn.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get<SourceDocumentRow>(normalizedDocId);
     });
   }
 
   // PDF 高亮屏幕几何实现见 ./pdf-highlight-geometry.mjs；此处保留 store 门面方法，注入 db 句柄。
-  getPdfHighlightRects(docId, ranges) {
-    return pdfHighlightRects(this.db, docId, ranges);
+  getPdfHighlightRects(docId: unknown, ranges: unknown) {
+    return pdfHighlightRects(this.conn, docId, ranges);
   }
 
-  getPdfSpanHitRects(docId) {
-    return pdfSpanHitRects(this.db, docId);
+  getPdfSpanHitRects(docId: unknown) {
+    return pdfSpanHitRects(this.conn, docId);
   }
 
-  insertNode({ docId, parentId, text = '', nodeType = 'TEXT', nodeTitle = '', nodeNote = '', sourcePosition = null, trustLevel = null, afterNodeId = null }) {
-    const siblings = this.db.prepare(`
+  insertNode({ docId, parentId, text = '', nodeType = 'TEXT', nodeTitle = '', nodeNote = '', sourcePosition = null, trustLevel = null, afterNodeId = null }: InsertNodePayload): NodeRow {
+    const siblings = this.conn.prepare(`
       SELECT id, sort_order FROM nodes
       WHERE doc_id = ? AND parent_id IS ?
       ORDER BY sort_order, id
-    `).all(docId, parentId);
+    `).all<Pick<NodeRow, 'id' | 'sort_order'>>(docId, parentId);
 
     let insertOrder = siblings.length + 1;
     if (afterNodeId !== null) {
@@ -1935,7 +2195,7 @@ export class IftreeStore {
       if (index >= 0) insertOrder = siblings[index].sort_order + 1;
     }
 
-    this.db.prepare(`
+    this.conn.prepare(`
       UPDATE nodes
       SET sort_order = sort_order + 1
       WHERE doc_id = ? AND parent_id IS ? AND sort_order >= ?
@@ -1943,19 +2203,19 @@ export class IftreeStore {
 
     const nodeId = newStableId();
     const normalizedNodeType = normalizeNodeType(nodeType);
-    this.db.prepare(`
+    this.conn.prepare(`
       INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, node_title, node_note, source_position, trust_level)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(nodeId, docId, parentId, insertOrder, normalizedNodeType, text, nodeTitle || '', nodeNote || '', normalizeSourcePosition(sourcePosition), normalizeNullableText(trustLevel));
 
     this.refreshAddressScopes(docId, [parentId]);
     this.touchDoc(docId);
-    return this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+    return this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId)!;
   }
 
-  updateNode(nodeId, patch) {
+  updateNode(nodeId: unknown, patch: RowObject) {
     assertNoHumanTagField(patch, 'updateNode patch');
-    const current = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+    const current = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
     if (!current) throw new Error(`Node not found: ${nodeId}`);
 
     const next = {
@@ -1967,7 +2227,7 @@ export class IftreeStore {
       trust_level: normalizeNullableText(patchValue(patch, 'trust_level', 'trustLevel', current.trust_level))
     };
 
-    this.db.prepare(`
+    this.conn.prepare(`
       UPDATE nodes
       SET text = ?, node_title = ?, node_note = ?, source_position = ?, node_type = ?, trust_level = ?,
           updated_at = CURRENT_TIMESTAMP
@@ -1983,17 +2243,17 @@ export class IftreeStore {
     );
 
     this.touchDoc(current.doc_id);
-    return this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+    return this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
   }
 
-  deleteNodeSubtree(nodeId) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  deleteNodeSubtree(nodeId: unknown) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
     if (!node) return false;
     if (node.parent_id === null) throw new Error('Cannot delete document root node');
 
     this.withTransaction(() => {
       // 节点被摧毁 → 指向子树内任何节点的引用连带蒸发（refs 无外键，需手工清）。
-      this.db.prepare(`
+      this.conn.prepare(`
         WITH RECURSIVE subtree(id) AS (
           SELECT id FROM nodes WHERE id = ?
           UNION ALL
@@ -2003,7 +2263,7 @@ export class IftreeStore {
         WHERE (source_type = 'node' AND source_id IN (SELECT id FROM subtree))
            OR (target_type = 'node' AND target_id IN (SELECT id FROM subtree))
       `).run(nodeId);
-      this.db.prepare('DELETE FROM nodes WHERE id = ?').run(nodeId);
+      this.conn.prepare('DELETE FROM nodes WHERE id = ?').run(nodeId);
       this.normalizeSiblingOrder(node.doc_id, node.parent_id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id]);
       this.touchDoc(node.doc_id);
@@ -2011,13 +2271,13 @@ export class IftreeStore {
     return true;
   }
 
-  moveNode(nodeId, direction) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  moveNode(nodeId: unknown, direction: unknown) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
     if (!node || node.parent_id === null) return false;
 
     const comparator = direction === 'up' ? '<' : '>';
     const order = direction === 'up' ? 'DESC' : 'ASC';
-    const sibling = this.db.prepare(`
+    const sibling = this.conn.prepare(`
       SELECT * FROM nodes
       WHERE doc_id = ? AND parent_id IS ? AND sort_order ${comparator} ?
       ORDER BY sort_order ${order}
@@ -2027,16 +2287,16 @@ export class IftreeStore {
     if (!sibling) return false;
 
     this.withTransaction(() => {
-      this.db.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(sibling.sort_order, node.id);
-      this.db.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(node.sort_order, sibling.id);
+      this.conn.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(sibling.sort_order, node.id);
+      this.conn.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(node.sort_order, sibling.id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id]);
       this.touchDoc(node.doc_id);
     });
     return true;
   }
 
-  splitNodeIntoChildren(nodeId, options = {}) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  splitNodeIntoChildren(nodeId: unknown, options: { splitAsciiPunctuation?: unknown; split_ascii_punctuation?: unknown } = {}) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
     if (!node) throw new Error(`Node not found: ${nodeId}`);
 
     if (this.splitSourceParagraphsIntoSentenceChildren(node)) return true;
@@ -2047,16 +2307,16 @@ export class IftreeStore {
     if (sentences.length < 2) return false;
 
     this.withTransaction(() => {
-      this.db.prepare('UPDATE nodes SET text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      this.conn.prepare('UPDATE nodes SET text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(sentences[0], nodeId);
 
-      this.db.prepare(`
+      this.conn.prepare(`
         UPDATE nodes
         SET sort_order = sort_order + ?
         WHERE doc_id = ? AND parent_id IS ? AND sort_order >= 1
       `).run(sentences.length - 1, node.doc_id, nodeId);
 
-      const insert = this.db.prepare(`
+      const insert = this.conn.prepare(`
         INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text)
         VALUES (?, ?, ?, ?, 'TEXT', ?)
       `);
@@ -2072,8 +2332,8 @@ export class IftreeStore {
     return true;
   }
 
-  splitSourceParagraphsIntoSentenceChildren(rootNode) {
-    const candidates = this.db.prepare(`
+  splitSourceParagraphsIntoSentenceChildren(rootNode: NodeRow) {
+    const candidates = this.conn.prepare(`
       WITH RECURSIVE subtree(id) AS (
         SELECT id FROM nodes WHERE id = ?
         UNION ALL
@@ -2085,31 +2345,31 @@ export class IftreeStore {
       WHERE n.source_position IS NOT NULL
         AND ABS(n.source_position - CAST(n.source_position AS INTEGER)) > 0.000001
       ORDER BY n.id
-    `).all(rootNode.id);
+    `).all<NodeRow>(rootNode.id);
     if (candidates.length === 0) return false;
 
-    const spansForNode = this.db.prepare(`
+    const spansForNode = this.conn.prepare(`
       SELECT *
       FROM source_spans
       WHERE node_id = ?
       ORDER BY sentence_index, id
     `);
-    const childCount = this.db.prepare('SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?');
-    const targetRows = [];
+    const childCount = this.conn.prepare('SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?');
+    const targetRows: SourceParagraphTarget[] = [];
     for (const candidate of candidates) {
-      if (childCount.get(candidate.id)?.count > 0) continue;
-      const spans = spansForNode.all(candidate.id);
+      if (Number(childCount.get<CountRow>(candidate.id)?.count) > 0) continue;
+      const spans = spansForNode.all<SourceSpanRow>(candidate.id);
       if (spans.length > 0) targetRows.push({ node: candidate, spans });
     }
     if (targetRows.length === 0) return false;
 
     this.withTransaction(() => {
-      const clearParagraph = this.db.prepare('UPDATE nodes SET text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?');
-      const insert = this.db.prepare(`
+      const clearParagraph = this.conn.prepare('UPDATE nodes SET text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?');
+      const insert = this.conn.prepare(`
         INSERT INTO nodes (id, doc_id, parent_id, sort_order, node_type, text, source_position)
         VALUES (?, ?, ?, ?, 'TEXT', ?, ?)
       `);
-      const updateSpan = this.db.prepare('UPDATE source_spans SET node_id = ? WHERE id = ?');
+      const updateSpan = this.conn.prepare('UPDATE source_spans SET node_id = ? WHERE id = ?');
 
       for (const target of targetRows) {
         clearParagraph.run('', target.node.id);
@@ -2134,16 +2394,16 @@ export class IftreeStore {
     return true;
   }
 
-  mergeNodeIntoPreviousSibling(nodeId) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  mergeNodeIntoPreviousSibling(nodeId: unknown) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
     if (!node || node.parent_id === null) return false;
 
-    const previous = this.db.prepare(`
+    const previous = this.conn.prepare(`
       SELECT * FROM nodes
       WHERE doc_id = ? AND parent_id IS ? AND sort_order < ?
       ORDER BY sort_order DESC, id DESC
       LIMIT 1
-    `).get(node.doc_id, node.parent_id, node.sort_order);
+    `).get<NodeRow>(node.doc_id, node.parent_id, node.sort_order);
 
     if (!previous) return false;
 
@@ -2155,32 +2415,32 @@ export class IftreeStore {
       const mergedTitle = mergeNodeNotes(previous.node_title, node.node_title);
       const mergedNote = mergeNodeNotes(previous.node_note, node.node_note);
 
-      this.db.prepare('UPDATE nodes SET text = ?, node_title = ?, node_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      this.conn.prepare('UPDATE nodes SET text = ?, node_title = ?, node_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(mergedText, mergedTitle, mergedNote, previous.id);
 
-      const previousChildCount = Number(this.db.prepare(`
+      const previousChildCount = Number(this.conn.prepare(`
         SELECT COUNT(*) AS count FROM nodes WHERE doc_id = ? AND parent_id IS ?
-      `).get(node.doc_id, previous.id).count);
+      `).get<CountRow>(node.doc_id, previous.id)?.count ?? 0);
 
-      const movingChildren = this.db.prepare(`
+      const movingChildren = this.conn.prepare(`
         SELECT id FROM nodes
         WHERE doc_id = ? AND parent_id IS ?
         ORDER BY sort_order, id
-      `).all(node.doc_id, node.id);
+      `).all<Pick<NodeRow, 'id'>>(node.doc_id, node.id);
 
       movingChildren.forEach((child, index) => {
-        this.db.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
+        this.conn.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
           .run(previous.id, previousChildCount + index + 1, child.id);
       });
 
-      this.db.prepare('UPDATE source_spans SET node_id = ? WHERE node_id = ?').run(previous.id, node.id);
+      this.conn.prepare('UPDATE source_spans SET node_id = ? WHERE node_id = ?').run(previous.id, node.id);
       // 被合并节点被摧毁 → 指向它的引用连带蒸发（孩子已搬走、其引用不动）。
-      this.db.prepare(`
+      this.conn.prepare(`
         DELETE FROM refs
         WHERE (source_type = 'node' AND source_id = ?)
            OR (target_type = 'node' AND target_id = ?)
       `).run(node.id, node.id);
-      this.db.prepare('DELETE FROM nodes WHERE id = ?').run(node.id);
+      this.conn.prepare('DELETE FROM nodes WHERE id = ?').run(node.id);
       this.normalizeSiblingOrder(node.doc_id, node.parent_id);
       this.normalizeSiblingOrder(node.doc_id, previous.id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id, previous.id]);
@@ -2190,9 +2450,9 @@ export class IftreeStore {
     return true;
   }
 
-  mergeNodeIntoTarget({ nodeId, targetNodeId }) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
-    const target = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(targetNodeId);
+  mergeNodeIntoTarget({ nodeId, targetNodeId }: NodeRefPayload & { targetNodeId?: unknown }) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
+    const target = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(targetNodeId);
     if (!node || !target) return false;
     if (node.parent_id === null) return false;
     if (node.id === target.id) return false;
@@ -2207,33 +2467,33 @@ export class IftreeStore {
       const mergedTitle = mergeNodeNotes(target.node_title, node.node_title);
       const mergedNote = mergeNodeNotes(target.node_note, node.node_note);
 
-      this.db.prepare('UPDATE nodes SET text = ?, node_title = ?, node_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      this.conn.prepare('UPDATE nodes SET text = ?, node_title = ?, node_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(mergedText, mergedTitle, mergedNote, target.id);
 
-      const targetChildCount = Number(this.db.prepare(`
+      const targetChildCount = Number(this.conn.prepare(`
         SELECT COUNT(*) AS count FROM nodes WHERE doc_id = ? AND parent_id IS ?
-      `).get(node.doc_id, target.id).count);
+      `).get<CountRow>(node.doc_id, target.id)?.count ?? 0);
 
-      const movingChildren = this.db.prepare(`
+      const movingChildren = this.conn.prepare(`
         SELECT id FROM nodes
         WHERE doc_id = ? AND parent_id IS ?
         ORDER BY sort_order, id
-      `).all(node.doc_id, node.id);
+      `).all<Pick<NodeRow, 'id'>>(node.doc_id, node.id);
 
       movingChildren.forEach((child, index) => {
-        this.db.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
+        this.conn.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
           .run(target.id, targetChildCount + index + 1, child.id);
       });
 
       const oldParentId = node.parent_id;
-      this.db.prepare('UPDATE source_spans SET node_id = ? WHERE node_id = ?').run(target.id, node.id);
+      this.conn.prepare('UPDATE source_spans SET node_id = ? WHERE node_id = ?').run(target.id, node.id);
       // 被合并节点被摧毁 → 指向它的引用连带蒸发（孩子已搬走、其引用不动）。
-      this.db.prepare(`
+      this.conn.prepare(`
         DELETE FROM refs
         WHERE (source_type = 'node' AND source_id = ?)
            OR (target_type = 'node' AND target_id = ?)
       `).run(node.id, node.id);
-      this.db.prepare('DELETE FROM nodes WHERE id = ?').run(node.id);
+      this.conn.prepare('DELETE FROM nodes WHERE id = ?').run(node.id);
       this.normalizeSiblingOrder(node.doc_id, oldParentId);
       this.normalizeSiblingOrder(node.doc_id, target.id);
       this.refreshAddressScopes(node.doc_id, [oldParentId, target.id]);
@@ -2243,21 +2503,21 @@ export class IftreeStore {
     return true;
   }
 
-  promoteNode(nodeId) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  promoteNode(nodeId: unknown) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
     if (!node || node.parent_id === null) return false;
 
-    const parent = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(node.parent_id);
+    const parent = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(node.parent_id);
     if (!parent || parent.parent_id === null) return false;
 
     this.withTransaction(() => {
-      this.db.prepare(`
+      this.conn.prepare(`
         UPDATE nodes
         SET sort_order = sort_order + 1
         WHERE doc_id = ? AND parent_id IS ? AND sort_order > ?
       `).run(node.doc_id, parent.parent_id, parent.sort_order);
 
-      this.db.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
+      this.conn.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
         .run(parent.parent_id, parent.sort_order + 1, node.id);
 
       this.normalizeSiblingOrder(node.doc_id, parent.id);
@@ -2269,22 +2529,22 @@ export class IftreeStore {
     return true;
   }
 
-  moveNodeToParent({ nodeId, newParentId }) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
-    const newParent = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(newParentId);
+  moveNodeToParent({ nodeId, newParentId }: NodeRefPayload & { newParentId?: unknown }) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
+    const newParent = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(newParentId);
     if (!node || !newParent) return false;
     if (node.parent_id === null) return false;
     if (node.id === newParent.id) return false;
     if (node.doc_id !== newParent.doc_id) return false;
     if (this.isDescendant(newParent.id, node.id)) return false;
 
-    const newOrder = Number(this.db.prepare(`
+    const newOrder = Number(this.conn.prepare(`
       SELECT COUNT(*) AS count FROM nodes WHERE doc_id = ? AND parent_id IS ?
-    `).get(node.doc_id, newParent.id).count) + 1;
+    `).get<CountRow>(node.doc_id, newParent.id)?.count ?? 0) + 1;
 
     this.withTransaction(() => {
       const oldParentId = node.parent_id;
-      this.db.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
+      this.conn.prepare('UPDATE nodes SET parent_id = ?, sort_order = ? WHERE id = ?')
         .run(newParent.id, newOrder, node.id);
       this.normalizeSiblingOrder(node.doc_id, oldParentId);
       this.normalizeSiblingOrder(node.doc_id, newParent.id);
@@ -2295,9 +2555,9 @@ export class IftreeStore {
     return true;
   }
 
-  moveNodeAfterSibling({ nodeId, targetNodeId }) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
-    const target = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(targetNodeId);
+  moveNodeAfterSibling({ nodeId, targetNodeId }: NodeRefPayload & { targetNodeId?: unknown }) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
+    const target = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(targetNodeId);
     if (!node || !target) return false;
     if (node.parent_id === null || target.parent_id === null) return false;
     if (node.id === target.id) return false;
@@ -2305,16 +2565,16 @@ export class IftreeStore {
     if (this.isDescendant(target.parent_id, node.id)) return false;
 
     this.withTransaction(() => {
-      const targetSiblings = this.db.prepare(`
+      const targetSiblings = this.conn.prepare(`
         SELECT id FROM nodes
         WHERE doc_id = ? AND parent_id IS ? AND id != ?
         ORDER BY sort_order, id
-      `).all(node.doc_id, target.parent_id, node.id).map((item) => item.id);
+      `).all<Pick<NodeRow, 'id'>>(node.doc_id, target.parent_id, node.id).map((item) => item.id);
 
       const targetIndex = targetSiblings.indexOf(target.id);
       targetSiblings.splice(targetIndex + 1, 0, node.id);
 
-      this.db.prepare('UPDATE nodes SET parent_id = ? WHERE id = ?').run(target.parent_id, node.id);
+      this.conn.prepare('UPDATE nodes SET parent_id = ? WHERE id = ?').run(target.parent_id, node.id);
       this.setSiblingOrder(node.doc_id, target.parent_id, targetSiblings);
       if (node.parent_id !== target.parent_id) this.normalizeSiblingOrder(node.doc_id, node.parent_id);
       this.refreshAddressScopes(node.doc_id, [node.parent_id, target.parent_id]);
@@ -2324,9 +2584,9 @@ export class IftreeStore {
     return true;
   }
 
-  moveNodeBeforeSibling({ nodeId, targetNodeId }) {
-    const node = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
-    const target = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(targetNodeId);
+  moveNodeBeforeSibling({ nodeId, targetNodeId }: NodeRefPayload & { targetNodeId?: unknown }) {
+    const node = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
+    const target = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(targetNodeId);
     if (!node || !target) return false;
     if (node.parent_id === null || target.parent_id === null) return false;
     if (node.id === target.id) return false;
@@ -2334,18 +2594,18 @@ export class IftreeStore {
     if (this.isDescendant(target.parent_id, node.id)) return false;
 
     this.withTransaction(() => {
-      const targetSiblings = this.db.prepare(`
+      const targetSiblings = this.conn.prepare(`
         SELECT id FROM nodes
         WHERE doc_id = ? AND parent_id IS ? AND id != ?
         ORDER BY sort_order, id
-      `).all(node.doc_id, target.parent_id, node.id).map((item) => item.id);
+      `).all<Pick<NodeRow, 'id'>>(node.doc_id, target.parent_id, node.id).map((item) => item.id);
 
       const targetIndex = targetSiblings.indexOf(target.id);
       if (targetIndex < 0) return;
       targetSiblings.splice(targetIndex, 0, node.id);
 
       const oldParentId = node.parent_id;
-      this.db.prepare('UPDATE nodes SET parent_id = ? WHERE id = ?').run(target.parent_id, node.id);
+      this.conn.prepare('UPDATE nodes SET parent_id = ? WHERE id = ?').run(target.parent_id, node.id);
       this.setSiblingOrder(node.doc_id, target.parent_id, targetSiblings);
       if (oldParentId !== target.parent_id) this.normalizeSiblingOrder(node.doc_id, oldParentId);
       this.refreshAddressScopes(node.doc_id, [oldParentId, target.parent_id]);
@@ -2355,19 +2615,19 @@ export class IftreeStore {
     return true;
   }
 
-  isDescendant(candidateId, ancestorId) {
-    let current = this.db.prepare('SELECT parent_id FROM nodes WHERE id = ?').get(candidateId);
+  isDescendant(candidateId: unknown, ancestorId: unknown) {
+    let current = this.conn.prepare('SELECT parent_id FROM nodes WHERE id = ?').get<Pick<NodeRow, 'parent_id'>>(candidateId);
     while (current?.parent_id !== null && current?.parent_id !== undefined) {
       if (current.parent_id === ancestorId) return true;
-      current = this.db.prepare('SELECT parent_id FROM nodes WHERE id = ?').get(current.parent_id);
+      current = this.conn.prepare('SELECT parent_id FROM nodes WHERE id = ?').get<Pick<NodeRow, 'parent_id'>>(current.parent_id);
     }
     return false;
   }
 
-  addAxiomRefToNode({ docId, nodeId, axiomId, note = null }) {
-    const target = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  addAxiomRefToNode({ docId, nodeId, axiomId, note = null }: NodeRefPayload & { axiomId?: unknown; note?: unknown }) {
+    const target = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(nodeId);
     if (!target) throw new Error(`Target node not found: ${nodeId}`);
-    const axiom = this.db.prepare('SELECT * FROM axioms WHERE id = ?').get(axiomId);
+    const axiom = this.conn.prepare('SELECT * FROM axioms WHERE id = ?').get<AxiomRow>(axiomId);
     if (!axiom) throw new Error(`Axiom not found: ${axiomId}`);
     if (!sameStableId(target.doc_id, docId) || !sameStableId(axiom.doc_id, docId)) {
       throw new Error('Axiom and node must belong to the same document');
@@ -2376,7 +2636,7 @@ export class IftreeStore {
       throw new Error('根节点天然引用全部事实前提，无需添加引用。');
     }
 
-    const existing = this.db.prepare(`
+    const existing = this.conn.prepare(`
       SELECT * FROM refs
       WHERE source_type = 'axiom'
         AND source_id = ?
@@ -2384,30 +2644,30 @@ export class IftreeStore {
         AND target_id = ?
         AND ref_kind = '事实前提'
       LIMIT 1
-    `).get(axiomId, nodeId);
+    `).get<RefRow>(axiomId, nodeId);
     if (existing) return existing;
 
     const refId = newStableId();
-    this.db.prepare(`
+    this.conn.prepare(`
       INSERT INTO refs (id, source_type, source_id, target_type, target_id, ref_kind, note)
       VALUES (?, 'axiom', ?, 'node', ?, '事实前提', ?)
     `).run(refId, axiomId, nodeId, normalizeNullableText(note));
 
     this.touchDoc(docId);
-    return this.db.prepare('SELECT * FROM refs WHERE id = ?').get(refId);
+    return this.conn.prepare('SELECT * FROM refs WHERE id = ?').get<RefRow>(refId);
   }
 
-  addNodeRefToNode({ docId, sourceNodeId, targetNodeId, refKind, note = null }) {
+  addNodeRefToNode({ docId, sourceNodeId, targetNodeId, refKind, note = null }: { docId?: unknown; sourceNodeId?: unknown; targetNodeId?: unknown; refKind?: unknown; note?: unknown }) {
     const kind = normalizeNullableText(refKind);
     if (!kind) throw new Error('ref.addNodeToNode requires refKind');
-    const source = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(sourceNodeId);
+    const source = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(sourceNodeId);
     if (!source) throw new Error(`Source node not found: ${sourceNodeId}`);
-    const target = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(targetNodeId);
+    const target = this.conn.prepare('SELECT * FROM nodes WHERE id = ?').get<NodeRow>(targetNodeId);
     if (!target) throw new Error(`Target node not found: ${targetNodeId}`);
     if (!sameStableId(source.doc_id, docId) || !sameStableId(target.doc_id, docId)) {
       throw new Error('Source node and target node must belong to the same document');
     }
-    const existing = this.db.prepare(`
+    const existing = this.conn.prepare(`
       SELECT * FROM refs
       WHERE source_type = 'node'
         AND source_id = ?
@@ -2415,56 +2675,59 @@ export class IftreeStore {
         AND target_id = ?
         AND ref_kind = ?
       LIMIT 1
-    `).get(sourceNodeId, targetNodeId, kind);
+    `).get<RefRow>(sourceNodeId, targetNodeId, kind);
     if (existing) return existing;
 
     const refId = newStableId();
-    this.db.prepare(`
+    this.conn.prepare(`
       INSERT INTO refs (id, source_type, source_id, target_type, target_id, ref_kind, note)
       VALUES (?, 'node', ?, 'node', ?, ?, ?)
     `).run(refId, sourceNodeId, targetNodeId, kind, normalizeNullableText(note));
 
     this.touchDoc(docId);
-    return this.db.prepare('SELECT * FROM refs WHERE id = ?').get(refId);
+    return this.conn.prepare('SELECT * FROM refs WHERE id = ?').get<RefRow>(refId);
   }
 
-  deleteRef(refId) {
-    const ref = this.db.prepare('SELECT * FROM refs WHERE id = ?').get(refId);
+  deleteRef(refId: unknown) {
+    const ref = this.conn.prepare('SELECT * FROM refs WHERE id = ?').get<RefRow>(refId);
     if (!ref) return false;
 
     let docId = null;
     if (ref.source_type === 'node') {
-      docId = this.db.prepare('SELECT doc_id FROM nodes WHERE id = ?').get(ref.source_id)?.doc_id ?? null;
+      docId = this.conn.prepare('SELECT doc_id FROM nodes WHERE id = ?').get<Pick<NodeRow, 'doc_id'>>(ref.source_id)?.doc_id ?? null;
     }
     if (docId === null && ref.target_type === 'node') {
-      docId = this.db.prepare('SELECT doc_id FROM nodes WHERE id = ?').get(ref.target_id)?.doc_id ?? null;
+      docId = this.conn.prepare('SELECT doc_id FROM nodes WHERE id = ?').get<Pick<NodeRow, 'doc_id'>>(ref.target_id)?.doc_id ?? null;
     }
 
-    this.db.prepare('DELETE FROM refs WHERE id = ?').run(refId);
+    this.conn.prepare('DELETE FROM refs WHERE id = ?').run(refId);
     if (docId !== null) this.touchDoc(docId);
     return true;
   }
 
-  exportDocMarkdown(docId) {
+  // 未启用（待重新设计）：经 doc.exportMarkdown 入口已停用——渲染有「地址当标题 / 混入 node_note」等
+  // 功能错误，导出应写文件而非返回命令行，幂等与 import/export 对称设计未定（详见 NOW.md）。实现暂留作重做
+  // 参考，当前无入口可达；重做时连同 core.renderDocMarkdown 一并设计。
+  exportDocMarkdown(docId: unknown) {
     const normalizedDocId = requireStableId(docId, 'export docId');
-    const doc = this.db.prepare('SELECT * FROM docs WHERE id = ?').get(normalizedDocId);
+    const doc = this.conn.prepare('SELECT * FROM docs WHERE id = ?').get<DocRow>(normalizedDocId);
     if (!doc) throw new Error(`Document not found: ${normalizedDocId}`);
-    const rows = this.db.prepare(`
+    const rows = this.conn.prepare(`
       SELECT *
       FROM nodes
       WHERE doc_id = ?
       ORDER BY depth, address, sort_order, id
-    `).all(normalizedDocId).sort(compareNodeAddress);
+    `).all<NodeRow>(normalizedDocId).sort(compareNodeAddress);
     // 渲染下沉 core/markdown-export.mjs（与导入侧 core/tree.mjs 对称）；store 只负责查库 + 地址排序。
-    return renderDocMarkdown(doc, rows);
+    return renderDocMarkdown(doc, rows as Array<NodeRow & RowObject>);
   }
 
   // 历史读：列文档历史 / 节点级历史。祖先链查询与子树成员辅助是 history 模块内部实现、门面不暴露。
-  listHistory(docId) {
-    return history.listHistory(this, docId);
+  listHistory(docId: unknown) {
+    return history.listHistory(this, docId as string);
   }
 
-  nodeHistory(docId, address, options) {
+  nodeHistory(docId: unknown, address: unknown, options: RowObject = {}) {
     return history.nodeHistory(this, docId, address, options);
   }
 
@@ -2473,17 +2736,18 @@ export class IftreeStore {
   // entries（edit-branch 提交的 operation 级条目）也内联进 meta：它是快照重建不出的操作序列，
   //   cherry-pick 重放、单 ref history.diff 展示都要它；体积按改动数（O(改动) 非 O(文档)）。
   // 不再存整篇 snapshot + 冗余 field-diff（新行那两列留空默认值，迁移脚本最终删列）。
-  /** @param {{ docId?: any, summary?: any, snapshot?: any, entries?: any, committedAt?: any, author?: any }} arg */
-  createCommit({ docId, summary = null, snapshot = {}, entries = null, committedAt = null, author = null }) {
+  /** @param {{ docId?: unknown, summary?: unknown, snapshot?: unknown, entries?: unknown, committedAt?: unknown, author?: unknown }} arg */
+  createCommit({ docId, summary = null, snapshot = {}, entries = null, committedAt = null, author = null }: CommitPayload) {
     const normalizedDocId = requireStableId(docId, 'commit docId');
-    const head = this.db.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get(normalizedDocId);
+    const head = this.conn.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?')
+      .get<Pick<CommitRow, 'parent_commit_id'> & { head_commit_id: string | null }>(normalizedDocId);
     const commitId = newStableId();
 
-    const tree = writeCommitTree(this.db, snapshot.nodes || []);
-    const sourceHash = writeSource(this.db, snapshot.sourceDocument?.raw_markdown);
+    const tree = writeCommitTree(this.conn, (snapshot.nodes || []) as MerkleNode[]);
+    const sourceHash = writeSource(this.conn, snapshot.sourceDocument?.raw_markdown);
     const meta = buildCommitMeta(snapshot, entries);
 
-    this.db.prepare(`
+    this.conn.prepare(`
       INSERT INTO commits (id, doc_id, parent_commit_id, committed_at, summary, author, root_node_id, root_tree_hash, source_hash, meta)
       VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?)
     `).run(
@@ -2498,29 +2762,29 @@ export class IftreeStore {
       sourceHash,
       JSON.stringify(meta)
     );
-    this.db.prepare(`
+    this.conn.prepare(`
       INSERT INTO doc_heads (doc_id, head_commit_id, updated_at)
       VALUES (?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(doc_id) DO UPDATE SET
         head_commit_id = excluded.head_commit_id,
         updated_at = CURRENT_TIMESTAMP
     `).run(normalizedDocId, commitId);
-    return this.db.prepare('SELECT * FROM commits WHERE id = ?').get(commitId);
+    return this.conn.prepare('SELECT * FROM commits WHERE id = ?').get<CommitRow>(commitId);
   }
 
   // 从 commit 行重建完整快照 {doc, nodes, axioms, refs, sourceDocument}（所有读历史路径的唯一重建口）。
   // 节点树 + raw_markdown 从对象库展开（materializeTree 顺带算 address/depth）、doc/axioms/refs 从内联 meta 取。
   // 未迁移旧行（无 root_tree_hash 但有 snapshot/diff 列）回退读旧形态——迁移删列后该兜底自动失效。
-  commitSnapshotFromRow(row) {
+  commitSnapshotFromRow(row: CommitSnapshotRow | null | undefined) {
     if (!row) return null;
     if (!row.root_tree_hash) {
       const legacy = this._legacyCommitSnapshot(row);
       return legacy?.nodes ? legacy : null;
     }
-    const nodes = materializeTree(this.db, row.root_tree_hash, row.root_node_id);
+    const nodes = materializeTree(this.conn, row.root_tree_hash, row.root_node_id);
     const meta = parseJsonObject(row.meta) || {};
     const sourceMeta = meta.sourceDocument || null;
-    const rawMarkdown = readSource(this.db, row.source_hash);
+    const rawMarkdown = readSource(this.conn, row.source_hash);
     return {
       doc: meta.doc ?? null,
       nodes,
@@ -2532,7 +2796,8 @@ export class IftreeStore {
     };
   }
 
-  _legacyCommitSnapshot(row) {
+  _legacyCommitSnapshot(row: CommitSnapshotRow | null | undefined) {
+    if (!row) return null;
     try {
       const snap = JSON.parse(row.snapshot || 'null');
       if (snap?.nodes) return snap;
@@ -2545,8 +2810,8 @@ export class IftreeStore {
     return null;
   }
 
-  commitSnapshot(commitId) {
-    const row = this.db.prepare('SELECT * FROM commits WHERE id = ?').get(commitId);
+  commitSnapshot(commitId: unknown) {
+    const row = this.conn.prepare('SELECT * FROM commits WHERE id = ?').get<CommitSnapshotRow>(commitId);
     return this.commitSnapshotFromRow(row);
   }
 
@@ -2554,51 +2819,49 @@ export class IftreeStore {
     return history.gcHistoryObjects(this);
   }
 
-  saveHistorySnapshot(args) {
+  saveHistorySnapshot(args: SaveHistorySnapshotPayload) {
     return history.saveHistorySnapshot(this, args);
   }
 
-  /** @param {{ docId?: any, nodeId?: any, address?: any, scope?: string, trust?: string, owner?: string }} [args] */
-  certifyNodes(args) {
+  certifyNodes(args: CertifyNodesPayload) {
     return history.certifyNodes(this, args);
   }
 
-  computeDiff(prevSnapshot, currentSnapshot) {
+  computeDiff(prevSnapshot: SnapshotPayload, currentSnapshot: SnapshotPayload) {
     return computeSnapshotDiff(prevSnapshot, currentSnapshot);
   }
 
-  restoreCommit(commitId) {
+  restoreCommit(commitId: unknown) {
     return history.restoreCommit(this, commitId);
   }
 
-  /** @param {{ commitId?: any, owner?: string, summary?: any }} [args] */
-  revertCommit(args) {
+  revertCommit(args: RevertCommitPayload) {
     return history.revertCommit(this, args);
   }
 
-  updateDocAxiomsCollapsed(docId, collapsed) {
+  updateDocAxiomsCollapsed(docId: unknown, collapsed: unknown) {
     const value = collapsed ? 1 : 0;
-    this.db.prepare('UPDATE docs SET axioms_collapsed = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    this.conn.prepare('UPDATE docs SET axioms_collapsed = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run(value, docId);
-    return this.db.prepare('SELECT * FROM docs WHERE id = ?').get(docId);
+    return this.conn.prepare('SELECT * FROM docs WHERE id = ?').get<DocRow>(docId);
   }
 
-  updateDocTreeViewState(docId, state) {
+  updateDocTreeViewState(docId: unknown, state: unknown) {
     const value = normalizeTreeViewState(state);
-    this.db.prepare('UPDATE docs SET tree_view_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    this.conn.prepare('UPDATE docs SET tree_view_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run(value, docId);
-    return this.db.prepare('SELECT * FROM docs WHERE id = ?').get(docId);
+    return this.conn.prepare('SELECT * FROM docs WHERE id = ?').get<DocRow>(docId);
   }
 
-  addAxiom({ docId, content, status = 'pending', nodeTitle = '', nodeNote = '', nodeWidth = null, nodeHeight = null, nodeSizeMode = 'auto' }) {
+  addAxiom({ docId, content, status = 'pending', nodeTitle = '', nodeNote = '', nodeWidth = null, nodeHeight = null, nodeSizeMode = 'auto' }: RowObject) {
     return this.withTransaction(() => {
-      const next = this.db.prepare(`
+      const next = this.conn.prepare(`
         SELECT COALESCE(MAX(
           CASE WHEN label GLOB 'A[0-9]*' THEN CAST(substr(label, 2) AS INTEGER) ELSE 0 END
         ), 0) + 1 AS next_label
         FROM axioms
         WHERE doc_id = ?
-      `).get(docId);
+      `).get<{ next_label: number }>(docId);
       const label = `A${Number(next?.next_label || 1)}`;
       const width = normalizePositiveNumber(nodeWidth);
       const height = normalizePositiveNumber(nodeHeight);
@@ -2609,7 +2872,7 @@ export class IftreeStore {
         sizeMode = width !== null && height !== null ? 'manual' : 'auto';
       }
       const axiomId = newStableId();
-      this.db.prepare(`
+      this.conn.prepare(`
         INSERT INTO axioms (id, doc_id, label, content, status, node_title, node_note, node_width, node_height, node_size_mode)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -2625,31 +2888,31 @@ export class IftreeStore {
         sizeMode
       );
       this.touchDoc(docId);
-      return this.db.prepare('SELECT * FROM axioms WHERE id = ?').get(axiomId);
+      return this.conn.prepare('SELECT * FROM axioms WHERE id = ?').get<AxiomRow>(axiomId);
     });
   }
 
-  listAxioms(docId) {
-    return this.db.prepare(`
+  listAxioms(docId: unknown) {
+    return this.conn.prepare(`
       SELECT * FROM axioms
       WHERE doc_id = ?
       ORDER BY ${AXIOM_ORDER_SQL}
-    `).all(docId);
+    `).all<AxiomRow>(docId);
   }
 
-  deleteAxiom(axiomId) {
-    const axiom = this.db.prepare('SELECT * FROM axioms WHERE id = ?').get(axiomId);
+  deleteAxiom(axiomId: unknown) {
+    const axiom = this.conn.prepare('SELECT * FROM axioms WHERE id = ?').get<AxiomRow>(axiomId);
     if (!axiom) return false;
     this.withTransaction(() => {
-      this.db.prepare("DELETE FROM refs WHERE source_type = 'axiom' AND source_id = ?").run(axiomId);
-      this.db.prepare('DELETE FROM axioms WHERE id = ?').run(axiomId);
+      this.conn.prepare("DELETE FROM refs WHERE source_type = 'axiom' AND source_id = ?").run(axiomId);
+      this.conn.prepare('DELETE FROM axioms WHERE id = ?').run(axiomId);
       this.touchDoc(axiom.doc_id);
     });
     return true;
   }
 
-  updateAxiom(axiomId, patch) {
-    const current = this.db.prepare('SELECT * FROM axioms WHERE id = ?').get(axiomId);
+  updateAxiom(axiomId: unknown, patch: RowObject) {
+    const current = this.conn.prepare('SELECT * FROM axioms WHERE id = ?').get<AxiomRow>(axiomId);
     if (!current) throw new Error(`Axiom not found: ${axiomId}`);
     const hasWidthPatch = hasPatchValue(patch, 'node_width', 'nodeWidth');
     const hasHeightPatch = hasPatchValue(patch, 'node_height', 'nodeHeight');
@@ -2666,7 +2929,7 @@ export class IftreeStore {
       nodeWidth = null;
       nodeHeight = null;
     }
-    this.db.prepare(`
+    this.conn.prepare(`
       UPDATE axioms
       SET content = ?, status = ?, node_title = ?, node_note = ?, node_width = ?, node_height = ?, node_size_mode = ?
       WHERE id = ?
@@ -2681,10 +2944,10 @@ export class IftreeStore {
       axiomId
     );
     this.touchDoc(current.doc_id);
-    return this.db.prepare('SELECT * FROM axioms WHERE id = ?').get(axiomId);
+    return this.conn.prepare('SELECT * FROM axioms WHERE id = ?').get<AxiomRow>(axiomId);
   }
 
-  moveAxiom({ docId, axiomId, direction }) {
+  moveAxiom({ docId, axiomId, direction }: { docId?: unknown; axiomId?: unknown; direction?: unknown }) {
     const axioms = this.listAxioms(docId);
     const index = axioms.findIndex((axiom) => sameStableId(axiom.id, axiomId));
     if (index < 0) throw new Error(`Axiom not found: ${axiomId}`);
@@ -2693,20 +2956,20 @@ export class IftreeStore {
     const current = axioms[index];
     const target = axioms[targetIndex];
     this.withTransaction(() => {
-      this.db.prepare('UPDATE axioms SET label = ? WHERE id = ?').run(target.label, current.id);
-      this.db.prepare('UPDATE axioms SET label = ? WHERE id = ?').run(current.label, target.id);
+      this.conn.prepare('UPDATE axioms SET label = ? WHERE id = ?').run(target.label, current.id);
+      this.conn.prepare('UPDATE axioms SET label = ? WHERE id = ?').run(current.label, target.id);
       this.touchDoc(docId);
     });
     return true;
   }
 
-  getDocFolder(folderId) {
+  getDocFolder(folderId: unknown) {
     const id = Number(folderId);
     if (!Number.isInteger(id) || id <= 0) return null;
-    return this.db.prepare('SELECT * FROM doc_folders WHERE id = ?').get(id) || null;
+    return this.conn.prepare('SELECT * FROM doc_folders WHERE id = ?').get<DocFolderRow>(id) || null;
   }
 
-  normalizeFolderId(folderId) {
+  normalizeFolderId(folderId: unknown) {
     if (folderId === null || folderId === undefined || folderId === '') return null;
     const id = Number(folderId);
     if (!Number.isInteger(id) || id <= 0) throw new Error(`Invalid document folder id: ${folderId}`);
@@ -2715,25 +2978,25 @@ export class IftreeStore {
     return folder.id;
   }
 
-  nextFolderSortOrder(parentId) {
-    const result = this.db.prepare(`
+  nextFolderSortOrder(parentId: unknown) {
+    const result = this.conn.prepare(`
       SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order
       FROM doc_folders
       WHERE parent_id IS ?
-    `).get(parentId);
+    `).get<{ next_order: number }>(parentId);
     return Number(result?.next_order || 1);
   }
 
-  nextDocSortOrder(folderId) {
-    const result = this.db.prepare(`
+  nextDocSortOrder(folderId: unknown) {
+    const result = this.conn.prepare(`
       SELECT COALESCE(MAX(doc_sort_order), 0) + 1 AS next_order
       FROM docs
       WHERE folder_id IS ?
-    `).get(folderId);
+    `).get<{ next_order: number }>(folderId);
     return Number(result?.next_order || 1);
   }
 
-  isDocFolderDescendant(folderId, ancestorId) {
+  isDocFolderDescendant(folderId: unknown, ancestorId: unknown) {
     let current = this.getDocFolder(folderId);
     while (current) {
       if (current.parent_id === ancestorId) return true;
@@ -2742,21 +3005,21 @@ export class IftreeStore {
     return false;
   }
 
-  normalizeSiblingOrder(docId, parentId) {
-    const siblings = this.db.prepare(`
+  normalizeSiblingOrder(docId: unknown, parentId: unknown) {
+    const siblings = this.conn.prepare(`
       SELECT id FROM nodes
       WHERE doc_id = ? AND parent_id IS ?
       ORDER BY sort_order, id
-    `).all(docId, parentId);
+    `).all<Pick<NodeRow, 'id'>>(docId, parentId);
 
     siblings.forEach((sibling, index) => {
-      this.db.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(index + 1, sibling.id);
+      this.conn.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?').run(index + 1, sibling.id);
     });
   }
 
-  setSiblingOrder(docId, parentId, orderedIds) {
+  setSiblingOrder(docId: unknown, parentId: unknown, orderedIds: unknown[]) {
     orderedIds.forEach((id, index) => {
-      this.db.prepare(`
+      this.conn.prepare(`
         UPDATE nodes
         SET parent_id = ?, sort_order = ?
         WHERE doc_id = ? AND id = ?
@@ -2764,50 +3027,51 @@ export class IftreeStore {
     });
   }
 
-  touchDoc(docId) {
-    this.db.prepare('UPDATE docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(docId);
+  touchDoc(docId: unknown) {
+    this.conn.prepare('UPDATE docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(docId);
   }
 
-  createSnapshot(docId) {
-    const doc = this.db.prepare('SELECT id, meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?').get(docId) || null;
-    const sourceDocument = this.db.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(docId) || null;
-    const nodes = this.db.prepare('SELECT * FROM nodes WHERE doc_id = ? ORDER BY id').all(docId);
+  createSnapshot(docId: unknown) {
+    const doc = this.conn.prepare('SELECT id, meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?')
+      .get<Pick<DocRow, 'id' | 'meta' | 'axioms_collapsed' | 'tree_view_state'>>(docId) || null;
+    const sourceDocument = this.conn.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get<SourceDocumentRow>(docId) || null;
+    const nodes = this.conn.prepare('SELECT * FROM nodes WHERE doc_id = ? ORDER BY id').all<NodeRow>(docId);
     const refs = nodes.length === 0
       ? []
-      : this.db.prepare(`
+      : this.conn.prepare(`
         SELECT * FROM refs
         WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
            OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
         ORDER BY id
-      `).all(docId, docId);
+      `).all<RefRow>(docId, docId);
 
     return {
       doc,
-      nodes,
-      axioms: this.listAxioms(docId),
-      refs,
+      nodes: nodes as unknown as SnapshotPayload['nodes'],
+      axioms: this.listAxioms(docId) as unknown as SnapshotPayload['axioms'],
+      refs: refs as unknown as SnapshotPayload['refs'],
       sourceDocument
     };
   }
 
-  assertRestorableSnapshot(snapshot) {
+  assertRestorableSnapshot(snapshot: SnapshotPayload | null | undefined) {
     return assertRestorableSnapshotPayload(snapshot);
   }
 
   // 编辑器易失令牌实现见 ./editor-snapshot-tokens.mjs；此处保留 store 门面方法转调（实例持进程内表）。
-  createEditorSnapshotToken(docId) {
+  createEditorSnapshotToken(docId: unknown) {
     return this.editorSnapshots.create(docId);
   }
 
-  restoreEditorSnapshotToken(args) {
+  restoreEditorSnapshotToken(args: RestoreEditorSnapshotTokenArgs) {
     return this.editorSnapshots.restore(args);
   }
 
-  discardEditorSnapshotTokens(tokenIds = []) {
+  discardEditorSnapshotTokens(tokenIds: unknown[] = []) {
     return this.editorSnapshots.discard(tokenIds);
   }
 
-  restoreSnapshot(docId, snapshot) {
+  restoreSnapshot(docId: unknown, snapshot: SnapshotPayload) {
     const snapshotNodes = this.assertRestorableSnapshot(snapshot);
     this.withTransaction(() => {
       if (snapshot.doc) {
@@ -2815,8 +3079,13 @@ export class IftreeStore {
         const hasAxiomsCollapsed = Object.prototype.hasOwnProperty.call(snapshot.doc, 'axioms_collapsed');
         const hasTreeViewState = Object.prototype.hasOwnProperty.call(snapshot.doc, 'tree_view_state');
         if (hasMeta || hasAxiomsCollapsed || hasTreeViewState) {
-          const current = this.db.prepare('SELECT meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?').get(docId) || {};
-          this.db.prepare('UPDATE docs SET meta = ?, axioms_collapsed = ?, tree_view_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          const current = this.conn.prepare('SELECT meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?')
+            .get<Pick<DocRow, 'meta' | 'axioms_collapsed' | 'tree_view_state'>>(docId) ?? {
+              meta: null,
+              axioms_collapsed: 0,
+              tree_view_state: '{}'
+            };
+          this.conn.prepare('UPDATE docs SET meta = ?, axioms_collapsed = ?, tree_view_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
             .run(
               hasMeta ? (snapshot.doc.meta || null) : current.meta,
               hasAxiomsCollapsed ? (snapshot.doc.axioms_collapsed ? 1 : 0) : (current.axioms_collapsed ? 1 : 0),
@@ -2826,9 +3095,9 @@ export class IftreeStore {
         }
       }
       if (Object.prototype.hasOwnProperty.call(snapshot, 'sourceDocument')) {
-        this.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
+        this.conn.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
         if (snapshot.sourceDocument) {
-          this.db.prepare(`
+          this.conn.prepare(`
             INSERT INTO source_documents (doc_id, source_type, original_path, raw_markdown, created_at)
             VALUES (?, ?, ?, ?, ?)
           `).run(
@@ -2840,28 +3109,28 @@ export class IftreeStore {
           );
         }
       }
-      const sourceSpanLinks = this.db.prepare(`
+      const sourceSpanLinks = this.conn.prepare(`
         SELECT id, node_id FROM source_spans
         WHERE doc_id = ? AND node_id IS NOT NULL
-      `).all(docId);
+      `).all<Pick<SourceSpanRow, 'id' | 'node_id'>>(docId);
       const snapshotNodeIds = new Set(snapshotNodes.map((node) => node.id));
 
-      this.db.prepare(`
+      this.conn.prepare(`
         DELETE FROM refs
         WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
            OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
       `).run(docId, docId);
 
-      this.db.prepare('DELETE FROM axioms WHERE doc_id = ?').run(docId);
-      this.db.prepare('DELETE FROM nodes WHERE doc_id = ?').run(docId);
+      this.conn.prepare('DELETE FROM axioms WHERE doc_id = ?').run(docId);
+      this.conn.prepare('DELETE FROM nodes WHERE doc_id = ?').run(docId);
 
       this.insertSnapshotNodes(snapshotNodes, docId);
-      const restoreSourceSpan = this.db.prepare('UPDATE source_spans SET node_id = ? WHERE id = ?');
+      const restoreSourceSpan = this.conn.prepare('UPDATE source_spans SET node_id = ? WHERE id = ?');
       for (const link of sourceSpanLinks) {
         if (snapshotNodeIds.has(link.node_id)) restoreSourceSpan.run(link.node_id, link.id);
       }
 
-      const insertAxiom = this.db.prepare(`
+      const insertAxiom = this.conn.prepare(`
         INSERT INTO axioms (id, doc_id, label, content, status, node_title, node_note, node_width, node_height, node_size_mode)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
@@ -2885,7 +3154,7 @@ export class IftreeStore {
         );
       }
 
-      const insertRef = this.db.prepare(`
+      const insertRef = this.conn.prepare(`
         INSERT INTO refs (id, source_type, source_id, target_type, target_id, ref_kind, note)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
@@ -2901,16 +3170,16 @@ export class IftreeStore {
 
   // docId 由调用方（restore）显式传：对象库重建出的节点不带 doc_id（内容寻址 doc 无关），用目标 doc 盖上。
   // created_at/updated_at 同理不入对象库（非内容）；缺失时取当下，旧形态快照带了就保留。
-  insertSnapshotNodes(nodes, docId = null) {
+  insertSnapshotNodes(nodes: SnapshotRow[], docId: unknown = null) {
     const nowIso = new Date().toISOString();
-    const insertNode = this.db.prepare(`
+    const insertNode = this.conn.prepare(`
       INSERT INTO nodes (
         id, doc_id, parent_id, sort_order, node_type, text, node_title, node_note, source_position,
         trust_level, created_at, updated_at
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const runInsert = (node) => insertNode.run(
+    const runInsert = (node: SnapshotRow) => insertNode.run(
       node.id,
       docId ?? node.doc_id,
       node.parent_id,
@@ -2927,8 +3196,8 @@ export class IftreeStore {
 
     // 拓扑插入（Kahn/BFS）：父必先于子（FK 要求），从根按邻接表下行，一次过 O(N)。
     // 替换原「每轮倒序扫剩余数组找『父已插入』者 + splice」的 O(N²)——深父子链每轮只插一个节点。
-    const childrenByParent = new Map();
-    const roots = [];
+    const childrenByParent = new Map<string, SnapshotRow[]>();
+    const roots: SnapshotRow[] = [];
     for (const node of nodes) {
       if (node.parent_id === null || node.parent_id === undefined) {
         roots.push(node);
@@ -2936,7 +3205,7 @@ export class IftreeStore {
       }
       const key = String(node.parent_id);
       if (!childrenByParent.has(key)) childrenByParent.set(key, []);
-      childrenByParent.get(key).push(node);
+      childrenByParent.get(key)!.push(node);
     }
 
     const queue = [...roots];
@@ -2952,17 +3221,17 @@ export class IftreeStore {
     if (head !== nodes.length) throw new Error('Snapshot contains unresolved node parents');
   }
 
-  withTransaction(fn) {
+  withTransaction<T>(fn: () => T): T {
     if (this.inTransaction) return fn();
 
     this.inTransaction = true;
-    this.db.exec('BEGIN IMMEDIATE');
+    this.conn.exec('BEGIN IMMEDIATE');
     try {
       const result = fn();
-      this.db.exec('COMMIT');
+      this.conn.exec('COMMIT');
       return result;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      this.conn.exec('ROLLBACK');
       throw error;
     } finally {
       this.inTransaction = false;

@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   PanelLeftClose,
   PanelLeftOpen,
@@ -6,8 +5,9 @@ import {
   PanelRightOpen,
   Settings
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 
+import type { DocRow, EditBranchRow } from '../backend/db/schema.js';
 import { buildNodeSentenceLabelMap } from '../core/source-ranges.js';
 import { findNode, flattenTree } from '../core/tree.js';
 
@@ -28,7 +28,8 @@ import {
   pushCapped,
   editBranchUndoEntries as hsEditBranchUndoEntries,
   editBranchRedoEntries as hsEditBranchRedoEntries,
-  snapshotTokenIds
+  snapshotTokenIds,
+  type EditBranchEntry
 } from './session/history-stack.js';
 import { debugLog, debugPerfBegin, debugPerfEnd } from './lib/debug-log.js';
 import { debugElementTarget, debugShouldLogKey } from './features/debug/ui-debug-actions.js';
@@ -45,7 +46,7 @@ import { SettingsView } from './components/SettingsView.jsx';
 import { ProgressOverlay } from './components/ProgressOverlay.jsx';
 import { OutlinePanel } from './components/OutlinePanel.jsx';
 import { WorkspaceHeader } from './components/WorkspaceHeader.jsx';
-import { EditBranchDiffDialog } from './components/EditBranchDiffDialog.jsx';
+import { EditBranchDiffDialog, type EditBranchDiffViewModel } from './components/EditBranchDiffDialog.jsx';
 import { MergeConflictDialog } from './components/MergeConflictDialog.jsx';
 import { DocBrowser } from './components/DocBrowser.jsx';
 import { useAppUIContext } from './hooks/useAppUI.js';
@@ -75,8 +76,86 @@ import {
   vectorService
 } from './data/repositories.js';
 
-function c2dAxiomPatch(patch: any = {}) {
-  const nextPatch: any = {};
+// AppBody 内的 A 类（自身 utility / handler / state / useRef）类型收紧专用本地接口。
+// 沿数据流上游（hook 子集接口对齐 docState 真返回）在第 18 刀。
+type AppBodyAxiomPatchIn = Record<string, unknown>;
+type AppBodyAxiomPatchOut = Record<string, unknown>;
+type UnknownStack = unknown[];
+type UnknownStackUpdater = UnknownStack | ((prev: UnknownStack) => UnknownStack);
+type DebugContextLog = Record<string, unknown>;
+type LastUiAction = { event: string; [extra: string]: unknown } | null;
+
+// D 类（IPC 边界返回值字段散落访问 `{}` 报 TS2339）：在顶部定一组 IPC 投影 interface，使用点单点 cast。
+// 这些接口字段全 optional——IPC 边界形态、上游真签名（documentRepository / agentRepository）这一刀不动。
+interface AppBodyBeginEditBranchResult {
+  baseDocId?: unknown;
+  branch?: EditBranchRow | null;
+  [extra: string]: unknown;
+}
+
+interface AppBodyApplyMergeResult {
+  applied?: unknown;
+  baseDocId?: unknown;
+  changed?: unknown;
+  [extra: string]: unknown;
+}
+
+interface AppBodyPendingBranchRow {
+  base_doc_id?: unknown;
+  shadow_doc_id?: unknown;
+  [extra: string]: unknown;
+}
+
+interface AppBodyPendingBranchesResult {
+  branches?: AppBodyPendingBranchRow[];
+  [extra: string]: unknown;
+}
+
+interface AppBodyOpenedDoc {
+  doc?: { id?: unknown; node_count?: unknown; [extra: string]: unknown } | null;
+  tree?: { id?: unknown; [extra: string]: unknown } | null;
+  editBranch?: EditBranchRow | null;
+  sourceWindow?: { anchorNodeId?: unknown; [extra: string]: unknown } | null;
+  [extra: string]: unknown;
+}
+
+interface AppBodyAddAxiomResult {
+  axiom?: { id?: unknown; [extra: string]: unknown } | null;
+  [extra: string]: unknown;
+}
+
+interface AppBodyCaptureToken {
+  token?: { id?: unknown; docId?: unknown; [extra: string]: unknown } | null;
+  [extra: string]: unknown;
+}
+
+interface AppBodyAgentRequestResult {
+  usage?: unknown;
+  answer?: string;
+  diffs?: unknown[];
+  toolEvents?: unknown[];
+  segments?: unknown[];
+  canceled?: boolean;
+  changedDocIds?: unknown[];
+  sessionId?: unknown;
+  [extra: string]: unknown;
+}
+
+interface AppBodyApplyDiffResult {
+  ok?: unknown;
+  diffs?: unknown[];
+  docId?: unknown;
+  editBranch?: unknown;
+  [extra: string]: unknown;
+}
+
+interface AppBodyRejectDiffResult {
+  diffs?: unknown[];
+  [extra: string]: unknown;
+}
+
+function c2dAxiomPatch(patch: AppBodyAxiomPatchIn = {}): AppBodyAxiomPatchOut {
+  const nextPatch: AppBodyAxiomPatchOut = {};
   if (Object.prototype.hasOwnProperty.call(patch, 'text')) nextPatch.content = patch.text;
   if (Object.prototype.hasOwnProperty.call(patch, 'node_title')) nextPatch.node_title = patch.node_title;
   if (Object.prototype.hasOwnProperty.call(patch, 'node_note')) nextPatch.node_note = patch.node_note;
@@ -124,7 +203,7 @@ export function AppBody() {
   const treeEditMode = Boolean(currentDoc?.editBranch);
 
   // 统一忙碌锁：包住一次异步操作，开始置忙、结束复位，免去每处手写 setBusy + try/finally。
-  const withBusy = useCallback(async (fn) => {
+  const withBusy = useCallback(async (fn: () => Promise<unknown> | unknown): Promise<unknown> => {
     setBusy(true);
     try {
       return await fn();
@@ -132,20 +211,22 @@ export function AppBody() {
       setBusy(false);
     }
   }, [setBusy]);
-  const undoStackRef = useRef(undoStack);
-  const redoStackRef = useRef(redoStack);
-  const debugContextRef = useRef({});
-  const lastUiActionRef = useRef(null);
-  const previousActiveTabRef = useRef(activeTab);
+  // useEditorOps 的 undo/redoStack 现 narrow 成 never[]（第 18 刀会对齐 hook 真返回）；
+  // 这里 useRef 给显式 UnknownStack 泛型，setter 调用处用 Parameters 边界 cast 适配。
+  const undoStackRef = useRef<UnknownStack>(undoStack);
+  const redoStackRef = useRef<UnknownStack>(redoStack);
+  const debugContextRef = useRef<DebugContextLog>({});
+  const lastUiActionRef = useRef<LastUiAction>(null);
+  const previousActiveTabRef = useRef<typeof activeTab>(activeTab);
 
-  const updateUndoStack = useCallback((update) => {
+  const updateUndoStack = useCallback((update: UnknownStackUpdater) => {
     const next = typeof update === 'function' ? update(undoStackRef.current) : update;
     undoStackRef.current = Array.isArray(next) ? next : [];
     setUndoStackState(undoStackRef.current);
     return undoStackRef.current;
   }, [setUndoStackState]);
 
-  const updateRedoStack = useCallback((update) => {
+  const updateRedoStack = useCallback((update: UnknownStackUpdater) => {
     const next = typeof update === 'function' ? update(redoStackRef.current) : update;
     redoStackRef.current = Array.isArray(next) ? next : [];
     setRedoStackState(redoStackRef.current);
@@ -192,9 +273,9 @@ export function AppBody() {
     loadSession: loadAgentSession,
     deleteSession: deleteAgentSession
   } = agentChat;
-  const activeAgentRequestIdRef = useRef(null);
+  const activeAgentRequestIdRef = useRef<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState([]);
+  const [searchResults, setSearchResults] = useState<unknown[]>([]);
   const {
     entityQuery, setEntityQuery, entityRows, selectedEntity, entityDetail,
     entityNodeQuery, entityNodeMatchMode, entityNodeResults, entityNodeGroups, entityNodePage,
@@ -233,12 +314,10 @@ export function AppBody() {
     multiSelectedNodeIds,
     llmSummarySettings,
     setDocs,
-    dispatch: runWrite,
-    syncEditBranchHistoryStacks,
-    activeEditBranch
+    dispatch: runWrite
   });
-  const [axiomDialog, setAxiomDialog] = useState(null);
-  const [axiomRefDialog, setAxiomRefDialog] = useState(null);
+  const [axiomDialog, setAxiomDialog] = useState<{ docId?: unknown; content?: string } | null>(null);
+  const [axiomRefDialog, setAxiomRefDialog] = useState<{ docId?: unknown; nodeId?: unknown; axiomId?: unknown; options?: Array<{ id?: unknown; label?: string; content?: string }> } | null>(null);
   const editExitDialog = usePromptDialog();
   const startupEditBranchDialog = usePromptDialog();
   const agentApprovalEditDialog = usePromptDialog();
@@ -246,13 +325,24 @@ export function AppBody() {
   const editModeTransitionRef = useRef(false);
   // 撤销/重做在途锁：键盘连发 Ctrl+Z 会绕过按钮 disabled，必须同步挡住重入。
   const historyOpInFlightRef = useRef(false);
-  const [editBranchDiffDialog, setEditBranchDiffDialog] = useState({
+  const [editBranchDiffDialog, setEditBranchDiffDialog] = useState<{
+    open: boolean;
+    loading: boolean;
+    view: EditBranchDiffViewModel | null;
+    error: string;
+  }>({
     open: false,
     loading: false,
     view: null,
     error: ''
   });
-  const [mergeConflictDialog, setMergeConflictDialog] = useState({
+  const [mergeConflictDialog, setMergeConflictDialog] = useState<{
+    open: boolean;
+    applying: boolean;
+    view: unknown;
+    error: string;
+    ctx: { shadowDocId: string | null; baseDocId: string | null; owner: string; sourceDoc: unknown } | null;
+  }>({
     open: false,
     applying: false,
     view: null,
@@ -261,7 +351,7 @@ export function AppBody() {
   });
 
   useEffect(() => {
-    const onClick = (event) => {
+    const onClick = (event: MouseEvent) => {
       const target = debugElementTarget(event.target);
       if (!target) return;
       const payload = {
@@ -277,9 +367,9 @@ export function AppBody() {
       };
       debugLog('ui.click', payload);
     };
-    const onKeyDown = (event) => {
+    const onKeyDown = (event: KeyboardEvent) => {
       if (!debugShouldLogKey(event)) return;
-      const editable = isEditableTarget(event.target);
+      const editable = isEditableTarget(event.target as Element | null);
       if (editable && !(event.ctrlKey || event.metaKey || event.altKey || event.key === 'Escape')) return;
       const payload = {
         key: event.key,
@@ -318,7 +408,7 @@ export function AppBody() {
     return byPath;
   }, [docs]);
   const visibleNodeCount = Number(currentDoc?.doc?.node_count) > 0
-    ? Number(currentDoc.doc.node_count)
+    ? Number(currentDoc!.doc!.node_count)
     : Number(currentDoc?.nodes?.length || 0);
   const visibleDepthLimit = depthLimit;
   const visibleDepthOptions = depthOptions;
@@ -342,11 +432,11 @@ export function AppBody() {
   });
   const activeSourceSpans = currentDoc?.sourceWindow?.sourceSpans || currentDoc?.sourceSpans || null;
   const sentenceLabelByNodeId = useMemo(() => {
-    if (!(activeSourceSpans?.length > 0)) return new Map();
+    if (!((activeSourceSpans?.length ?? 0) > 0)) return new Map();
     // debug 模式下测全树 sentence label 聚合耗时——这个会在 sourceSpans 变化（如翻窗口）时重跑
     const perfToken = debugPerfBegin('buildNodeSentenceLabelMap');
-    const map = buildNodeSentenceLabelMap(currentDoc?.tree, activeSourceSpans) as Map<string, string>;
-    debugPerfEnd('buildNodeSentenceLabelMap', perfToken, { spans: activeSourceSpans.length, nodes: map.size });
+    const map = buildNodeSentenceLabelMap(currentDoc?.tree ?? null, activeSourceSpans as Parameters<typeof buildNodeSentenceLabelMap>[1]) as Map<string, string>;
+    debugPerfEnd('buildNodeSentenceLabelMap', perfToken, { spans: activeSourceSpans!.length, nodes: map.size });
     return map;
   }, [currentDoc?.tree, currentDoc?.sourceSpans, currentDoc?.sourceWindow?.sourceSpans]);
   const paragraphLabelByNodeId = useMemo(() => {
@@ -364,42 +454,48 @@ export function AppBody() {
     return openAxiomDialog(currentDoc?.tree?.id || null);
   }
 
-  function activeEditBranch(doc = currentDoc) {
-    return doc?.editBranch || null;
+  function activeEditBranch(doc: { editBranch?: unknown } | null | undefined = currentDoc): EditBranchRow | null {
+    return (doc?.editBranch || null) as EditBranchRow | null;
   }
 
-  function editBranchBaseDocId(branch = activeEditBranch()) {
-    return normalizeDocId(branch?.base_doc_id ?? branch?.baseDocId);
+  function editBranchBaseDocId(branch: unknown = activeEditBranch()) {
+    const obj = branch as EditBranchRow | null | undefined;
+    return normalizeDocId(obj?.base_doc_id);
   }
 
-  function editBranchShadowDocId(branch = activeEditBranch()) {
-    return normalizeDocId(branch?.shadow_doc_id ?? branch?.shadowDocId);
+  function editBranchShadowDocId(branch: unknown = activeEditBranch()) {
+    const obj = branch as EditBranchRow | null | undefined;
+    return normalizeDocId(obj?.shadow_doc_id);
   }
 
-  function editBranchDiffEntries(branch = activeEditBranch()) {
+  function editBranchDiffEntries(branch: EditBranchRow | null | undefined = activeEditBranch()): unknown[] {
     if (!branch?.diff) return [];
     try {
-      const diff = typeof branch.diff === 'string' ? JSON.parse(branch.diff || '{}') : branch.diff;
-      return Array.isArray(diff.entries) ? diff.entries : [];
+      const diff: { entries?: unknown } = typeof branch.diff === 'string'
+        ? JSON.parse(branch.diff || '{}')
+        : branch.diff;
+      return Array.isArray(diff?.entries) ? diff.entries : [];
     } catch {
       return [];
     }
   }
 
-  function editBranchUndoEntries(branch = activeEditBranch()) {
-    return hsEditBranchUndoEntries(editBranchDiffEntries(branch));
+  function editBranchUndoEntries(branch: EditBranchRow | null | undefined = activeEditBranch()) {
+    return hsEditBranchUndoEntries(editBranchDiffEntries(branch) as EditBranchEntry[]);
   }
 
-  function editBranchRedoEntries(branch = activeEditBranch()) {
-    return hsEditBranchRedoEntries(editBranchDiffEntries(branch));
+  function editBranchRedoEntries(branch: EditBranchRow | null | undefined = activeEditBranch()) {
+    return hsEditBranchRedoEntries(editBranchDiffEntries(branch) as EditBranchEntry[]);
   }
 
-  function syncEditBranchHistoryStacks(branch = activeEditBranch()) {
+  function syncEditBranchHistoryStacks(branch: unknown = activeEditBranch()) {
     // 进入编辑模式时旧栈里是非编辑模式的快照 token，整栈替换前先释放；
     // 编辑模式内的常规刷新旧栈是 diff entry，discard 会被前缀过滤成空操作。
+    // 形参 unknown：useWritePipeline/useSummaryRun 等下游 hook 字段也是 unknown，函数变体兼容。
+    const branchObj = branch as EditBranchRow | null | undefined;
     discardHistoryTokens([...undoStackRef.current, ...redoStackRef.current]);
-    updateUndoStack(editBranchUndoEntries(branch));
-    updateRedoStack(editBranchRedoEntries(branch));
+    updateUndoStack(editBranchUndoEntries(branchObj));
+    updateRedoStack(editBranchRedoEntries(branchObj));
   }
 
   const diffBranchOptions = useMemo(() => {
@@ -417,14 +513,18 @@ export function AppBody() {
     }];
   }, [currentDoc?.editBranch]);
 
-  async function loadDocForCurrentView(docId, sourceDoc = currentDoc) {
-    const depth = Math.max(loadedDepthForDoc(sourceDoc), depthLimit, 1);
+  async function loadDocForCurrentView(docId: unknown, sourceDoc: unknown = currentDoc) {
+    const depth = Math.max(loadedDepthForDoc(sourceDoc as Parameters<typeof loadedDepthForDoc>[0]), depthLimit, 1);
     return documentRepository.getDoc(treeDocRequest(docId, depth));
   }
 
   // 退出编辑切回主干 doc（base↔shadow node_id 不同）= 重建 session：直接 loadComplete 扩散加载目标 doc，
   // 折叠/深度从该 doc 的 tree_view_state 持久化恢复（loadComplete 内做），不手工 remap（扩散下映射不全）。
-  async function switchDocPreservingView(nextDocId, _sourceDoc, { persistedDocId, noticeText }: any = {}) {
+  async function switchDocPreservingView(
+    nextDocId: unknown,
+    _sourceDoc: unknown,
+    { persistedDocId, noticeText }: { persistedDocId?: unknown; noticeText?: string } = {}
+  ) {
     const docId = normalizeDocId(nextDocId);
     if (!docId) return;
     setSelectedLibraryEntry(null);
@@ -440,8 +540,8 @@ export function AppBody() {
     return editExitDialog.prompt({}, 'cancel');
   }
 
-  function promptStartupEditBranchChoice(branch) {
-    return startupEditBranchDialog.prompt(branch || {}, 'stash');
+  function promptStartupEditBranchChoice(branch: unknown) {
+    return startupEditBranchDialog.prompt((branch || {}) as Record<string, unknown>, 'stash');
   }
 
   function promptAgentApprovalEditChoice() {
@@ -467,7 +567,7 @@ export function AppBody() {
     editModeTransitionRef.current = true;
     setBusy(true);
     try {
-      const result = await documentRepository.beginEditBranch({ docId: sourceDoc.doc.id, owner: 'human', includeDoc: false });
+      const result = await documentRepository.beginEditBranch({ docId: sourceDoc.doc.id, owner: 'human', includeDoc: false }) as AppBodyBeginEditBranchResult | null;
       const baseDocId = result?.baseDocId || result?.branch?.base_doc_id || sourceDoc.doc.id;
       if (!baseDocId) throw new Error('进入编辑模式失败');
       if (sameDocId(currentDoc?.doc?.id, sourceDoc?.doc?.id)) {
@@ -478,7 +578,7 @@ export function AppBody() {
       setNotice('已进入编辑模式');
       return true;
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
       return false;
     } finally {
       setBusy(false);
@@ -497,7 +597,7 @@ export function AppBody() {
     return enterEditMode();
   }
 
-  async function saveAndLeaveEditMode(targetDocId = null) {
+  async function saveAndLeaveEditMode(targetDocId: unknown = null) {
     const branch = activeEditBranch();
     if (!treeEditMode) return true;
     if (!branch) {
@@ -519,12 +619,12 @@ export function AppBody() {
       if (choice !== 'save' && choice !== 'discard') return false;
       setBusy(true);
       // 保存/丢弃成功后的统一离场：重载主干、退出编辑投影、刷新文档列表。
-      const leaveWithTrunk = async (docIdToLoad, sourceDoc, noticeText) => {
+      const leaveWithTrunk = async (docIdToLoad: unknown, sourceDoc: unknown, noticeText: string) => {
         await switchDocPreservingView(docIdToLoad, sourceDoc, {
           persistedDocId: docIdToLoad,
           noticeText
         });
-        setDocs(await documentRepository.listDocs());
+        setDocs(await documentRepository.listDocs() as Parameters<typeof setDocs>[0]);
       };
       try {
         const sourceDoc = currentDoc;
@@ -536,7 +636,7 @@ export function AppBody() {
           await leaveWithTrunk(baseDocId, sourceDoc, '已丢弃本次编辑并退出');
           return true;
         }
-        const result = await documentRepository.applyEditBranchMerge({ shadowDocId, owner: branchOwner, includeDoc: false });
+        const result = await documentRepository.applyEditBranchMerge({ shadowDocId, owner: branchOwner, includeDoc: false }) as AppBodyApplyMergeResult | null;
         if (!result?.applied) {
           // 主干在编辑期间前移：字段级冲突 → 三列面板人裁；结构性失配（blocked）→
           // 「主干已被修改，无法保存」，只能放弃本次编辑或取消保留分支。两种都留在编辑模式，不静默覆盖。
@@ -561,10 +661,10 @@ export function AppBody() {
         // 写库与视图刷新分开归因：分支已不在 = 保存/丢弃其实已提交（响应丢失、重复点击、
         // 或提交成功后刷新那步抛错），必须按成功离场重载主干——不能把刷新失败误报成
         // 「保存失败」让用户白白重试（实际翻过车：31 条已落主干、前端却报错）。
-        let branchGone = /Edit branch not found/i.test(String(error?.message || error));
+        let branchGone = /Edit branch not found/i.test(String((error as { message?: string } | null | undefined)?.message || error));
         if (!branchGone) {
           try {
-            const pending = await documentRepository.getPendingEditBranches();
+            const pending = await documentRepository.getPendingEditBranches() as AppBodyPendingBranchesResult | null;
             branchGone = !(pending?.branches || []).some((row) => (
               sameDocId(row.base_doc_id, baseDocId) || sameDocId(row.shadow_doc_id, shadowDocId)
             ));
@@ -580,11 +680,11 @@ export function AppBody() {
               choice === 'save' ? '已保存当前编辑状态并退出编辑模式' : '已丢弃本次编辑并退出'
             );
           } catch (refreshError) {
-            clearEditModeState(`已退出编辑模式；视图刷新失败：${refreshError.message}`);
+            clearEditModeState(`已退出编辑模式；视图刷新失败：${(refreshError as { message?: string } | null | undefined)?.message ?? String(refreshError)}`);
           }
           return true;
         }
-        setNotice(error.message);
+        setNotice((error as { message?: string }).message ?? '');
         return false;
       } finally {
         setBusy(false);
@@ -607,7 +707,7 @@ export function AppBody() {
     maxDepth: actualMaxDepth
   };
 
-  const changeActiveTab = useCallback((nextTab) => {
+  const changeActiveTab = useCallback((nextTab: unknown) => {
     const targetTab = String(nextTab || '');
     const payload = {
       from: activeTab,
@@ -634,13 +734,13 @@ export function AppBody() {
     }
   }, [activeTab, activeScreen, currentVisualDocId, treeEditMode, busy, visibleDepthLimit, actualMaxDepth]);
 
-  async function confirmLeaveEditMode(targetDocId = null) {
+  async function confirmLeaveEditMode(targetDocId: unknown = null) {
     return saveAndLeaveEditMode(targetDocId);
   }
 
   async function handleCloseWindow() {
     if (closeAfterEditModeSaveRef.current) {
-      closeWindow().catch((error) => setNotice(error.message));
+      closeWindow().catch((error) => setNotice((error as { message?: string }).message ?? ''));
       return;
     }
     const saved = await saveAndLeaveEditMode();
@@ -648,11 +748,14 @@ export function AppBody() {
     closeAfterEditModeSaveRef.current = true;
     closeWindow().catch((error) => {
       closeAfterEditModeSaveRef.current = false;
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     });
   }
 
-  async function refreshDocs(nextDocId = currentVisualDocId, options: any = {}) {
+  async function refreshDocs(
+    nextDocId: unknown = currentVisualDocId,
+    options: { autoOpen?: boolean } = {}
+  ) {
     const list = await refreshDocList();
     const branch = activeEditBranch();
     if (branch && (sameDocId(nextDocId, editBranchBaseDocId(branch)) || sameDocId(nextDocId, editBranchShadowDocId(branch)))) {
@@ -676,7 +779,7 @@ export function AppBody() {
         setSelectedLibraryEntry(null);
         persistActiveDocId(doc?.doc?.id || targetDoc.id);
         // 同文档刷新保留选中（loadComplete 重置为 null，显式恢复）；切文档保持 null。
-        if (!isDifferentDoc && prevSelectedId) setSelectedNodeId(prevSelectedId);
+        if (!isDifferentDoc && prevSelectedId) setSelectedNodeId?.(prevSelectedId);
         setBusy(false);
         if (!renderUnlockArmed) {
           setProgress(null);
@@ -696,7 +799,14 @@ export function AppBody() {
     return list;
   }
 
-  async function openDoc(docId, options: any = {}) {
+  async function openDoc(
+    docId: unknown,
+    options: {
+      includeEditBranch?: boolean;
+      onComplete?: (doc: unknown) => void;
+      onFailure?: (error: unknown) => void;
+    } = {}
+  ) {
     const branch = activeEditBranch();
     if (branch && (sameDocId(docId, editBranchBaseDocId(branch)) || sameDocId(docId, editBranchShadowDocId(branch)))) {
       return currentDoc;
@@ -745,10 +855,10 @@ export function AppBody() {
     if (!canLeave) return null;
     setBusy(true);
     try {
-      const doc = await documentRepository.getLibraryNavigation();
+      const doc = await documentRepository.getLibraryNavigation() as AppBodyOpenedDoc | null;
       // 库导航是虚拟 doc（不建 session）：先清旧 session + 停预取，避免旧预取 project 覆盖虚拟视图。
       setCurrentDoc(null);
-      setCurrentDoc(doc);
+      setCurrentDoc(doc as Parameters<typeof setCurrentDoc>[0]);
       setSelectedLibraryEntry(null);
       persistActiveDocId(null);
       clearHistoryStacks();
@@ -756,7 +866,7 @@ export function AppBody() {
       setLocateRequest((prev) => ({ seq: (prev?.seq || 0) + 1, nodeId: doc?.tree?.id || null }));
       return doc;
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
       return null;
     } finally {
       setBusy(false);
@@ -766,7 +876,8 @@ export function AppBody() {
   }
 
   useEffect(() => {
-    return onProgress((data) => {
+    return onProgress((rawData: unknown) => {
+      const data = (rawData || {}) as { done?: boolean; [extra: string]: unknown };
       setProgress(data.done ? null : data);
     });
   }, []);
@@ -825,54 +936,64 @@ export function AppBody() {
     };
   }
 
-  function normalizeEditorHistoryViewState(value) {
+  // history token/viewState/effect 都是 IPC 边界对象；形参一律 unknown，函数内 narrow 后用 Record<string, unknown> 访问字段。
+  function normalizeEditorHistoryViewState(value: unknown) {
     if (!value || typeof value !== 'object') return null;
-    const docId = normalizeDocId(value.docId || value.doc_id);
+    const obj = value as Record<string, unknown>;
+    const docId = normalizeDocId(obj.docId || obj.doc_id);
     if (!docId) return null;
+    const activeTabRaw = typeof obj.activeTab === 'string' ? obj.activeTab : '';
+    const allowedTabs = ['tree', 'ide', 'rich', 'entity', 'search'];
     return {
       docId,
-      activeTab: ['tree', 'ide', 'rich', 'entity', 'search'].includes(value.activeTab) ? value.activeTab : null,
-      depthLimit: Math.max(1, Math.floor(Number(value.depthLimit) || 1)),
-      collapsedNodeIds: [...idSetFromArray(value.collapsedNodeIds)],
-      expandedNodeIds: [...idSetFromArray(value.expandedNodeIds)],
-      selectedNodeId: normalizeDocId(value.selectedNodeId || value.selected_node_id)
+      activeTab: allowedTabs.includes(activeTabRaw) ? activeTabRaw : null,
+      depthLimit: Math.max(1, Math.floor(Number(obj.depthLimit) || 1)),
+      collapsedNodeIds: [...idSetFromArray(obj.collapsedNodeIds)],
+      expandedNodeIds: [...idSetFromArray(obj.expandedNodeIds)],
+      selectedNodeId: normalizeDocId(obj.selectedNodeId || obj.selected_node_id)
     };
   }
 
-  function normalizeEditorHistoryEffect(value) {
+  function normalizeEditorHistoryEffect(value: unknown) {
     if (!value || typeof value !== 'object') return null;
-    const kind = String(value.kind || '');
+    const obj = value as Record<string, unknown>;
+    const kind = String(obj.kind || '');
     if (kind !== 'expandNodeOne') return null;
-    const docId = normalizeDocId(value.docId || value.doc_id || currentDoc?.doc?.id);
-    const nodeId = normalizeDocId(value.nodeId || value.node_id);
+    const docId = normalizeDocId(obj.docId || obj.doc_id || currentDoc?.doc?.id);
+    const nodeId = normalizeDocId(obj.nodeId || obj.node_id);
     if (!docId || !nodeId) return null;
     return {
       kind,
       docId,
       nodeId,
-      minDepth: Math.max(0, Math.floor(Number(value.minDepth) || 0))
+      minDepth: Math.max(0, Math.floor(Number(obj.minDepth) || 0))
     };
   }
 
-  function attachEditorHistoryViewState(token, viewState = null, effect = null) {
+  function attachEditorHistoryViewState(token: unknown, viewState: unknown = null, effect: unknown = null) {
     const normalized = normalizeHistoryToken(token);
     if (!normalized) return null;
-    const normalizedEffect = normalizeEditorHistoryEffect(effect || token?.effect || token?.redoEffect || normalized.effect);
+    const tokenObj = (token && typeof token === 'object' ? token : {}) as Record<string, unknown>;
+    const normalizedEffect = normalizeEditorHistoryEffect(
+      effect || tokenObj.effect || tokenObj.redoEffect || normalized.effect
+    );
     return {
       ...normalized,
-      viewState: normalizeEditorHistoryViewState(viewState || token?.viewState) || normalized.viewState || null,
+      viewState: normalizeEditorHistoryViewState(viewState || tokenObj.viewState) || normalized.viewState || null,
       effect: normalizedEffect || null
     };
   }
 
-  function applyEditorHistoryViewState(viewState, doc) {
+  function applyEditorHistoryViewState(viewState: unknown, doc: unknown) {
     const state = normalizeEditorHistoryViewState(viewState);
-    const docId = normalizeDocId(doc?.doc?.id || currentDoc?.doc?.id);
+    const docObj = (doc && typeof doc === 'object' ? doc : {}) as Record<string, unknown>;
+    const docDoc = docObj.doc as { id?: unknown } | null | undefined;
+    const docId = normalizeDocId(docDoc?.id || currentDoc?.doc?.id);
     if (!state || !sameDocId(state.docId, docId)) {
       if (doc) applyTreeViewState(doc);
       return;
     }
-    const nextDepthLimit = clampDepthLimit(state.depthLimit, fullDepthForDoc(doc || currentDoc));
+    const nextDepthLimit = clampDepthLimit(state.depthLimit, fullDepthForDoc((doc || currentDoc) as Parameters<typeof fullDepthForDoc>[0]));
     if (state.activeTab) setActiveTab(state.activeTab);
     setPersistedTreeView(
       nextDepthLimit,
@@ -881,44 +1002,50 @@ export function AppBody() {
       state.docId
     );
     if (state.selectedNodeId) {
-      const node = findNode(doc?.tree, state.selectedNodeId) || doc?.treeIndex?.nodeOf?.(state.selectedNodeId);
-      setSelectedNodeId(node?.id || state.selectedNodeId);
+      const treeIndex = docObj.treeIndex as { nodeOf?: (id: unknown) => { id?: unknown } | null | undefined } | undefined;
+      const node = findNode(docObj.tree, state.selectedNodeId) || treeIndex?.nodeOf?.(state.selectedNodeId);
+      setSelectedNodeId?.(node?.id || state.selectedNodeId);
     }
   }
 
-  function normalizeHistoryToken(token) {
-    const id = String(token?.id || token?.tokenId || '');
-    const docId = normalizeDocId(token?.docId || token?.doc_id || currentDoc?.doc?.id);
+  function normalizeHistoryToken(token: unknown) {
+    const obj = (token && typeof token === 'object' ? token : {}) as Record<string, unknown>;
+    const id = String(obj.id || obj.tokenId || '');
+    const docId = normalizeDocId(obj.docId || obj.doc_id || currentDoc?.doc?.id);
     if (!id || !docId) return null;
     return {
       id,
       docId,
-      viewState: normalizeEditorHistoryViewState(token?.viewState),
-      effect: normalizeEditorHistoryEffect(token?.effect || token?.redoEffect)
+      viewState: normalizeEditorHistoryViewState(obj.viewState),
+      effect: normalizeEditorHistoryEffect(obj.effect || obj.redoEffect)
     };
   }
 
-  async function captureEditorHistoryToken(docId = currentDoc?.doc?.id, viewState = editorHistoryViewState(docId), effect = null) {
+  async function captureEditorHistoryToken(
+    docId: unknown = currentDoc?.doc?.id,
+    viewState: unknown = editorHistoryViewState(docId),
+    effect: unknown = null
+  ) {
     const normalizedDocId = normalizeDocId(docId);
     if (!normalizedDocId) return null;
-    const result = await historyRepository.captureEditorHistoryToken({ docId: normalizedDocId });
+    const result = await historyRepository.captureEditorHistoryToken({ docId: normalizedDocId }) as AppBodyCaptureToken | null;
     return attachEditorHistoryViewState(result?.token || result, viewState, effect);
   }
 
   // 只有后端 editorSnapshotTokens 里的快照 token（id 形如 editor-N）需要释放；
   // 编辑分支栈里的 diff entry 会被 normalizeHistoryToken 误判成 token（docId 有兜底），靠前缀挡掉。
-  function tokenIds(tokens) {
-    return snapshotTokenIds(tokens, (token) => normalizeHistoryToken(token)?.id);
+  function tokenIds(tokens: unknown[]) {
+    return snapshotTokenIds(tokens, (token: unknown) => normalizeHistoryToken(token)?.id);
   }
 
-  function discardHistoryTokens(tokens) {
+  function discardHistoryTokens(tokens: unknown[]) {
     const ids = tokenIds(tokens);
     if (ids.length === 0) return;
-    historyRepository.discardEditorHistoryTokens({ tokenIds: ids }).catch((error) => setNotice(error.message));
+    historyRepository.discardEditorHistoryTokens({ tokenIds: ids }).catch((error) => setNotice((error as { message?: string }).message ?? ''));
   }
 
   // 栈封顶 80：被挤出的旧 token 必须通知后端释放对应全量快照，否则滞留到进程退出。
-  function pushHistoryToken(stack, token) {
+  function pushHistoryToken(stack: unknown[], token: unknown) {
     const { stack: next, evicted } = pushCapped(stack, token);
     if (evicted.length > 0) discardHistoryTokens(evicted);
     return next;
@@ -940,28 +1067,28 @@ export function AppBody() {
     setAxiomsCollapsed(nextValue);
     setBusy(true);
     try {
-      const next = await documentRepository.updateDocAxiomsCollapsed({ docId, collapsed: nextValue, includeDoc: false });
+      const next = await documentRepository.updateDocAxiomsCollapsed({ docId, collapsed: nextValue, includeDoc: false }) as { doc?: { axioms_collapsed?: unknown; updated_at?: unknown; [k: string]: unknown } } | null;
       if (next) {
         if (sameDocId(currentDoc?.doc?.id, docId)) {
           docState.patchDocMeta({
             doc: {
-              ...currentDoc.doc,
-              axioms_collapsed: next.doc?.axioms_collapsed ?? (nextValue ? 1 : 0),
-              updated_at: next.doc?.updated_at ?? currentDoc.doc?.updated_at
-            }
+              ...currentDoc!.doc!,
+              axioms_collapsed: Number(next.doc?.axioms_collapsed ?? (nextValue ? 1 : 0)) || 0,
+              updated_at: String(next.doc?.updated_at ?? currentDoc!.doc?.updated_at ?? '')
+            } as DocRow
           });
         }
-        setDocs(await documentRepository.listDocs());
+        setDocs(await documentRepository.listDocs() as Parameters<typeof setDocs>[0]);
       }
     } catch (error) {
       setAxiomsCollapsed(!nextValue);
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     } finally {
       setBusy(false);
     }
   }
 
-  async function openAxiomDialog(targetNodeId = null) {
+  async function openAxiomDialog(targetNodeId: unknown = null) {
     const docId = currentDoc?.doc?.id;
     if (!docId) return null;
     if (!treeEditMode) {
@@ -971,16 +1098,16 @@ export function AppBody() {
     const target = targetNodeId ? findNode(currentDoc?.tree, targetNodeId) : null;
     if (axiomsCollapsed) setAxiomsCollapsed(false);
     const result = await runWrite(async () => {
-      const result = await axiomRepository.addAxiom({ docId, content: '', status: 'pending' });
+      const result = await axiomRepository.addAxiom({ docId, content: '', status: 'pending' } as Parameters<typeof axiomRepository.addAxiom>[0]) as AppBodyAddAxiomResult | null;
       const axiomId = result?.axiom?.id;
-      if (target?.id && depthOf(target.address || '1') > 1 && axiomId) {
-        await refRepository.addAxiomRefToNode({ docId, nodeId: target.id, axiomId });
+      if (target?.id && depthOf(String(target.address ?? '1')) > 1 && axiomId) {
+        await refRepository.addAxiomRefToNode({ docId, nodeId: target.id, axiomId } as Parameters<typeof refRepository.addAxiomRefToNode>[0]);
       }
       if (axiomsCollapsed) {
-        await documentRepository.updateDocAxiomsCollapsed({ docId, collapsed: false, includeDoc: false });
+        await documentRepository.updateDocAxiomsCollapsed({ docId, collapsed: false, includeDoc: false } as Parameters<typeof documentRepository.updateDocAxiomsCollapsed>[0]);
       }
       return result;
-    });
+    }) as AppBodyAddAxiomResult | null | undefined;
     const axiomId = result?.axiom?.id;
     if (axiomId) {
       setLocateRequest((previous) => ({
@@ -992,7 +1119,7 @@ export function AppBody() {
     return null;
   }
 
-  async function openAxiomRefDialog(targetNodeId, preferredAxiomId = null) {
+  async function openAxiomRefDialog(targetNodeId: unknown, preferredAxiomId: unknown = null) {
     const docId = currentDoc?.doc?.id;
     const nodeId = normalizeDocId(targetNodeId);
     if (!docId) return null;
@@ -1006,7 +1133,7 @@ export function AppBody() {
     }
     const target = findNode(currentDoc?.tree, nodeId);
     if (!target) return null;
-    if (depthOf(target.address || '1') <= 1) {
+    if (depthOf(String(target.address ?? '1')) <= 1) {
       setNotice('根节点天然引用全部事实前提，无需添加引用。');
       return null;
     }
@@ -1033,15 +1160,20 @@ export function AppBody() {
     return null;
   }
 
-  async function applyEditorHistoryEffect(effect, doc, options: any = {}) {
+  async function applyEditorHistoryEffect(
+    effect: unknown,
+    doc: unknown,
+    options: { minDepth?: number | string } = {}
+  ) {
     const normalized = normalizeEditorHistoryEffect(effect);
-    if (!normalized || !sameDocId(normalized.docId, doc?.doc?.id || currentDoc?.doc?.id)) return false;
+    const docObj = (doc && typeof doc === 'object' ? doc : {}) as { doc?: { id?: unknown } };
+    if (!normalized || !sameDocId(normalized.docId, docObj.doc?.id || currentDoc?.doc?.id)) return false;
     if (normalized.kind === 'expandNodeOne') {
       const requestedMinDepth = Math.max(
         Math.floor(Number(normalized.minDepth) || 0),
         Math.floor(Number(options.minDepth) || 0)
       );
-      const maxDepth = fullDepthForDoc(doc || currentDoc);
+      const maxDepth = fullDepthForDoc((doc || currentDoc) as Parameters<typeof fullDepthForDoc>[0]);
       const minDepth = requestedMinDepth > 0 ? clampDepthLimit(requestedMinDepth, maxDepth) : 0;
       debugLog('editor.history.effect', {
         kind: normalized.kind,
@@ -1056,7 +1188,7 @@ export function AppBody() {
     return false;
   }
 
-  async function restoreEditorSnapshot(token, direction) {
+  async function restoreEditorSnapshot(token: unknown, direction: 'undo' | 'redo' | string) {
     const targetToken = normalizeHistoryToken(token);
     if (!targetToken) {
       debugLog('editor.restore.skip', { direction, reason: 'invalid-token' });
@@ -1089,7 +1221,7 @@ export function AppBody() {
       const result = await historyRepository.restoreEditorHistoryToken({
         docId: targetDocId,
         tokenId: targetToken.id
-      });
+      }) as { token?: unknown; editBranch?: unknown } | null;
       const inverseToken = attachEditorHistoryViewState(result?.token, inverseViewState, targetEffect);
       if (direction === 'undo' && inverseToken) {
         updateUndoStack((stack) => stack.slice(0, -1));
@@ -1099,13 +1231,13 @@ export function AppBody() {
         updateUndoStack((stack) => pushHistoryToken(stack, inverseToken));
       }
       // 撤销/重做：后端已回退，重取反映 + 恢复 viewState（折叠/深度/选中走 session 转发壳）。
-      docState.patchDocMeta({ editBranch: result?.editBranch ?? null });
+      docState.patchDocMeta({ editBranch: (result?.editBranch ?? null) as EditBranchRow | null });
       const reloaded = await docState.reloadStructuralChange();
       if (reloaded) {
         applyEditorHistoryViewState(targetViewState, reloaded);
         if (direction === 'redo') await applyEditorHistoryEffect(targetEffect, reloaded, { minDepth: refreshDepth });
       }
-      setDocs(await documentRepository.listDocs());
+      setDocs(await documentRepository.listDocs() as Parameters<typeof setDocs>[0]);
       debugLog('editor.restore.end', {
         direction,
         ok: true,
@@ -1124,17 +1256,17 @@ export function AppBody() {
         direction,
         ok: false,
         docId: targetDocId,
-        error: String(error?.message || error || '').slice(0, 240),
+        error: String((error as { message?: string } | null | undefined)?.message || error || '').slice(0, 240),
         undoDepth: undoStackRef.current.length,
         redoDepth: redoStackRef.current.length
       });
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     } finally {
       setBusy(false);
     }
   }
 
-  async function restoreEditBranchStep(direction) {
+  async function restoreEditBranchStep(direction: 'undo' | 'redo' | string) {
     const branch = activeEditBranch();
     if (!branch) return;
     const stack = direction === 'undo' ? undoStackRef.current : redoStackRef.current;
@@ -1153,11 +1285,11 @@ export function AppBody() {
         redoDepth: redoStackRef.current.length
       });
       const branchOwner = String(branch?.owner || 'human');
-      const result = direction === 'undo'
+      const result = (direction === 'undo'
         ? await documentRepository.undoEditBranch({ shadowDocId, owner: branchOwner, includeDoc: false })
-        : await documentRepository.redoEditBranch({ shadowDocId, owner: branchOwner, includeDoc: false });
+        : await documentRepository.redoEditBranch({ shadowDocId, owner: branchOwner, includeDoc: false })) as { branch?: EditBranchRow | null } | null;
       syncEditBranchHistoryStacks(result?.branch || branch);
-      const nextDoc = await loadDocForCurrentView(baseDocId, currentDoc);
+      const nextDoc = await loadDocForCurrentView(baseDocId, currentDoc) as AppBodyOpenedDoc | null;
       docState.patchDocMeta({ editBranch: nextDoc?.editBranch ?? result?.branch ?? branch ?? null });
       await docState.reloadStructuralChange();
       syncEditBranchHistoryStacks(nextDoc?.editBranch || result?.branch || branch);
@@ -1174,11 +1306,11 @@ export function AppBody() {
         direction,
         ok: false,
         baseDocId,
-        error: String(error?.message || error || '').slice(0, 240),
+        error: String((error as { message?: string } | null | undefined)?.message || error || '').slice(0, 240),
         undoDepth: undoStackRef.current.length,
         redoDepth: redoStackRef.current.length
       });
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     } finally {
       setBusy(false);
     }
@@ -1187,8 +1319,8 @@ export function AppBody() {
   // full agent 直写 base 后的紧邻回退窗口：编辑模式下栈顶若是 base 快照 token
   //（agent 改动后、下一次分支编辑前），undo/redo 优先恢复 base 快照而非分支条目。
   // 窗口由 syncEditBranchHistoryStacks 重建栈时连带 discard 自然关闭。
-  function isEditorHistoryToken(entry) {
-    return String(entry?.id || '').startsWith('editor-');
+  function isEditorHistoryToken(entry: unknown) {
+    return String((entry as { id?: unknown } | null | undefined)?.id || '').startsWith('editor-');
   }
 
   async function undoEdit() {
@@ -1237,7 +1369,7 @@ export function AppBody() {
     }
   }
 
-  async function createDoc(titleOverride = null, folderId = null) {
+  async function createDoc(titleOverride: unknown = null, folderId: unknown = null) {
     const canLeave = await confirmLeaveEditMode();
     if (!canLeave) return;
     const title = typeof titleOverride === 'string' && titleOverride.trim()
@@ -1245,11 +1377,11 @@ export function AppBody() {
       : '未命名条件树文档';
     await withBusy(async () => {
       try {
-        const doc = await documentRepository.createDoc({ title, rootText: title, folderId });
+        const doc = await documentRepository.createDoc({ title, rootText: title, folderId }) as AppBodyOpenedDoc | null;
         persistActiveDocId(doc?.doc?.id);
-        await refreshDocs(doc.doc.id);
+        await refreshDocs(doc?.doc?.id);
       } catch (error) {
-        setNotice(error.message);
+        setNotice((error as { message?: string }).message ?? '');
       }
     });
   }
@@ -1257,8 +1389,8 @@ export function AppBody() {
   function clearActiveDocumentForLibraryFile() {
     setCurrentDoc(null);
     persistActiveDocId(null);
-    setSelectedNodeId(null);
-    setMultiSelectedNodeIds(new Set());
+    setSelectedNodeId?.(null);
+    setMultiSelectedNodeIds?.(new Set());
     setCollapsed(new Set());
     setExpanded(new Set());
     clearHistoryStacks();
@@ -1266,8 +1398,8 @@ export function AppBody() {
     setLocateRequest({ seq: 0, nodeId: null });
   }
 
-  function showLibraryFileOnly(item, noticeText = '未导入原始文件，请先手动导入') {
-    setSelectedLibraryEntry(item);
+  function showLibraryFileOnly(item: unknown, noticeText = '未导入原始文件，请先手动导入') {
+    setSelectedLibraryEntry(item as Parameters<typeof setSelectedLibraryEntry>[0]);
     clearActiveDocumentForLibraryFile();
     setNotice(noticeText);
   }
@@ -1301,7 +1433,7 @@ export function AppBody() {
     setSelectedLibraryEntry
   });
 
-  function toggleOutlineNode(nodeId) {
+  function toggleOutlineNode(nodeId: unknown) {
     setCollapsedOutlineNodeIds((previous) => {
       const next = new Set(previous);
       if (next.has(nodeId)) next.delete(nodeId);
@@ -1311,7 +1443,7 @@ export function AppBody() {
     });
   }
 
-  async function confirmAxiomDialog(event) {
+  async function confirmAxiomDialog(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!axiomDialog) return;
     const content = String(axiomDialog.content || '').trim();
@@ -1321,47 +1453,47 @@ export function AppBody() {
     }
     const docId = axiomDialog.docId;
     setAxiomDialog(null);
-    await runWrite(() => axiomRepository.addAxiom({ docId, content, status: 'pending' }));
+    await runWrite((() => axiomRepository.addAxiom({ docId, content, status: 'pending' } as Parameters<typeof axiomRepository.addAxiom>[0])) as Parameters<typeof runWrite>[0]);
   }
 
   function cancelAxiomDialog() {
     setAxiomDialog(null);
   }
 
-  async function confirmAxiomRefDialog(event) {
+  async function confirmAxiomRefDialog(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!axiomRefDialog) return;
     const { docId, nodeId, axiomId } = axiomRefDialog;
     setAxiomRefDialog(null);
-    await runWrite(() => refRepository.addAxiomRefToNode({ docId, nodeId, axiomId }));
+    await runWrite((() => refRepository.addAxiomRefToNode({ docId, nodeId, axiomId } as Parameters<typeof refRepository.addAxiomRefToNode>[0])) as Parameters<typeof runWrite>[0]);
   }
 
   function cancelAxiomRefDialog() {
     setAxiomRefDialog(null);
   }
 
-  async function deleteDoc(doc) {
+  async function deleteDoc(doc: { id?: unknown; title?: string }) {
     const ok = window.confirm(`删除文档“${doc.title}”及其全部节点？`);
     if (!ok) return;
     setBusy(true);
     try {
-      const nextDocs = await documentRepository.deleteDoc({ docId: doc.id });
-      setDocs(nextDocs);
+      const nextDocs: unknown = await documentRepository.deleteDoc({ docId: doc.id });
+      setDocs(nextDocs as Parameters<typeof setDocs>[0]);
       if (currentDoc?.doc?.id === doc.id) {
-        const nextDoc = nextDocs[0];
+        const nextDoc = (Array.isArray(nextDocs) ? nextDocs[0] : null) as { id?: unknown } | null;
         if (nextDoc) {
           await openDoc(nextDoc.id);
         } else {
           setCurrentDoc(null);
           persistActiveDocId(null);
-          setSelectedNodeId(null);
+          setSelectedNodeId?.(null);
           setCollapsed(new Set());
           setExpanded(new Set());
         }
       }
       setNotice('已删除文档');
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     } finally {
       setBusy(false);
     }
@@ -1376,8 +1508,8 @@ export function AppBody() {
     await saveAndLeaveEditMode();
   }
 
-  async function openEditBranchDiff(option = null) {
-    const branch = option?.branch || activeEditBranch();
+  async function openEditBranchDiff(option: { branch?: EditBranchRow | null; activeEntryCount?: number; owner?: string } | null = null) {
+    const branch: EditBranchRow | null = option?.branch || activeEditBranch();
     const activeEntryCount = Number(option?.activeEntryCount ?? editBranchUndoEntries(branch).length);
     if (!branch || activeEntryCount <= 0) {
       setNotice('没有可对比的 active diff');
@@ -1393,7 +1525,7 @@ export function AppBody() {
       const payload = branch.id
         ? { branchId: branch.id, owner: branch.owner || option?.owner || 'human' }
         : { shadowDocId: editBranchShadowDocId(branch), owner: branch.owner || option?.owner || 'human' };
-      const view = await documentRepository.getEditBranchDiffView(payload);
+      const view = await documentRepository.getEditBranchDiffView(payload) as EditBranchDiffViewModel;
       setEditBranchDiffDialog({
         open: true,
         loading: false,
@@ -1405,7 +1537,7 @@ export function AppBody() {
         open: true,
         loading: false,
         view: null,
-        error: error.message || String(error)
+        error: (error as { message?: string }).message || String(error)
       });
     }
   }
@@ -1419,7 +1551,7 @@ export function AppBody() {
     });
   }
 
-  async function applyMergeResolutions(resolutions) {
+  async function applyMergeResolutions(resolutions: unknown) {
     const ctx = mergeConflictDialog.ctx;
     if (!ctx) return;
     setMergeConflictDialog((current) => ({ ...current, applying: true, error: '' }));
@@ -1429,7 +1561,7 @@ export function AppBody() {
         owner: ctx.owner,
         includeDoc: false,
         resolutions
-      });
+      }) as AppBodyApplyMergeResult | null;
       if (!result?.applied) {
         // 仍未应用（如结构冲突）→ 留面板，刷新冲突视图与 resolutionErrors。
         setMergeConflictDialog((current) => ({ ...current, applying: false, view: result, error: '' }));
@@ -1440,9 +1572,9 @@ export function AppBody() {
         persistedDocId: result?.baseDocId || ctx.baseDocId,
         noticeText: '已解决冲突并合并，退出编辑模式'
       });
-      setDocs(await documentRepository.listDocs());
+      setDocs(await documentRepository.listDocs() as Parameters<typeof setDocs>[0]);
     } catch (error) {
-      setMergeConflictDialog((current) => ({ ...current, applying: false, error: error.message || String(error) }));
+      setMergeConflictDialog((current) => ({ ...current, applying: false, error: (error as { message?: string }).message || String(error) }));
     }
   }
 
@@ -1463,9 +1595,9 @@ export function AppBody() {
         persistedDocId: ctx.baseDocId,
         noticeText: '已放弃本次编辑并退出'
       });
-      setDocs(await documentRepository.listDocs());
+      setDocs(await documentRepository.listDocs() as Parameters<typeof setDocs>[0]);
     } catch (error) {
-      setMergeConflictDialog((current) => ({ ...current, applying: false, error: error.message || String(error) }));
+      setMergeConflictDialog((current) => ({ ...current, applying: false, error: (error as { message?: string }).message || String(error) }));
     }
   }
 
@@ -1482,9 +1614,9 @@ export function AppBody() {
     });
   }
 
-  async function saveAgentSettings(next) {
+  async function saveAgentSettings(next: unknown) {
     await saveAgentSettingsAction({
-      next,
+      next: (next || {}) as Record<string, unknown>,
       agentSettings,
       llmSummarySettings,
       setLlmSummarySettings,
@@ -1492,12 +1624,22 @@ export function AppBody() {
     });
   }
 
-  async function runAgentRequest({ mode, prompt, modelOption = null, reasoningEffort = 'auto' }) {
+  async function runAgentRequest({
+    mode,
+    prompt,
+    modelOption = null,
+    reasoningEffort = 'auto'
+  }: {
+    mode: string;
+    prompt: unknown;
+    modelOption?: { providerId?: string; apiId?: string; model?: string } | null;
+    reasoningEffort?: string;
+  }) {
     const text = String(prompt || '').trim();
     if (!text) return;
     const requestId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const startedAt = Date.now();
-    let beforeFullAccessToken = null;
+    let beforeFullAccessToken: Awaited<ReturnType<typeof captureEditorHistoryToken>> = null;
     activeAgentRequestIdRef.current = requestId;
     setAgentBusy(true);
     setAgentMessages((previous) => [
@@ -1541,7 +1683,7 @@ export function AppBody() {
         selectedNodeId: selectedNode?.id || null,
         viewMode: activeTab,
         depthLimit: visibleDepthLimit
-      });
+      }) as AppBodyAgentRequestResult | null;
       if (result?.usage) setAgentContextUsage(result.usage);
       setAgentMessages((previous) => previous.map((message) => (
         message.requestId === requestId && message.role === 'assistant'
@@ -1558,7 +1700,7 @@ export function AppBody() {
             }
           : message
       )));
-      setAgentDiffs(Array.isArray(result?.diffs) ? result.diffs : []);
+      setAgentDiffs((Array.isArray(result?.diffs) ? result.diffs : []) as Parameters<typeof setAgentDiffs>[0]);
       const changedDocIds = Array.isArray(result?.changedDocIds) ? result.changedDocIds.map(normalizeDocId).filter(Boolean) : [];
       if (changedDocIds.length > 0) {
         if (beforeFullAccessToken && changedDocIds.includes(normalizeDocId(beforeFullAccessToken.docId))) {
@@ -1571,7 +1713,7 @@ export function AppBody() {
           // full agent 直写 base：refreshDocs 的编辑分支保护会早退、视图不动，
           // 这里显式重取投影让 agent 改动立即可见；不调 syncEditBranchHistoryStacks，
           // 保住栈顶 base 快照 token 的紧邻回退窗口（Ctrl+Z 一键回退 agent 改动）。
-          const nextDoc = await loadDocForCurrentView(currentDoc.doc.id, currentDoc);
+          const nextDoc = await loadDocForCurrentView(currentDoc!.doc!.id, currentDoc) as AppBodyOpenedDoc | null;
           docState.patchDocMeta({ editBranch: nextDoc?.editBranch ?? null });
           await docState.reloadStructuralChange();
           await refreshDocList();
@@ -1591,7 +1733,7 @@ export function AppBody() {
         message.requestId === requestId && message.role === 'assistant'
           ? {
               ...message,
-              answer: error.message || 'Agent 调用失败',
+              answer: (error as { message?: string }).message || 'Agent 调用失败',
               elapsedMs: Date.now() - startedAt,
               toolEvents: message.toolEvents || [],
               status: '失败',
@@ -1600,11 +1742,11 @@ export function AppBody() {
             }
           : message
       )));
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     } finally {
       if (activeAgentRequestIdRef.current === requestId) activeAgentRequestIdRef.current = null;
       setAgentBusy(false);
-      refreshAgentSessions().catch((error) => setNotice(error.message));
+      refreshAgentSessions().catch((error) => setNotice((error as { message?: string }).message ?? ''));
     }
   }
 
@@ -1619,24 +1761,24 @@ export function AppBody() {
           : message
       )));
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     }
   }
 
-  async function applyAgentDiff(diffId, options: any = {}) {
-    const pendingDiff = agentDiffs.find((diff) => Number(diff.id) === Number(diffId));
+  async function applyAgentDiff(diffId: unknown, options: { skipEditModeCheck?: boolean } = {}) {
+    const pendingDiff = agentDiffs.find((diff: { id?: unknown; [k: string]: unknown }) => Number(diff.id) === Number(diffId));
     if (!pendingDiff) return false;
     if (!options.skipEditModeCheck) {
       const ready = await ensureAgentApprovalEditMode();
       if (!ready) return false;
     }
-    const target = { docId: pendingDiff.base_doc_id };
-    let undoToken = null;
+    const target = { docId: (pendingDiff as { base_doc_id?: unknown }).base_doc_id };
+    let undoToken: Awaited<ReturnType<typeof captureEditorHistoryToken>> = null;
     try {
       if (target.docId && !treeEditMode) {
         undoToken = await captureEditorHistoryToken(target.docId);
       }
-      const result = await agentRepository.applyDiff({ diffId });
+      const result = await agentRepository.applyDiff({ diffId } as Parameters<typeof agentRepository.applyDiff>[0]) as AppBodyApplyDiffResult | null;
       if (result?.ok !== false && undoToken) {
         discardHistoryTokens(redoStackRef.current);
         updateUndoStack((stack) => pushHistoryToken(stack, undoToken));
@@ -1647,10 +1789,10 @@ export function AppBody() {
         discardHistoryTokens([undoToken]);
         undoToken = null;
       }
-      setAgentDiffs(Array.isArray(result?.diffs) ? result.diffs : []);
+      setAgentDiffs((Array.isArray(result?.diffs) ? result.diffs : []) as Parameters<typeof setAgentDiffs>[0]);
       const resultDocId = result?.docId || currentDoc?.doc?.id;
       if (treeEditMode && resultDocId) {
-        const nextDoc = await loadDocForCurrentView(resultDocId, currentDoc);
+        const nextDoc = await loadDocForCurrentView(resultDocId, currentDoc) as AppBodyOpenedDoc | null;
         docState.patchDocMeta({ editBranch: nextDoc?.editBranch ?? null });
         await docState.reloadStructuralChange();
         syncEditBranchHistoryStacks(nextDoc?.editBranch || activeEditBranch());
@@ -1661,18 +1803,18 @@ export function AppBody() {
       return true;
     } catch (error) {
       if (undoToken) discardHistoryTokens([undoToken]);
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
       return false;
     }
   }
 
-  async function rejectAgentDiff(diffId) {
+  async function rejectAgentDiff(diffId: unknown) {
     try {
-      const result = await agentRepository.rejectDiff({ diffId });
-      setAgentDiffs(Array.isArray(result?.diffs) ? result.diffs : []);
+      const result = await agentRepository.rejectDiff({ diffId } as Parameters<typeof agentRepository.rejectDiff>[0]) as AppBodyRejectDiffResult | null;
+      setAgentDiffs((Array.isArray(result?.diffs) ? result.diffs : []) as Parameters<typeof setAgentDiffs>[0]);
       await refreshAgentSessions();
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     }
   }
 
@@ -1697,20 +1839,20 @@ export function AppBody() {
 
   async function chooseLocalModelRoot() {
     try {
-      setVectorSettings(await vectorService.chooseLocalModelRoot());
+      setVectorSettings(await vectorService.chooseLocalModelRoot() as Parameters<typeof setVectorSettings>[0]);
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     }
   }
 
   async function downloadVectorModel() {
     setBusy(true);
     try {
-      const settings = await vectorService.downloadVectorModel();
+      const settings = await vectorService.downloadVectorModel() as { downloadedModelPath?: string; localModelRoot?: string; [k: string]: unknown };
       setVectorSettings(settings);
       setNotice(`已下载模型：${settings.downloadedModelPath || settings.localModelRoot}`);
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     } finally {
       setBusy(false);
       setProgress(null);
@@ -1728,13 +1870,13 @@ export function AppBody() {
       try {
         // 智能导入不在前端/后端落库：后端构造任务 prompt，前端以 full 档发起一次 agent 会话，
         // agent 自主跑 smart-import skill（观察源文 → 写脚本 → 校验 → 入库），过程在 AgentPanel 可见。
-        const task = await importService.smartImportTask({ relativePath: selectedLibraryEntry.relativePath });
+        const task = await importService.smartImportTask({ relativePath: selectedLibraryEntry.relativePath }) as { mode?: string; prompt?: string } | null;
         await runAgentRequest({ mode: task?.mode || 'full', prompt: task?.prompt || '' });
         // agent 跑 db import-json 直接入库、不一定进 runAgent 的 changedDocIds，显式刷新库与文档列表。
         await refreshLibraryTree();
         await refreshDocList();
       } catch (error) {
-        setNotice(error?.message || '智能导入发起失败');
+        setNotice((error as { message?: string } | null | undefined)?.message || '智能导入发起失败');
       }
       return;
     }
@@ -1748,13 +1890,14 @@ export function AppBody() {
     setOperationLock({ label: '正在处理导入……', step: 0, total: 0 });
     try {
       const payload = { mode: importMode };
-      const imported = selectedLibraryEntry?.type === 'file' && importService.canImportLibraryDocument()
+      const importedRaw = selectedLibraryEntry?.type === 'file' && importService.canImportLibraryDocument()
         ? await importService.importLibraryDocument({ relativePath: selectedLibraryEntry.relativePath, ...payload })
         : await importService.chooseImportFile(payload);
-      if (imported?.length) {
+      const imported = (Array.isArray(importedRaw) ? importedRaw : []) as Array<{ doc?: { id?: unknown }; [k: string]: unknown }>;
+      if (imported.length) {
         const last = imported[imported.length - 1];
         setOperationLock({ label: '正在打开文档……', step: 0, total: 0 });
-        const opened = await loadCompleteDoc(last.doc.id, '正在打开文档……');
+        const opened = await loadCompleteDoc(last.doc?.id, '正在打开文档……');
         setSelectedLibraryEntry(null);
         persistActiveDocId(opened?.doc?.id || last?.doc?.id);
         const importUnlock = () => {
@@ -1771,7 +1914,7 @@ export function AppBody() {
         setOperationLock(null);
       }
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
       setBusy(false);
       setProgress(null);
       setOperationLock(null);
@@ -1782,33 +1925,41 @@ export function AppBody() {
     if (!currentDoc || !searchQuery.trim()) return;
     if (vectorModuleDisabled) {
       setSearchResults([]);
-      setNotice(vectorDisabledMessage);
+      setNotice(String(vectorDisabledMessage ?? ''));
       return;
     }
     setBusy(true);
     try {
       const results = await vectorService.searchContentByVector({
-        docId: currentDoc.doc.id,
+        docId: currentDoc.doc?.id,
         query: searchQuery.trim(),
         limit: 20
       });
-      setSearchResults(results);
+      setSearchResults(results as unknown[]);
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     } finally {
       setBusy(false);
     }
   }
 
-  async function focusNodeInDoc(doc, node) {
+  async function focusNodeInDoc(
+    doc: {
+      doc?: { id?: unknown };
+      tree?: unknown;
+      idByAddress?: Record<string, unknown>;
+      [k: string]: unknown;
+    } | null | undefined,
+    node: { id?: unknown; address?: unknown; [k: string]: unknown } | null | undefined
+  ) {
     if (!doc?.tree || !node?.id) return false;
     const nodeAddress = String(node.address || '1');
-    setSelectedNodeId(node.id);
+    setSelectedNodeId?.(node.id);
     // 节点视图（树/IDE/富文本）内就地定位；仅从实体/搜索等非节点视图才切到树视图。
     if (activeTab !== 'tree' && activeTab !== 'ide' && activeTab !== 'rich') setActiveTab('tree');
     const baseState = normalizeDocId(doc?.doc?.id) === normalizeDocId(currentDoc?.doc?.id)
       ? { depthLimit, collapsed, expanded }
-      : treeViewStateFromDoc(doc, fullDepthForDoc(doc));
+      : treeViewStateFromDoc(doc as Parameters<typeof treeViewStateFromDoc>[0], fullDepthForDoc(doc as Parameters<typeof fullDepthForDoc>[0]));
     const nextDepthLimit = baseState.depthLimit;
     const nextCollapsed = new Set(baseState.collapsed);
     const nextExpanded = new Set(baseState.expanded);
@@ -1835,7 +1986,7 @@ export function AppBody() {
     return true;
   }
 
-  async function selectNodeAndOpenTree(nodeId, result: any = {}) {
+  async function selectNodeAndOpenTree(nodeId: unknown, result: { address?: unknown; [k: string]: unknown } = {}) {
     if (!nodeId) return;
     const address = String(result?.address || '').trim();
     // 先确保目标深度的数据已加载，再走统一就地定位（从搜索/实体这类非节点视图会切到树视图）。
@@ -1846,35 +1997,35 @@ export function AppBody() {
           // 扩散加载下「定位」= 聚焦目标并沿 DFS 取祖先链/邻窗（不再按深度整层预拉）。
           await docState.ensureNodeChildren(nodeId);
         } catch (error) {
-          setNotice(error.message);
+          setNotice((error as { message?: string }).message ?? '');
         }
       }
     }
     const node = findNode(currentDoc?.tree, nodeId) || { id: nodeId, address: address || '1' };
-    focusNodeInDoc(currentDoc, node);
+    focusNodeInDoc(currentDoc, node as Parameters<typeof focusNodeInDoc>[1]);
   }
 
   function locateSelectedNode() {
     // 16-3：统一走就地定位，由当前视图自己滚动到目标，不强制切视图。
-    focusNodeInDoc(currentDoc, selectedNode);
+    focusNodeInDoc(currentDoc, selectedNode as Parameters<typeof focusNodeInDoc>[1]);
   }
 
-  async function jumpToCurrentDocAddress(rawAddress) {
+  async function jumpToCurrentDocAddress(rawAddress: unknown) {
     const address = String(rawAddress || '').trim();
     if (!address) return { ok: false, message: '请输入节点地址。' };
     const docId = normalizeDocId(currentDoc?.doc?.id);
     if (!docId || !currentDoc?.tree) return { ok: false, message: '当前没有打开文档。' };
-    let nodeId = currentDoc.idByAddress?.[address];
+    let nodeId = (currentDoc.idByAddress as Record<string, unknown> | undefined)?.[address];
     let node = nodeId ? findNode(currentDoc.tree, nodeId) : null;
     if (!node && documentRepository.canRead()) {
-      try { node = await documentRepository.getNode({ docId, address }); } catch {}
+      try { node = await documentRepository.getNode({ docId, address }) as typeof node; } catch {}
     }
     if (!node?.id) return { ok: false, message: `当前文档没有节点 ${address}。` };
-    focusNodeInDoc(currentDoc, node);
+    focusNodeInDoc(currentDoc, node as Parameters<typeof focusNodeInDoc>[1]);
     return { ok: true };
   }
 
-  async function traceAgentDiff(branch) {
+  async function traceAgentDiff(branch: { base_doc_id?: unknown; [k: string]: unknown } | null | undefined) {
     // 整批：打开该 owner=llm:<会话> 分支的基底文档；明细对照走 changes / 分支 diff 视图。
     const docId = branch?.base_doc_id;
     if (!docId) {
@@ -1885,29 +2036,47 @@ export function AppBody() {
       if (normalizeDocId(currentDoc?.doc?.id) !== normalizeDocId(docId)) await openDoc(docId);
       setNotice('已打开文档；在 changes / 分支 diff 视图查看该会话的待审改动。');
     } catch (error) {
-      setNotice(error.message);
+      setNotice((error as { message?: string }).message ?? '');
     }
   }
 
   // 取子已收编到 session：toggle/展开直接调 docState.ensureNodeChildren（聚焦目标 + 扩散取子
   // reconcile 进状态机），不再本地 mergeNodeChildrenIntoTree 直改投影树（那会被下一次 project 覆盖）。
 
-  function treeActionNode(nodeId) {
-    return findNode(currentDoc?.tree, nodeId) || currentDoc?.treeIndex?.nodeOf?.(nodeId) || null;
+  // 节点形参在 tree action 链路里用 minimal 接口：本组件内只读 id/address/children/childCount。
+  type AppBodyTreeActionNode = {
+    id?: unknown;
+    address?: string;
+    children?: unknown[];
+    childCount?: unknown;
+    [k: string]: unknown;
+  };
+  type AppBodyToggleOptions = {
+    nodeAddress?: string;
+    hasChildren?: boolean;
+    singlePath?: boolean;
+    promoteDepth?: boolean;
+    maxDepth?: number;
+    minDepth?: number;
+    [k: string]: unknown;
+  };
+
+  function treeActionNode(nodeId: unknown): AppBodyTreeActionNode | null {
+    return (findNode(currentDoc?.tree, nodeId) || currentDoc?.treeIndex?.nodeOf?.(nodeId) || null) as AppBodyTreeActionNode | null;
   }
 
-  function treeActionHasChildren(node) {
+  function treeActionHasChildren(node: AppBodyTreeActionNode | null | undefined) {
     if (!node) return false;
-    return hasKnownChildren(node) || Boolean(currentDoc?.treeIndex?.hasChildren?.(node.id));
+    return hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]) || Boolean(currentDoc?.treeIndex?.hasChildren?.(node.id));
   }
 
-  function treeActionDescendants(node) {
+  function treeActionDescendants(node: AppBodyTreeActionNode | null | undefined): AppBodyTreeActionNode[] {
     if (!node) return [];
-    if (Array.isArray(node.children)) return flattenTree(node);
+    if (Array.isArray(node.children)) return flattenTree(node) as AppBodyTreeActionNode[];
     return [node];
   }
 
-  async function toggleCollapsed(nodeId, options: any = {}) {
+  async function toggleCollapsed(nodeId: unknown, options: AppBodyToggleOptions = {}) {
     const node = treeActionNode(nodeId) || (
       options.nodeAddress
         ? {
@@ -1955,7 +2124,7 @@ export function AppBody() {
     }
   }
 
-  async function expandNodeOneLevel(nodeId, options: any = {}) {
+  async function expandNodeOneLevel(nodeId: unknown, options: AppBodyToggleOptions = {}) {
     const node = treeActionNode(nodeId) || (
       options.nodeAddress
         ? {
@@ -1997,8 +2166,8 @@ export function AppBody() {
   useEffect(() => { redoEditRef.current = redoEdit; });
 
   useEffect(() => {
-    const handleKeyDown = (event) => {
-      if (isEditableTarget(event.target)) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target as Element | null)) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'b') {
         event.preventDefault();
         if (event.shiftKey) toggleRightSidebar();
@@ -2017,7 +2186,7 @@ export function AppBody() {
   }, [toggleLeftSidebar, toggleRightSidebar]);
 
   useEffect(() => {
-    const blockWindowClose = (event) => {
+    const blockWindowClose = (event: BeforeUnloadEvent) => {
       if (!treeEditMode) return;
       if (closeAfterEditModeSaveRef.current) return;
       event.preventDefault();
@@ -2038,13 +2207,22 @@ export function AppBody() {
     ? '点按展开目录，拖动调整文件和目录占比'
     : '拖动调整文件和目录占比，点按向下收起目录';
   const inspectorActions = useMemo(() => ({
-    updateNode: (payload) => nodeRepository.updateNode(payload),
-    createImageAsset: (payload) => assetRepository.createImageAsset(payload),
-    deleteRef: (payload) => refRepository.deleteRef(payload),
-    updateAxiom: (payload) => axiomRepository.updateAxiom(payload),
-    restoreHistory: (payload) => historyRepository.restoreDocumentSnapshot(payload)
+    updateNode: (payload: Parameters<typeof nodeRepository.updateNode>[0]) => nodeRepository.updateNode(payload),
+    createImageAsset: (payload: Parameters<typeof assetRepository.createImageAsset>[0]) => assetRepository.createImageAsset(payload),
+    deleteRef: (payload: Parameters<typeof refRepository.deleteRef>[0]) => refRepository.deleteRef(payload),
+    updateAxiom: (payload: Parameters<typeof axiomRepository.updateAxiom>[0]) => axiomRepository.updateAxiom(payload),
+    restoreHistory: (payload: Parameters<typeof historyRepository.restoreDocumentSnapshot>[0]) => historyRepository.restoreDocumentSnapshot(payload)
   }), []);
-  const runC2DNodeCommand = useCallback((command: any = {}) => {
+  const runC2DNodeCommand = useCallback((command: {
+    type?: string;
+    target?: { kind?: string; nodeId?: unknown; axiomId?: unknown; [k: string]: unknown };
+    parentNodeId?: unknown;
+    afterNodeId?: unknown;
+    nodeId?: unknown;
+    direction?: unknown;
+    patch?: AppBodyAxiomPatchIn;
+    [k: string]: unknown;
+  } = {}) => {
     const docId = currentDoc?.doc?.id;
     if (!docId) return null;
     const target = command?.target || {};
@@ -2143,7 +2321,7 @@ export function AppBody() {
         style={{ left: leftCollapsed ? 0 : leftWidth - 6 }}
         title={leftSidebarRailHint}
         aria-label={leftSidebarRailHint}
-        onPointerDown={(event) => startSidebarResize('left', event)}
+        onPointerDown={(event) => startSidebarResize('left', event.nativeEvent)}
       >
         {leftCollapsed ? <PanelLeftOpen size={12} /> : <PanelLeftClose size={12} />}
       </button>
@@ -2153,7 +2331,7 @@ export function AppBody() {
         style={{ right: rightCollapsed ? 0 : rightWidth - 6 }}
         title={rightSidebarRailHint}
         aria-label={rightSidebarRailHint}
-        onPointerDown={(event) => startSidebarResize('right', event)}
+        onPointerDown={(event) => startSidebarResize('right', event.nativeEvent)}
       >
         {rightCollapsed ? <PanelRightOpen size={12} /> : <PanelRightClose size={12} />}
       </button>
@@ -2186,7 +2364,7 @@ export function AppBody() {
           onRefreshLibrary={refreshLibraryTree}
           onOpenDoc={openDoc}
           onCreateDoc={createDoc}
-          onCreateFolder={createDocFolder}
+          onCreateFolder={createDocFolder as (parentId?: number | null) => unknown}
           onRenameFolder={renameDocFolder}
           onDeleteFolder={deleteDocFolder}
           onDeleteDoc={deleteDoc}
@@ -2205,11 +2383,11 @@ export function AppBody() {
           className={`left-panel-resizer${outlineCollapsedDown ? ' is-collapsed' : ''}`}
           title={outlineSplitHint}
           aria-label={outlineSplitHint}
-          onPointerDown={startDocOutlineResize}
+          onPointerDown={(event) => startDocOutlineResize(event.nativeEvent)}
         />
 
         <OutlinePanel
-          tree={currentDoc?.tree}
+          tree={currentDoc?.tree as Parameters<typeof OutlinePanel>[0]['tree']}
           selectedNodeId={selectedNodeId}
           collapsedOutlineNodeIds={collapsedOutlineNodeIds}
           onToggle={toggleOutlineNode}
@@ -2227,7 +2405,7 @@ export function AppBody() {
         <WorkspaceHeader
           title={workspaceTitle}
           subtitle={workspaceSubtitle}
-          activeTab={activeTab}
+          activeTab={activeTab as Parameters<typeof WorkspaceHeader>[0]['activeTab']}
           setActiveTab={changeActiveTab}
           undoEdit={undoEdit}
           redoEdit={redoEdit}
@@ -2245,9 +2423,9 @@ export function AppBody() {
           actualMaxDepth={actualMaxDepth}
           summaryNotesVisible={summaryNotesVisible}
           onToggleSummaryNotes={toggleSummaryNotesVisible}
-          onGenerateSummary={generateSummary}
-          onRunSummaryGeneration={runSummaryGeneration}
-          diffBranches={diffBranchOptions}
+          onGenerateSummary={generateSummary as Parameters<typeof WorkspaceHeader>[0]['onGenerateSummary']}
+          onRunSummaryGeneration={(req, strat) => { void runSummaryGeneration(req as Parameters<typeof runSummaryGeneration>[0], strat as Parameters<typeof runSummaryGeneration>[1]); }}
+          diffBranches={diffBranchOptions as Parameters<typeof WorkspaceHeader>[0]['diffBranches']}
           onOpenDiff={openEditBranchDiff}
           onOpenEntityMaintenance={openEntityMaintenance}
         >
@@ -2265,12 +2443,12 @@ export function AppBody() {
             <>
               <div style={{ display: activeTab === 'tree' ? 'contents' : 'none' }}>
                 <C2DMapView
-                  docId={currentDoc.doc.id}
-                  rootNode={currentDoc.tree}
-                  selectedNodeId={selectedNodeId}
+                  docId={currentDoc.doc?.id as Parameters<typeof C2DMapView>[0]['docId']}
+                  rootNode={currentDoc.tree as Parameters<typeof C2DMapView>[0]['rootNode']}
+                  selectedNodeId={selectedNodeId as Parameters<typeof C2DMapView>[0]['selectedNodeId']}
                   setSelectedNodeId={setSelectedNodeId}
                   setMultiSelectedIds={setMultiSelectedNodeIds}
-                  onRenderReady={handleMindMapRenderReady}
+                  onRenderReady={(info: unknown) => handleMindMapRenderReady(info as Parameters<typeof handleMindMapRenderReady>[0])}
                   onNotice={setNotice}
                   locateRequest={locateRequest}
                   axioms={currentDoc.axioms}
@@ -2299,7 +2477,7 @@ export function AppBody() {
                   toggleCollapsed={toggleCollapsed}
                   depthLimit={depthLimit}
                   sentenceLabelByNodeId={sentenceLabelByNodeId}
-                  axioms={currentDoc.axioms}
+                  axioms={currentDoc.axioms as Parameters<typeof IdeView>[0]['axioms']}
                   showTitles={viewShowTitles}
                   showNotes={viewShowNotes}
                   showAxioms={viewShowAxioms}
@@ -2308,8 +2486,8 @@ export function AppBody() {
               </div>
               <div style={{ display: activeTab === 'rich' ? 'contents' : 'none' }}>
                 <RichTextView
-                  currentDoc={currentDoc}
-                  docId={currentDoc.doc.id}
+                  currentDoc={currentDoc as Parameters<typeof RichTextView>[0]['currentDoc']}
+                  docId={currentDoc.doc?.id}
                   selectedNodeId={selectedNodeId}
                   setSelectedNodeId={setSelectedNodeId}
                   depthLimit={depthLimit}
@@ -2321,7 +2499,7 @@ export function AppBody() {
                   showNotes={viewShowNotes}
                   showAxioms={viewShowAxioms}
                   onAddAxiom={addAxiomFromReadableView}
-                  loadSourceWindow={loadSourceWindow}
+                  loadSourceWindow={loadSourceWindow as Parameters<typeof RichTextView>[0]['loadSourceWindow']}
                   sourceWindowLoading={sourceWindowLoading}
                   locateRequest={locateRequest}
                 />
@@ -2355,19 +2533,19 @@ export function AppBody() {
                 <SearchView
                   query={searchQuery}
                   setQuery={setSearchQuery}
-                  results={searchResults}
+                  results={searchResults as Parameters<typeof SearchView>[0]['results']}
                   onSearch={runVectorSearch}
                   selectNode={selectNodeAndOpenTree}
                   placeholder={vectorModuleDisabled ? '向量模块已由用户禁用' : '输入要检索的语义内容'}
                   disabled={vectorModuleDisabled}
-                  disabledMessage={vectorDisabledMessage}
+                  disabledMessage={String(vectorDisabledMessage ?? '')}
                 />
               </div>
             </>
           ) : (
             <ViewAlignedEmptyState
               activeTab={activeTab}
-              selectedLibraryEntry={selectedLibraryEntry}
+              selectedLibraryEntry={selectedLibraryEntry as Parameters<typeof ViewAlignedEmptyState>[0]['selectedLibraryEntry']}
               onImport={importFiles}
             />
           )}
@@ -2378,12 +2556,12 @@ export function AppBody() {
       </section>
 
       <Inspector
-        currentDoc={currentDoc}
-        selectedNode={selectedNode}
-        runWrite={runWrite}
+        currentDoc={currentDoc as Parameters<typeof Inspector>[0]['currentDoc']}
+        selectedNode={selectedNode as Parameters<typeof Inspector>[0]['selectedNode']}
+        runWrite={runWrite as Parameters<typeof Inspector>[0]['runWrite']}
         selectNode={selectNodeAndOpenTree}
         canEdit={treeEditMode}
-        viewMode={activeTab}
+        viewMode={activeTab as Parameters<typeof Inspector>[0]['viewMode']}
         collapsed={rightCollapsed}
         sidebarWidth={rightWidth}
         onLocateNode={locateSelectedNode}
@@ -2407,7 +2585,7 @@ export function AppBody() {
         onNewAgentSession={newAgentSession}
         onTraceAgentDiff={traceAgentDiff}
         onAddAxiomRef={openAxiomRefDialog}
-        inspectorActions={inspectorActions}
+        inspectorActions={inspectorActions as Parameters<typeof Inspector>[0]['inspectorActions']}
       />
 
       {editBranchDiffDialog.open && (
@@ -2421,7 +2599,7 @@ export function AppBody() {
 
       {mergeConflictDialog.open && (
         <MergeConflictDialog
-          view={mergeConflictDialog.view}
+          view={mergeConflictDialog.view as Parameters<typeof MergeConflictDialog>[0]['view']}
           applying={mergeConflictDialog.applying}
           error={mergeConflictDialog.error}
           onApply={applyMergeResolutions}
@@ -2509,7 +2687,7 @@ export function AppBody() {
               <span>事实前提</span>
               <select
                 className="dialog-input"
-                value={axiomRefDialog.axiomId}
+                value={String(axiomRefDialog.axiomId ?? '')}
                 onChange={(event) => setAxiomRefDialog((current) => current ? {
                   ...current,
                   axiomId: event.target.value
@@ -2520,8 +2698,8 @@ export function AppBody() {
                 }}
                 autoFocus
               >
-                {axiomRefDialog.options.map((axiom) => (
-                  <option key={axiom.id} value={axiom.id}>
+                {(axiomRefDialog.options ?? []).map((axiom: { id?: unknown; label?: string; content?: string; [k: string]: unknown }) => (
+                  <option key={String(axiom.id ?? '')} value={String(axiom.id ?? '')}>
                     {axiom.label} {axiom.content}
                   </option>
                 ))}
@@ -2535,7 +2713,7 @@ export function AppBody() {
         </div>
       )}
 
-      <ProgressOverlay progress={progress} lockedProgress={lockedProgress} locked={Boolean(operationLock)} onCancel={cancelSummaryGeneration} />
+      <ProgressOverlay progress={progress as Parameters<typeof ProgressOverlay>[0]['progress']} lockedProgress={lockedProgress as Parameters<typeof ProgressOverlay>[0]['lockedProgress']} locked={Boolean(operationLock)} onCancel={cancelSummaryGeneration} />
       </main>
     </>
   );

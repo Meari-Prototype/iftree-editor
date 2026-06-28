@@ -1,10 +1,40 @@
-// @ts-nocheck
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import Database from 'better-sqlite3';
 
-function json(value, fallback = null) {
+type SessionResult = Record<string, unknown> & {
+  messages?: unknown[];
+  answer?: unknown;
+  error?: unknown;
+  pendingDiffCount?: unknown;
+  usage?: unknown;
+  toolEvents?: unknown;
+};
+type AgentRow = Record<string, unknown> & {
+  id?: unknown;
+  mode?: unknown;
+  prompt?: unknown;
+  doc_id?: unknown;
+  selected_node_id?: unknown;
+  context_json?: unknown;
+  result_json?: unknown;
+  created_at?: unknown;
+  updated_at?: unknown;
+  pending_diff_count?: unknown;
+  context?: unknown;
+  result?: SessionResult;
+};
+type SessionInput = {
+  sessionId?: unknown;
+  mode?: unknown;
+  prompt?: unknown;
+  docId?: unknown;
+  selectedNodeId?: unknown;
+  context?: unknown;
+};
+
+function json(value: unknown, fallback: unknown = null) {
   try {
     return JSON.stringify(value ?? fallback);
   } catch {
@@ -12,24 +42,24 @@ function json(value, fallback = null) {
   }
 }
 
-function parseJson(value, fallback = null) {
+function parseJson(value: unknown, fallback: unknown = null) {
   try {
-    return value ? JSON.parse(value) : fallback;
+    return value ? JSON.parse(String(value)) : fallback;
   } catch {
     return fallback;
   }
 }
 
-function rowToSession(row) {
+function rowToSession(row: AgentRow | null | undefined): AgentRow | null {
   if (!row) return null;
   return {
     ...row,
     context: parseJson(row.context_json, {}),
     result: parseJson(row.result_json, {})
-  };
+  } as AgentRow;
 }
 
-function rowToSessionSummary(row) {
+function rowToSessionSummary(row: AgentRow | null | undefined) {
   if (!row) return null;
   return {
     id: row.id,
@@ -43,7 +73,7 @@ function rowToSessionSummary(row) {
   };
 }
 
-function legacyMessagesFromSession(session) {
+function legacyMessagesFromSession(session: AgentRow | null | undefined) {
   if (!session) return [];
   const result = session.result || {};
   if (Array.isArray(result.messages)) return result.messages;
@@ -75,7 +105,10 @@ function legacyMessagesFromSession(session) {
 }
 
 export class AgentStore {
-  constructor(dbPath) {
+  dbPath: string;
+  db: Database | null;
+
+  constructor(dbPath: string) {
     this.dbPath = dbPath;
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
@@ -83,7 +116,7 @@ export class AgentStore {
   }
 
   init() {
-    this.db.exec(`
+    this.db!.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS agent_sessions (
         id INTEGER PRIMARY KEY,
@@ -100,7 +133,7 @@ export class AgentStore {
     // agent_diffs 物理退役（projectneed 18-1）：A2A 待审已统一为 owner=llm:<会话> 编辑分支，
     // 独立待审 diff 表与 commits/edit_branches 不再有等价用途；旧库残留表在此删除（零数据迁移，
     // 索引随表删除），等价于主库的 dropLegacySaveHistory。
-    this.db.exec('DROP TABLE IF EXISTS agent_diffs');
+    this.db!.exec('DROP TABLE IF EXISTS agent_diffs');
   }
 
   close() {
@@ -108,19 +141,19 @@ export class AgentStore {
     this.db = null;
   }
 
-  createSession({ mode, prompt, docId = null, selectedNodeId = null, context = {} }) {
-    const result = this.db.prepare(`
+  createSession({ mode, prompt, docId = null, selectedNodeId = null, context = {} }: SessionInput = {}) {
+    const result = this.db!.prepare(`
       INSERT INTO agent_sessions (mode, prompt, doc_id, selected_node_id, context_json)
       VALUES (?, ?, ?, ?, ?)
     `).run(mode, prompt, docId, selectedNodeId, json(context, {}));
     return this.getSession(Number(result.lastInsertRowid));
   }
 
-  startSessionTurn({ sessionId = null, mode, prompt, docId = null, selectedNodeId = null, context = {} }) {
+  startSessionTurn({ sessionId = null, mode, prompt, docId = null, selectedNodeId = null, context = {} }: SessionInput = {}) {
     const id = Number(sessionId);
     const existing = Number.isInteger(id) && id > 0 ? this.getSession(id) : null;
     if (!existing) return this.createSession({ mode, prompt, docId, selectedNodeId, context });
-    this.db.prepare(`
+    this.db!.prepare(`
       UPDATE agent_sessions
       SET mode = ?, doc_id = ?, selected_node_id = ?, context_json = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
@@ -128,8 +161,8 @@ export class AgentStore {
     return this.getSession(existing.id);
   }
 
-  finishSession(sessionId, result = {}) {
-    this.db.prepare(`
+  finishSession(sessionId: unknown, result: Record<string, unknown> = {}) {
+    this.db!.prepare(`
       UPDATE agent_sessions
       SET result_json = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
@@ -137,7 +170,7 @@ export class AgentStore {
     return this.getSession(sessionId);
   }
 
-  finishSessionTurn(sessionId, result = {}, turnMessages = []) {
+  finishSessionTurn(sessionId: unknown, result: Record<string, unknown> = {}, turnMessages: unknown[] = []) {
     const current = this.getSession(sessionId);
     const previousResult = current?.result || {};
     const previousMessages = Array.isArray(previousResult.messages)
@@ -150,16 +183,16 @@ export class AgentStore {
     });
   }
 
-  getSession(sessionId) {
-    return rowToSession(this.db.prepare('SELECT * FROM agent_sessions WHERE id = ?').get(sessionId));
+  getSession(sessionId: unknown) {
+    return rowToSession(this.db!.prepare('SELECT * FROM agent_sessions WHERE id = ?').get(sessionId));
   }
 
-  listSessions({ limit = 40 } = {}) {
+  listSessions({ limit = 40 }: { limit?: unknown } = {}) {
     const safeLimit = Math.max(1, Math.min(200, Number(limit) || 40));
     // 待审计数（pending_diff_count）不再由本库子查询提供（agent_diffs 已退役）：
     // 待审已是 owner=llm:<会话> 编辑分支，跨库归属，由 agent-runtime.listAgentSessions
     // 合并主库分支后补齐该字段。
-    return this.db.prepare(`
+    return this.db!.prepare(`
       SELECT
         s.id,
         s.mode,
@@ -174,10 +207,10 @@ export class AgentStore {
     `).all(safeLimit).map(rowToSessionSummary);
   }
 
-  deleteSession(sessionId) {
+  deleteSession(sessionId: unknown) {
     const id = Number(sessionId);
     if (!Number.isInteger(id) || id <= 0) return false;
-    const result = this.db.prepare('DELETE FROM agent_sessions WHERE id = ?').run(id);
+    const result = this.db!.prepare('DELETE FROM agent_sessions WHERE id = ?').run(id);
     return result.changes > 0;
   }
 }

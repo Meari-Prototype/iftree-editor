@@ -15,8 +15,10 @@ export interface C2DBlock {
   title?: string;
   text?: string;
   note?: string;
-  sourcePosition?: number | null;
+  // 与 node-model.TreeNode.sourcePosition 形态对齐（来源行 unknown，本地按需 narrow）。
+  sourcePosition?: unknown;
   axiomId?: string | null;
+  [extra: string]: unknown;
 }
 
 export interface C2DGroup {
@@ -33,7 +35,8 @@ export interface C2DColumn {
 export interface C2DTreeIndex {
   byId: Map<string, C2DBlock>;
   byAddress: Map<string, C2DBlock>;
-  childrenOf: Map<string, C2DBlock[]>;
+  // node-model.TreeIndex.childrenOf 真形态 = Map<string | null, T[]>（null key 收 root 的 parentId）。
+  childrenOf: Map<string | null, C2DBlock[]>;
   root: C2DBlock | null;
   size: number;
 }

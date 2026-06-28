@@ -1,18 +1,35 @@
-// @ts-nocheck
 import {
   normalizeApiProtocol,
   normalizeReasoningEffortMap,
   normalizeReasoningEfforts
 } from '../../agent/llm-api-config.js';
 
-export const DEFAULT_SUMMARY_STRATEGIES = [
+export interface SummaryStrategy {
+  id: string;
+  name: string;
+  skipBelowChars: number;
+  minWords: number;
+  maxWords: number;
+  ratioPercent: number;
+  [extra: string]: unknown;
+}
+
+export const DEFAULT_SUMMARY_STRATEGIES: SummaryStrategy[] = [
   { id: 'article-default', name: '全文默认', skipBelowChars: 100, minWords: 250, maxWords: 1200, ratioPercent: 10 },
   { id: 'node-default', name: '节点/子树默认', skipBelowChars: 100, minWords: 80, maxWords: 300, ratioPercent: 20 }
 ];
 
 export const DEFAULT_SUMMARY_CONCURRENCY = 10;
 
-export const DEFAULT_AGENT_TOOL_SETTINGS = {
+export interface AgentToolSettings {
+  searchResultLimit: number;
+  searchBlockMaxChars: number;
+  fetchContentMaxChars: number;
+  webSearchResultLimit: number;
+  webOpenCharLimit: number;
+}
+
+export const DEFAULT_AGENT_TOOL_SETTINGS: AgentToolSettings = {
   searchResultLimit: 20,
   searchBlockMaxChars: 20000,
   fetchContentMaxChars: 20000,
@@ -20,11 +37,29 @@ export const DEFAULT_AGENT_TOOL_SETTINGS = {
   webOpenCharLimit: 12000
 };
 
-function hasOwn(value, key) {
+function hasOwn(value: unknown, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value || {}, key);
 }
 
-export const LLM_PROVIDER_PRESETS = [
+export interface LlmApiPreset {
+  name?: string;
+  baseUrl?: string;
+  model?: string;
+  protocol?: string;
+  reasoningEfforts?: string[];
+  [extra: string]: unknown;
+}
+
+export interface LlmProviderPreset {
+  id: string;
+  name: string;
+  note?: string;
+  websiteUrl?: string;
+  api?: LlmApiPreset;
+  apis?: LlmApiPreset[];
+}
+
+export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
   {
     id: 'openai',
     name: 'OpenAI 官方',
@@ -124,46 +159,57 @@ export const LLM_PROVIDER_PRESETS = [
   }
 ];
 
-export function newSettingsId(prefix) {
+export function newSettingsId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-export function clampSummaryNumber(value, min, max, fallback) {
+export function clampSummaryNumber(value: unknown, min: number, max: number, fallback: number): number {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, number));
 }
 
-export function optionalSummaryInteger(value, fallback, max) {
+export function optionalSummaryInteger(value: unknown, fallback: number, max: number): number {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   if (number <= 0) return 0;
   return Math.round(Math.min(max, number));
 }
 
-export function optionalSummaryRatio(value, fallback) {
+export function optionalSummaryRatio(value: unknown, fallback: number): number {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   if (number <= 0) return 0;
   return Math.round(clampSummaryNumber(number, 0.1, 90, fallback) * 10) / 10;
 }
 
-export function normalizeSummaryConcurrency(value, fallback = DEFAULT_SUMMARY_CONCURRENCY) {
+export function normalizeSummaryConcurrency(value: unknown, fallback: number = DEFAULT_SUMMARY_CONCURRENCY): number {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return fallback;
   return Math.max(1, Math.round(number));
 }
 
-export function normalizeSummaryStrategy(strategy = {}, index = 0) {
+export interface SummaryStrategyRaw {
+  id?: unknown;
+  name?: unknown;
+  skipBelowChars?: unknown;
+  minWords?: unknown;
+  maxWords?: unknown;
+  ratioPercent?: unknown;
+  [extra: string]: unknown;
+}
+
+export function normalizeSummaryStrategy(strategy: unknown = {}, index: number = 0): SummaryStrategy {
+  const raw: SummaryStrategyRaw = strategy && typeof strategy === 'object' ? strategy as SummaryStrategyRaw : {};
   const fallback = DEFAULT_SUMMARY_STRATEGIES[index] || DEFAULT_SUMMARY_STRATEGIES[1];
-  const skipBelowChars = optionalSummaryInteger(strategy.skipBelowChars, fallback.skipBelowChars, 1000000);
-  const minWords = optionalSummaryInteger(strategy.minWords, fallback.minWords, 100000);
-  let maxWords = optionalSummaryInteger(strategy.maxWords, fallback.maxWords, 100000);
+  const skipBelowChars = optionalSummaryInteger(raw.skipBelowChars, fallback.skipBelowChars, 1000000);
+  const minWords = optionalSummaryInteger(raw.minWords, fallback.minWords, 100000);
+  let maxWords = optionalSummaryInteger(raw.maxWords, fallback.maxWords, 100000);
   if (maxWords > 0 && minWords > 0 && maxWords < minWords) maxWords = minWords;
-  const ratioPercent = optionalSummaryRatio(strategy.ratioPercent, fallback.ratioPercent);
+  const ratioPercent = optionalSummaryRatio(raw.ratioPercent, fallback.ratioPercent);
   return {
-    id: String(strategy.id || fallback.id || newSettingsId('summary')),
-    name: String(Object.prototype.hasOwnProperty.call(strategy, 'name') ? strategy.name : fallback.name).trim() || fallback.name,
+    id: String(raw.id || fallback.id || newSettingsId('summary')),
+    name: String(Object.prototype.hasOwnProperty.call(raw, 'name') ? raw.name : fallback.name).trim() || fallback.name,
     skipBelowChars,
     minWords,
     maxWords,
@@ -171,8 +217,18 @@ export function normalizeSummaryStrategy(strategy = {}, index = 0) {
   };
 }
 
-export function normalizeAgentToolSettings(settings = {}) {
-  const number = (key, min, max) => clampSummaryNumber(settings[key], min, max, DEFAULT_AGENT_TOOL_SETTINGS[key]);
+export interface AgentToolSettingsRaw {
+  searchResultLimit?: unknown;
+  searchBlockMaxChars?: unknown;
+  fetchContentMaxChars?: unknown;
+  webSearchResultLimit?: unknown;
+  webOpenCharLimit?: unknown;
+  [extra: string]: unknown;
+}
+
+export function normalizeAgentToolSettings(settings: AgentToolSettingsRaw = {}): AgentToolSettings {
+  const number = (key: keyof AgentToolSettings, min: number, max: number): number =>
+    clampSummaryNumber(settings[key], min, max, DEFAULT_AGENT_TOOL_SETTINGS[key]);
   return {
     searchResultLimit: number('searchResultLimit', 1, 80),
     searchBlockMaxChars: number('searchBlockMaxChars', 200, 50000),
@@ -182,18 +238,34 @@ export function normalizeAgentToolSettings(settings = {}) {
   };
 }
 
-export function normalizeSummaryStrategySettings(settings = {}) {
-  const strategies = (Array.isArray(settings.summaryStrategies) ? settings.summaryStrategies : [])
+export interface SummaryStrategySettingsRaw {
+  summaryStrategies?: unknown;
+  activeArticleSummaryStrategyId?: unknown;
+  activeNodeSummaryStrategyId?: unknown;
+  summaryConcurrency?: unknown;
+  [extra: string]: unknown;
+}
+
+export interface SummaryStrategySettings {
+  summaryStrategies: SummaryStrategy[];
+  activeArticleSummaryStrategyId: string;
+  activeNodeSummaryStrategyId: string;
+  summaryConcurrency: number;
+  [extra: string]: unknown;
+}
+
+export function normalizeSummaryStrategySettings(settings: SummaryStrategySettingsRaw = {}): SummaryStrategySettings {
+  const strategies = (Array.isArray(settings.summaryStrategies) ? settings.summaryStrategies as SummaryStrategyRaw[] : [])
     .map((strategy, index) => normalizeSummaryStrategy(strategy, index));
   const summaryStrategies = strategies.length
     ? strategies
     : DEFAULT_SUMMARY_STRATEGIES.map((strategy, index) => normalizeSummaryStrategy(strategy, index));
-  const has = (id) => summaryStrategies.some((strategy) => strategy.id === id);
+  const has = (id: unknown): boolean => summaryStrategies.some((strategy) => strategy.id === id);
   const activeArticleSummaryStrategyId = has(settings.activeArticleSummaryStrategyId)
-    ? settings.activeArticleSummaryStrategyId
+    ? String(settings.activeArticleSummaryStrategyId)
     : (summaryStrategies.find((strategy) => strategy.id === 'article-default')?.id || summaryStrategies[0].id);
   const activeNodeSummaryStrategyId = has(settings.activeNodeSummaryStrategyId)
-    ? settings.activeNodeSummaryStrategyId
+    ? String(settings.activeNodeSummaryStrategyId)
     : (summaryStrategies.find((strategy) => strategy.id === 'node-default')?.id || summaryStrategies[0].id);
   return {
     ...settings,
@@ -204,7 +276,7 @@ export function normalizeSummaryStrategySettings(settings = {}) {
   };
 }
 
-export function summaryStrategyForMode(settings, mode) {
+export function summaryStrategyForMode(settings: SummaryStrategySettingsRaw | null | undefined, mode: 'article' | 'node' | string): SummaryStrategy {
   const normalized = normalizeSummaryStrategySettings(settings || {});
   const id = mode === 'article'
     ? normalized.activeArticleSummaryStrategyId
@@ -214,7 +286,7 @@ export function summaryStrategyForMode(settings, mode) {
     normalizeSummaryStrategy({}, mode === 'article' ? 0 : 1);
 }
 
-export function summaryStrategyLabel(strategy) {
+export function summaryStrategyLabel(strategy: SummaryStrategyRaw): string {
   const normalized = normalizeSummaryStrategy(strategy);
   const skip = normalized.skipBelowChars > 0 ? `低于${normalized.skipBelowChars}字跳过` : '不跳过短文本';
   const min = normalized.minWords > 0 ? `不少于${normalized.minWords}字` : '无下限';
@@ -223,23 +295,35 @@ export function summaryStrategyLabel(strategy) {
   return `${skip} / ${min} / ${max} / ${ratio}`;
 }
 
-export function applySummarySkipStrategy(items = [], strategy, index = 0) {
+export interface SummaryItem {
+  text?: unknown;
+  skip?: 'generated' | 'short' | null;
+  [extra: string]: unknown;
+}
+
+export interface ProcessedSummaryItem extends SummaryItem {
+  text: string;
+  skip: 'generated' | 'short' | null;
+}
+
+// 泛型保留调用方在 SummaryItem 之上扩展的额外字段（如 useSummaryRun 的 target）。
+export function applySummarySkipStrategy<T extends SummaryItem>(items: T[] = [], strategy: unknown, index: number = 0): Array<T & ProcessedSummaryItem> {
   const normalized = normalizeSummaryStrategy(strategy, index);
   return items.map((item) => {
     const text = String(item?.text || '').trim();
-    if (item?.skip === 'generated') return { ...item, text, skip: 'generated' };
+    if (item?.skip === 'generated') return { ...item, text, skip: 'generated' as const };
     if (normalized.skipBelowChars > 0 && text.length < normalized.skipBelowChars) {
-      return { ...item, text, skip: 'short' };
+      return { ...item, text, skip: 'short' as const };
     }
     return { ...item, text, skip: null };
   });
 }
 
-export function summarySkipBelowCount(items = [], strategy, index = 0) {
+export function summarySkipBelowCount<T extends SummaryItem>(items: T[] = [], strategy: unknown, index: number = 0): number {
   return applySummarySkipStrategy(items, strategy, index).filter((item) => item.skip === 'short').length;
 }
 
-export function newSummaryStrategy(existing = []) {
+export function newSummaryStrategy<T>(existing: T[] = []): SummaryStrategy {
   return {
     ...normalizeSummaryStrategy(DEFAULT_SUMMARY_STRATEGIES[1], 1),
     id: newSettingsId('summary'),
@@ -247,7 +331,32 @@ export function newSummaryStrategy(existing = []) {
   };
 }
 
-export function newLlmApi() {
+export interface LlmApi {
+  id: string;
+  name: string;
+  note: string;
+  apiKey: string;
+  baseUrl: string;
+  fullUrl: boolean;
+  model: string;
+  protocol: string;
+  contextLimit: number;
+  maxOutputTokens: number;
+  reasoningEfforts: string[];
+  reasoningEffortMap: Record<string, string>;
+  enabled: boolean;
+  [extra: string]: unknown;
+}
+
+export interface LlmProvider {
+  id: string;
+  name: string;
+  note: string;
+  websiteUrl: string;
+  apis: LlmApi[];
+}
+
+export function newLlmApi(): LlmApi {
   return {
     id: newSettingsId('api'),
     name: '新 API',
@@ -265,28 +374,73 @@ export function newLlmApi() {
   };
 }
 
-export function newLlmApiFromPreset(api = {}) {
+export interface LlmApiRaw {
+  id?: unknown;
+  name?: unknown;
+  note?: unknown;
+  apiKey?: unknown;
+  baseUrl?: unknown;
+  fullUrl?: unknown;
+  model?: unknown;
+  protocol?: unknown;
+  contextLimit?: unknown;
+  contextWindowTokens?: unknown;
+  contextWindow?: unknown;
+  maxContextTokens?: unknown;
+  maxOutputTokens?: unknown;
+  maxTokens?: unknown;
+  max_tokens?: unknown;
+  reasoningEfforts?: unknown;
+  reasoning_efforts?: unknown;
+  reasoningEffortMap?: unknown;
+  reasoning_effort_map?: unknown;
+  enabled?: unknown;
+  modelCard?: { contextLimit?: unknown };
+  metadata?: { contextLimit?: unknown };
+  [extra: string]: unknown;
+}
+
+export function newLlmApiFromPreset(api: LlmApiRaw = {}): LlmApi {
   return {
     ...newLlmApi(),
     ...api,
     id: newSettingsId('api'),
+    name: String(api.name || '新 API'),
+    note: String(api.note || ''),
     apiKey: '',
+    baseUrl: String(api.baseUrl || 'https://api.deepseek.com'),
     fullUrl: api.fullUrl === true,
+    model: String(api.model || 'deepseek-v4-pro'),
+    protocol: String(api.protocol || 'openai-compatible'),
+    contextLimit: Number(api.contextLimit) || 0,
+    maxOutputTokens: Number(api.maxOutputTokens) || 0,
+    reasoningEfforts: Array.isArray(api.reasoningEfforts) ? api.reasoningEfforts as string[] : [],
+    reasoningEffortMap: (api.reasoningEffortMap && typeof api.reasoningEffortMap === 'object' ? api.reasoningEffortMap : {}) as Record<string, string>,
     enabled: api.enabled !== false
   };
 }
 
-export function newLlmProvider(preset = null, existingProviders = []) {
+export interface LlmProviderRaw {
+  id?: unknown;
+  name?: unknown;
+  note?: unknown;
+  websiteUrl?: unknown;
+  apis?: LlmApiRaw[];
+  api?: LlmApiRaw;
+  [extra: string]: unknown;
+}
+
+export function newLlmProvider(preset: LlmProviderRaw | null = null, existingProviders: LlmProvider[] = []): LlmProvider {
   if (preset) {
     const apis = Array.isArray(preset.apis) && preset.apis.length > 0
       ? preset.apis.map((api) => newLlmApiFromPreset(api))
       : [newLlmApiFromPreset(preset.api || {})];
     const usedIds = new Set(existingProviders.map((provider) => provider.id));
     return {
-      id: preset.id && !usedIds.has(preset.id) ? preset.id : newSettingsId('provider'),
-      name: preset.name || '新供应商',
-      note: preset.note || '',
-      websiteUrl: preset.websiteUrl || '',
+      id: preset.id && !usedIds.has(String(preset.id)) ? String(preset.id) : newSettingsId('provider'),
+      name: String(preset.name || '新供应商'),
+      note: String(preset.note || ''),
+      websiteUrl: String(preset.websiteUrl || ''),
       apis
     };
   }
@@ -300,7 +454,7 @@ export function newLlmProvider(preset = null, existingProviders = []) {
   };
 }
 
-export function normalizeLlmApiForEditor(api = {}, index = 0) {
+export function normalizeLlmApiForEditor(api: LlmApiRaw = {}, index: number = 0): LlmApi {
   const contextLimit = Number(api.contextLimit ?? api.contextWindowTokens ?? api.contextWindow ?? api.maxContextTokens ?? api.modelCard?.contextLimit ?? api.metadata?.contextLimit);
   const maxOutputTokens = Number(api.maxOutputTokens ?? api.maxTokens ?? api.max_tokens);
   const hasReasoningEfforts = hasOwn(api, 'reasoningEfforts') || hasOwn(api, 'reasoning_efforts');
@@ -324,7 +478,7 @@ export function normalizeLlmApiForEditor(api = {}, index = 0) {
   };
 }
 
-export function defaultLlmProviderForEditor() {
+export function defaultLlmProviderForEditor(): LlmProvider {
   return {
     id: 'deepseek',
     name: 'DeepSeek',
@@ -339,9 +493,27 @@ export function defaultLlmProviderForEditor() {
   };
 }
 
-export function normalizeLlmSettingsForEditor(settings = {}) {
+export interface LlmSettingsRaw {
+  providers?: LlmProviderRaw[];
+  activeProviderId?: unknown;
+  activeApiId?: unknown;
+  configPath?: string;
+  envPath?: string;
+  [extra: string]: unknown;
+}
+
+export interface LlmSettings {
+  providers: LlmProvider[];
+  activeProviderId: string;
+  activeApiId: string;
+  configPath: string;
+  envPath: string;
+  [extra: string]: unknown;
+}
+
+export function normalizeLlmSettingsForEditor(settings: LlmSettingsRaw = {}): LlmSettings {
   const rawProviders = Array.isArray(settings.providers) ? settings.providers : [];
-  const providers = rawProviders.length
+  const providers: LlmProvider[] = rawProviders.length
     ? rawProviders.map((provider, index) => {
       const apis = Array.isArray(provider.apis) && provider.apis.length > 0
         ? provider.apis.map((api, apiIndex) => normalizeLlmApiForEditor(api, apiIndex))
@@ -367,8 +539,8 @@ export function normalizeLlmSettingsForEditor(settings = {}) {
   };
 }
 
-export function providerMatchesPreset(provider, preset) {
+export function providerMatchesPreset(provider: LlmProvider | null | undefined, preset: LlmProviderPreset): boolean {
   return provider?.id === preset.id ||
     provider?.name === preset.name ||
-    (provider?.websiteUrl && provider.websiteUrl === preset.websiteUrl);
+    Boolean(provider?.websiteUrl && provider.websiteUrl === preset.websiteUrl);
 }

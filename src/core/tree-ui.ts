@@ -1,17 +1,10 @@
-import { collectDescendantText, findNode, flattenTree } from './tree.js';
+import { collectDescendantText, findNode, flattenTree, type TreeNodeLike } from './tree.js';
 
 export function addressDepth(address: unknown = '1'): number {
   return String(address || '1').split('-').length;
 }
 
-interface TreeNodeLike {
-  id?: unknown;
-  address?: unknown;
-  text?: unknown;
-  children?: TreeNodeLike[];
-}
-
-interface SummaryTarget {
+export interface SummaryTarget {
   node: TreeNodeLike;
   text: string;
   summaryMode: string;
@@ -29,7 +22,7 @@ function hasLoadedChildren(node: TreeNodeLike): boolean {
   return Array.isArray(node?.children) && node.children.length > 0;
 }
 
-interface SummaryTargetsOptions {
+export interface SummaryTargetsOptions {
   tree?: TreeNodeLike | null;
   selectedNodeId?: unknown;
   selectedNodeIds?: unknown[];

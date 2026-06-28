@@ -1,4 +1,219 @@
-// @ts-nocheck
+// DB 行类型层（数据形状发源处）。逐表对齐本文件的 SQL DDL：
+//   - 列名一比一 snake_case（DB 直出即 snake_case，全 backend 无 camelCase 别名）。
+//   - NOT NULL -> 必填；其余 -> `T | null`（如 parent_id / meta / trust_level）。
+//   - 带 CHECK 枚举的列用字面量联合（node_type / edit_mode / trust_level / kind 等）。
+//   - INTEGER -> number，含 0/1 布尔列（axioms_collapsed / nodes_hash_dirty）不擅自转 boolean，
+//     由领域层转换。
+//   - `DEFAULT CURRENT_TIMESTAMP` 的时间戳列虽无 NOT NULL，但所有写路径都走默认值、从不写 NULL，
+//     故类型为 string（避免下游被迫到处判空）。
+//
+// 约定：这些是“整行”形状。部分列 SELECT（如 `SELECT id FROM docs`）请在调用处用 Pick<DocRow, ...>；
+// JOIN 出的派生列（如 child_count）请就地用交叉类型 `NodeRow & { child_count: number }` 扩展。
+// 此处不加索引签名，保留 strict 取属性检查。
+
+export type NodeType =
+  | 'TEXT'
+  | 'IF'
+  | 'THEN'
+  | 'ELSE'
+  | 'LOOP'
+  | 'FOREACH'
+  | 'BREAK'
+  | 'CONTINUE'
+  | 'ERROR'
+  | 'HUMAN_BLOCK'
+  | 'HUMAN_SUMMARY';
+
+export type TrustLevel = '受控' | '不受控';
+
+export type DocEditMode = 'readonly' | 'incremental' | 'full';
+
+export type NodeSizeMode = 'auto' | 'manual';
+
+export type ObjectKind = 'blob' | 'tree' | 'source';
+
+export type EntityLinkKind = 'synonym' | 'related';
+
+export type EntityBindingStatus = 'bound' | 'ignored';
+
+export interface DocRow {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  meta: string | null;
+  folder_id: number | null;
+  doc_sort_order: number;
+  axioms_collapsed: number;
+  tree_view_state: string;
+  nodes_hash_dirty: number;
+  edit_mode: DocEditMode;
+}
+
+export interface DocFolderRow {
+  id: number;
+  parent_id: number | null;
+  name: string;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NodeRow {
+  id: string;
+  doc_id: string;
+  parent_id: string | null;
+  sort_order: number;
+  depth: number;
+  address: string;
+  node_type: NodeType;
+  text: string;
+  node_title: string;
+  node_note: string;
+  source_position: number | null;
+  trust_level: TrustLevel | null;
+  content_hash: string | null;
+  subtree_hash: string | null;
+  title_chars: number;
+  text_chars: number;
+  note_chars: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AxiomRow {
+  id: string;
+  doc_id: string;
+  label: string;
+  content: string;
+  status: string;
+  node_title: string;
+  node_note: string;
+  node_width: number | null;
+  node_height: number | null;
+  node_size_mode: NodeSizeMode;
+}
+
+export interface RefRow {
+  id: string;
+  source_type: string;
+  source_id: string;
+  target_type: string;
+  target_id: string;
+  ref_kind: string;
+  note: string | null;
+}
+
+export interface SourceDocumentRow {
+  doc_id: string;
+  source_type: string;
+  original_path: string | null;
+  raw_markdown: string;
+  created_at: string;
+}
+
+export interface SourceSpanRow {
+  id: number;
+  doc_id: string;
+  node_id: string | null;
+  sentence_index: number;
+  start_offset: number;
+  end_offset: number;
+  text: string;
+}
+
+export interface SourcePdfPageRow {
+  id: number;
+  doc_id: string;
+  page_number: number;
+  width: number;
+  height: number;
+}
+
+export interface SourcePdfCharRow {
+  id: number;
+  doc_id: string;
+  char_offset: number;
+  page_number: number;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  char_text: string;
+}
+
+export interface SourceDocBlockRow {
+  id: number;
+  doc_id: string;
+  block_index: number;
+  start_offset: number;
+  end_offset: number;
+}
+
+export interface CommitRow {
+  id: string;
+  doc_id: string;
+  parent_commit_id: string | null;
+  committed_at: string;
+  summary: string | null;
+  author: string | null;
+  root_node_id: string | null;
+  root_tree_hash: string | null;
+  source_hash: string | null;
+  meta: string | null;
+}
+
+export interface ObjectRow {
+  hash: string;
+  kind: ObjectKind;
+  data: string;
+}
+
+export interface DocHeadRow {
+  doc_id: string;
+  head_commit_id: string | null;
+  updated_at: string;
+}
+
+export interface EditBranchRow {
+  id: number;
+  base_doc_id: string;
+  shadow_doc_id: string;
+  owner: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  base_snapshot: string;
+  diff: string;
+}
+
+export interface EntityRow {
+  id: string;
+  doc_id: string;
+  literal: string;
+  normalized_literal: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EntityLinkRow {
+  id: number;
+  kind: EntityLinkKind;
+  entity_a_id: string;
+  entity_b_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EntityNodeBindingRow {
+  id: number;
+  entity_id: string;
+  node_id: string;
+  status: EntityBindingStatus;
+  created_at: string;
+  updated_at: string;
+}
+
 export const AXIOM_ORDER_SQL = "CAST(CASE WHEN label GLOB 'A[0-9]*' THEN substr(label, 2) ELSE 0 END AS INTEGER), id";
 
 // schema 版本号（PRAGMA user_version）：建库/导入时盖章；启动只读它判断要不要迁移，跑过不再全表扫。

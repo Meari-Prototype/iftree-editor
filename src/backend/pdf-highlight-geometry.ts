@@ -1,12 +1,37 @@
-// @ts-nocheck
 // PDF 源文档高亮的屏幕几何计算——从主库存储类剥离（后端解耦第 1 步）。
 // 职责：把节点的字符偏移区间映射成 PDF 页面上的高亮矩形。只读 source_pdf_chars / source_spans
 // 两表，接收 db 句柄，不持有状态。
 import { requireStableId } from './db/ids.js';
 import { mergePdfCharRects } from './db/normalizers.js';
 
+interface PdfCharRectRow {
+  char_offset?: unknown;
+  page_number?: unknown;
+  x0?: unknown;
+  y0?: unknown;
+  x1?: unknown;
+  y1?: unknown;
+  [key: string]: unknown;
+}
+
+interface SourceSpanRow {
+  id?: unknown;
+  node_id?: unknown;
+  sentence_index?: unknown;
+  start_offset?: unknown;
+  end_offset?: unknown;
+}
+
+interface PdfGeometryDb {
+  prepare(sql: string): {
+    all(...params: unknown[]): Array<Record<string, unknown>>;
+  };
+}
+
+const mergePdfCharRectsTyped = mergePdfCharRects as unknown as (rows: Array<Record<string, unknown>>) => PdfCharRectRow[];
+
 // PDF 高亮多区间入参清洗：去掉非法区间，按 start 排序并合并相邻/重叠段。
-function mergeHighlightOffsetRanges(ranges) {
+function mergeHighlightOffsetRanges(ranges: unknown): Array<{ start: number; end: number }> {
   const normalized = (Array.isArray(ranges) ? ranges : [])
     .map((range) => ({ start: Number(range?.start), end: Number(range?.end) }))
     .filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start)
@@ -22,7 +47,7 @@ function mergeHighlightOffsetRanges(ranges) {
 
 // ranges 是 [start,end) 区间列表：多 span 节点的高亮不能用单一包络区间，
 // 否则 spans 之间别的节点的正文也会被一起点亮。
-export function pdfHighlightRects(db, docId, ranges) {
+export function pdfHighlightRects(db: PdfGeometryDb, docId: unknown, ranges: unknown): PdfCharRectRow[] {
   const merged = mergeHighlightOffsetRanges(ranges);
   if (merged.length === 0) return [];
   const statement = db.prepare(`
@@ -35,28 +60,28 @@ export function pdfHighlightRects(db, docId, ranges) {
   `);
   const rects = [];
   for (const range of merged) {
-    rects.push(...mergePdfCharRects(statement.all(docId, range.start, range.end)));
+    rects.push(...mergePdfCharRectsTyped(statement.all(docId, range.start, range.end)));
   }
   return rects;
 }
 
-export function pdfSpanHitRects(db, docId) {
+export function pdfSpanHitRects(db: PdfGeometryDb, docId: unknown) {
   const normalizedDocId = requireStableId(docId, 'docId');
   const spans = db.prepare(`
     SELECT id, node_id, sentence_index, start_offset, end_offset
     FROM source_spans
     WHERE doc_id = ?
     ORDER BY start_offset, end_offset, sentence_index, id
-  `).all(normalizedDocId);
+  `).all(normalizedDocId) as SourceSpanRow[];
   if (spans.length === 0) return [];
   const chars = db.prepare(`
     SELECT char_offset, page_number, x0, y0, x1, y1
     FROM source_pdf_chars
     WHERE doc_id = ?
     ORDER BY char_offset
-  `).all(normalizedDocId);
-  const rows = [];
-  const lowerBoundCharOffset = (target) => {
+  `).all(normalizedDocId) as PdfCharRectRow[];
+  const rows: Array<Record<string, unknown>> = [];
+  const lowerBoundCharOffset = (target: number) => {
     let left = 0;
     let right = chars.length;
     while (left < right) {
@@ -76,7 +101,7 @@ export function pdfSpanHitRects(db, docId) {
       spanChars.push(chars[cursor]);
       cursor += 1;
     }
-    for (const rect of mergePdfCharRects(spanChars)) {
+    for (const rect of mergePdfCharRectsTyped(spanChars)) {
       rows.push({
         span_id: span.id,
         node_id: span.node_id,

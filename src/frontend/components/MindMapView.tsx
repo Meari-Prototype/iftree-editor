@@ -1,9 +1,8 @@
-// @ts-nocheck
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { buildTreeIndex, getChildren, getNodeByAddress, getSiblings } from '../../core/node-model.js';
+import { buildTreeIndex } from '../../core/node-model.js';
 import { NODE_TYPES } from '../../core/tree.js';
 import { plainNodeNote } from '../../core/node-notes.js';
 import { nodeTypeLabel } from '../lib/doc-utils.js';
@@ -109,11 +108,12 @@ interface CardApi {
   inlineInputRef: RefObject<HTMLTextAreaElement | null>;
 }
 
-function axiomBlock(axiom: any, index: number): C2DBlock {
+function axiomBlock(rawAxiom: unknown, index: number): C2DBlock {
   // axiom.id 是 uuid 或 lazy 编辑分支的 `tmp-axiom-…` 字符串；保留原值，
   // 父组件处理事实前提命令时需要用它定位真实目标。
-  const rawAxiomId = axiom?.id ?? null;
-  const label = String(axiom?.label || `A${index + 1}`);
+  const axiom = (rawAxiom || {}) as { id?: unknown; label?: string; node_title?: string; content?: string; node_note?: string };
+  const rawAxiomId = (axiom.id ?? null) as string | null;
+  const label = String(axiom.label || `A${index + 1}`);
   return {
     id: `axiom:${rawAxiomId ?? label}`,
     axiomId: rawAxiomId,
@@ -121,9 +121,9 @@ function axiomBlock(axiom: any, index: number): C2DBlock {
     parentId: null,
     childCount: 0,
     nodeType: 'AXIOMS',
-    title: String(axiom?.node_title || '').trim(),
-    text: String(axiom?.content || '').trim(),
-    note: String(axiom?.node_note || '').trim()
+    title: String(axiom.node_title || '').trim(),
+    text: String(axiom.content || '').trim(),
+    note: String(axiom.node_note || '').trim()
   };
 }
 
@@ -161,7 +161,8 @@ function ancestorAddresses(address: string) {
 
 function focusAddressForExpandedNode(index: C2DTreeIndex, node: C2DBlock | null) {
   if (!node) return null;
-  const firstChild = getChildren(index, node.id)[0];
+  // c2d 视角下直接走 Map 访问；不绕 node-model 的 getChildren（视角差 + normalizeNodeId 兜底）。
+  const firstChild = index.childrenOf.get(node.id)?.[0];
   return firstChild?.address || node.address || null;
 }
 
@@ -184,7 +185,7 @@ function expandedAddressesForVisibleDepth(root: C2DBlock | null, visibleDepthLim
   while (stack.length > 0) {
     const node = stack.pop()!;
     const nodeDepth = Math.max(1, Number(node.depth) || addressDepth(node.address));
-    const children = index ? getChildren(index, node.id) : [];
+    const children = index ? (index.childrenOf.get(node.id) || []) : [];
     if (nodeDepth < targetDepth && (Number(node.childCount) > 0 || children.length > 0)) {
       next.add(node.address);
     }
@@ -347,7 +348,7 @@ const C2DNodeCard = memo(function C2DNodeCard({
   // ownText 都要先剥掉直接子节点的 text 再渲染；否则收起态下 ownText + subtreePreview
   // 会重复显示同一段内容。
   if (hasChildren) {
-    const children = getChildren(index, block.id);
+    const children = index.childrenOf.get(block.id) || [];
     if (children.length > 0) {
       let stripped = ownText;
       for (const child of children) {
@@ -398,7 +399,7 @@ const C2DNodeCard = memo(function C2DNodeCard({
       <div className="c2d-node-meta">{addr}</div>
       {editingField === 'title' ? titleEditor : (title ? <div className="c2d-node-title">{title}</div> : null)}
       {editingField === 'text' ? textEditor : (ownText
-        ? <div className="c2d-node-body" onDoubleClick={editTextFromBody}><RichMarkdown markdown={ownText} docId={docId} /></div>
+        ? <div className="c2d-node-body" onDoubleClick={editTextFromBody}><RichMarkdown markdown={ownText} docId={docId == null ? null : String(docId)} /></div>
         : !subtreePreview && <div className="c2d-node-body muted" onDoubleClick={editTextFromBody}>{emptyPlaceholder}</div>)}
       {subtreePreview ? <div className="c2d-node-body c2d-subtree-preview" onDoubleClick={editTextFromBody}>{subtreePreview}</div> : null}
       {editingField === 'note' ? noteEditor : (showNotes && noteText ? <div className="c2d-node-note">{noteText}</div> : null)}
@@ -461,7 +462,7 @@ interface C2DMapViewProps {
   maxVisibleDepth?: number;
   onVisibleDepthChange?: ((depth: number) => void) | null;
   treeEditMode?: boolean;
-  onNodeCommand?: ((command: Record<string, any>) => any) | null;
+  onNodeCommand?: ((command: Record<string, unknown>) => any) | null;
   onAddAxiom?: ((nodeId: string) => void) | null;
   onAddAxiomRef?: ((nodeId: string) => void) | null;
 }
@@ -545,7 +546,8 @@ export function C2DMapView({
   }
 
   // ── 推导数据 ─────────────────────────────────
-  const index = useMemo<C2DTreeIndex>(() => buildTreeIndex(rootNode), [rootNode]);
+  // buildTreeIndex 固定产 TreeIndex<TreeNode>；C2DBlock 是 TreeNode 的字段宽松投影（id/address/parentId/childCount/nodeType 同名同型，其余 optional 或 unknown），边界 cast 当 C2DTreeIndex 用、丢失 axiomId 字段（axiom 节点不入 buildTreeIndex，独立维护）。
+  const index = useMemo<C2DTreeIndex>(() => buildTreeIndex(rootNode as Parameters<typeof buildTreeIndex>[0]) as unknown as C2DTreeIndex, [rootNode]);
   const root = index.root;
   const columns = useMemo<C2DColumn[]>(() => deriveColumns(root, expanded, index), [root, expanded, index]);
   // 字数/字符统计整树一次预计算，渲染路径 O(1) 取数。
@@ -584,7 +586,7 @@ export function C2DMapView({
     input.setSelectionRange(end, end);
   }, [inlineEdit?.nodeId, inlineEdit?.field]);
 
-  const runNodeCommand = useCallback((command: Record<string, any>) => {
+  const runNodeCommand = useCallback((command: Record<string, unknown>) => {
     if (!canEdit) return null;
     if (typeof onNodeCommand !== 'function') {
       onNotice?.('当前动作尚未接入。');
@@ -599,8 +601,9 @@ export function C2DMapView({
     return lookupBlock(index, blockId);
   }
 
-  function resultNodeId(result: any): string | null {
-    return result?.insertedNodeId || result?.node?.id || result?.nodeId || null;
+  function resultNodeId(rawResult: unknown): string | null {
+    const result = (rawResult || {}) as { insertedNodeId?: unknown; node?: { id?: unknown }; nodeId?: unknown };
+    return (result.insertedNodeId || result.node?.id || result.nodeId || null) as string | null;
   }
 
   async function addChild(block: C2DBlock) {
@@ -869,7 +872,7 @@ export function C2DMapView({
   async function applyMoveDialog(mode: 'merge' | 'sibling' | 'child') {
     if (!moveDialog) return;
     const node = lookupBlock(index, moveDialog.nodeId);
-    const target = getNodeByAddress(index, String(moveDialog.address || '').trim());
+    const target = index.byAddress.get(String(moveDialog.address || '').trim()) ?? null;
     if (!node || !target) {
       setMoveDialog((current) => current ? { ...current, error: '目标节点地址不存在。' } : current);
       return;
@@ -1375,7 +1378,7 @@ export function C2DMapView({
         const isRoot = !isAxiom && !block?.parentId;
         const parentBlock = block?.parentId ? lookupBlock(index, block.parentId) : null;
         const canPromoteToParentSibling = !isAxiom && Boolean(block?.parentId && parentBlock?.parentId);
-        const siblings = block && !isAxiom ? getSiblings(index, block.id) : [];
+        const siblings = block && !isAxiom ? (index.childrenOf.get(block.parentId) || []) : [];
         const siblingIndex = siblings.findIndex((item: C2DBlock) => item.id === block.id);
         const canMoveUp = siblingIndex > 0;
         const canMoveDown = siblingIndex >= 0 && siblingIndex < siblings.length - 1;

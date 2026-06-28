@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   docRefresh,
   maybeRefreshDoc,
@@ -7,22 +6,30 @@ import {
   plain,
   requireDocId,
   requireId,
-  rowById
+  rowById,
+  type WriteContext
 } from './shared.js';
+import type { IftreeStore } from '../../store/index.js';
 
-function hasTrustField(source = {}) {
+type WritePayload = Record<string, unknown>;
+type EffectList = Array<Record<string, unknown>>;
+
+type NodeMutationStore = IftreeStore;
+type NodeMutationContext = WriteContext;
+
+function hasTrustField(source: unknown = {}): boolean {
   return ['trust_level', 'trustLevel', 'trust'].some((key) => (
     Object.prototype.hasOwnProperty.call(source || {}, key)
   ));
 }
 
-function assertNoNodeTrustField(source = {}, context = 'node mutation') {
+function assertNoNodeTrustField(source: unknown = {}, context = 'node mutation'): void {
   if (hasTrustField(source)) {
     throw new Error(`${context} no longer supports trust_level; use human certify to set trust_level`);
   }
 }
 
-function nodeInsertPayload(payload = {}) {
+function nodeInsertPayload(payload: WritePayload = {}): WritePayload {
   assertNoNodeTrustField(payload, 'node.insert payload');
   return {
     ...payload,
@@ -36,7 +43,7 @@ function nodeInsertPayload(payload = {}) {
   };
 }
 
-export async function handleNodeMutation(store, payload, ctx, action, effects) {
+export async function handleNodeMutation(store: NodeMutationStore, payload: WritePayload, ctx: NodeMutationContext, action: string, effects: EffectList) {
   if (action === 'node.insert') {
     const docId = requireDocId(payload);
     const node = store.insertNode(nodeInsertPayload(payload));
@@ -55,6 +62,7 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
     const patch = ownPatch(payload);
     assertNoNodeTrustField(patch, 'node.update patch');
     const node = store.updateNode(nodeId, patch);
+    if (!node) throw new Error(`node.update: node not found: ${nodeId}`);
     return nodeRefresh(action, node.doc_id, node.id, { node: plain(node), sideEffects: effects });
   }
 
@@ -64,35 +72,50 @@ export async function handleNodeMutation(store, payload, ctx, action, effects) {
   if (!docId) throw new Error(`${action} requires docId or an existing nodeId`);
 
   let changed = false;
+  let sourceNodeId: unknown = null;
+  let targetNodeId: unknown = null;
+  let newParentId: unknown = null;
+  let direction: unknown = null;
   if (action === 'node.delete') changed = store.deleteNodeSubtree(nodeId);
-  else if (action === 'node.move') changed = store.moveNode(nodeId, payload.direction);
+  else if (action === 'node.move') {
+    direction = payload.direction === 'up' ? 'up' : 'down';
+    changed = store.moveNode(nodeId, direction);
+  }
   else if (action === 'node.promote') changed = store.promoteNode(nodeId);
   else if (action === 'node.split') changed = store.splitNodeIntoChildren(nodeId, {
     splitAsciiPunctuation: payload.splitAsciiPunctuation === true || payload.split_ascii_punctuation === true
   });
   else if (action === 'node.mergePrevious') changed = store.mergeNodeIntoPreviousSibling(nodeId);
-  else if (action === 'node.mergeInto') changed = store.mergeNodeIntoTarget({
-    nodeId,
-    targetNodeId: requireId(payload, 'targetNodeId', 'target_node_id')
-  });
-  else if (action === 'node.reparent') changed = store.moveNodeToParent({
-    nodeId,
-    newParentId: requireId(payload, 'newParentId', 'new_parent_id')
-  });
-  else if (action === 'node.moveBefore') changed = store.moveNodeBeforeSibling({
-    nodeId,
-    targetNodeId: requireId(payload, 'targetNodeId', 'target_node_id')
-  });
-  else if (action === 'node.moveAfter') changed = store.moveNodeAfterSibling({
-    nodeId,
-    targetNodeId: requireId(payload, 'targetNodeId', 'target_node_id')
-  });
+  else if (action === 'node.mergeInto') {
+    targetNodeId = requireId(payload, 'targetNodeId', 'target_node_id');
+    sourceNodeId = nodeId;
+    changed = store.mergeNodeIntoTarget({ nodeId, targetNodeId });
+  }
+  else if (action === 'node.reparent') {
+    newParentId = requireId(payload, 'newParentId', 'new_parent_id');
+    changed = store.moveNodeToParent({ nodeId, newParentId });
+  }
+  else if (action === 'node.moveBefore') {
+    targetNodeId = requireId(payload, 'targetNodeId', 'target_node_id');
+    changed = store.moveNodeBeforeSibling({ nodeId, targetNodeId });
+  }
+  else if (action === 'node.moveAfter') {
+    targetNodeId = requireId(payload, 'targetNodeId', 'target_node_id');
+    changed = store.moveNodeAfterSibling({ nodeId, targetNodeId });
+  }
   else throw new Error(`Unhandled database_write action: ${action}`);
 
+  const after = rowById(store, 'nodes', nodeId);
   const doc = maybeRefreshDoc(store, ctx, docId, payload.refreshOptions || {});
   return docRefresh(action, docId, {
     changed: Boolean(changed),
     doc,
+    nodeId,
+    ...(sourceNodeId ? { sourceNodeId } : {}),
+    ...(targetNodeId ? { targetNodeId } : {}),
+    ...(newParentId ? { newParentId } : {}),
+    ...(direction ? { direction } : {}),
+    ...(after ? { node: plain(after) } : {}),
     sideEffects: effects
   });
 }

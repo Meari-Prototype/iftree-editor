@@ -1,9 +1,8 @@
-// @ts-nocheck
 // edit branch 暂存变更的紧凑状态行（git status 语义）。MCP（draft list / diff）与
 // CLI（db-shell）共用——此前两处逐字重复、只数笼统的 active/undone，不分改/增/删。
 // diff.entries 是 op-log 形态（kind: node.insert/delete/update/move...），按 kind 归类计数。
 
-const KIND_BUCKET = {
+const KIND_BUCKET: Record<string, 'insert' | 'delete' | 'update' | 'move'> = {
   'node.insert': 'insert',
   'node.split': 'insert',        // 拆分主效果=增出子节点
   'node.delete': 'delete',
@@ -17,9 +16,33 @@ const KIND_BUCKET = {
   'node.promote': 'move'         // 提升层级=移动
 };
 
-export function parseBranchEntryCounts(branch = {}) {
+interface BranchStatusEntry {
+  status?: unknown;
+  kind?: string;
+  paragraph_splits?: Array<{ spans?: unknown[] }>;
+}
+
+interface BranchStatusRow {
+  id?: unknown;
+  base_doc_id?: unknown;
+  owner?: unknown;
+  diff?: string | null;
+  updated_at?: string;
+}
+
+interface BranchStatusCounts {
+  active: number;
+  undone: number;
+  update: number;
+  insert: number;
+  delete: number;
+  move: number;
+  other: number;
+}
+
+export function parseBranchEntryCounts(branch: BranchStatusRow = {}): BranchStatusCounts {
   const counts = { active: 0, undone: 0, update: 0, insert: 0, delete: 0, move: 0, other: 0 };
-  let entries = [];
+  let entries: BranchStatusEntry[] = [];
   try {
     const diff = JSON.parse(branch.diff || '{}');
     entries = Array.isArray(diff.entries) ? diff.entries : [];
@@ -38,7 +61,8 @@ export function parseBranchEntryCounts(branch = {}) {
       counts.update += 1;
       continue;
     }
-    counts[KIND_BUCKET[entry?.kind] || 'other'] += 1;
+    const bucket = KIND_BUCKET[entry?.kind || ''] || 'other';
+    counts[bucket] += 1;
   }
   return counts;
 }
@@ -46,7 +70,7 @@ export function parseBranchEntryCounts(branch = {}) {
 // 一行 git status：`[*] branch:X doc:Y owner:Z 改:U 增:I 删:D [移:M] [其他:O] [撤销:K] 时间`。
 // opts.current 传当前 switch 选中的 branchId 时，该行以 * 标出。改/增/删常驻（哪怕 0），
 // 移/其他/撤销有才显示，避免噪声。
-export function formatBranchLine(branch = {}, opts = {}) {
+export function formatBranchLine(branch: BranchStatusRow = {}, opts: { current?: unknown } = {}): string {
   const counts = parseBranchEntryCounts(branch);
   const isCurrent = opts.current != null && String(opts.current) === String(branch.id);
   const parts = [

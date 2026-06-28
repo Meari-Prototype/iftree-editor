@@ -1,7 +1,6 @@
-// @ts-nocheck
 export const MIN_VECTOR_DIMENSIONS = 1024;
 export const DEFAULT_BATCH_SIZE = 16;
-export const DEFAULT_WORKER_COUNT = 2;
+export const DEFAULT_WORKER_COUNT = 4;
 export const EMBEDDING_INIT_PROGRESS_UNITS = 1;
 
 export const VECTOR_MODEL_OPTIONS = Object.freeze([
@@ -70,19 +69,21 @@ export const DEFAULT_VECTOR_CONFIG = Object.freeze({
   importVectors: true
 });
 
-function optionById(options, id, fallbackId) {
+type VectorConfigInput = Record<string, unknown>;
+
+function optionById<T extends { id: string }>(options: readonly T[], id: unknown, fallbackId: string): T {
   return options.find((option) => option.id === id)
     || options.find((option) => option.id === fallbackId)
-    || options[0];
+    || options[0]!;
 }
 
-function clampInteger(value, min, max, fallback) {
+function clampInteger(value: unknown, min: number, max: number, fallback: number): number {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(number)));
 }
 
-export function normalizeVectorConfig(input = {}) {
+export function normalizeVectorConfig(input: VectorConfigInput = {}) {
   const model = optionById(VECTOR_MODEL_OPTIONS, input.modelId, DEFAULT_VECTOR_CONFIG.modelId);
   const compute = optionById(VECTOR_COMPUTE_OPTIONS, input.computeTarget, DEFAULT_VECTOR_CONFIG.computeTarget);
   const batchSize = clampInteger(input.batchSize, 1, 128, DEFAULT_VECTOR_CONFIG.batchSize);
@@ -123,11 +124,11 @@ export function normalizeVectorConfig(input = {}) {
   };
 }
 
-export function assertEmbeddingVector(vector, context = 'Embedding vector', expectedDimensions = null) {
+export function assertEmbeddingVector(vector: unknown, context = 'Embedding vector', expectedDimensions: number | null = null) {
   if (!Array.isArray(vector) && !(ArrayBuffer.isView(vector))) {
     throw new Error(`${context} must be an array-like vector`);
   }
-  const values = Array.from(/** @type {ArrayLike<any>} */ (vector), Number);
+  const values = Array.from(vector as ArrayLike<any>, Number);
   const exactDimensions = Number(expectedDimensions) || null;
   if (exactDimensions && values.length !== exactDimensions) {
     throw new Error(`${context} must have exactly ${exactDimensions} dimensions; got ${values.length}`);
@@ -150,20 +151,20 @@ export function zeroEmbedding(dimensions = MIN_VECTOR_DIMENSIONS) {
   return new Array(dimensions).fill(0);
 }
 
-export function normalizeVector(vector, expectedDimensions = null) {
+export function normalizeVector(vector: unknown, expectedDimensions: number | null = null) {
   const values = assertEmbeddingVector(vector, 'Vector', expectedDimensions);
   const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
   if (norm === 0) return values.map(() => 0);
   return values.map((value) => value / norm);
 }
 
-function clampProgressNumber(value, min, max) {
+function clampProgressNumber(value: unknown, min: number, max: number) {
   const number = Number(value);
   if (!Number.isFinite(number)) return min;
   return Math.min(max, Math.max(min, number));
 }
 
-export function embeddingProgressTotal(textCount, includeInitialization = true) {
+export function embeddingProgressTotal(textCount: unknown, includeInitialization = true) {
   const count = Math.max(0, Math.trunc(Number(textCount) || 0));
   return count + (includeInitialization && count > 0 ? EMBEDDING_INIT_PROGRESS_UNITS : 0);
 }
@@ -173,6 +174,11 @@ export function embeddingProgressStep({
   textCount = 0,
   initializationProgress = 1,
   includeInitialization = true
+}: {
+  completedTexts?: unknown;
+  textCount?: unknown;
+  initializationProgress?: unknown;
+  includeInitialization?: boolean;
 } = {}) {
   const count = Math.max(0, Math.trunc(Number(textCount) || 0));
   const completed = clampProgressNumber(completedTexts, 0, count);
@@ -181,13 +187,13 @@ export function embeddingProgressStep({
   return clampProgressNumber(completed + init, 0, embeddingProgressTotal(count, true));
 }
 
-export function embeddingProgressCountLabel(completedTexts, totalTexts) {
+export function embeddingProgressCountLabel(completedTexts: unknown, totalTexts: unknown) {
   const total = Math.max(0, Math.trunc(Number(totalTexts) || 0));
   const completed = Math.trunc(clampProgressNumber(completedTexts, 0, total));
   return `${completed} / ${total}`;
 }
 
-export function cosineSimilarity(left, right) {
+export function cosineSimilarity(left: ArrayLike<number>, right: ArrayLike<number>) {
   const size = Math.min(left.length, right.length);
   let dot = 0;
   let leftNorm = 0;

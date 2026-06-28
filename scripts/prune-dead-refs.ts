@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 清理 refs 表里指向已不存在节点/事实前提的死引用行。
 // 死行来源：补「节点摧毁 → 引用连带蒸发」逻辑（2026-06-11）之前，
 // deleteNodeSubtree / mergeNodeIntoTarget / mergeNodeIntoPreviousSibling
@@ -17,6 +16,19 @@ import Database from 'better-sqlite3';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+interface CountRow {
+  c?: unknown;
+}
+
+interface RefRow {
+  id?: unknown;
+  source_type?: unknown;
+  source_id?: unknown;
+  target_type?: unknown;
+  target_id?: unknown;
+  ref_kind?: unknown;
+}
+
 // 只判定已知端类型；未知 type 不动，避免误杀。
 const DEAD_PREDICATE = `
   (source_type = 'node' AND source_id NOT IN (SELECT id FROM nodes))
@@ -28,16 +40,17 @@ const DEAD_PREDICATE = `
 function mainDbPath() {
   const argv = process.argv;
   for (let i = 0; i < argv.length; i += 1) {
-    if (argv[i] === '--db' && argv[i + 1]) return resolve(argv[i + 1]);
+    const next = argv[i + 1];
+    if (argv[i] === '--db' && next) return resolve(next);
   }
   return resolve(process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite'));
 }
 
-function describeDeadEnd(db, row) {
-  const reasons = [];
+function describeDeadEnd(db: Database, row: RefRow) {
+  const reasons: string[] = [];
   const nodeExists = db.prepare('SELECT 1 FROM nodes WHERE id = ?');
   const axiomExists = db.prepare('SELECT 1 FROM axioms WHERE id = ?');
-  const endAlive = (type, id) => {
+  const endAlive = (type: unknown, id: unknown) => {
     if (type === 'node') return Boolean(nodeExists.get(id));
     if (type === 'axiom') return Boolean(axiomExists.get(id));
     return true;
@@ -57,13 +70,13 @@ function main() {
 
   const db = new Database(dbPath, { readonly: !apply, fileMustExist: true });
   try {
-    const total = db.prepare('SELECT COUNT(*) AS c FROM refs').get().c;
+    const total = (db.prepare('SELECT COUNT(*) AS c FROM refs').get() as CountRow | undefined)?.c;
     const deadRows = db.prepare(`
       SELECT id, source_type, source_id, target_type, target_id, ref_kind
       FROM refs
       WHERE ${DEAD_PREDICATE}
       ORDER BY id
-    `).all();
+    `).all() as RefRow[];
     console.log(`refs 总行数 ${total}，死引用行 ${deadRows.length}`);
 
     for (const row of deadRows) {
@@ -73,8 +86,8 @@ function main() {
     if (deadRows.length === 0) return;
 
     if (apply) {
-      const result = db.prepare(`DELETE FROM refs WHERE ${DEAD_PREDICATE}`).run();
-      const remaining = db.prepare(`SELECT COUNT(*) AS c FROM refs WHERE ${DEAD_PREDICATE}`).get().c;
+      const result = db.prepare(`DELETE FROM refs WHERE ${DEAD_PREDICATE}`).run() as { changes?: unknown };
+      const remaining = (db.prepare(`SELECT COUNT(*) AS c FROM refs WHERE ${DEAD_PREDICATE}`).get() as CountRow | undefined)?.c;
       console.log(`已删除 ${result.changes} 行，剩余死引用行 ${remaining}`);
     } else {
       console.log('\ndry-run 完成，未做任何修改；加 --yes 执行删除。');
@@ -86,7 +99,7 @@ function main() {
 
 try {
   main();
-} catch (error) {
-  console.error(error?.message || error);
+} catch (error: unknown) {
+  console.error((error as { message?: string } | null | undefined)?.message || error);
   process.exit(1);
 }

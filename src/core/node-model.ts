@@ -72,11 +72,11 @@ export interface BaseIndexNode {
   [key: string]: unknown;
 }
 
-export interface TreeIndex<T extends BaseIndexNode = TreeNode> {
-  byId: Map<string, T>;
-  byAddress: Map<string, T>;
-  childrenOf: Map<string | null, T[]>;
-  root: T | null;
+export interface TreeIndex {
+  byId: Map<string, TreeNode>;
+  byAddress: Map<string, TreeNode>;
+  childrenOf: Map<string | null, TreeNode[]>;
+  root: TreeNode | null;
   size: number;
 }
 
@@ -138,9 +138,9 @@ export function toTreeNode(row: NodeRow | null): TreeNode | null {
 
 // ─── TreeIndex: 整棵树，O(1) 查询 ────────────
 
-export function buildTreeIndex<T extends BaseIndexNode = TreeNode>(
+export function buildTreeIndex(
   source: NodeRow[] | NestedNode | null | undefined
-): TreeIndex<T> {
+): TreeIndex {
   let raw: NodeRow[];
   if (Array.isArray(source)) {
     raw = source;
@@ -176,7 +176,7 @@ export function buildTreeIndex<T extends BaseIndexNode = TreeNode>(
     children.sort((a, b) => a.sortOrder - b.sortOrder || compareNodeId(a.id, b.id));
   }
 
-  return { byId, byAddress, childrenOf, root, size: byId.size } as unknown as TreeIndex<T>;
+  return { byId, byAddress, childrenOf, root, size: byId.size };
 }
 
 function flattenNested(root: NestedNode): NodeRow[] {
@@ -193,35 +193,35 @@ function flattenNested(root: NestedNode): NodeRow[] {
 
 // ─── 查询 ─────────────────────────────────────
 
-export function getNode<T extends BaseIndexNode>(index: TreeIndex<T>, id: unknown): T | null {
+export function getNode(index: TreeIndex, id: unknown): TreeNode | null {
   const key = normalizeNodeId(id);
   if (key === null) return null;
   return index.byId.get(key) ?? null;
 }
 
-export function getNodeByAddress<T extends BaseIndexNode>(index: TreeIndex<T>, address: unknown): T | null {
+export function getNodeByAddress(index: TreeIndex, address: unknown): TreeNode | null {
   return index.byAddress.get(String(address)) ?? null;
 }
 
-export function getChildren<T extends BaseIndexNode>(index: TreeIndex<T>, parentId: unknown): T[] {
+export function getChildren(index: TreeIndex, parentId: unknown): TreeNode[] {
   const key = normalizeNodeId(parentId);
   if (key === null) return [];
   return index.childrenOf.get(key) ?? [];
 }
 
-export function getParent<T extends BaseIndexNode>(index: TreeIndex<T>, nodeId: unknown): T | null {
+export function getParent(index: TreeIndex, nodeId: unknown): TreeNode | null {
   const node = getNode(index, nodeId);
   return node?.parentId ? getNode(index, node.parentId) : null;
 }
 
-export function getSiblings<T extends BaseIndexNode>(index: TreeIndex<T>, nodeId: unknown): T[] {
+export function getSiblings(index: TreeIndex, nodeId: unknown): TreeNode[] {
   const parent = getParent(index, nodeId);
   if (!parent) return [];
   return getChildren(index, parent.id);
 }
 
-export function getAncestors<T extends BaseIndexNode>(index: TreeIndex<T>, nodeId: unknown): T[] {
-  const result: T[] = [];
+export function getAncestors(index: TreeIndex, nodeId: unknown): TreeNode[] {
+  const result: TreeNode[] = [];
   let cur = getNode(index, nodeId);
   while (cur?.parentId) {
     cur = getNode(index, cur.parentId);
@@ -230,8 +230,8 @@ export function getAncestors<T extends BaseIndexNode>(index: TreeIndex<T>, nodeI
   return result;
 }
 
-export function getDescendants<T extends BaseIndexNode>(index: TreeIndex<T>, nodeId: unknown): T[] {
-  const result: T[] = [];
+export function getDescendants(index: TreeIndex, nodeId: unknown): TreeNode[] {
+  const result: TreeNode[] = [];
   const stack = getChildren(index, nodeId).slice().reverse();
   while (stack.length > 0) {
     const node = stack.pop()!;
@@ -242,11 +242,11 @@ export function getDescendants<T extends BaseIndexNode>(index: TreeIndex<T>, nod
   return result;
 }
 
-export function getSubtreeText<T extends BaseIndexNode>(index: TreeIndex<T>, nodeId: unknown, separator = '\n'): string {
+export function getSubtreeText(index: TreeIndex, nodeId: unknown, separator = '\n'): string {
   const node = getNode(index, nodeId);
   if (!node) return '';
   const parts: string[] = [];
-  const stack: T[] = [node];
+  const stack: TreeNode[] = [node];
   while (stack.length > 0) {
     const n = stack.pop()!;
     const title = String(n.title ?? '');
@@ -278,17 +278,17 @@ export function isAncestorAddress(ancestor: unknown, descendant: unknown): boole
 
 // ─── 索引更新（乐观更新 / 局部刷新）──────────
 
-export function patchNode<T extends BaseIndexNode>(index: TreeIndex<T>, updatedRow: NodeRow): TreeIndex<T> {
+export function patchNode(index: TreeIndex, updatedRow: NodeRow): TreeIndex {
   const node = toTreeNode(updatedRow);
   if (!node) return index;
 
   const prev = index.byId.get(node.id);
-  index.byId.set(node.id, node as unknown as T);
+  index.byId.set(node.id, node);
 
   if (prev && prev.address && prev.address !== node.address) {
     index.byAddress.delete(prev.address);
   }
-  if (node.address) index.byAddress.set(node.address, node as unknown as T);
+  if (node.address) index.byAddress.set(node.address, node);
 
   if (prev && prev.parentId !== node.parentId) {
     const oldSiblings = index.childrenOf.get(prev.parentId);
@@ -299,23 +299,23 @@ export function patchNode<T extends BaseIndexNode>(index: TreeIndex<T>, updatedR
     if (node.parentId != null) {
       if (!index.childrenOf.has(node.parentId)) index.childrenOf.set(node.parentId, []);
       const siblings = index.childrenOf.get(node.parentId)!;
-      siblings.push(node as unknown as T);
+      siblings.push(node);
       siblings.sort((a, b) => Number(a.sortOrder) - Number(b.sortOrder) || compareNodeId(a.id, b.id));
     }
   } else if (prev) {
     const siblings = index.childrenOf.get(node.parentId);
     if (siblings) {
       const idx = siblings.findIndex(n => n.id === node.id);
-      if (idx >= 0) siblings[idx] = node as unknown as T;
+      if (idx >= 0) siblings[idx] = node;
     }
   }
 
-  if (node.id === index.root?.id) index.root = node as unknown as T;
+  if (node.id === index.root?.id) index.root = node;
   index.size = index.byId.size;
   return { ...index };
 }
 
-export function removeNode<T extends BaseIndexNode>(index: TreeIndex<T>, nodeId: unknown): TreeIndex<T> {
+export function removeNode(index: TreeIndex, nodeId: unknown): TreeIndex {
   const id = normalizeNodeId(nodeId);
   if (id === null) return index;
   const node = index.byId.get(id);

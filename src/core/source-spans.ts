@@ -5,6 +5,7 @@ export interface SourceSpanRecord {
   start_offset: number;
   end_offset: number;
   text: string;
+  [key: string]: unknown;
 }
 
 interface SentenceSegment {
@@ -62,7 +63,13 @@ export function createSpanAccumulator(): SpanAccumulator {
 
 interface AddSentenceContainerArgs {
   acc: SpanAccumulator;
-  addRecord: (...args: any[]) => any;
+  // 各 reader（chm/docx/epub）的 addRecord 形态：定址 + 正文 + 角色 + 容器选项，返回带 address 的记录或空。
+  addRecord: (
+    parentAddress: string,
+    text: string,
+    role: string,
+    options?: { indexes?: number[]; sourcePosition?: number; skipVector?: boolean }
+  ) => { address: string } | null | undefined;
   parentAddress: string;
   text: unknown;
   rolePrefix: string;

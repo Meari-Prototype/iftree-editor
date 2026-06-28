@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,11 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { createDatabaseService, databaseWriteActions } from '../src/backend/database-service.js';
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+type MutatePayload = Record<string, unknown> & { help?: boolean; action?: string };
+
 function defaultDbPath() {
   return process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite');
 }
 
-function parseValue(value) {
+function parseValue(value: unknown): unknown {
   const raw = String(value ?? '');
   if (raw === 'true') return true;
   if (raw === 'false') return false;
@@ -23,13 +24,13 @@ function parseValue(value) {
   return raw;
 }
 
-function parseArgs(argv) {
+function parseArgs(argv: string[]): MutatePayload {
   if (argv.length === 0) return { help: true };
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') return { help: true };
   if (argv[0] === 'actions') return { action: 'mutation.actions' };
   if (argv[0]?.startsWith('{')) return JSON.parse(argv.join(' '));
 
-  const payload = {};
+  const payload: MutatePayload = {};
   let index = 0;
   if (!argv[0]?.startsWith('--')) {
     payload.action = argv[0];
@@ -65,7 +66,7 @@ function printHelp() {
   ].join('\n'));
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.versions.electron) {
     const { app } = await import('electron');
     app.exit(code);
@@ -104,7 +105,7 @@ async function main() {
 
 main()
   .then(() => exitProcess(0))
-  .catch(async (error) => {
-    console.error(error?.stack || error?.message || String(error));
+  .catch(async (error: unknown) => {
+    console.error((error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || String(error));
     await exitProcess(1);
   });

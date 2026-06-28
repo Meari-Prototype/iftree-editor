@@ -1,4 +1,3 @@
-// @ts-nocheck
 import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,7 +11,36 @@ import { importRecordsForFile } from '../src/core/import-formats/router.js';
 
 // --- helpers ---
 
-function tempStore() {
+// store.getDoc 返回 LoadedDoc | null；tree 字段又是 AddressTreeNode | null。
+// 各 test 用 expectFullDoc 一次性 narrow 成「doc + tree 都非空」形态。
+type GetDocResult = NonNullable<ReturnType<IftreeStore['getDoc']>>;
+type LoadedTree = NonNullable<GetDocResult['tree']>;
+type LoadedDoc = GetDocResult & { tree: LoadedTree };
+
+function expectFullDoc(doc: ReturnType<IftreeStore['getDoc']>): asserts doc is LoadedDoc {
+  if (!doc) throw new Error('store.getDoc 返回 null');
+  if (!doc.tree) throw new Error('store.getDoc.tree 为空');
+}
+
+// AddressTreeNode.children 是 optional；test 频繁访问 children[i]，统一 ?? [] 兜底拿数组。
+function treeChildren(tree: LoadedTree): NonNullable<LoadedTree['children']> {
+  return tree.children ?? [];
+}
+
+interface FlattenedNodeLike {
+  id?: unknown;
+  text?: unknown;
+  address?: unknown;
+  [extra: string]: unknown;
+}
+
+interface SnapshotNodeLike {
+  id?: unknown;
+  text?: unknown;
+  [extra: string]: unknown;
+}
+
+function tempStore(): { store: IftreeStore; dbPath: string } {
   const dir = join(tmpdir(), `iftree-integ-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const dbPath = join(dir, 'store.sqlite');
   rmSync(dbPath, { force: true });
@@ -53,29 +81,38 @@ test('创建文档 → 列出 → 打开 → 节点操作', () => {
 
     // 打开
     const loaded = store.getDoc(d1.id);
-    assert.ok(loaded.tree, 'getDoc 返回根节点');
+    expectFullDoc(loaded);
     assert.equal(loaded.tree.text, '根节点文本A');
     assert.equal(loaded.tree.address, '1');
 
     // 插入子节点（getDoc 返回的树节点字段是驼峰 nodeType）
     const child = store.insertNode({ docId: d1.id, parentId: d1.rootNodeId, text: '子节点', nodeType: 'IF' });
     let reloaded = store.getDoc(d1.id);
-    assert.equal(reloaded.tree.children.length, 1);
-    assert.equal(reloaded.tree.children[0].text, '子节点');
-    assert.equal(reloaded.tree.children[0].address, '1-1');
-    assert.equal(reloaded.tree.children[0].nodeType, 'IF');
+    expectFullDoc(reloaded);
+    {
+      const kids = treeChildren(reloaded.tree);
+      assert.equal(kids.length, 1);
+      assert.equal(kids[0].text, '子节点');
+      assert.equal(kids[0].address, '1-1');
+      assert.equal(kids[0].nodeType, 'IF');
+    }
 
     // 更新节点（写入也用驼峰 nodeType）
     store.updateNode(child.id, { text: '更新后的子节点', nodeType: 'ELSE' });
     reloaded = store.getDoc(d1.id);
-    assert.equal(reloaded.tree.children[0].text, '更新后的子节点');
-    assert.equal(reloaded.tree.children[0].nodeType, 'ELSE');
+    expectFullDoc(reloaded);
+    {
+      const kids = treeChildren(reloaded.tree);
+      assert.equal(kids[0].text, '更新后的子节点');
+      assert.equal(kids[0].nodeType, 'ELSE');
+    }
 
     // 删除子树
     store.insertNode({ docId: d1.id, parentId: child.id, text: '孙子节点', nodeType: 'TEXT' });
     store.deleteNodeSubtree(child.id);
     const afterDelete = store.getDoc(d1.id);
-    assert.equal(afterDelete.tree.children.length, 0, '子树删除后无子节点');
+    expectFullDoc(afterDelete);
+    assert.equal(treeChildren(afterDelete.tree).length, 0, '子树删除后无子节点');
   } finally {
     store.close();
   }
@@ -90,11 +127,13 @@ test('trust_level 和 node_type 约束', () => {
 
     store.updateNode(doc.rootNodeId, { trustLevel: '受控', nodeType: 'HUMAN_BLOCK' });
     let loaded = store.getDoc(doc.id);
+    expectFullDoc(loaded);
     assert.equal(loaded.tree.trustLevel, '受控');
     assert.equal(loaded.tree.nodeType, 'HUMAN_BLOCK');
 
     store.updateNode(doc.rootNodeId, { trustLevel: '不受控', nodeType: 'HUMAN_SUMMARY' });
     loaded = store.getDoc(doc.id);
+    expectFullDoc(loaded);
     assert.equal(loaded.tree.trustLevel, '不受控');
     assert.equal(loaded.tree.nodeType, 'HUMAN_SUMMARY');
   } finally {
@@ -118,13 +157,15 @@ test('保存版本 → 快照重建 → 恢复', () => {
 
     // 快照按内容寻址对象库重建（取代旧的 SELECT diff FROM commits）
     const snap1 = store.commitSnapshot(h1.id);
-    assert.equal(snap1.nodes.find((n) => n.id === child.id)?.text, '第一节', '第一版快照保留初始正文');
+    if (!snap1) throw new Error('commitSnapshot(h1) 返回 null');
+    assert.equal((snap1.nodes as SnapshotNodeLike[]).find((n) => n.id === child.id)?.text, '第一节', '第一版快照保留初始正文');
 
     // 改一版再存
     store.updateNode(child.id, { text: '第一节（修改后）', nodeType: 'IF' });
     const h2 = store.saveHistorySnapshot({ docId: doc.id, summary: '第二版' });
     const snap2 = store.commitSnapshot(h2.id);
-    assert.equal(snap2.nodes.find((n) => n.id === child.id)?.text, '第一节（修改后）', '第二版快照反映修改');
+    if (!snap2) throw new Error('commitSnapshot(h2) 返回 null');
+    assert.equal((snap2.nodes as SnapshotNodeLike[]).find((n) => n.id === child.id)?.text, '第一节（修改后）', '第二版快照反映修改');
 
     // diff 不再持久化，由 computeDiff 现算两版差异
     const diff = store.computeDiff(snap1, snap2);
@@ -133,8 +174,12 @@ test('保存版本 → 快照重建 → 恢复', () => {
     // 恢复第一版
     store.restoreCommit(h1.id);
     const restored = store.getDoc(doc.id);
-    assert.equal(restored.tree.children[0].text, '第一节', '恢复后正文回到初始值');
-    assert.equal(restored.tree.children[0].nodeType, 'TEXT', '恢复后类型回到初始值');
+    expectFullDoc(restored);
+    {
+      const kids = treeChildren(restored.tree);
+      assert.equal(kids[0].text, '第一节', '恢复后正文回到初始值');
+      assert.equal(kids[0].nodeType, 'TEXT', '恢复后类型回到初始值');
+    }
   } finally {
     store.close();
   }
@@ -148,10 +193,11 @@ test('导入夹具文档并校验节点结构', async () => {
     const routed = await importRecordsForFile(FIXTURE_PATH, { mode: 'complete' });
     assert.ok(Array.isArray(routed.structured) && routed.structured.length > 0, '夹具解析出结构化记录');
 
+    type CreateRecords = Parameters<typeof store.createDocFromStructuredRecords>[0]['records'];
     const doc = store.createDocFromStructuredRecords({
       title: 'IFTreeEditor导入导出测试夹具',
       sourcePath: FIXTURE_PATH,
-      records: routed.structured
+      records: routed.structured as CreateRecords
     });
 
     // 认 UUID：不数文档总数
@@ -159,12 +205,13 @@ test('导入夹具文档并校验节点结构', async () => {
     assert.ok(store.listDocs().some((d) => d.id === doc.id), '导入的文档按 UUID 出现在列表');
 
     const loaded = store.getDoc(doc.id);
-    const nodes = flattenTree(loaded.tree);
-    const allText = nodes.map((n) => n.text || '').join('\n');
+    expectFullDoc(loaded);
+    const nodes = flattenTree(loaded.tree) as FlattenedNodeLike[];
+    const allText = nodes.map((n) => String(n.text ?? '')).join('\n');
 
     // 标题层级被导入成树：两个章节标题都在
-    assert.ok(nodes.some((n) => (n.text || '').includes('第一章 入口条件')), '第一章标题节点存在');
-    assert.ok(nodes.some((n) => (n.text || '').includes('第二章 主流程')), '第二章标题节点存在');
+    assert.ok(nodes.some((n) => String(n.text ?? '').includes('第一章 入口条件')), '第一章标题节点存在');
+    assert.ok(nodes.some((n) => String(n.text ?? '').includes('第二章 主流程')), '第二章标题节点存在');
 
     // 稳定靶子全部导入（叶子正文）
     for (const marker of ['IOFX_ALPHA', 'IOFX_BETA', 'IOFX_GAMMA', 'IOFX_DELTA', 'IOFX_END']) {
@@ -186,10 +233,11 @@ test('导入夹具后导出 Markdown 保留层级与内容', async () => {
   const { store } = tempStore();
   try {
     const routed = await importRecordsForFile(FIXTURE_PATH, { mode: 'complete' });
+    type CreateRecords = Parameters<typeof store.createDocFromStructuredRecords>[0]['records'];
     const doc = store.createDocFromStructuredRecords({
       title: 'IFTreeEditor导入导出测试夹具',
       sourcePath: FIXTURE_PATH,
-      records: routed.structured
+      records: routed.structured as CreateRecords
     });
 
     const markdown = store.exportDocMarkdown(doc.id);
@@ -223,7 +271,7 @@ test('模拟 UI 工具栏按钮：prompt → createDoc → 状态刷新', () => 
 
     // 模拟 setCurrentDoc + refreshDocs
     const loaded = store.getDoc(doc.id);
-    assert.ok(loaded.tree);
+    expectFullDoc(loaded);
     assert.equal(loaded.tree.text, title);
     assert.equal(loaded.tree.address, '1');
     assert.equal(loaded.tree.nodeType, 'TEXT');

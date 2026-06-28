@@ -1,20 +1,19 @@
-// @ts-nocheck
 import {
   v7 as uuidv7,
   validate as validateUuid,
   version as uuidVersion
 } from 'uuid';
 
-export function newStableId() {
+export function newStableId(): string {
   return uuidv7();
 }
 
-export function isStableId(value) {
+export function isStableId(value: unknown): boolean {
   if (typeof value !== 'string') return false;
   return validateUuid(value) && uuidVersion(value) === 7;
 }
 
-export function normalizeStableId(value, fallback = null) {
+export function normalizeStableId(value: unknown, fallback: string | null = null): string | null {
   if (value === null || value === undefined || value === '') return fallback;
   if (typeof value === 'number') {
     return Number.isInteger(value) && value > 0 ? String(value) : fallback;
@@ -26,25 +25,25 @@ export function normalizeStableId(value, fallback = null) {
   return isStableId(text) ? text : fallback;
 }
 
-export function requireStableId(value, label = 'id') {
+export function requireStableId(value: unknown, label = 'id'): string {
   const id = normalizeStableId(value);
   if (!id) throw new Error(`${label} is required`);
   return id;
 }
 
-export function sameStableId(left, right) {
+export function sameStableId(left: unknown, right: unknown): boolean {
   if (left === null || left === undefined) return right === null || right === undefined;
   if (right === null || right === undefined) return false;
   return String(left) === String(right);
 }
 
-export function compareStableIds(left, right) {
+export function compareStableIds(left: unknown, right: unknown): number {
   return String(left || '').localeCompare(String(right || ''), undefined, { numeric: true });
 }
 
-export function normalizeStableIdBatch(value, max = 500) {
-  const ids = [];
-  const seen = new Set();
+export function normalizeStableIdBatch(value: unknown, max = 500): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
   for (const item of Array.isArray(value) ? value : []) {
     const id = normalizeStableId(item);
     if (!id || seen.has(id)) continue;

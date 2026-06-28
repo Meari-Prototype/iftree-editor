@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { readFileSync } from 'node:fs';
 import { normalizeStableId, isStableId } from './db/ids.js';
 import { runImportJson } from './import-json.js';
@@ -15,26 +14,310 @@ import {
   snapshotNodeId,
   snapshotParentId,
   snapshotReadNode,
-  snapshotSubtreeRows
+  snapshotSubtreeRows,
+  type SnapshotRow,
+  type SnapshotReadNodeResult
 } from '../core/snapshot-tree.js';
+import { nextInDfs, parentAddress, formatAddress, parseAddress, isAncestor } from '../core/tree-cursor.js';
 
-function cleanLine(value = '') {
+// db-shell 是 endpoint：处理 IPC 返回的扁平 JSON（混 camelCase + snake_case + 派生字段），
+// 不接数据库真行类型——下面这组 shell-layer 接口描述显示形态、字段全 optional。
+// run 返回 any 是有意为之的 IPC 边界：不同 action 返回结构差异巨大，下游靠 result?.rows / result?.tree 形态分支。
+
+type FlagValue = string | number | boolean;
+type ShellRunMode = 'read' | 'write' | 'edit' | 'full';
+
+interface ShellRunEnvelope {
+  operation: 'read' | 'write';
+  payload: Record<string, unknown>;
+}
+
+interface ShellDatabase {
+  run(envelope: ShellRunEnvelope, mode: ShellRunMode): Promise<any>;
+}
+
+interface ParsedFlags {
+  // value-flags（parseValue → string | number）
+  scopeDocId?: FlagValue;
+  scopeAddress?: FlagValue;
+  depth?: FlagValue;
+  limit?: FlagValue;
+  timeoutMs?: FlagValue;
+  charLimit?: FlagValue;
+  branch?: FlagValue;
+  base?: FlagValue;
+  owner?: FlagValue;
+  history?: FlagValue;
+  sourceBranch?: FlagValue;
+  targetBranch?: FlagValue;
+  targetBase?: FlagValue;
+  entryId?: FlagValue;
+  entryIndex?: FlagValue;
+  mode?: FlagValue;
+  docId?: FlagValue;
+  sessionId?: FlagValue;
+  set?: FlagValue;
+  insert?: FlagValue;
+  cwd?: FlagValue;
+  at?: FlagValue;
+  state?: FlagValue;
+  agent?: FlagValue;
+  workspace?: FlagValue;
+  kind?: FlagValue;
+  trust?: FlagValue;
+  since?: FlagValue;
+  until?: FlagValue;
+  matchMode?: FlagValue;
+  excludeFolder?: FlagValue;
+  sections?: FlagValue;
+  range?: FlagValue;
+  start?: FlagValue;
+  before?: FlagValue;
+  spansLimit?: FlagValue;
+  nodeId?: FlagValue;
+  minScore?: FlagValue;
+  detail?: FlagValue;
+  folder?: FlagValue;
+  from?: FlagValue;
+  to?: FlagValue;
+  // 可带可不带值（无值时为 true）
+  summary?: FlagValue;
+  tag?: FlagValue;
+  strategy?: FlagValue;
+  resolutions?: FlagValue;
+  // boolean 开关
+  entity?: boolean;
+  expand?: boolean;
+  allDocs?: boolean;
+  all?: boolean;
+  or?: boolean;
+  semantic?: boolean;
+  yes?: boolean;
+  delete?: boolean;
+  uuid?: boolean;
+  dryRun?: boolean;
+  embed?: boolean;
+  force?: boolean;
+  labels?: boolean;
+  spans?: boolean;
+  json?: boolean;
+  node?: boolean;
+  atAddress?: boolean;
+  includeHidden?: boolean;
+}
+
+interface ParsedArgs {
+  flags: ParsedFlags;
+  positional: string[];
+}
+
+interface ShellSemanticStatus {
+  status?: string;
+  vectorCount?: number;
+  nodeCount?: number;
+}
+
+interface ShellNodeMeta {
+  subtreeTextChars?: number;
+  textChars?: number;
+  semantic?: ShellSemanticStatus | null;
+}
+
+interface ShellDoc {
+  id?: string | number;
+  docId?: string | number;
+  doc_id?: string | number;
+  title?: string;
+  docTitle?: string;
+  doc_title?: string;
+  name?: string;
+  kind?: string | null;
+}
+
+interface ShellNode {
+  id?: string | number;
+  node_id?: string | number;
+  nodeId?: string | number;
+  docId?: string | number;
+  doc_id?: string | number;
+  address?: string;
+  parentId?: string | number | null;
+  parent_id?: string | number | null;
+  sortOrder?: number;
+  sort_order?: number;
+  type?: string;
+  nodeType?: string;
+  node_type?: string;
+  title?: string;
+  node_title?: string;
+  nodeTitle?: string;
+  text?: string;
+  textPreview?: string;
+  note?: string;
+  node_note?: string;
+  tags?: { trustLevel?: string | null } & Record<string, unknown>;
+  trustLevel?: string | null;
+  trust_level?: string | null;
+  score?: number | string;
+  rowHits?: number;
+  row_hits?: number;
+  termCount?: number;
+  term_count?: number;
+  updatedAt?: string | null;
+  updated_at?: string | null;
+  createdAt?: string | null;
+  created_at?: string | null;
+  meta?: ShellNodeMeta;
+  source?: { position?: number | string | null } & Record<string, unknown>;
+  doc?: ShellDoc;
+  docTitle?: string;
+  doc_title?: string;
+  children?: ShellNode[];
+}
+
+type ShellHitRow = ShellNode & {
+  node?: ShellNode;
+  doc?: ShellDoc;
+};
+
+interface ShellEntityRow {
+  id?: string;
+  literal?: string;
+  term?: string;
+  hitCount?: number;
+  hit_count?: number;
+  docId?: string | number;
+  doc_id?: string | number;
+  doc?: ShellDoc;
+  entity?: ShellEntityRow;
+  seed?: ShellEntityRow;
+  relation?: string;
+}
+
+interface ShellHistoryRow {
+  id?: string;
+  commit_id?: string;
+  commitId?: string;
+  committed_at?: string;
+  committedAt?: string;
+  saved_at?: string;
+  savedAt?: string;
+  author?: string;
+  owner?: string;
+  summary?: string;
+  doc_id?: string;
+  docId?: string;
+}
+
+interface ShellHistorySpec {
+  kind: string;
+  value: string | number | boolean;
+  docId: string | null;
+}
+
+interface ShellRefRow {
+  id?: string | number;
+  refId?: string | number;
+  ref_id?: string | number;
+  source_type?: string;
+  sourceType?: string;
+  source_id?: string | number;
+  sourceId?: string | number;
+  target_type?: string;
+  targetType?: string;
+  target_id?: string | number;
+  targetId?: string | number;
+  ref_kind?: string;
+  refKind?: string;
+  kind?: string;
+  note?: string;
+}
+
+interface ShellSourceSpan {
+  id?: string | number;
+  spanId?: string | number;
+  span_id?: string | number;
+  sentence_index?: number;
+  sentenceIndex?: number;
+  absolute_start_offset?: number;
+  absoluteStartOffset?: number;
+  start_offset?: number;
+  startOffset?: number;
+  absolute_end_offset?: number;
+  absoluteEndOffset?: number;
+  end_offset?: number;
+  endOffset?: number;
+  node_id?: string | number;
+  nodeId?: string | number;
+}
+
+interface ShellAxiomRow {
+  label?: string;
+  address?: string;
+  id?: string | number;
+  status?: string;
+  content?: string;
+  text?: string;
+  node_title?: string;
+  nodeTitle?: string;
+}
+
+interface ShellArticleWindow {
+  startOffset?: number;
+  endOffset?: number;
+  totalLength?: number;
+  hasBefore?: boolean;
+  hasAfter?: boolean;
+}
+
+interface ShellArticleResult {
+  article?: unknown;
+  text?: string | null;
+  window?: ShellArticleWindow;
+  sourceSpans?: ShellSourceSpan[];
+  spansTotal?: number;
+}
+
+interface ShellBranchTarget {
+  branchId?: FlagValue | null;
+  baseDocId?: FlagValue | null;
+  owner?: FlagValue | null;
+}
+
+interface ShellState {
+  selectedBranch?: ShellBranchTarget;
+}
+
+interface ShellContext {
+  currentDocId?: string | number | null;
+  docId?: string | number | null;
+  shellState?: ShellState;
+  // 嵌入式 helper 函数：headless-agent-host / agent-runtime 注入；存在性由动词在调用前检查（contextFunction）。
+  askAgent?: (payload: Record<string, unknown>) => Promise<any>;
+  importLibraryDocument?: (payload: Record<string, unknown>) => Promise<any>;
+  ensureDocVectors?: (payload: Record<string, unknown>) => Promise<any>;
+  deleteImportedDocument?: (payload: Record<string, unknown>) => Promise<any>;
+  agentTool?: (payload: Record<string, unknown>) => Promise<any>;
+  [key: string]: unknown;
+}
+
+function cleanLine(value: unknown = '') {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function clip(value = '', limit = 80) {
+function clip(value: unknown = '', limit = 80) {
   const text = cleanLine(value);
   return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3))}...` : text;
 }
 
 const READ_SUBTREE_TEXT_LIMIT = 10000;
 
-function normalizeShellDocId(value, fallback = null) {
+function normalizeShellDocId(value: unknown, fallback: string | null = null): string | null {
   return normalizeStableId(value, fallback);
 }
 
 // 去掉命中行/组头里的 doc: 前缀，取裸 doc 标识。
-function bareDocRef(value = '') {
+function bareDocRef(value: unknown = '') {
   const raw = cleanLine(value);
   return raw.startsWith('doc:') ? raw.slice(4).trim() : raw;
 }
@@ -42,7 +325,26 @@ function bareDocRef(value = '') {
 // 把用户/agent 传入的 doc 标识解析为真实 docId：合法 UUIDv7 直接用；否则按文档标题精确匹配——
 // 唯一命中返回其 docId，重名报冲突并列出候选 UUID，无命中报未找到。
 // 让 read/tree 等默认用标题下钻：库内标题唯一时 UUID 完全不必出现，只有重名才被逼出来。
-export async function resolveDocRef(database, input, { allowMissing = false } = {}) {
+// 重载：默认 allowMissing=false 时不为空（找不到即抛）；显式 allowMissing=true 才可能返回 null。
+export async function resolveDocRef(
+  database: ShellDatabase,
+  input: unknown
+): Promise<string>;
+export async function resolveDocRef(
+  database: ShellDatabase,
+  input: unknown,
+  options: { allowMissing?: false }
+): Promise<string>;
+export async function resolveDocRef(
+  database: ShellDatabase,
+  input: unknown,
+  options: { allowMissing: true }
+): Promise<string | null>;
+export async function resolveDocRef(
+  database: ShellDatabase,
+  input: unknown,
+  { allowMissing = false }: { allowMissing?: boolean } = {}
+): Promise<string | null> {
   const bare = bareDocRef(input);
   if (!bare) {
     if (allowMissing) return null;
@@ -50,7 +352,7 @@ export async function resolveDocRef(database, input, { allowMissing = false } = 
   }
   if (isStableId(bare)) return bare;
   const listed = await database.run({ operation: 'read', payload: { action: 'doc.list' } }, 'read');
-  const docs = Array.isArray(listed) ? listed : (listed?.rows || listed?.docs || []);
+  const docs: ShellDoc[] = Array.isArray(listed) ? listed : (listed?.rows || listed?.docs || []);
   const target = cleanLine(bare);
   const matches = docs.filter((doc) => cleanLine(doc.title ?? doc.doc_title ?? '') === target);
   if (matches.length === 1) return String(matches[0].id ?? matches[0].docId ?? matches[0].doc_id);
@@ -62,20 +364,21 @@ export async function resolveDocRef(database, input, { allowMissing = false } = 
   throw new Error(`文档标题「${bare}」重名（${matches.length} 个），无法用标题定位，请改用其中之一的 UUID：${candidates}`);
 }
 
-function parseValue(value) {
+function parseValue(value: unknown): string | number {
   const raw = String(value ?? '').trim();
   if (/^-?\d+$/.test(raw)) return Number(raw);
   return raw;
 }
 
-function normalizeArgv(argv = []) {
+function normalizeArgv(argv: unknown[] = []): string[] {
   const source = Array.isArray(argv) ? argv.map((item) => String(item)) : [];
   return source[0] === 'db' ? source.slice(1) : source;
 }
 
-function parseFlags(argv = []) {
-  const flags = {};
-  const positional = [];
+function parseFlags(argv: string[] = []): ParsedArgs {
+  // 内部用宽松 Record 接收动态键写入；返回时收口为 ParsedFlags，让下游 typo 在使用点被抓到。
+  const flags: Record<string, FlagValue> = {};
+  const positional: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (!token.startsWith('--')) {
@@ -132,19 +435,20 @@ function parseFlags(argv = []) {
       index += 1;
       continue;
     }
-    if (['tags', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'embed', 'force', 'labels', 'spans', 'json', 'node', 'at-address', 'include-hidden'].includes(name)) {
+    if (['entity', 'expand', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'embed', 'force', 'labels', 'spans', 'json', 'node', 'at-address', 'include-hidden'].includes(name)) {
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
-    if (name === 'fuzzy') throw new Error('db find --fuzzy is not supported; use db find --tags to expand related entities.');
+    if (name === 'tags') { flags.entity = true; continue; }
+    if (name === 'fuzzy') throw new Error('db find --fuzzy is not supported; use db find --entity to browse related entities.');
     throw new Error(`Unknown db option: --${name}`);
   }
-  return { flags, positional };
+  return { flags: flags as ParsedFlags, positional };
 }
 
-function parseLooseFlags(argv = [], valueFlagNames = []) {
-  const flags = {};
-  const positional = [];
+function parseLooseFlags(argv: unknown[] = [], valueFlagNames: string[] = []): ParsedArgs {
+  const flags: Record<string, FlagValue> = {};
+  const positional: string[] = [];
   const valueFlags = new Set(valueFlagNames);
   for (let index = 0; index < argv.length; index += 1) {
     const token = String(argv[index] || '');
@@ -162,53 +466,80 @@ function parseLooseFlags(argv = [], valueFlagNames = []) {
     }
     positional.push(token);
   }
-  return { flags, positional };
+  return { flags: flags as ParsedFlags, positional };
 }
 
-function currentDocIdFrom(context = {}) {
+interface ShellDocScope {
+  allDocs?: boolean;
+  // docId 只在 allowMissing=true 且没有可用 currentDocId 时缺省；其余分支若返回则必有值。
+  docId?: string;
+  scopeDocId?: string;
+  scopeAddress?: string;
+}
+
+function currentDocIdFrom(context: ShellContext = {}): string | null {
   return normalizeShellDocId(context.currentDocId ?? context.docId ?? process.env.IFTREE_CURRENT_DOC_ID, null);
 }
 
-function docScope(flags = {}, context = {}, options = {}) {
+function docScope(
+  flags: ParsedFlags = {},
+  context: ShellContext = {},
+  options: { allowMissing?: boolean } = {}
+): ShellDocScope {
   if (flags.allDocs) return { allDocs: true };
-  const scopedDocId = normalizeShellDocId(flags.scopeDocId, null);
-  if (scopedDocId) return { docId: scopedDocId, scopeDocId: scopedDocId, scopeAddress: flags.scopeAddress || '' };
+  const scopedDocId: string | null = normalizeShellDocId(flags.scopeDocId, null);
+  if (scopedDocId) return { docId: scopedDocId, scopeDocId: scopedDocId, scopeAddress: String(flags.scopeAddress || '') };
   const currentDocId = currentDocIdFrom(context);
   if (currentDocId) return { docId: currentDocId };
   if (options.allowMissing) return {};
   throw new Error('db command requires current document id, --scope, or --all-docs');
 }
 
-function nodeTitle(node = {}) {
+function nodeTitle(node: ShellNode = {}) {
   return clip(node.title || node.textPreview || node.text || '', 80);
 }
 
 // find 命中行的内容预览：标题后拼接正文、共截 30 字——无标题/短标题能带出一部分正文开头，
 // 标题长则只显示标题。比单显 title（会话卷里 title 就是「用户/助手」角色名、会遮蔽正文）更利于挑候选。
-function hitContentPreview(node = {}) {
+function hitContentPreview(node: ShellNode = {}) {
   const title = cleanLine(node.title || '');
   const body = cleanLine(node.textPreview || node.text || '');
   const combined = title ? (body && body !== title ? `${title} ${body}` : title) : body;
   return clip(combined, 30);
 }
 
-function nodeTypeLabel(node = {}) {
+function nodeTypeLabel(node: ShellNode = {}) {
   return nodeTypeDisplayLabel(node.type || node.nodeType || node.node_type || 'TEXT');
 }
 
-function nodeTrustLabel(node = {}) {
+function nodeTrustLabel(node: ShellNode = {}) {
   const trust = node.tags?.trustLevel ?? node.trustLevel ?? node.trust_level ?? null;
   return `trust:${trust == null || trust === '' ? 'null' : cleanLine(trust)}`;
 }
 
-function docDisplayLabel(doc = {}, options = {}) {
+interface DocDisplayOptions {
+  uuid?: boolean;
+  docId?: string | number;
+  title?: string;
+}
+
+function docDisplayLabel(doc: ShellDoc = {}, options: DocDisplayOptions = {}) {
   const docId = doc.docId ?? doc.doc_id ?? doc.id ?? options.docId ?? '';
   if (options.uuid) return docId ? `doc:${docId}` : '';
   return cleanLine(doc.title || doc.docTitle || doc.doc_title || doc.name || options.title || '') || (docId ? `doc:${docId}` : '');
 }
 
-function formatNodeLine(item = {}, options = {}) {
-  const node = item.node || item;
+interface FormatNodeLineOptions {
+  uuid?: boolean;
+  omitDocLabel?: boolean;
+  docLabel?: string;
+  score?: number | string | null;
+  scoreKind?: 'sim' | 'hit';
+  labels?: boolean;
+}
+
+function formatNodeLine(item: ShellHitRow = {}, options: FormatNodeLineOptions = {}) {
+  const node: ShellNode = item.node || item;
   const docId = item.doc?.docId ?? item.doc?.id ?? node.docId ?? node.doc_id;
   const label = options.omitDocLabel ? '' : docDisplayLabel(item.doc || node.doc || {
     docId,
@@ -222,6 +553,9 @@ function formatNodeLine(item = {}, options = {}) {
     else if (options.scoreKind === 'hit') parts.push(`hit:${Math.round(Number(score))}`);
     else parts.push(Number(score).toFixed(2));
   }
+  const rowHits = node.rowHits ?? node.row_hits;
+  const termCount = node.termCount ?? node.term_count;
+  if (rowHits != null && termCount != null) parts.push(`terms:${rowHits}/${termCount}`);
   // find --labels（opt-in）：命中行带节点信任标，便于一眼分受控/不受控。
   if (options.labels) parts.push(nodeTrustLabel(node));
   // 召回结果必须附带时间元数据（projectneed 15-12-6）：命中行尾缀更新时间。
@@ -230,15 +564,27 @@ function formatNodeLine(item = {}, options = {}) {
   return parts.filter(Boolean).join(' ');
 }
 
+interface FormatGroupedHitsOptions extends FormatNodeLineOptions {
+  fallbackDocId?: string | number;
+  fallbackTitle?: string;
+}
+
+interface GroupedHitBucket {
+  docId: string;
+  title: string;
+  kind: string | null;
+  lines: string[];
+}
+
 // find 命中按文档分组：文档标识（标题/docId）只在组头出一次，组内行省略 doc label，
 // 消除每行重复 doc 标签的 token 开销，并让外部调用方从组头一次拿到下钻所需的 doc 标识。
 // 单文档检索传 fallbackDocId/fallbackTitle 兜底（命中行不自带 doc 信息时用它）。
 // 本次结果内出现同名文档（或显式 --uuid）时，组头带 doc:UUID 消歧。
-function formatGroupedHits(rows = [], options = {}) {
-  const groups = new Map();
-  const order = [];
+function formatGroupedHits(rows: ShellHitRow[] = [], options: FormatGroupedHitsOptions = {}) {
+  const groups = new Map<string, GroupedHitBucket>();
+  const order: string[] = [];
   for (const row of rows) {
-    const node = row.node || row;
+    const node: ShellNode = row.node || row;
     const docId = String(row.doc?.docId ?? row.doc?.id ?? node.docId ?? node.doc_id ?? options.fallbackDocId ?? '');
     const title = cleanLine(row.doc?.title ?? row.doc?.doc_title ?? row.docTitle ?? node.doc?.title ?? node.docTitle ?? options.fallbackTitle ?? '');
     const key = docId || title;
@@ -246,17 +592,17 @@ function formatGroupedHits(rows = [], options = {}) {
       groups.set(key, { docId, title, kind: row.doc?.kind ?? null, lines: [] });
       order.push(key);
     }
-    groups.get(key).lines.push(formatNodeLine(row, { ...options, omitDocLabel: true }));
+    groups.get(key)!.lines.push(formatNodeLine(row, { ...options, omitDocLabel: true }));
   }
-  const titleCounts = new Map();
+  const titleCounts = new Map<string, number>();
   for (const key of order) {
-    const { title } = groups.get(key);
+    const { title } = groups.get(key)!;
     if (title) titleCounts.set(title, (titleCounts.get(title) || 0) + 1);
   }
-  const lines = [];
+  const lines: string[] = [];
   for (const key of order) {
-    const group = groups.get(key);
-    const ambiguous = Boolean(options.uuid) || (group.title && titleCounts.get(group.title) > 1);
+    const group = groups.get(key)!;
+    const ambiguous = Boolean(options.uuid) || (group.title && (titleCounts.get(group.title) || 0) > 1);
     const head = group.title
       ? (ambiguous && group.docId ? `[doc:${group.docId} | ${group.title}]` : `[${group.title}]`)
       : (group.docId ? `[doc:${group.docId}]` : '[?]');
@@ -268,7 +614,7 @@ function formatGroupedHits(rows = [], options = {}) {
 }
 
 // find --labels 的层级中文名（三层时态）。
-function searchKindLabel(kind) {
+function searchKindLabel(kind: unknown) {
   if (kind === 'event') return '事件卷';
   if (kind === 'memory') return '核心记忆';
   if (kind === 'knowledge') return '知识';
@@ -276,8 +622,8 @@ function searchKindLabel(kind) {
 }
 
 // 检索范围的人读描述（统计行用）：单篇 / 全库 / folder + 各过滤维度。
-function searchScopeDescriptor(flags = {}, scope = {}) {
-  const parts = [];
+function searchScopeDescriptor(flags: ParsedFlags = {}, scope: ShellDocScope = {}) {
+  const parts: string[] = [];
   if (scope.docId && !scope.allDocs) parts.push('单篇');
   else if (flags.folder) parts.push(`folder:${flags.folder}`);
   else parts.push('全库');
@@ -289,32 +635,60 @@ function searchScopeDescriptor(flags = {}, scope = {}) {
   return parts.join(' ');
 }
 
+interface ShellSearchResult {
+  rows?: ShellHitRow[];
+  returned?: number;
+  total?: number;
+  scopeDocs?: number;
+  matchMode?: string;
+  groups?: Array<{ term?: string; rows?: ShellHitRow[] }>;
+  error?: string;
+}
+
 // find 返回统计行：让命中数/范围一目了然，尤其让"0 命中"能区分范围空 vs 范围内没命中。
-function findStatsLine(result = {}, scopeDesc = '') {
+function findStatsLine(result: ShellSearchResult = {}, scopeDesc = '') {
   const returned = Number(result.returned ?? (result.rows?.length || 0)) || 0;
   const total = Number(result.total) || returned;
   const docs = new Set((result.rows || []).map((row) => String(row.doc?.docId ?? row.doc?.id ?? '')).filter(Boolean)).size;
   const scopeDocs = result.scopeDocs;
   const coverage = scopeDocs != null ? `，范围内可检索 ${scopeDocs} 篇` : '';
+  const mode = result.matchMode ? `，matchMode=${result.matchMode}` : '';
+  const docModeNote = result.matchMode === 'doc'
+    ? '；doc 模式表示全部词在同一文档内命中，单行可能只命中部分词；同节点 AND 用 matchMode=node'
+    : '';
   if (returned === 0) {
-    return `— 0 命中（范围：${scopeDesc}${coverage}）；可拆词 / 调 kind/folder / 用 library_index 看目录`;
+    return `— 0 命中（范围：${scopeDesc}${coverage}${mode}）；可拆词 / 调 kind/folder / 用 library_index 看目录${docModeNote}`;
   }
   const more = total > returned ? `，共 ${total}（已截 ${returned}）` : '';
-  return `— 命中 ${returned} 节点 / ${docs} 文档${more}（范围：${scopeDesc}${coverage}）`;
+  return `— 命中 ${returned} 节点 / ${docs} 文档${more}（范围：${scopeDesc}${coverage}${mode}）${docModeNote}`;
 }
 
-function formatEntityLabel(entity = {}, options = {}) {
+interface EntityFormatOptions {
+  uuid?: boolean;
+}
+
+function formatEntityLabel(entity: ShellEntityRow = {}, options: EntityFormatOptions = {}) {
   const literal = cleanLine(entity.literal || entity.term || '');
-  const label = docDisplayLabel(entity.doc || entity, {
+  const label = docDisplayLabel(entity.doc || (entity as ShellDoc), {
     uuid: options.uuid,
     docId: entity.docId ?? entity.doc_id
   });
   return literal ? `${literal}${label ? `(${label})` : ''}` : '';
 }
 
-function formatEntityTags(rows = [], options = {}) {
-  const synonym = [];
-  const related = [];
+function formatEntityList(rows: ShellEntityRow[] = [], options: EntityFormatOptions = {}) {
+  if (rows.length === 0) return '(无实体)';
+  return rows.map((row) => {
+    const literal = cleanLine(row.literal || '');
+    const hits = Number(row.hitCount ?? row.hit_count) || 0;
+    const label = docDisplayLabel(row as ShellDoc, { uuid: options.uuid, docId: row.docId ?? row.doc_id });
+    return `${literal} x${hits}${label ? ` (${label})` : ''}`;
+  }).filter(Boolean).join('\n');
+}
+
+function formatEntityTags(rows: ShellEntityRow[] = [], options: EntityFormatOptions = {}) {
+  const synonym: string[] = [];
+  const related: string[] = [];
   for (const row of rows) {
     const label = formatEntityLabel(row.entity || row, options);
     if (!label) continue;
@@ -327,7 +701,7 @@ function formatEntityTags(rows = [], options = {}) {
   ].filter(Boolean).join('\n');
 }
 
-function formatHistoryLine(row = {}) {
+function formatHistoryLine(row: ShellHistoryRow = {}) {
   const commit = row.id ?? row.commit_id ?? row.commitId ?? '';
   const savedAt = row.committed_at ?? row.committedAt ?? row.saved_at ?? row.savedAt ?? '';
   const author = row.author ?? row.owner ?? '';
@@ -339,7 +713,7 @@ function formatHistoryLine(row = {}) {
   return parts.filter(Boolean).join(' ');
 }
 
-function historyRefSpec(flags = {}, positional = []) {
+function historyRefSpec(flags: ParsedFlags = {}, positional: string[] = []): ShellHistorySpec {
   const flaggedDocId = normalizeShellDocId(flags.docId ?? positional[0], null);
   if (flags.history) return { kind: 'id', value: flags.history, docId: flaggedDocId };
   if (flags.at) return { kind: 'committed_at', value: flags.at, docId: flaggedDocId };
@@ -351,12 +725,12 @@ function historyRefSpec(flags = {}, positional = []) {
   return { kind: 'committed_at_or_summary', value: ref, docId };
 }
 
-async function resolveHistoryRef(database, spec = {}) {
+async function resolveHistoryRef(database: ShellDatabase, spec: ShellHistorySpec): Promise<ShellHistoryRow> {
   const value = String(spec.value ?? '').trim();
   if (!value) throw new Error('history ref requires history id, saved_at, or tag');
 
-  const clauses = [];
-  const params = {};
+  const clauses: string[] = [];
+  const params: Record<string, string | number> = {};
   if (spec.kind === 'id') {
     clauses.push('id = @value');
     params.value = value;
@@ -400,12 +774,11 @@ async function resolveHistoryRef(database, spec = {}) {
 
 // article 原文窗口文本化：窗口头一行 + 原文（含 [原文开始]/[原文结束] 边界标记）+ 可选 source spans 紧凑行。
 // db article（CLI/测试）与 MCP article 工具共用这一个格式化器——一套实现。传 --json 给原始结构。
-/** @param {Record<string, any>} [res] 运行时形状的原文窗口结果（来自查询，非静态类型） */
-function formatArticleWindow(res = {}) {
+function formatArticleWindow(res: ShellArticleResult = {}) {
   if (!res || typeof res !== 'object' || res.article === null || (res.text == null && !res.window)) {
     return '(无原文：该文档无 source 文档或窗口为空)';
   }
-  const w = res.window || {};
+  const w: ShellArticleWindow = res.window || {};
   const head = `[原文窗口 offset ${w.startOffset ?? '?'}-${w.endOffset ?? '?'} / 全长 ${w.totalLength ?? '?'}`
     + `${w.hasBefore ? ' ↑上文更多' : ''}${w.hasAfter ? ' ↓下文更多' : ''}]`;
   const lines = [head, String(res.text ?? '')];
@@ -422,13 +795,13 @@ function formatArticleWindow(res = {}) {
   return lines.join('\n');
 }
 
-function historyRefFromReadAt(ref, docId) {
+function historyRefFromReadAt(ref: unknown, docId: string | null): ShellHistorySpec {
   const value = String(ref || '').trim();
   if (isStableId(value)) return { kind: 'id', value, docId };
   return { kind: 'committed_at_or_summary', value, docId };
 }
 
-async function resolveCurrentNodeId(database, docId, address) {
+async function resolveCurrentNodeId(database: ShellDatabase, docId: string, address: string): Promise<string | null> {
   const res = await database.run({
     operation: 'read',
     payload: {
@@ -446,7 +819,14 @@ async function resolveCurrentNodeId(database, docId, address) {
 // 节点历史上换过地址也认得（git log --follow 的「认人不认位置」），节点不在该版本则明确报错、
 // 绝不静默命中同址的别的节点。--at-address 退回 git <commit>:<path> 语义按历史地址定位，
 // 供查已删节点或纯「那个版本那个位置」的查询。
-async function resolveHistoryTarget(database, docId, address, rows, history, flags = {}) {
+async function resolveHistoryTarget(
+  database: ShellDatabase,
+  docId: string,
+  address: string,
+  rows: SnapshotRow[],
+  history: ShellHistoryRow,
+  flags: ParsedFlags = {}
+): Promise<SnapshotRow> {
   if (flags.atAddress) {
     const target = rows.find((row) => String(row.address || '') === String(address || '')) || null;
     if (!target) throw new Error(`db --at-address target not found: doc ${docId} ${address} @${history.id}`);
@@ -463,17 +843,17 @@ async function resolveHistoryTarget(database, docId, address, rows, history, fla
   return target;
 }
 
-function formatAxiomLine(row = {}) {
+function formatAxiomLine(row: ShellAxiomRow = {}) {
   const label = cleanLine(row.label || row.address || row.id || '');
   const status = cleanLine(row.status || '');
   const content = clip(row.content || row.text || row.node_title || row.nodeTitle || '', 160);
   return [label, status ? `[${status}]` : '', content].filter(Boolean).join(' ');
 }
 
-function formatRefLine(row = {}, addrById = null) {
+function formatRefLine(row: ShellRefRow = {}, addrById: Map<string, string> | null = null) {
   // 引用存的是稳定节点 UUID（位置变了也不断）；显示时若给了 id→address 映射，则把当前地址放前面作导航、
   // UUID 收进括号作稳定锚——地址方便直接 read，UUID 保证编辑后仍能定位、悬空引用也能暴露。
-  const refEnd = (type, id) => {
+  const refEnd = (type: string | undefined, id: string | number | undefined) => {
     const ref = `${type || '?'}:${id ?? '?'}`;
     if (type === 'node' && addrById && id !== undefined && id !== null && addrById.has(String(id))) {
       return `${addrById.get(String(id))} (${ref})`;
@@ -489,27 +869,27 @@ function formatRefLine(row = {}, addrById = null) {
   return [`${source} -> ${target}`, kind ? `[${kind}]` : '', refId != null ? `ref:${refId}` : '', note].filter(Boolean).join(' ');
 }
 
-function valueOrNull(value) {
+function valueOrNull(value: unknown) {
   return value === null || value === undefined || value === '' ? 'null' : String(value);
 }
 
-function formatSourceSpanLine(row = {}) {
+function formatSourceSpanLine(row: ShellSourceSpan = {}) {
   const id = row.id ?? row.spanId ?? row.span_id ?? '';
   const sentence = row.sentence_index ?? row.sentenceIndex ?? '';
   const start = row.absolute_start_offset ?? row.absoluteStartOffset ?? row.start_offset ?? row.startOffset ?? '';
   const end = row.absolute_end_offset ?? row.absoluteEndOffset ?? row.end_offset ?? row.endOffset ?? '';
-  const parts = [];
+  const parts: string[] = [];
   if (id !== '') parts.push(`span:${id}`);
   if (sentence !== '') parts.push(`sentence:${sentence}`);
   if (start !== '' || end !== '') parts.push(`offsets:${valueOrNull(start)}-${valueOrNull(end)}`);
   return parts.join(' ') || cleanLine(JSON.stringify(row));
 }
 
-function selectedBranch(context = {}) {
+function selectedBranch(context: ShellContext = {}): ShellBranchTarget {
   return context.shellState?.selectedBranch || {};
 }
 
-function updateSelectedBranch(context = {}, next = {}) {
+function updateSelectedBranch(context: ShellContext = {}, next: ShellBranchTarget = {}): ShellBranchTarget {
   if (!context.shellState) context.shellState = {};
   context.shellState.selectedBranch = {
     branchId: next.branchId ?? null,
@@ -519,7 +899,11 @@ function updateSelectedBranch(context = {}, next = {}) {
   return context.shellState.selectedBranch;
 }
 
-function branchTarget(flags = {}, context = {}, fallbackBaseDocId = null) {
+function branchTarget(
+  flags: ParsedFlags = {},
+  context: ShellContext = {},
+  fallbackBaseDocId: string | number | null = null
+): ShellBranchTarget {
   const selected = selectedBranch(context);
   const baseDocId = normalizeShellDocId(fallbackBaseDocId, null);
   return {
@@ -529,7 +913,7 @@ function branchTarget(flags = {}, context = {}, fallbackBaseDocId = null) {
   };
 }
 
-function branchTargetLabel(target = {}) {
+function branchTargetLabel(target: ShellBranchTarget = {}) {
   return [
     target.branchId ? `branch:${target.branchId}` : '',
     target.baseDocId ? `doc:${target.baseDocId}` : '',
@@ -539,20 +923,20 @@ function branchTargetLabel(target = {}) {
 
 // 把草稿定位（branchId/baseDocId/owner）按真值铺进 payload，返回 payload。各写动词（diff/discard/undo/redo/commit/merge/rebase）
 // 共用，省得逐处抄这三行；缺一报错信息各动词不同，仍留在各处。
-function applyBranchTarget(payload, target = {}) {
+function applyBranchTarget(payload: Record<string, unknown>, target: ShellBranchTarget = {}) {
   if (target.branchId) payload.branchId = target.branchId;
   if (target.baseDocId) payload.baseDocId = target.baseDocId;
   if (target.owner) payload.owner = String(target.owner);
   return payload;
 }
 
-function contextFunction(context = {}, name) {
+function contextFunction(context: ShellContext = {}, name: string): (payload: Record<string, unknown>) => Promise<any> {
   const fn = context[name];
   if (typeof fn !== 'function') throw new Error(`db ${name} context is not available`);
-  return fn;
+  return fn as (payload: Record<string, unknown>) => Promise<any>;
 }
 
-function parseJsonObjectArgument(value = '', fallback = {}) {
+function parseJsonObjectArgument(value: unknown = '', fallback: Record<string, unknown> = {}): Record<string, unknown> {
   const text = String(value || '').trim();
   if (!text) return fallback;
   const parsed = JSON.parse(text);
@@ -562,7 +946,7 @@ function parseJsonObjectArgument(value = '', fallback = {}) {
   return parsed;
 }
 
-function normalizeEditSetField(value = '') {
+function normalizeEditSetField(value: unknown = '') {
   const field = String(value || '').trim();
   if (field === 'text') return 'text';
   if (field === 'title' || field === 'node_title' || field === 'nodeTitle') return 'node_title';
@@ -572,35 +956,49 @@ function normalizeEditSetField(value = '') {
   throw new Error(`db edit --set unsupported field: ${field || '(empty)'}`);
 }
 
-function requireEditNodeArgs(positional = [], action = 'edit') {
+function requireEditNodeArgs(positional: string[] = [], action = 'edit'): { docId: string; address: string } {
   const docId = normalizeShellDocId(positional[0], null);
   const address = String(positional[1] || '').trim();
   if (!docId || !address) throw new Error(`db edit ${action} requires <doc_id> <address>`);
   return { docId, address };
 }
 
-async function readEditTargetNode(database, docId, address) {
+async function readEditTargetNode(database: ShellDatabase, docId: string, address: string): Promise<ShellNode> {
   const result = await database.run({
     operation: 'read',
     payload: { action: 'content.getNode', docId, address, detail: 'summary' }
   }, 'read');
-  const node = result?.node || null;
+  const node: ShellNode | null = result?.node || null;
   if (!node?.id) throw new Error(`db edit target not found: doc ${docId} ${address}`);
   return node;
 }
 
-function editBranchWriteTarget(flags = {}, context = {}, docId = null) {
+function editBranchWriteTarget(
+  flags: ParsedFlags = {},
+  context: ShellContext = {},
+  docId: string | null = null
+): { owner: string; baseDocId: FlagValue | null } {
   const target = branchTarget(flags, context);
   if (target.baseDocId && docId && String(target.baseDocId) !== String(docId)) {
     throw new Error('db edit target doc_id must match selected --base doc_id');
   }
   return {
-    owner: target.owner || 'llm',
+    owner: String(target.owner || 'llm'),
     baseDocId: target.baseDocId || docId
   };
 }
 
-async function runFriendlyEdit(database, flags = {}, positional = [], context = {}) {
+interface FriendlyEditResult {
+  kind: 'db_edit';
+  text: string;
+}
+
+async function runFriendlyEdit(
+  database: ShellDatabase,
+  flags: ParsedFlags = {},
+  positional: string[] = [],
+  context: ShellContext = {}
+): Promise<FriendlyEditResult | null> {
   if (flags.set) {
     const { docId, address } = requireEditNodeArgs(positional, '--set');
     const field = normalizeEditSetField(flags.set);
@@ -643,7 +1041,7 @@ async function runFriendlyEdit(database, flags = {}, positional = [], context = 
     const node = await readEditTargetNode(database, docId, address);
     if (mode === 'sibling' && !node.parentId) throw new Error('db edit --insert sibling cannot target the document root');
     const target = editBranchWriteTarget(flags, context, docId);
-    const payload = {
+    const payload: Record<string, unknown> = {
       action: 'node.insert',
       parentId: mode === 'child' ? node.id : node.parentId,
       text,
@@ -658,29 +1056,35 @@ async function runFriendlyEdit(database, flags = {}, positional = [], context = 
   return null;
 }
 
-function treeFromFlatNodes(nodes = []) {
-  const byId = new Map();
-  const roots = [];
+function treeFromFlatNodes(nodes: ShellNode[] = []): ShellNode[] {
+  const byId = new Map<string, ShellNode>();
+  const roots: ShellNode[] = [];
   for (const node of nodes) byId.set(String(node.id), { ...node, children: [] });
   for (const node of byId.values()) {
     const parent = byId.get(String(node.parentId || ''));
-    if (parent) parent.children.push(node);
+    if (parent) parent.children!.push(node);
     else roots.push(node);
   }
   return roots;
 }
 
-function formatIndexNode(node = {}, depth = 0, options = {}) {
-  const title = nodeTitle(node);
-  const chars = Number(node.meta?.subtreeTextChars ?? node.meta?.textChars) || 0;
-  const semantic = semanticLabel(node.meta?.semantic);
-  const idSuffix = options.uuid && node.id ? ` #${node.id}` : '';
-  const line = `${'  '.repeat(depth)}${node.address || ''} ${nodeTypeLabel(node)}${title ? ` ${title}` : ''} (${chars})${semantic ? ` ${semantic}` : ''}${idSuffix}`.trimEnd();
-  const children = Array.isArray(node.children) ? node.children : [];
+interface FormatIndexNodeOptions {
+  uuid?: boolean;
+}
+
+// 同时吃 shell 形态（content.getIndex / treeFromFlatNodes 产物）和历史快照展开形态（snapshotReadNode 返回 SnapshotReadNodeResult）。
+function formatIndexNode(node: ShellNode | SnapshotReadNodeResult = {} as ShellNode, depth = 0, options: FormatIndexNodeOptions = {}): string[] {
+  const shellNode = node as ShellNode;
+  const title = nodeTitle(shellNode);
+  const chars = Number(shellNode.meta?.subtreeTextChars ?? shellNode.meta?.textChars) || 0;
+  const semantic = semanticLabel(shellNode.meta?.semantic);
+  const idSuffix = options.uuid && shellNode.id ? ` #${shellNode.id}` : '';
+  const line = `${'  '.repeat(depth)}${shellNode.address || ''} ${nodeTypeLabel(shellNode)}${title ? ` ${title}` : ''} (${chars})${semantic ? ` ${semantic}` : ''}${idSuffix}`.trimEnd();
+  const children = Array.isArray(shellNode.children) ? shellNode.children : [];
   return [line, ...children.flatMap((child) => formatIndexNode(child, depth + 1, options))];
 }
 
-function semanticLabel(semantic = null) {
+function semanticLabel(semantic: ShellSemanticStatus | null = null) {
   if (!semantic?.status) return '';
   const vc = Number(semantic.vectorCount) || 0;
   const nc = Number(semantic.nodeCount) || 0;
@@ -692,12 +1096,21 @@ function semanticLabel(semantic = null) {
 // 跨库语义检索覆盖提示（projectneed 14-2）：allDocs 向量检索扫的是整个向量索引，只覆盖已向量化的节点，
 // 未建向量的文档/节点根本不进结果——必须显式告知，否则"搜了空"会被误读成"库里没有"。
 // （单篇语义不在此提示：requireDocVectorIndex 闸门会在向量不完整时先行报错，更具体，无需此处兜底。）
-function semanticCoverageNotice({ allDocs = false } = {}) {
+function semanticCoverageNotice({ allDocs = false }: { allDocs?: boolean } = {}) {
   if (!allDocs) return '';
   return '注意：语义检索只覆盖已建向量的节点；未向量化的节点/文档不会出现在结果里。用 library_index 看各文档 [semantic:] 状态，db vectors <doc> 补建。';
 }
 
-async function readDocDisplayLabel(database, docId, options = {}) {
+interface ReadDocDisplayLabelOptions {
+  uuid?: boolean;
+  docLabel?: string;
+}
+
+async function readDocDisplayLabel(
+  database: ShellDatabase,
+  docId: string,
+  options: ReadDocDisplayLabelOptions = {}
+): Promise<string> {
   if (options.docLabel !== undefined) return options.docLabel;
   try {
     const doc = await database.run({
@@ -710,7 +1123,13 @@ async function readDocDisplayLabel(database, docId, options = {}) {
   }
 }
 
-function limitReadText(text = '', options = {}) {
+interface LimitReadTextOptions {
+  limit?: number;
+  docId?: string;
+  address?: string;
+}
+
+function limitReadText(text: unknown = '', options: LimitReadTextOptions = {}) {
   const value = String(text || '');
   const limit = Number(options.limit) || 0;
   if (limit > 0 && value.length > limit) {
@@ -722,13 +1141,74 @@ function limitReadText(text = '', options = {}) {
   return value;
 }
 
+interface FlatSubtreeText {
+  text: string;
+  truncated: boolean;
+  totalChars: number;
+  used: number;
+}
+
+// 子树扁平正文：按 core 的 DFS 先序（tree-cursor.nextInDfs）拼接子树各节点正文、按【字符数】截断，
+// 而非 content.getSubtree 的分层早停。后者对大章节（一层就上万字）只能整层取舍，撞门禁时只剩标题层
+// （整回 28k 字 → 仅 42 字标题）；这里改成「按 DFS 阅读序累加正文、到 budget 字即停」，大章也能拿到
+// 前 budget 字的真实正文。整棵子树一次取回（节点带 address+text），childCountOf 由地址集现算，DFS 在内存里推。
+async function collectFlatSubtreeText(
+  database: ShellDatabase,
+  docId: string,
+  rootAddress: string,
+  budget: number
+): Promise<FlatSubtreeText> {
+  const root = formatAddress(parseAddress(rootAddress));
+  const res = await database.run({
+    operation: 'read',
+    payload: {
+      action: 'debug.sql',
+      sql: 'SELECT address, text FROM nodes WHERE doc_id = @docId AND (address = @root OR address GLOB @glob)',
+      params: { docId, root, glob: `${root}-*` },
+      limit: 1000000
+    }
+  }, 'read');
+  const rows = Array.isArray(res?.rows) ? res.rows : [];
+  const byAddress = new Map<string, string>();
+  const childCount = new Map<string, number>();
+  for (const row of rows) {
+    const addr = String(row.address || '');
+    if (!addr) continue;
+    byAddress.set(addr, String(row.text || ''));
+    const parent = parentAddress(addr);
+    if (parent) childCount.set(parent, (childCount.get(parent) || 0) + 1);
+  }
+  const childCountOf = (addr: string) => childCount.get(addr) || 0;
+  const parts: string[] = [];
+  let used = 0;
+  let totalChars = 0;
+  let truncated = false;
+  // DFS 先序遍历子树（root 自身 + 后代），到 root 子树之外即停。
+  for (let cur: string | null = root; cur && (cur === root || isAncestor(root, cur)); cur = nextInDfs(cur, childCountOf)) {
+    const text = byAddress.get(cur) || '';
+    if (!text) continue;
+    totalChars += text.length;
+    if (used >= budget) { truncated = true; continue; }
+    const remain = budget - used;
+    if (text.length <= remain) { parts.push(text); used += text.length; } else { parts.push(text.slice(0, remain)); used = budget; truncated = true; }
+  }
+  return { text: parts.join('\n'), truncated, totalChars, used };
+}
+
 // read scope=siblings：同父前/中/后三条的纯正文，带轻量导航标 〈role 地址〉、不带节点头。
-async function readNeighborNodes(database, docId, address, options = {}) {
+// 额度向 target 倾斜（target 是细读主角、邻居只是上下文）：target 给完整 limit、邻居各给 limit/4，
+// 都走 collectFlatSubtreeText 的 DFS 扁平截断——避免「大章 target 早停只剩标题、小邻居却整章刷屏」的反常。
+async function readNeighborNodes(
+  database: ShellDatabase,
+  docId: string,
+  address: string,
+  options: { limit?: number } = {}
+): Promise<string> {
   const indexResult = await database.run({
     operation: 'read',
     payload: { action: 'content.getIndex', docId, depth: 10000, detail: 'summary', limit: 0 }
   }, 'read');
-  const nodes = Array.isArray(indexResult.nodes) ? indexResult.nodes : [];
+  const nodes: ShellNode[] = Array.isArray(indexResult.nodes) ? indexResult.nodes : [];
   const target = nodes.find((node) => String(node.address || '') === String(address || '')) || null;
   if (!target?.id) throw new Error(`db read siblings target not found: doc ${docId} ${address}`);
   const siblings = nodes
@@ -738,13 +1218,15 @@ async function readNeighborNodes(database, docId, address, options = {}) {
       return order || String(left.address || '').localeCompare(String(right.address || ''));
     });
   const index = siblings.findIndex((node) => String(node.id) === String(target.id));
-  const selected = [
+  const selected: (ShellNode | null)[] = [
     index > 0 ? siblings[index - 1] : null,
     target,
     index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : null
   ];
   const labels = ['previous', 'target', 'next'];
-  const sections = [];
+  const limit = options.limit || READ_SUBTREE_TEXT_LIMIT;
+  const neighborBudget = Math.max(1, Math.floor(limit / 4));
+  const sections: string[] = [];
   for (let i = 0; i < selected.length; i += 1) {
     const node = selected[i];
     if (!node) {
@@ -752,26 +1234,30 @@ async function readNeighborNodes(database, docId, address, options = {}) {
       sections.push(`〈${labels[i]} 无〉`);
       continue;
     }
-    const result = await database.run({
-      operation: 'read',
-      payload: { action: 'content.getSubtree', docId, address: node.address, format: 'text', textLimit: options.limit || READ_SUBTREE_TEXT_LIMIT, limit: 0 }
-    }, 'read');
+    const isTarget = labels[i] === 'target';
+    const budget = isTarget ? limit : neighborBudget;
+    const { text, truncated, totalChars, used } = await collectFlatSubtreeText(database, docId, node.address || '', budget);
     sections.push(`〈${labels[i]} ${node.address || ''}〉`.trimEnd());
-    if (typeof result.text === 'string' && result.text) sections.push(result.text);
+    if (text) sections.push(text);
+    if (truncated) {
+      sections.push(isTarget
+        ? `— target 子树共 ${totalChars} 字，已显示前 ${used} 字；要全文：read address=${node.address} limit=${totalChars}`
+        : `— ${labels[i]}（上下文）子树共 ${totalChars} 字，已截前 ${used} 字`);
+    }
   }
   return sections.join('\n');
 }
 
-function dbReadTargetNotFoundError(docId, address) {
+function dbReadTargetNotFoundError(docId: string, address: string) {
   return new Error(`db read target not found: doc ${docId} ${address}`);
 }
 
-async function requireDbReadTargetNode(database, docId, address) {
+async function requireDbReadTargetNode(database: ShellDatabase, docId: string, address: string): Promise<ShellNode> {
   const result = await database.run({
     operation: 'read',
     payload: { action: 'content.getNode', docId, address, detail: 'summary' }
   }, 'read');
-  const node = result?.node || null;
+  const node: ShellNode | null = result?.node || null;
   if (!node?.id) throw dbReadTargetNotFoundError(docId, address);
   return node;
 }
@@ -780,14 +1266,19 @@ async function requireDbReadTargetNode(database, docId, address) {
 // 按节点稳定 UUID 兼容定位，解析成当前版本的 address 后复用 address 流程（address 仍是主路径，
 // nodeId 只是兼容入口；两者都给时以 nodeId 为准）。节点在当前版本不存在（已删 / UUID 有误）
 // 即报错——查历史里某版本的位置仍用 address + --at-address。
-async function resolveNodeAddress(database, docId, address, nodeId) {
+async function resolveNodeAddress(
+  database: ShellDatabase,
+  docId: string,
+  address: unknown,
+  nodeId: unknown
+): Promise<string> {
   const raw = nodeId === undefined || nodeId === null ? '' : String(nodeId).trim();
   if (!raw) return String(address || '').trim();
   const result = await database.run({
     operation: 'read',
     payload: { action: 'content.getNode', docId, nodeId: raw, detail: 'summary' }
   }, 'read');
-  const node = result?.node || null;
+  const node: ShellNode | null = result?.node || null;
   if (!node?.id) {
     throw new Error(`db: --node-id 未命中当前版本（doc ${docId} node ${raw}）：节点可能已删除或 UUID 有误；查历史位置请用 address + --at-address。`);
   }
@@ -798,7 +1289,17 @@ async function resolveNodeAddress(database, docId, address, nodeId) {
   return resolvedAddress;
 }
 
-async function readSourceBlame(database, docId, address, options = {}) {
+interface BlameOptions {
+  uuid?: boolean;
+  limit?: number | string | boolean;
+}
+
+async function readSourceBlame(
+  database: ShellDatabase,
+  docId: string,
+  address: string,
+  options: BlameOptions = {}
+): Promise<string> {
   const nodeResult = await database.run({
     operation: 'read',
     payload: { action: 'content.getNode', docId, address, detail: 'summary', include: ['source', 'timestamps', 'tags'] }
@@ -843,8 +1344,8 @@ async function readSourceBlame(database, docId, address, options = {}) {
       ...(options.limit ? { limit: options.limit } : {})
     }
   }, 'read');
-  const directSpans = (Array.isArray(article?.sourceSpans) ? article.sourceSpans : [])
-    .filter((span) => String(span.node_id ?? span.nodeId ?? '') === String(node.id));
+  const directSpans: ShellSourceSpan[] = (Array.isArray(article?.sourceSpans) ? article.sourceSpans : [])
+    .filter((span: ShellSourceSpan) => String(span.node_id ?? span.nodeId ?? '') === String(node.id));
   const hasAnchor = directSpans.length > 0 || node.source?.position !== null && node.source?.position !== undefined;
   if (hasAnchor && article?.window) {
     lines.push(`window: ${article.window.startOffset}-${article.window.endOffset}/${article.window.totalLength} before:${Boolean(article.window.hasBefore)} after:${Boolean(article.window.hasAfter)}`);
@@ -856,19 +1357,36 @@ async function readSourceBlame(database, docId, address, options = {}) {
   return lines.join('\n');
 }
 
+interface InspectOptions {
+  sections?: string[];
+  uuid?: boolean;
+  limit?: number | string | boolean;
+}
+
+// 历史快照走 core/snapshot-tree 的 SnapshotRow（字段都是 unknown，DAO 真行类型），不走 ShellNode（shell 显示形态）。
+interface ShellSnapshot {
+  doc?: ShellDoc;
+  nodes: SnapshotRow[];
+}
+
 // inspect（D1）：节点/文档档案——身份段(总在) + 选取的 meta/source/links/axioms/note 段，输出一种一致结构。
 // 吸收旧 read --meta/--blame/--links/--axioms；read 因此回归纯正文，身份/元信息一律来这里。
-async function dbInspect(database, docId, address, options = {}) {
+async function dbInspect(
+  database: ShellDatabase,
+  docId: string,
+  address: string,
+  options: InspectOptions = {}
+): Promise<string> {
   const sections = Array.isArray(options.sections) && options.sections.length ? options.sections : ['meta', 'note'];
   const nodeResult = await database.run({
     operation: 'read',
     payload: { action: 'content.getNode', docId, address, detail: 'summary', include: ['source', 'timestamps', 'tags', 'note'] }
   }, 'read');
-  const node = nodeResult?.node || null;
+  const node: ShellNode | null = nodeResult?.node || null;
   if (!node?.id) throw dbReadTargetNotFoundError(docId, address);
   const docLabel = await readDocDisplayLabel(database, docId, { uuid: options.uuid });
   const lines = [`[${[docLabel, node.address || address, nodeTypeLabel(node), nodeTrustLabel(node), nodeTitle(node)].filter(Boolean).join(' ')}]`];
-  let docCache = null;
+  let docCache: any = null;
   const loadDoc = async () => {
     if (!docCache) {
       docCache = await database.run({ operation: 'read', payload: { action: 'doc.get', docId, includeNodes: false, includeEditBranch: false } }, 'read');
@@ -893,17 +1411,17 @@ async function dbInspect(database, docId, address, options = {}) {
   }
   if (sections.includes('links')) {
     const doc = await loadDoc();
-    const refs = (doc?.refs || []).filter((row) => (
+    const refs: ShellRefRow[] = (doc?.refs || []).filter((row: ShellRefRow) => (
       (row.source_type === 'node' && String(row.source_id) === String(node.id))
       || (row.target_type === 'node' && String(row.target_id) === String(node.id))
     ));
     const idx = await database.run({ operation: 'read', payload: { action: 'content.getIndex', docId, depth: 10000, detail: 'summary', limit: 0 } }, 'read');
-    const addrById = new Map((idx?.nodes || []).map((entry) => [String(entry.id), entry.address]));
+    const addrById = new Map<string, string>((idx?.nodes || []).map((entry: ShellNode) => [String(entry.id), String(entry.address || '')]));
     lines.push(['[links]', ...(refs.length ? refs.map((row) => formatRefLine(row, addrById)) : ['(无)'])].join('\n'));
   }
   if (sections.includes('axioms')) {
     const doc = await loadDoc();
-    const axioms = doc?.axioms || [];
+    const axioms: ShellAxiomRow[] = doc?.axioms || [];
     lines.push(['[axioms]', ...(axioms.length ? axioms.map(formatAxiomLine) : ['(无)'])].join('\n'));
   }
   return lines.join('\n');
@@ -911,17 +1429,21 @@ async function dbInspect(database, docId, address, options = {}) {
 
 // 历史快照按 commit id 走后端 history.snapshot 动作重建（对象库展开 + 内联 meta）；
 // 不再客户端解析 diff/snapshot 列（已退役）。
-async function loadHistorySnapshot(database, history = {}) {
+async function loadHistorySnapshot(database: ShellDatabase, history: ShellHistoryRow = {}): Promise<ShellSnapshot> {
   const res = await database.run({
     operation: 'read',
     payload: { action: 'history.snapshot', commitId: history.id }
   }, 'read');
-  const snapshot = res?.snapshot;
+  const snapshot: ShellSnapshot | undefined = res?.snapshot;
   if (!Array.isArray(snapshot?.nodes)) throw new Error(`history snapshot is not readable: ${history.id ?? ''}`);
   return snapshot;
 }
 
-function snapshotBodyText(root, byParent, options = {}) {
+function snapshotBodyText(
+  root: SnapshotRow,
+  byParent: Map<string, SnapshotRow[]>,
+  options: LimitReadTextOptions = {}
+): string {
   const text = snapshotSubtreeRows(root, byParent)
     .filter((row) => (byParent.get(snapshotNodeId(row)) || []).length === 0)
     .map((row) => String(row.text || ''))
@@ -929,13 +1451,18 @@ function snapshotBodyText(root, byParent, options = {}) {
     .join('\n');
   return limitReadText(text, {
     ...options,
-    docId: options.docId || root.doc_id || root.docId,
-    address: options.address || root.address
+    docId: options.docId || String(root.doc_id || root.docId || ''),
+    address: options.address || String(root.address || '')
   });
 }
 
 // tree --at（D3）：从 commit 快照重建结构树，复用在线 tree 的 formatIndexNode 渲染。
-async function treeHistorySnapshot(database, docId, address, flags = {}) {
+async function treeHistorySnapshot(
+  database: ShellDatabase,
+  docId: string,
+  address: string,
+  flags: ParsedFlags = {}
+): Promise<string> {
   const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId));
   const snapshot = await loadHistorySnapshot(database, history);
   if (String(snapshot.doc?.id ?? docId) !== String(docId)) {
@@ -963,7 +1490,12 @@ async function treeHistorySnapshot(database, docId, address, flags = {}) {
 }
 
 // find --at（D3）：在 commit 快照的节点正文上做字面 node-AND 检索；语义/跨文档不支持（向量只建在 HEAD）。
-async function findHistorySnapshot(database, terms, flags = {}, context = {}) {
+async function findHistorySnapshot(
+  database: ShellDatabase,
+  terms: string[],
+  flags: ParsedFlags = {},
+  context: ShellContext = {}
+): Promise<string> {
   const scope = docScope(flags, context);
   if (!scope.docId || scope.allDocs) {
     throw new Error('find --at 需限定单篇（给 docId 或 --scope）；历史快照不支持跨文档检索');
@@ -978,14 +1510,15 @@ async function findHistorySnapshot(database, terms, flags = {}, context = {}) {
     return terms.every((term) => text.includes(term));
   });
   const docLabel = await readDocDisplayLabel(database, scope.docId, { uuid: flags.uuid });
-  const hitRows = matched.map((row) => ({
+  // SnapshotRow 字段都是 unknown，构造 ShellHitRow 时按需 String() / 兜底成具体类型。
+  const hitRows: ShellHitRow[] = matched.map((row): ShellHitRow => ({
     node: {
-      id: row.id,
-      address: row.address || '',
-      node_type: row.node_type ?? row.nodeType ?? 'TEXT',
-      node_title: row.node_title ?? row.nodeTitle ?? '',
-      text: row.text || '',
-      updatedAt: row.updated_at ?? row.updatedAt ?? null
+      id: row.id as string | number | undefined,
+      address: String(row.address || ''),
+      node_type: String(row.node_type ?? row.nodeType ?? 'TEXT'),
+      node_title: String(row.node_title ?? row.nodeTitle ?? ''),
+      text: String(row.text || ''),
+      updatedAt: (row.updated_at ?? row.updatedAt ?? null) as string | null
     },
     doc: { docId: scope.docId, title: snapshot.doc?.title }
   }));
@@ -1005,7 +1538,12 @@ async function findHistorySnapshot(database, terms, flags = {}, context = {}) {
 
 // read --at（历史快照）：与在线 read 一致，只回正文、按 range 取范围（不带节点头）。
 // 历史元信息/出处/引用是另一回事（snapshot 也不存 source spans），不在 read 里兼。
-async function readHistorySnapshot(database, docId, address, flags = {}) {
+async function readHistorySnapshot(
+  database: ShellDatabase,
+  docId: string,
+  address: string,
+  flags: ParsedFlags = {}
+): Promise<string> {
   const range = ['node', 'subtree', 'siblings'].includes(String(flags.range)) ? String(flags.range) : 'subtree';
   const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId));
   const snapshot = await loadHistorySnapshot(database, history);
@@ -1018,24 +1556,24 @@ async function readHistorySnapshot(database, docId, address, flags = {}) {
   if (range === 'siblings') {
     const siblings = byParent.get(snapshotParentId(target)) || [];
     const index = siblings.findIndex((row) => snapshotNodeId(row) === snapshotNodeId(target));
-    return [
+    return ([
       index > 0 ? ['previous', siblings[index - 1]] : ['previous', null],
       ['target', target],
       index >= 0 && index < siblings.length - 1 ? ['next', siblings[index + 1]] : ['next', null]
-    ].map(([label, row]) => (row
+    ] as Array<[string, SnapshotRow | null]>).map(([label, row]) => (row
       ? [`〈${label} ${row.address || ''}〉`.trimEnd(), String(row.text || '')].filter(Boolean).join('\n')
       : `〈${label} 无〉`)).join('\n');
   }
   if (range === 'node') {
     return String(target.text || '');
   }
-  return snapshotBodyText(target, byParent, { docId, address, limit: flags.limit || READ_SUBTREE_TEXT_LIMIT });
+  return snapshotBodyText(target, byParent, { docId, address, limit: Number(flags.limit) || READ_SUBTREE_TEXT_LIMIT });
 }
 
 export function dbShellHelp() {
   return [
     'Usage:',
-    '  db find <term>... [--semantic] [--scope <doc_id> <address>] [--all-docs] [--tags] [--at <ref>] [--limit N] [--uuid]',
+    '  db find <term>... [--semantic] [--entity [--expand]] [--scope <doc_id> <address>] [--all-docs] [--at <ref>] [--limit N] [--uuid]',
     '  db index [--folder <library_relative_path>] [--summary] [--uuid]',
     '  db tree <doc_id> [address] [--from <address>] [--depth N] [--at <ref>] [--uuid]',
     '  db read <doc_id> <address> [--range node|subtree|siblings] [--at <ref>] [--limit N] [--uuid]  (只回正文；元信息/出处/引用/事实用 inspect、原文窗口用 article)',
@@ -1056,7 +1594,6 @@ export function dbShellHelp() {
     '  db push <json_payload>  (流式写入 4-16；payload: {docId?,title?,parentId?,nodes:[...],idempotencyKey?,vectors?})',
     '  db set-mode <doc_id> <readonly|incremental|full>  (4-16-8 编辑模式)',
     '  db bulk begin|end  (海量流式导入加速会话：begin 设异步写+延迟索引，end 恢复+重建索引)',
-    '  db export <doc_id>',
     '  db restore <history_id|saved_at|tag> [doc_id]',
     '  db import <library_relative_path> [--mode simple|complete|direct|smart|vector] [--embed]',
     '  db import-json <json_file> <source_file> [--dry-run] [--embed]  (智能导入 4-3-3：校验节点树 JSON 并入库；JSON 与 db push 同契约)',
@@ -1088,7 +1625,16 @@ export function dbShellHelp() {
   ].join('\n');
 }
 
-export async function runDbShellArgv(database, argv = [], context = {}) {
+interface DbShellResult {
+  kind: string;
+  text: string;
+}
+
+export async function runDbShellArgv(
+  database: ShellDatabase,
+  argv: unknown[] = [],
+  context: ShellContext = {}
+): Promise<DbShellResult> {
   if (!database?.run) throw new Error('db command requires database service');
   const args = normalizeArgv(argv);
   const command = args[0] || '';
@@ -1114,11 +1660,12 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         context = { ...context, currentDocId: await resolveDocRef(database, rawCurrentDocId) };
       }
     }
-    if (flags.semantic && flags.tags) throw new Error('db find cannot combine --semantic and --tags');
+    if (flags.semantic && flags.entity) throw new Error('db find cannot combine --semantic and --entity');
+    if (flags.expand && !flags.entity) throw new Error('db find --expand requires --entity');
     if (flags.or) throw new Error('db find --or is not supported; run db find once per term for OR.');
     if (flags.at) {
       if (flags.semantic) throw new Error('find --at 仅支持字面检索（语义向量只建在 HEAD，历史快照无向量）');
-      if (flags.tags) throw new Error('find --at 不支持 --tags（实体库随 HEAD，不查历史快照）');
+      if (flags.entity) throw new Error('find --at 不支持 --entity（实体库随 HEAD，不查历史快照）');
       if (positional.length === 0) throw new Error('find --at requires at least one term');
       return { kind: 'db_find', text: await findHistorySnapshot(database, positional, flags, context) };
     }
@@ -1131,7 +1678,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         : { action: 'content.search', query, searchMode: 'vector', docId: scope.docId, limit: flags.limit };
       const result = await database.run({ operation: 'read', payload }, 'read');
       if (result.error) throw new Error(result.error);
-      let rows = result.rows || [];
+      let rows: ShellHitRow[] = result.rows || [];
       if (!scope.allDocs && flags.scopeAddress) {
         rows = rows.filter((node) => node.address === flags.scopeAddress || String(node.address || '').startsWith(`${flags.scopeAddress}-`));
       }
@@ -1141,7 +1688,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       const beforeMinSim = rows.length;
       rows = rows.filter((row) => Number((row.node || row).score ?? row.score ?? 0) >= minSim);
       const weakFilteredOut = beforeMinSim - rows.length;
-      const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId, { uuid: flags.uuid });
+      const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId!, { uuid: flags.uuid });
       const body = formatGroupedHits(rows, {
         uuid: flags.uuid,
         scoreKind: 'sim',
@@ -1166,22 +1713,130 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         text: [body, stats, notice].filter(Boolean).join('\n\n').replace(/^\n+/, '')
       };
     }
-    if (positional.length === 0) throw new Error('db find requires at least one term');
-    if (flags.tags) {
-      const result = await database.run({
+    if (flags.entity) {
+      const scope = docScope(flags, context);
+      if (positional.length === 0) {
+        const result = await database.run({
+          operation: 'read',
+          payload: { action: 'entity.list', ...scope, limit: flags.limit }
+        }, 'read');
+        return {
+          kind: 'db_find_entity',
+          text: formatEntityList(result.rows || [], { uuid: flags.uuid })
+        };
+      }
+      if (!flags.expand) {
+        const result = await database.run({
+          operation: 'read',
+          payload: {
+            action: 'entity.listRelated',
+            terms: positional,
+            ...scope,
+            limit: flags.limit
+          }
+        }, 'read');
+        return {
+          kind: 'db_find_entity',
+          text: formatEntityTags(result.rows || [], { uuid: flags.uuid })
+        };
+      }
+      // --entity --expand: 用同义组扩展 terms 后做字面检索，返回节点。
+      // 每个输入词独立扩展同义组（OR），多词之间保持 AND 框架。
+      const related = await database.run({
+        operation: 'read',
+        payload: { action: 'entity.listRelated', terms: positional, ...scope, limit: 1000 }
+      }, 'read');
+      const synonymsByTerm = new Map();
+      for (const row of (related.rows || [])) {
+        if (row.relation !== 'synonym') continue;
+        const seedLiteral = String(row.seed?.literal || '').trim().toLocaleLowerCase();
+        if (!seedLiteral) continue;
+        const group = synonymsByTerm.get(seedLiteral) || new Set();
+        group.add(String(row.entity?.literal || '').trim());
+        synonymsByTerm.set(seedLiteral, group);
+      }
+      const expandedTermGroups = positional.map((term) => {
+        const key = String(term).trim().toLocaleLowerCase();
+        const synonyms = synonymsByTerm.get(key);
+        return synonyms ? [term, ...synonyms] : [term];
+      });
+      // matchMode=or + 按组 AND 过滤：先 OR 召回全部命中，再按 AND 框架过滤节点。
+      const allTerms = [...new Set(expandedTermGroups.flat())];
+      const searchResult = await database.run({
         operation: 'read',
         payload: {
-          action: 'entity.listRelated',
-          terms: positional,
-          ...docScope(flags, context),
-          limit: flags.limit
+          action: 'content.searchKeyword',
+          terms: allTerms,
+          matchMode: 'or',
+          ...scope,
+          limit: flags.limit ? Number(flags.limit) * 5 : 500,
+          workspace: flags.workspace,
+          agent: flags.agent,
+          kind: flags.kind,
+          trust: flags.trust,
+          since: flags.since,
+          until: flags.until,
+          folder: flags.folder,
+          excludeFolder: flags.excludeFolder,
+          includeLabels: flags.labels,
+          includeHidden: flags.includeHidden
         }
       }, 'read');
+      // 按 AND 框架过滤：节点必须每个原始词组至少命中一个词。
+      const nodeTermHits = new Map();
+      for (const group of (searchResult.groups || [])) {
+        const hitTerm = String(group.term || '').trim().toLocaleLowerCase();
+        for (const row of (group.rows || [])) {
+          const nodeId = String((row.node || row).node_id || (row.node || row).id || '');
+          if (!nodeId) continue;
+          let termSet = nodeTermHits.get(nodeId);
+          if (!termSet) { termSet = new Set(); nodeTermHits.set(nodeId, termSet); }
+          termSet.add(hitTerm);
+        }
+      }
+      const matchingNodeIds = new Set();
+      for (const [nodeId, hitTerms] of nodeTermHits) {
+        const allGroupsCovered = expandedTermGroups.every((group) =>
+          group.some((term) => hitTerms.has(term.toLocaleLowerCase()))
+        );
+        if (allGroupsCovered) matchingNodeIds.add(nodeId);
+      }
+      let filteredRows: ShellHitRow[] = (searchResult.rows || []).filter((row: ShellHitRow) => {
+        const nodeId = String((row.node || row).node_id || (row.node || row).id || '');
+        return matchingNodeIds.has(nodeId);
+      });
+      // 去重（OR 召回可能有重复节点）
+      const seenNodes = new Set<string>();
+      filteredRows = filteredRows.filter((row) => {
+        const nodeId = String((row.node || row).node_id || (row.node || row).id || '');
+        if (seenNodes.has(nodeId)) return false;
+        seenNodes.add(nodeId);
+        return true;
+      });
+      const limit = flags.limit ? Number(flags.limit) : 100;
+      filteredRows = filteredRows.slice(0, limit);
+      const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId!, { uuid: flags.uuid });
+      const expandNote = synonymsByTerm.size > 0
+        ? `同义扩展: ${positional.map((t) => {
+            const syns = synonymsByTerm.get(t.toLocaleLowerCase());
+            return syns ? `${t} → [${[t, ...syns].join(', ')}]` : t;
+          }).join('；')}`
+        : '';
+      const body = formatGroupedHits(filteredRows, {
+        uuid: flags.uuid,
+        scoreKind: 'hit',
+        fallbackDocId: scope.docId || '',
+        fallbackTitle: (scope.allDocs || flags.uuid) ? '' : docLabel,
+        labels: flags.labels
+      });
+      const scopeDesc = searchScopeDescriptor(flags, scope);
+      const stats = `— 命中 ${filteredRows.length} 节点（范围：${scopeDesc}；实体同义扩展）`;
       return {
-        kind: 'db_find_tags',
-        text: formatEntityTags(result.rows || [], { uuid: flags.uuid })
+        kind: 'db_find_entity',
+        text: [expandNote, body, stats].filter(Boolean).join('\n\n').replace(/^\n+/, '')
       };
     }
+    if (positional.length === 0) throw new Error('db find requires at least one term');
     const scope = docScope(flags, context);
     const result = await database.run({
       operation: 'read',
@@ -1203,12 +1858,12 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         includeHidden: flags.includeHidden
       }
     }, 'read');
-    const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId, { uuid: flags.uuid });
+    const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId!, { uuid: flags.uuid });
     // 字面命中次数下限（高级搜索）：传 --min-score 时按 hit 过滤；默认不限。
     // score 取法与 formatNodeLine 对齐：命中行包成 {node,doc} 时 score 在 node.score。
     if (flags.minScore != null) {
       const minHit = Number(flags.minScore);
-      result.rows = (result.rows || []).filter((row) => Number((row.node || row).score ?? row.score ?? 0) >= minHit);
+      result.rows = (result.rows || []).filter((row: ShellHitRow) => Number((row.node || row).score ?? row.score ?? 0) >= minHit);
       // 客户端按命中次数过滤后同步统计来源：findStatsLine 优先读 result.returned/total，
       // 不同步会让统计行报过滤前的数量（body 2 条却显示"命中 10"）。过滤后这批即全部，
       // returned/total 同设为过滤后长度，避免误用"已截"（那是 limit 截断的语义）。
@@ -1240,7 +1895,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
   if (command === 'index') {
     const { flags, positional } = parseFlags(args.slice(1));
     if (positional.length > 0) throw new Error('db index does not accept doc id; use db tree <doc_id> for document structure');
-    const payload = { action: 'library.index', format: 'ascii_tree' };
+    const payload: Record<string, unknown> = { action: 'library.index', format: 'ascii_tree' };
     if (flags.folder) payload.path = flags.folder;
     if (flags.summary) payload.includeSummary = true;
     if (flags.uuid) payload.uuid = true;
@@ -1265,12 +1920,12 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     if (flags.at) {
       return { kind: 'db_tree', text: await treeHistorySnapshot(database, docId, address, flags) };
     }
-    const payload = address
+    const payload: Record<string, unknown> = address
       ? { action: 'content.getSubtree', docId, address, levels: flags.depth, detail: 'summary', limit: 0 }
       : { action: 'content.getIndex', docId, depth: flags.depth, detail: 'summary', limit: 0 };
     if (flags.uuid) payload.uuid = true;
     const result = await database.run({ operation: 'read', payload }, 'read');
-    const roots = result.tree ? [result.tree] : treeFromFlatNodes(result.nodes || []);
+    const roots: ShellNode[] = result.tree ? [result.tree] : treeFromFlatNodes(result.nodes || []);
     const lines = roots.flatMap((root) => formatIndexNode(root, 0, { uuid: Boolean(flags.uuid) }));
     // 默认 index（不带 address）只展开有限层；文档更深时提示当前/最大层与下钻方式，避免误以为文档只有这么浅。
     if (!address && result.docDepth && result.indexDepth && result.docDepth > result.indexDepth) {
@@ -1291,7 +1946,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         text: await readHistorySnapshot(database, docId, address, flags)
       };
     }
-    let targetNode = null;
+    let targetNode: ShellNode | null = null;
     const readTargetNode = async () => {
       if (!targetNode) targetNode = await requireDbReadTargetNode(database, docId, address);
       return targetNode;
@@ -1299,7 +1954,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     // read 只回正文，range 决定范围（node 只本节点 / subtree 整棵子树(默认) / siblings 同父前中后三条）、不带节点头。
     // 元信息/出处/引用/事实用 inspect、原文窗口用 article——read 不再兼这些镜头（一套实现、无兼容别名）。
     const range = ['node', 'subtree', 'siblings'].includes(String(flags.range)) ? String(flags.range) : 'subtree';
-    const textLimit = flags.limit || READ_SUBTREE_TEXT_LIMIT;
+    const textLimit = Number(flags.limit) || READ_SUBTREE_TEXT_LIMIT;
     if (range === 'siblings') {
       await readTargetNode();
       return {
@@ -1335,7 +1990,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const { flags, positional } = parseFlags(args.slice(1));
     if (!positional[0]) throw new Error('db article requires <doc_id>');
     const docId = await resolveDocRef(database, positional[0]);
-    const payload = { action: 'content.getArticle', docId };
+    const payload: Record<string, unknown> = { action: 'content.getArticle', docId };
     const address = String(positional[1] || '').trim();
     if (address) {
       const node = await requireDbReadTargetNode(database, docId, address);
@@ -1385,10 +2040,11 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
   if (command === 'diff') {
     const { flags, positional } = parseFlags(args.slice(1));
     const detail = flags.detail === 'summary' ? 'summary' : 'full';
-    const renderDiff = (result) => (flags.json ? JSON.stringify(result, null, 2) : formatDiffText(result, { detail }));
+    // formatDiffText 收 DiffTextResult；IPC 返回是 unknown，cast 在边界。
+    const renderDiff = (result: any) => (flags.json ? JSON.stringify(result, null, 2) : formatDiffText(result, { detail }));
     // refA↔refB（15-5-2）：给了 --from/--to 即走通用 diff.refs（ref ∈ head 正文 / <commitId> 历史 / draft[:branchId] 草稿）。
     if (flags.from !== undefined || flags.to !== undefined) {
-      const docId = positional[0] ? await resolveDocRef(database, positional[0]) : null;
+      const docId: string | null = positional[0] ? await resolveDocRef(database, positional[0]) : null;
       const selectedRef = selectedBranch(context);
       const draftRef = () => ({
         branchId: flags.branch ?? selectedRef.branchId ?? undefined,
@@ -1398,10 +2054,10 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       const headRef = { head: true, docId };
       const fromGiven = flags.from !== undefined;
       const toGiven = flags.to !== undefined;
-      const payload = {
+      const payload: Record<string, unknown> = {
         action: 'diff.refs',
         from: fromGiven ? parseDiffRef(flags.from, { docId, draftRef }) : headRef,
-        // 只给 --from（如某历史↔当前正文）时，对端默认落正文 head 而非草稿——否则未选草稿会误报“草稿未找到”。
+        // 只给 --from（如某历史↔当前正文）时，对端默认落正文 head 而非草稿——否则未选草稿会误报”草稿未找到”。
         to: toGiven ? parseDiffRef(flags.to, { docId, draftRef }) : (fromGiven ? headRef : draftRef())
       };
       if (docId) payload.docId = docId;
@@ -1413,7 +2069,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     if (flags.branch || flags.base || (!positional[0] && (selected.branchId || selected.baseDocId))) {
       const target = branchTarget(flags, context);
       if (!target.branchId && !target.baseDocId) throw new Error('db diff 需要 doc_id + history（两版历史），或 --branch/--base（草稿↔正文），或 --from/--to（任意 ref），或先 switch 到一个草稿');
-      const payload = { action: 'editBranch.diffView', changedOnly: true };
+      const payload: Record<string, unknown> = { action: 'editBranch.diffView', changedOnly: true };
       applyBranchTarget(payload, target);
       const result = await database.run({ operation: 'read', payload }, 'read');
       return { kind: 'db_diff', text: renderDiff(result) };
@@ -1424,7 +2080,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const fromHistoryId = positional[1] && positional[2] ? positional[1] : '';
     const toHistoryId = positional[2] || positional[1] || '';
     if (!toHistoryId) throw new Error('db diff requires history id');
-    const payload = { action: 'history.diff', docId, toHistoryId };
+    const payload: Record<string, unknown> = { action: 'history.diff', docId, toHistoryId };
     if (fromHistoryId && fromHistoryId !== toHistoryId) payload.fromHistoryId = fromHistoryId;
     const result = await database.run({ operation: 'read', payload }, 'read');
     return { kind: 'db_diff', text: renderDiff(result) };
@@ -1434,7 +2090,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const { flags, positional } = parseFlags(args.slice(1));
     const sql = positional.join(' ').trim();
     if (!sql) throw new Error('db sql requires a SELECT/WITH query');
-    const payload = { action: 'debug.sql', sql };
+    const payload: Record<string, unknown> = { action: 'debug.sql', sql };
     if (flags.limit) payload.limit = flags.limit;
     const result = await database.run({ operation: 'read', payload }, 'read');
     return { kind: 'db_sql', text: JSON.stringify(result, null, 2) };
@@ -1444,7 +2100,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const { flags, positional } = parseFlags(args.slice(1));
     const prompt = positional.join(' ').trim();
     if (!prompt) throw new Error('db ask_agent requires prompt text');
-    const payload = { prompt };
+    const payload: Record<string, unknown> = { prompt };
     // docId 解析交给 askAgent 漏斗（runAgent 统一过 resolveDocRef、支持标题）：这里只取原值，
     // 不预先 normalize 掉标题。优先显式 --doc-id，否则用当前文档（已是规范化 id）。
     const rawDocId = (flags.docId != null && String(flags.docId).trim() !== '') ? flags.docId : currentDocIdFrom(context);
@@ -1464,7 +2120,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     if (!action) throw new Error('db edit requires database_write action');
     const payload = parseJsonObjectArgument(positional.slice(1).join(' '), {});
     const target = branchTarget(flags, context);
-    const writePayload = {
+    const writePayload: Record<string, unknown> = {
       ...payload,
       action,
       editBranchOwner: target.owner || 'llm'
@@ -1516,17 +2172,9 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
   }
 
   if (command === 'export') {
-    const { positional } = parseFlags(args.slice(1));
-    const docId = normalizeShellDocId(positional[0], null);
-    if (!docId) throw new Error('db export requires doc_id');
-    const result = await database.run({
-      operation: 'read',
-      payload: { action: 'doc.exportMarkdown', docId }
-    }, 'read');
-    return {
-      kind: 'db_export',
-      text: result?.text || ''
-    };
+    // 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，渲染有地址当标题/混入
+    // node_note 等问题，幂等与 import/export 对称设计未定。详见 NOW.md。
+    throw new Error('db export 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，且渲染有地址当标题/混入 node_note 等功能错误，幂等与 import/export 对称设计未定。详见 NOW.md。');
   }
 
   if (command === 'restore') {
@@ -1541,7 +2189,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const { flags, positional } = parseFlags(args.slice(1));
     const relativePath = String(positional[0] || '').trim();
     if (!relativePath) throw new Error('db import requires library_relative_path');
-    const payload = { relativePath };
+    const payload: Record<string, unknown> = { relativePath };
     if (flags.mode) payload.mode = String(flags.mode);
     if (flags.embed) payload.embed = true;
     const result = await contextFunction(context, 'importLibraryDocument')(payload);
@@ -1628,10 +2276,10 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     const subcommand = String(positional[0] || 'list').trim();
     if (subcommand === 'list') {
       const docId = normalizeShellDocId(positional[1], null);
-      const payload = { action: 'editBranch.listPending' };
+      const payload: Record<string, unknown> = { action: 'editBranch.listPending' };
       if (flags.owner) payload.owner = String(flags.owner);
       const result = await database.run({ operation: 'read', payload }, 'read');
-      const branches = (result.branches || []).filter((branch) => (
+      const branches = (result.branches || []).filter((branch: { base_doc_id?: unknown }) => (
         docId ? String(branch.base_doc_id) === String(docId) : true
       ));
       return { kind: 'db_draft_list', text: branches.map(formatBranchLine).join('\n') || '(无草稿)' };
@@ -1639,7 +2287,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     if (subcommand === 'new') {
       const docId = normalizeShellDocId(positional[1], null);
       if (!docId) throw new Error('db draft new requires doc_id');
-      const payload = { action: 'editBranch.begin', docId, includeDoc: false };
+      const payload: Record<string, unknown> = { action: 'editBranch.begin', docId, includeDoc: false };
       if (flags.owner) payload.owner = String(flags.owner);
       const result = await database.run({ operation: 'write', payload }, 'write');
       return { kind: 'db_draft_new', text: JSON.stringify(result, null, 2) };
@@ -1657,7 +2305,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
         text: `would discard ${branchTargetLabel(target)}; rerun with --yes to apply`
       };
     }
-    const payload = { action: 'editBranch.discard', includeDoc: false };
+    const payload: Record<string, unknown> = { action: 'editBranch.discard', includeDoc: false };
     applyBranchTarget(payload, target);
     const result = await database.run({ operation: 'write', payload }, 'write');
     return { kind: 'db_discard', text: JSON.stringify(result, null, 2) };
@@ -1666,7 +2314,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
   if (command === 'undo' || command === 'redo') {
     const { flags } = parseFlags(args.slice(1));
     const target = branchTarget(flags, context);
-    const payload = {
+    const payload: Record<string, unknown> = {
       action: command === 'undo' ? 'editBranch.undo' : 'editBranch.redo',
       includeDoc: false
     };
@@ -1701,7 +2349,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       };
     }
     // commit 不带裁决走 editBranch.save（冲突→待裁清单、不落）；merge 走 applyMerge，可带 strategy/resolutions 折叠字段冲突。
-    const payload = command === 'merge'
+    const payload: Record<string, unknown> = command === 'merge'
       ? { action: 'editBranch.applyMerge', includeDoc: false }
       : { action: 'editBranch.save', includeDoc: false };
     applyBranchTarget(payload, target);
@@ -1722,7 +2370,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
   if (command === 'rebase') {
     const { flags } = parseFlags(args.slice(1));
     const target = branchTarget(flags, context);
-    const payload = { action: 'editBranch.rebase', includeDoc: false };
+    const payload: Record<string, unknown> = { action: 'editBranch.rebase', includeDoc: false };
     applyBranchTarget(payload, target);
     if (!payload.branchId && !payload.baseDocId) throw new Error('db rebase requires --branch or --base');
     const result = await database.run({ operation: 'write', payload }, 'write');
@@ -1732,7 +2380,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
   if (command === 'cherry-pick') {
     const { flags } = parseFlags(args.slice(1));
     const target = branchTarget({ branch: flags.targetBranch, base: flags.targetBase, owner: flags.owner }, context);
-    const payload = { action: 'editBranch.cherryPick', includeDoc: false };
+    const payload: Record<string, unknown> = { action: 'editBranch.cherryPick', includeDoc: false };
     if (flags.history) payload.sourceHistoryId = flags.history;
     if (flags.sourceBranch) payload.sourceBranchId = flags.sourceBranch;
     if (target.branchId) payload.targetBranchId = target.branchId;
@@ -1772,7 +2420,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
     if (mode !== 'search' && mode !== 'open') throw new Error('db web requires search or open');
     const value = rest.join(' ').trim();
     if (!value) throw new Error(`db web ${mode} requires ${mode === 'open' ? 'url' : 'query'}`);
-    const toolArgs = mode === 'open'
+    const toolArgs: Record<string, unknown> = mode === 'open'
       ? { mode, url: value }
       : { mode, query: value };
     if (flags.limit) toolArgs.limit = flags.limit;
@@ -1784,7 +2432,7 @@ export async function runDbShellArgv(database, argv = [], context = {}) {
       args: toolArgs
     });
     if (mode === 'search' && Array.isArray(result?.results)) {
-      const items = result.results.map((row, i) => [
+      const items = result.results.map((row: { title?: string; url?: string; snippet?: string }, i: number) => [
         `${i + 1}. ${row.title || '(无标题)'}`,
         row.url ? `   ${row.url}` : null,
         row.snippet ? `   ${String(row.snippet).replace(/\s+/g, ' ').trim()}` : null

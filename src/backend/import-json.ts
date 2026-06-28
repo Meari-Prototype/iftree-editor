@@ -1,4 +1,3 @@
-// @ts-nocheck
 // 智能导入的校验 + 入库命令实现（projectneed 4-3-3）。
 // 吃流式写入（stream.push，4-16）同一契约的节点树 JSON——不另设格式（4-3-4）：
 // {title, nodes:[{address, text, nodeTitle?, nodeNote?, nodeType?, trustLevel, sourcePosition?, children?}], vectors?}
@@ -9,28 +8,84 @@ import { extname, resolve } from 'node:path';
 import { splitSentences } from '../core/tree.js';
 import { isBlockMath } from '../core/sentence-split.js';
 
+export interface ImportTreeNode {
+  address?: string;
+  text?: unknown;
+  nodeTitle?: string;
+  nodeNote?: string;
+  nodeType?: string;
+  trustLevel?: string;
+  trust_level?: string;
+  sourcePosition?: number;
+  source_position?: number;
+  role?: string;
+  skipVector?: boolean;
+  children?: ImportTreeNode[];
+  [extra: string]: unknown;
+}
+
+export interface ImportPayload {
+  title?: string;
+  nodes?: ImportTreeNode[];
+  docId?: unknown;
+  parentId?: unknown;
+  vectors?: unknown;
+  splitSentences?: boolean;
+  embed?: boolean;
+  [extra: string]: unknown;
+}
+
+export interface ValidationError {
+  kind: string;
+  address: string;
+  message: string;
+  textPreview?: string;
+}
+
+export interface AnchorEntry {
+  address: string;
+  start: number;
+  end: number;
+}
+
+export interface ValidateReport {
+  ok: boolean;
+  nodeCount: number;
+  textNodeCount: number;
+  virtualCount: number;
+  anchors: AnchorEntry[];
+  coverage: {
+    coveredChars: number;
+    sourceChars: number;
+    ratio: number;
+  };
+  errors: ValidationError[];
+}
+
 // 与导入管线的源文本规范化语义一致（CRLF→LF、去 BOM）。
-export function normalizeImportSourceText(raw) {
+export function normalizeImportSourceText(raw: unknown): string {
   return String(raw || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^﻿/, '');
 }
 
-function flattenPreorder(nodes, out = []) {
+function flattenPreorder(nodes: unknown, out: ImportTreeNode[] = []): ImportTreeNode[] {
   for (const node of Array.isArray(nodes) ? nodes : []) {
-    out.push(node);
-    if (Array.isArray(node?.children) && node.children.length) flattenPreorder(node.children, out);
+    out.push(node as ImportTreeNode);
+    if (Array.isArray((node as ImportTreeNode)?.children) && (node as ImportTreeNode).children!.length) {
+      flattenPreorder((node as ImportTreeNode).children, out);
+    }
   }
   return out;
 }
 
-function nodeText(node) {
+function nodeText(node: ImportTreeNode | null | undefined): string {
   return typeof node?.text === 'string' ? node.text : '';
 }
 
-function nodeAddress(node) {
+function nodeAddress(node: ImportTreeNode | null | undefined): string {
   return String(node?.address ?? '').trim();
 }
 
-function preview(text, limit = 80) {
+function preview(text: unknown, limit = 80): string {
   const compact = String(text || '').replace(/\s+/g, ' ').trim();
   return compact.length > limit ? `${compact.slice(0, limit)}...` : compact;
 }
@@ -38,10 +93,11 @@ function preview(text, limit = 80) {
 // 地址连续性预检（与 store._validateStreamAddresses 同语义，4-16-2）：
 // 新建文档场景挂载点是根节点（address = '1'），顶层节点必须是 1-1、1-2…。
 // 前置在校验报告里给出，省得 push 阶段才炸。
-function validateAddresses(nodes, parentAddress, errors) {
+function validateAddresses(nodes: ImportTreeNode[] | unknown, parentAddress: string, errors: ValidationError[]): void {
   let expected = 1;
   for (const node of Array.isArray(nodes) ? nodes : []) {
-    const addr = nodeAddress(node);
+    const typedNode = node as ImportTreeNode;
+    const addr = nodeAddress(typedNode);
     if (!addr) {
       errors.push({ kind: 'address_missing', address: '', message: `父 ${parentAddress || '(根)'} 下存在缺少 address 的节点` });
       return;
@@ -55,8 +111,8 @@ function validateAddresses(nodes, parentAddress, errors) {
       errors.push({ kind: 'address_order', address: addr, message: `地址不连续：父 ${parentAddress} 下期望 ${parentAddress}-${expected}，收到 ${addr}` });
     }
     expected += 1;
-    if (Array.isArray(node.children) && node.children.length) {
-      validateAddresses(node.children, addr, errors);
+    if (Array.isArray(typedNode.children) && typedNode.children.length) {
+      validateAddresses(typedNode.children, addr, errors);
     }
   }
 }
@@ -64,24 +120,26 @@ function validateAddresses(nodes, parentAddress, errors) {
 // 契约增强：address 缺失时按 children 嵌套前序自动补全（顶层 1-1、1-2…，子节点 父地址-序号）。
 // agent 只贡献「哪里是章节、哪里是段落」的结构与逐字文本，连续地址这种纯机械的事由这里生成——
 // 规则先于 LLM，地址连续性不该让模型写代码去算（最易翻车处）。已带 address 的节点原样保留（向后兼容）。
-export function fillMissingAddresses(nodes, parentAddress = '1') {
+export function fillMissingAddresses(nodes: ImportTreeNode[] | unknown, parentAddress: string = '1'): ImportTreeNode[] {
   return (Array.isArray(nodes) ? nodes : []).map((node, index) => {
-    const address = String(node?.address ?? '').trim() || `${parentAddress}-${index + 1}`;
-    const next = { ...node, address };
-    if (Array.isArray(node?.children) && node.children.length) {
-      next.children = fillMissingAddresses(node.children, address);
+    const typedNode = node as ImportTreeNode;
+    const address = String(typedNode?.address ?? '').trim() || `${parentAddress}-${index + 1}`;
+    const next: ImportTreeNode = { ...typedNode, address };
+    if (Array.isArray(typedNode?.children) && typedNode.children.length) {
+      next.children = fillMissingAddresses(typedNode.children, address);
     }
     return next;
   });
 }
 
 // 插入 gap 节点后整树位置变了，必须按 children 前序重排全部地址（不能沿用旧 address，否则与新位置撞号）。
-export function reassignAddresses(nodes, parentAddress = '1') {
+export function reassignAddresses(nodes: ImportTreeNode[] | unknown, parentAddress: string = '1'): ImportTreeNode[] {
   return (Array.isArray(nodes) ? nodes : []).map((node, index) => {
+    const typedNode = node as ImportTreeNode;
     const address = `${parentAddress}-${index + 1}`;
-    const next = { ...node, address };
-    if (Array.isArray(node?.children) && node.children.length) {
-      next.children = reassignAddresses(node.children, address);
+    const next: ImportTreeNode = { ...typedNode, address };
+    if (Array.isArray(typedNode?.children) && typedNode.children.length) {
+      next.children = reassignAddresses(typedNode.children, address);
     }
     return next;
   });
@@ -92,10 +150,10 @@ export function reassignAddresses(nodes, parentAddress = '1') {
 // 顺序一致性——树前序与源文出现位置单调对应，重复文本按树序贪心消歧；
 // 全覆盖——源文非空白区间必须被某节点逐字节覆盖，漏掉的正文（uncovered）即 error 不放行；纯空白不报。
 // 虚拟节点形态——text 为空的节点必须带数值 source_position（9-1-1 半步偏移）。
-export function validateImportTree(payload, sourceText) {
+export function validateImportTree(payload: ImportPayload | null | undefined, sourceText: unknown): ValidateReport {
   const source = normalizeImportSourceText(sourceText);
-  const errors = [];
-  const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+  const errors: ValidationError[] = [];
+  const nodes = Array.isArray(payload?.nodes) ? payload!.nodes : [];
   if (nodes.length === 0) {
     errors.push({ kind: 'empty', address: '', message: 'nodes 为空：契约要求至少一个节点' });
   }
@@ -108,7 +166,7 @@ export function validateImportTree(payload, sourceText) {
   validateAddresses(nodes, '1', errors);
 
   const flat = flattenPreorder(nodes);
-  const anchors = [];
+  const anchors: AnchorEntry[] = [];
   let cursor = 0;
   let virtualCount = 0;
   for (const node of flat) {
@@ -180,29 +238,40 @@ export function validateImportTree(payload, sourceText) {
 // 锚定结果 → 源文档层：spans 顺序编号即句位（sentence_index），
 // text 节点缺省 source_position 时回填它锚定的句位——智能导入文档
 // 因此获得与直写导入同等的句位对照/选区高亮能力（4-3-3）。
-function fillSourcePositions(nodes, anchorIndexByAddress) {
+function fillSourcePositions(nodes: ImportTreeNode[] | unknown, anchorIndexByAddress: Map<string, number>): ImportTreeNode[] {
   return (Array.isArray(nodes) ? nodes : []).map((node) => {
-    const next = { ...node };
-    const address = nodeAddress(node);
-    if (nodeText(node) && next.sourcePosition == null && next.source_position == null) {
+    const typedNode = node as ImportTreeNode;
+    const next: ImportTreeNode = { ...typedNode };
+    const address = nodeAddress(typedNode);
+    if (nodeText(typedNode) && next.sourcePosition == null && next.source_position == null) {
       const index = anchorIndexByAddress.get(address);
       if (index != null) next.sourcePosition = index;
     }
-    if (Array.isArray(node.children) && node.children.length) {
-      next.children = fillSourcePositions(node.children, anchorIndexByAddress);
+    if (Array.isArray(typedNode.children) && typedNode.children.length) {
+      next.children = fillSourcePositions(typedNode.children, anchorIndexByAddress);
     }
     return next;
   });
 }
 
-function zipCreatedIds(payloadNodes, createdNodes, idByAddress = new Map()) {
-  const created = Array.isArray(createdNodes) ? createdNodes : [];
+interface CreatedNode {
+  id: string;
+  children?: CreatedNode[];
+}
+
+function zipCreatedIds(
+  payloadNodes: ImportTreeNode[] | unknown,
+  createdNodes: CreatedNode[] | unknown,
+  idByAddress: Map<string, string> = new Map()
+): Map<string, string> {
+  const created = (Array.isArray(createdNodes) ? createdNodes : []) as CreatedNode[];
   (Array.isArray(payloadNodes) ? payloadNodes : []).forEach((node, index) => {
+    const typedNode = node as ImportTreeNode;
     const match = created[index];
     if (!match) return;
-    idByAddress.set(nodeAddress(node), match.id);
-    if (Array.isArray(node.children) && node.children.length) {
-      zipCreatedIds(node.children, match.children, idByAddress);
+    idByAddress.set(nodeAddress(typedNode), match.id);
+    if (Array.isArray(typedNode.children) && typedNode.children.length) {
+      zipCreatedIds(typedNode.children, match.children, idByAddress);
     }
   });
   return idByAddress;
@@ -211,26 +280,27 @@ function zipCreatedIds(payloadNodes, createdNodes, idByAddress = new Map()) {
 // 切句子（照完整导入「切到句子」那档的形态）：把每个叶子段落正文节点变成「空容器 + 句子子节点」——
 // 段落节点正文清空、给半步 source_position（标记它是段落边界容器）、不进向量；段落正文按句末标点
 // 切成句子、每句作它的子节点。章节容器（有子）只递归、标题占一个句位；已是空节点的原样。
-export function splitParagraphsToSentenceContainers(nodes) {
+export function splitParagraphsToSentenceContainers(nodes: ImportTreeNode[] | unknown): ImportTreeNode[] {
   let ordinal = 0; // 已分配句位的正文节点数（标题 + 句子），= 校验锚定后的句位
-  const walk = (list) => (Array.isArray(list) ? list : []).flatMap((node) => {
-    const children = Array.isArray(node.children) ? node.children : [];
-    const text = typeof node.text === 'string' ? node.text : '';
+  const walk = (list: ImportTreeNode[] | unknown): ImportTreeNode[] => (Array.isArray(list) ? list : []).flatMap((node): ImportTreeNode[] => {
+    const typedNode = node as ImportTreeNode;
+    const children = Array.isArray(typedNode.children) ? typedNode.children : [];
+    const text = typeof typedNode.text === 'string' ? typedNode.text : '';
     if (children.length > 0) {
       if (text) ordinal += 1; // 章节标题正文占一个句位
-      return [{ ...node, children: walk(children) }];
+      return [{ ...typedNode, children: walk(children) }];
     }
     if (!text) return []; // 空节点：丢弃（智能导入只产嵌套 + 正文，误产的空节点不入库）
     const sentences = splitSentences(text);
     if (sentences.length === 0) return []; // 切不出句子（纯空白 / 纯标点段落）：丢弃、不产空容器
-    const trust = node.trustLevel ?? node.trust_level ?? '不受控';
+    const trust = typedNode.trustLevel ?? typedNode.trust_level ?? '不受控';
     // 纯公式段落（整段就一个 $$ / \[ 块）：整块一个 math 节点，拉齐完整导入待遇——不套容器、不切、不进向量。
     if (sentences.length === 1 && isBlockMath(sentences[0])) {
       ordinal += 1;
-      return [{ ...node, text: sentences[0], role: 'math', skipVector: true, trustLevel: trust }];
+      return [{ ...typedNode, text: sentences[0], role: 'math', skipVector: true, trustLevel: trust }];
     }
     const firstOrdinal = ordinal + 1; // 段落容器半步 = 首句句位 − 0.5
-    const sentenceNodes = sentences.map((sentence) => {
+    const sentenceNodes: ImportTreeNode[] = sentences.map((sentence) => {
       ordinal += 1;
       // 段落内夹的公式块也整块 + 标 math + skipVector（与完整导入一致）；其余是普通句子。
       return isBlockMath(sentence)
@@ -238,7 +308,7 @@ export function splitParagraphsToSentenceContainers(nodes) {
         : { text: sentence, role: 'sentence', trustLevel: trust };
     });
     return [{
-      ...node,
+      ...typedNode,
       text: '',
       role: 'paragraph',
       skipVector: true,
@@ -249,15 +319,30 @@ export function splitParagraphsToSentenceContainers(nodes) {
   return walk(nodes);
 }
 
-export async function runImportJson({ database, jsonPath, sourcePath, dryRun = false, embed = false }) {
+export interface ImportJsonDatabase {
+  run(
+    request: { operation: 'write'; payload: Record<string, unknown> },
+    role: 'write'
+  ): Promise<Record<string, unknown> | null | undefined>;
+}
+
+export interface RunImportJsonInput {
+  database: ImportJsonDatabase;
+  jsonPath: string;
+  sourcePath: string;
+  dryRun?: boolean;
+  embed?: boolean;
+}
+
+export async function runImportJson({ database, jsonPath, sourcePath, dryRun = false, embed = false }: RunImportJsonInput): Promise<Record<string, unknown>> {
   if (!database) throw new Error('import-json requires a database service');
   const resolvedJsonPath = resolve(String(jsonPath || ''));
   const resolvedSourcePath = resolve(String(sourcePath || ''));
-  let payload;
+  let payload: ImportPayload;
   try {
-    payload = JSON.parse(normalizeImportSourceText(readFileSync(resolvedJsonPath, 'utf8')));
+    payload = JSON.parse(normalizeImportSourceText(readFileSync(resolvedJsonPath, 'utf8'))) as ImportPayload;
   } catch (error) {
-    throw new Error(`无法读取节点树 JSON（${resolvedJsonPath}）：${error.message || error}`);
+    throw new Error(`无法读取节点树 JSON（${resolvedJsonPath}）：${(error as { message?: string }).message || error}`);
   }
   const source = normalizeImportSourceText(readFileSync(resolvedSourcePath, 'utf8'));
   // 同步建向量统一用 embed；JSON 顶层旧的 vectors 字段不再认，传了直接报错、别静默不建。
@@ -275,7 +360,7 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
   // 系统只接 JSON、呈现错误，不替 agent 的切割脚本兜底补全（智能导入的「智能」是 agent 的事，不是系统的）。
   const report = validateImportTree({ ...payload, nodes: addressedNodes }, source);
   if (!report.ok || dryRun) {
-    return { ok: report.ok, imported: false, dryRun: Boolean(dryRun), ...report };
+    return { imported: false, dryRun: Boolean(dryRun), ...report };
   }
 
   const anchorIndexByAddress = new Map(report.anchors.map((anchor, index) => [anchor.address, index + 1]));
@@ -297,12 +382,12 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
         nodes,
         embed: embed === true || payload.embed === true
       }
-    }, 'write');
+    }, 'write') as { docId?: unknown; created?: CreatedNode[]; createdCount?: number } | null | undefined;
     const docId = pushResult?.docId;
     if (!docId) throw new Error('stream.push 未返回 docId');
 
-    const idByAddress = zipCreatedIds(nodes, pushResult.created);
-    const nodeIdsBySentenceIndex = {};
+    const idByAddress = zipCreatedIds(nodes, pushResult?.created);
+    const nodeIdsBySentenceIndex: Record<number, string> = {};
     for (const [address, sentenceIndex] of anchorIndexByAddress) {
       const nodeId = idByAddress.get(address);
       if (nodeId) nodeIdsBySentenceIndex[sentenceIndex] = nodeId;
@@ -321,12 +406,12 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
     }, 'write');
 
     return {
+      ...report,
       ok: true,
       imported: true,
       docId,
-      createdCount: pushResult.createdCount,
-      spanCount: spans.length,
-      ...report
+      createdCount: pushResult?.createdCount,
+      spanCount: spans.length
     };
   } finally {
     // bulkEnd 带 embed：写分发收尾据此对本批文档统一建（或不建）向量。

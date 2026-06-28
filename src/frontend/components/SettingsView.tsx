@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { ArrowLeft, Bot, Brain, Cpu, Database, ExternalLink, Gauge, HardDrive, Power, Settings, SlidersHorizontal, Upload, Zap } from 'lucide-react';
 import { useState } from 'react';
 import { normalizeNodeLayoutSettingsByView } from '../lib/doc-utils.js';
@@ -6,6 +5,88 @@ import { progressCountText } from '../lib/ui-utils.js';
 import { IconButton } from './common.jsx';
 import { AgentSettingsPanel } from './settings/AgentSettingsPanel.jsx';
 import { NodeLayoutSettingsPanel } from './settings/NodeLayoutSettingsPanel.jsx';
+
+// 向量模型 / 计算目标的下拉选项形态：来自 settingsRepository 返回值，字段 optional 兼容渐次扩展。
+interface ModelOption {
+  id: string;
+  label: string;
+  baseModelName?: string;
+  dimensions?: number;
+}
+
+interface ComputeOption {
+  id: string;
+  label: string;
+}
+
+// 向量模块设置完整字段集（覆盖本组件实际访问的全部字段）。
+interface VectorSettings {
+  enabled?: boolean;
+  disabledReason?: string;
+  modelOptions?: ModelOption[];
+  computeOptions?: ComputeOption[];
+  modelId?: string;
+  computeTarget?: string;
+  computePolicy?: string;
+  localModelRoot?: string;
+  remoteModelHost?: string;
+  importVectors?: boolean;
+  workerCount?: number;
+  batchSize?: number;
+  modelName?: string;
+  modelPath?: string;
+  backend?: string;
+  device?: string;
+  dtype?: string;
+  pooling?: string;
+  renderer?: string;
+  dimensions?: number;
+  minDimensions?: number;
+  modelCachePath?: string;
+  detectedOllamaBgeM3Path?: string;
+  lanceDbPath?: string;
+  vectorTable?: string;
+}
+
+interface MemorySettings {
+  enabled?: boolean;
+}
+
+interface ProgressInfo {
+  label?: string;
+  total?: number;
+  step?: number;
+}
+
+// useSettings 上游用 Record<string, unknown> 宽松形态接 IPC 返回；本组件 props 沿用宽松形态，
+// 内部一处 cast 收口成具体接口——AppBody 传 props 时无需改造。
+type SettingsObjectLike = Record<string, unknown> | null | undefined;
+type SettingsSection = 'vector' | 'memory' | 'agent' | 'treeNodeLayout';
+// normalizeNodeLayoutSettingsByView 返回 { tree, flow } 双视图——保留 flow 留给 mindmap 视图。
+type NodeLayoutViewKey = 'tree' | 'flow';
+
+export interface SettingsViewProps {
+  vectorSettings: SettingsObjectLike;
+  memorySettings: SettingsObjectLike;
+  llmSummarySettings: SettingsObjectLike;
+  agentSettings: SettingsObjectLike;
+  nodeLayoutSettings: SettingsObjectLike;
+  notice?: string;
+  clearNotice?: () => void;
+  onBack?: () => void;
+  onChange?: (patch: Partial<VectorSettings>) => void;
+  onMemoryChange?: (patch: Partial<MemorySettings>) => void;
+  onLlmSummaryChange?: (patch: Record<string, unknown>) => void;
+  onAgentChange?: (patch: Record<string, unknown>) => void;
+  onNodeLayoutChange?: (view: NodeLayoutViewKey, patch: Record<string, unknown>) => void;
+  canEditNodeLayout?: boolean;
+  treeEditMode?: boolean;
+  onToggleTreeEditMode?: () => void;
+  onChooseLocalModelRoot?: () => void;
+  onDownloadVectorModel?: () => void;
+  progress?: ProgressInfo | null;
+  busy?: boolean;
+}
 
 export function SettingsView({
   vectorSettings,
@@ -28,23 +109,26 @@ export function SettingsView({
   onDownloadVectorModel,
   progress,
   busy
-}) {
-  const [settingsSection, setSettingsSection] = useState('vector');
-  const settings = vectorSettings || {};
+}: SettingsViewProps) {
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('vector');
+  // 边界 cast 收口：vectorSettings 上游是 Record<string, unknown>（IPC 返回经 useSettings 中转），
+  // 本组件内部用 VectorSettings 严格类型操作；运行时形态由 useSettings 守恒，无运行风险。
+  const settings: VectorSettings = (vectorSettings || {}) as VectorSettings;
   const vectorEnabled = settings.enabled !== false;
-  const memoryEnabled = memorySettings?.enabled === true;
+  const memoryEnabled = (memorySettings as MemorySettings | null | undefined)?.enabled === true;
+  // normalizeNodeLayoutSettingsByView 返回 { tree: NodeLayout, flow: NodeLayout }；这里只用 .tree 子段。
   const nodeLayouts = normalizeNodeLayoutSettingsByView(nodeLayoutSettings);
-  const modelOptions = Array.isArray(settings.modelOptions) ? settings.modelOptions : [];
-  const computeOptions = Array.isArray(settings.computeOptions) ? settings.computeOptions : [];
+  const modelOptions: ModelOption[] = Array.isArray(settings.modelOptions) ? settings.modelOptions : [];
+  const computeOptions: ComputeOption[] = Array.isArray(settings.computeOptions) ? settings.computeOptions : [];
   const selectedModel = modelOptions.find((option) => option.id === settings.modelId);
   const selectedCompute = computeOptions.find((option) => option.id === settings.computeTarget);
-  const save = (patch) => onChange?.(patch);
-  const saveNodeLayout = (view, patch) => onNodeLayoutChange?.(view, patch);
-  const saveNumber = (key, value) => {
+  const save = (patch: Partial<VectorSettings>) => onChange?.(patch);
+  const saveNodeLayout = (view: NodeLayoutViewKey, patch: Record<string, unknown>) => onNodeLayoutChange?.(view, patch);
+  const saveNumber = (key: keyof VectorSettings, value: string) => {
     const next = Number(value);
-    if (Number.isFinite(next) && next > 0) save({ [key]: next });
+    if (Number.isFinite(next) && next > 0) save({ [key]: next } as Partial<VectorSettings>);
   };
-  const saveNodeNumber = (view, key, value) => {
+  const saveNodeNumber = (view: NodeLayoutViewKey, key: string, value: string) => {
     const next = Number(value);
     if (Number.isFinite(next) && next > 0) saveNodeLayout(view, { [key]: next });
   };
@@ -383,22 +467,26 @@ export function SettingsView({
         </div>
       </section>
 
-      {progress && (
-        <div className="progress-overlay">
-          <div className="progress-header">
-            <span className="progress-label">{progress.label}</span>
-            {progress.total > 0 && (
-              <span className="progress-count">{progressCountText(progress)}</span>
-            )}
+      {progress && (() => {
+        const total = progress.total ?? 0;
+        const step = progress.step ?? 0;
+        return (
+          <div className="progress-overlay">
+            <div className="progress-header">
+              <span className="progress-label">{progress.label}</span>
+              {total > 0 && (
+                <span className="progress-count">{progressCountText(progress)}</span>
+              )}
+            </div>
+            <div className="progress-track">
+              <div
+                className={`progress-fill${total === 0 ? ' progress-fill--indeterminate' : ''}`}
+                style={total > 0 ? { width: `${Math.round(step / total * 100)}%` } : undefined}
+              />
+            </div>
           </div>
-          <div className="progress-track">
-            <div
-              className={`progress-fill${progress.total === 0 ? ' progress-fill--indeterminate' : ''}`}
-              style={progress.total > 0 ? { width: `${Math.round(progress.step / progress.total * 100)}%` } : undefined}
-            />
-          </div>
-        </div>
-      )}
+        );
+      })()}
     </main>
   );
 }

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +7,72 @@ import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-cli
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-function printHelp() {
+// ── 本地 IPC 边界投影 / 业务领域类型 ──────────────────────────
+interface BenchmarkCliOptions {
+  testcard: string | null;
+  contextDepth: number;
+  offset: number;
+  json: boolean;
+  all: boolean;
+  failOnMiss: boolean;
+  docId?: string;
+  apiId?: string;
+  ids?: number[];
+  limit?: number;
+  help?: boolean;
+}
+
+interface BenchmarkCase {
+  id: number;
+  query: string;
+  expected: string;
+  passageCount: number;
+}
+
+interface ToolEventLike {
+  name?: string;
+  argsPreview?: string;
+  [extra: string]: unknown;
+}
+
+interface AgentRunResult {
+  answer?: unknown;
+  sessionId?: unknown;
+  toolEvents?: ToolEventLike[];
+  [extra: string]: unknown;
+}
+
+interface RunCaseResult {
+  id: number;
+  sessionId: string | null;
+  query: string;
+  expected: string;
+  answer: string;
+  answerHit: boolean;
+  evidenceNodeHit: boolean;
+  evidenceNodes: string[];
+  bodyRead: boolean;
+  actions: string[];
+}
+
+interface BenchmarkReport {
+  docId: string | undefined;
+  testcard: string | null;
+  summary: {
+    total: number;
+    answerHits: number;
+    answerRecall: string;
+    evidenceNodeHits: number;
+    evidenceNodeRecall: string;
+    bodyReadHits: number;
+    bodyReadRate: string;
+  };
+  results: RunCaseResult[];
+}
+
+type HeadlessAgentClient = ReturnType<typeof createHeadlessAgentClient>;
+
+function printHelp(): void {
   console.log([
     'Usage:',
     '  $env:ELECTRON_RUN_AS_NODE = \'1\'',
@@ -34,8 +98,8 @@ function printHelp() {
   ].join('\n'));
 }
 
-function parseArgs(argv = []) {
-  const options = {
+function parseArgs(argv: string[] = []): BenchmarkCliOptions {
+  const options: BenchmarkCliOptions = {
     testcard: null,
     contextDepth: 2,
     offset: 0,
@@ -45,7 +109,10 @@ function parseArgs(argv = []) {
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--help' || arg === '-h') return { help: true };
+    if (arg === '--help' || arg === '-h') {
+      options.help = true;
+      return options;
+    }
     if (arg === '--json') {
       options.json = true;
       continue;
@@ -85,7 +152,7 @@ function parseArgs(argv = []) {
       continue;
     }
     if (arg === '--testcard') {
-      options.testcard = resolve(PROJECT_ROOT, next);
+      options.testcard = resolve(PROJECT_ROOT, next ?? '');
       i += 1;
       continue;
     }
@@ -117,8 +184,8 @@ function parseArgs(argv = []) {
   return options;
 }
 
-function parseIdList(text = '') {
-  const ids = new Set();
+function parseIdList(text: string = ''): number[] {
+  const ids = new Set<number>();
   for (const part of String(text).split(',')) {
     const item = part.trim();
     if (!item) continue;
@@ -137,7 +204,7 @@ function parseIdList(text = '') {
   return [...ids];
 }
 
-function parseMarkdownTableRow(line = '') {
+function parseMarkdownTableRow(line: string = ''): BenchmarkCase | null {
   const trimmed = String(line).trim();
   if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) return null;
   const cells = trimmed.slice(1, -1).split('|').map((cell) => cell.trim());
@@ -151,34 +218,35 @@ function parseMarkdownTableRow(line = '') {
   };
 }
 
-function readTestcard(path) {
+function readTestcard(path: string): BenchmarkCase[] {
   return readFileSync(path, 'utf8')
     .split(/\r?\n/)
     .map(parseMarkdownTableRow)
-    .filter(Boolean);
+    .filter((row): row is BenchmarkCase => row !== null);
 }
 
-function selectCases(cases, options) {
+function selectCases(cases: BenchmarkCase[], options: BenchmarkCliOptions): BenchmarkCase[] {
   if (options.all) return cases;
   if (options.ids) {
-    const byId = new Map(cases.map((item) => [item.id, item]));
+    const byId = new Map<number, BenchmarkCase>(cases.map((item) => [item.id, item]));
     return options.ids.map((id) => {
       const item = byId.get(id);
       if (!item) throw new Error(`Case id not found in testcard: ${id}`);
       return item;
     });
   }
-  return cases.slice(options.offset, options.offset + options.limit);
+  const limit = options.limit ?? cases.length;
+  return cases.slice(options.offset, options.offset + limit);
 }
 
-function normalizeForMatch(value = '') {
+function normalizeForMatch(value: unknown = ''): string {
   return String(value)
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[\s"'“”‘’《》「」『』（）()\[\]【】，,。.!！?？:：;；、]/g, '');
 }
 
-function answerGroups(expected = '') {
+function answerGroups(expected: unknown = ''): string[][] {
   return String(expected)
     .split(/[；;]/)
     .map((group) => group
@@ -188,17 +256,17 @@ function answerGroups(expected = '') {
     .filter((group) => group.length > 0);
 }
 
-function answerHit(answer = '', expected = '') {
+function answerHit(answer: unknown = '', expected: unknown = ''): boolean {
   const normalizedAnswer = normalizeForMatch(answer);
   const groups = answerGroups(expected);
   if (groups.length === 0) return false;
   return groups.every((group) => group.some((alias) => {
     const normalizedAlias = normalizeForMatch(alias);
-    return normalizedAlias && normalizedAnswer.includes(normalizedAlias);
+    return Boolean(normalizedAlias) && normalizedAnswer.includes(normalizedAlias);
   }));
 }
 
-function evidenceNodeAddresses(answer = '') {
+function evidenceNodeAddresses(answer: unknown = ''): string[] {
   const text = String(answer || '');
   const markerIndex = text.search(/证据节点[：:]/);
   if (markerIndex < 0) return [];
@@ -206,8 +274,8 @@ function evidenceNodeAddresses(answer = '') {
   return [...tail.matchAll(/\b1(?:-\d+)+\b/g)].map((match) => match[0]);
 }
 
-function toolActionSummary(toolEvents = []) {
-  const actions = [];
+function toolActionSummary(toolEvents: ToolEventLike[] = []): { actions: string[]; bodyRead: boolean } {
+  const actions: string[] = [];
   let bodyRead = false;
   for (const tool of toolEvents || []) {
     if (tool?.name === 'admin_override' && tool.argsPreview) {
@@ -233,12 +301,12 @@ function toolActionSummary(toolEvents = []) {
   return { actions, bodyRead };
 }
 
-function formatPercent(numerator, denominator) {
+function formatPercent(numerator: number, denominator: number): string {
   if (denominator === 0) return '0.00%';
   return `${((numerator / denominator) * 100).toFixed(2)}%`;
 }
 
-function printReport(report) {
+function printReport(report: BenchmarkReport): void {
   console.log(`RGB Agent benchmark doc#${report.docId}`);
   console.log(`cases=${report.summary.total} answerRecall=${report.summary.answerRecall} evidenceNodeRecall=${report.summary.evidenceNodeRecall} bodyReadRate=${report.summary.bodyReadRate}`);
   console.log('');
@@ -258,7 +326,7 @@ function printReport(report) {
   }
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number): Promise<void> {
   if (process.env.ELECTRON_RUN_AS_NODE === '1') {
     process.exit(code);
     return;
@@ -273,7 +341,7 @@ async function exitProcess(code) {
   process.exit(code);
 }
 
-async function runCase(client, item, options) {
+async function runCase(client: HeadlessAgentClient, item: BenchmarkCase, options: BenchmarkCliOptions): Promise<RunCaseResult> {
   const result = await client.request('agent.run', {
     payload: {
       mode: 'qa',
@@ -282,13 +350,13 @@ async function runCase(client, item, options) {
       prompt: item.query,
       agentApiId: options.apiId || undefined
     }
-  });
+  }) as AgentRunResult;
   const answer = String(result.answer || '');
   const evidenceNodes = evidenceNodeAddresses(answer);
   const toolSummary = toolActionSummary(result.toolEvents || []);
   return {
     id: item.id,
-    sessionId: result.sessionId || null,
+    sessionId: result.sessionId ? String(result.sessionId) : null,
     query: item.query,
     expected: item.expected,
     answer,
@@ -300,20 +368,21 @@ async function runCase(client, item, options) {
   };
 }
 
-async function main() {
+async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     printHelp();
     await exitProcess(0);
     return;
   }
+  if (!options.testcard) throw new Error('--testcard 未传入（parseArgs 应已校验）');
   const cases = selectCases(readTestcard(options.testcard), options);
   const client = createHeadlessAgentClient({
     cwd: PROJECT_ROOT,
     scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
-    onStderr: (text) => process.stderr.write(text)
+    onStderr: (text: string) => process.stderr.write(text)
   });
-  const results = [];
+  const results: RunCaseResult[] = [];
   try {
     for (const item of cases) {
       results.push(await runCase(client, item, options));
@@ -351,6 +420,6 @@ async function main() {
 }
 
 main().catch(async (error) => {
-  console.error(error?.stack || error?.message || String(error));
+  console.error((error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || String(error));
   await exitProcess(1);
 });

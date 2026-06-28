@@ -1,4 +1,3 @@
-// @ts-nocheck
 // IPC channel 名集中表——main（注册/推送侧）与 preload（暴露/监听侧）共用。
 // 抽出来防两边字符串拼写错位：main 改了 channel 名 preload 不知道 = 调用静默失败。
 
@@ -82,4 +81,4 @@ export default {
   // main → renderer push
   OP_PROGRESS: 'op:progress',
   MENU_ACTION: 'menu:action'
-};
+} as const;

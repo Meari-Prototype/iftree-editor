@@ -75,15 +75,16 @@ type SourceBlock =
   | SourceImageBlock
   | SourceCodeBlock;
 
-interface RichInline {
+export interface RichInline {
   [key: string]: unknown;
   type: string;
   text?: string;
+  href?: string;
   src?: string;
   alt?: string;
 }
 
-interface RichBlock {
+export interface RichBlock {
   type: string;
   level?: number;
   inline?: RichInline[];

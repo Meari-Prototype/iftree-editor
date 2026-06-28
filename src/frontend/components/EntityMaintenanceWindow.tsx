@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   Check,
   Database,
@@ -9,8 +8,9 @@ import {
   Trash2,
   Unlink2
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { type DragEvent, useEffect, useMemo, useState } from 'react';
 
+import type { DocListItem } from '../../backend/query-api.js';
 import { WindowTitlebar } from './common.jsx';
 import { rawIftreeApi } from '../data/iftree-api.js';
 import { readDatabase, writeDatabase } from '../data/database-client.js';
@@ -26,55 +26,79 @@ import {
   fetchEntityList,
   linkEntities,
   removeEntityNodeBinding,
-  unlinkEntities
+  unlinkEntities,
+  type EntityGetResult,
+  type EntityListBindingsResult,
+  type FormattedEntity
 } from '../features/entity/entity-actions.js';
 
-function initialDocIdFromLocation() {
+// 视图内对实体/绑定的扩展字段（mergedHitCount 是 entity.get 计算的同义组合并命中数；docTitle 在投影里）。
+type EntityView = FormattedEntity & { mergedHitCount?: number };
+type BindingRowView = EntityListBindingsResult['rows'][number];
+type EntityLinkKind = 'synonym' | 'related';
+type BindingSortValue = 'node:asc' | 'node:desc' | 'bm25:desc' | 'bm25:asc';
+
+function initialDocIdFromLocation(): string | null {
   if (typeof window === 'undefined') return null;
   const docId = String(new URLSearchParams(window.location.search).get('docId') || '').trim();
   return docId || null;
 }
 
-function docDisplayTitle(doc: any = {}) {
+function docDisplayTitle(doc: Partial<DocListItem> | null | undefined = {}): string {
   return String(doc?.title || '').trim() || '未命名文档';
 }
 
-function entityDocTitle(entity: any = {}) {
-  return String(entity.docTitle || '').trim();
+function entityDocTitle(entity: Partial<EntityView> | null | undefined = {}): string {
+  return String(entity?.docTitle || '').trim();
 }
 
-function entityLabel(entity: any = {}, options: any = {}) {
-  const literal = entity.literal || '未命名实体';
+function entityLabel(entity: Partial<EntityView> | null | undefined = {}, options: { showDocTitle?: boolean } = {}): string {
+  const literal = entity?.literal || '未命名实体';
   const docTitle = options.showDocTitle ? entityDocTitle(entity) : '';
   return docTitle ? `${literal} · ${docTitle}` : literal;
 }
 
-function hitText(value) {
+function hitText(value: unknown): string {
   return `x${Number(value) || 0}`;
 }
 
-const BINDING_SORT_OPTIONS = Object.freeze([
+interface BindingSortOption {
+  value: BindingSortValue;
+  label: string;
+  sortBy: 'node' | 'bm25';
+  sortDirection: 'asc' | 'desc';
+}
+
+const BINDING_SORT_OPTIONS: readonly BindingSortOption[] = Object.freeze([
   { value: 'node:asc', label: '正文顺序↑', sortBy: 'node', sortDirection: 'asc' },
   { value: 'node:desc', label: '正文顺序↓', sortBy: 'node', sortDirection: 'desc' },
   { value: 'bm25:desc', label: 'BM25相关↓', sortBy: 'bm25', sortDirection: 'desc' },
   { value: 'bm25:asc', label: 'BM25相关↑', sortBy: 'bm25', sortDirection: 'asc' }
 ]);
 
-function bindingSortPayload(value = 'node:asc') {
+function bindingSortPayload(value: BindingSortValue = 'node:asc'): BindingSortOption {
   return BINDING_SORT_OPTIONS.find((item) => item.value === value) || BINDING_SORT_OPTIONS[0];
 }
 
-function nodeStatusIcon(status) {
+function nodeStatusIcon(status: 'bound' | 'ignored') {
   if (status === 'bound') return <Check size={15} />;
   return <HelpCircle size={15} />;
 }
 
-function nodeStatusText(status) {
+function nodeStatusText(status: 'bound' | 'ignored'): string {
   if (status === 'bound') return '已绑';
   return '待绑';
 }
 
-function EntityLibraryRow({ entity, active, showDocTitle, onSelect, onDragStart }) {
+interface EntityLibraryRowProps {
+  entity: EntityView;
+  active: boolean;
+  showDocTitle: boolean;
+  onSelect: (entity: EntityView) => void;
+  onDragStart: (event: DragEvent<HTMLButtonElement>, entity: EntityView) => void;
+}
+
+function EntityLibraryRow({ entity, active, showDocTitle, onSelect, onDragStart }: EntityLibraryRowProps) {
   const docTitle = showDocTitle ? entityDocTitle(entity) : '';
   return (
     <button
@@ -92,7 +116,14 @@ function EntityLibraryRow({ entity, active, showDocTitle, onSelect, onDragStart 
   );
 }
 
-function RelationRow({ entity, kind, showDocTitle, onUnlink }) {
+interface RelationRowProps {
+  entity: EntityView;
+  kind: EntityLinkKind;
+  showDocTitle: boolean;
+  onUnlink: (entity: EntityView, kind: EntityLinkKind) => void;
+}
+
+function RelationRow({ entity, kind, showDocTitle, onUnlink }: RelationRowProps) {
   return (
     <div className="maintenance-relation-row">
       <span>{entityLabel(entity, { showDocTitle })}</span>
@@ -105,17 +136,23 @@ function RelationRow({ entity, kind, showDocTitle, onUnlink }) {
   );
 }
 
-function BindingRow({ row, onBind, onClear }) {
-  const node = row?.node || {};
-  const status = row?.status === 'ignored' ? 'ignored' : 'bound';
+interface BindingRowProps {
+  row: BindingRowView;
+  onBind: (row: BindingRowView) => void;
+  onClear: (row: BindingRowView) => void;
+}
+
+function BindingRow({ row, onBind, onClear }: BindingRowProps) {
+  const node = row?.node;
+  const status: 'bound' | 'ignored' = row?.status === 'ignored' ? 'ignored' : 'bound';
   return (
     <div className={`maintenance-binding-row ${status}`}>
       <span className="maintenance-binding-status">
         {nodeStatusIcon(status)}
         {nodeStatusText(status)}
       </span>
-      <code>{node.address || node.id || '未定位'}</code>
-      <span>{node.textPreview || node.title || '无正文片段'}</span>
+      <code>{node?.address || node?.id || '未定位'}</code>
+      <span>{node?.textPreview || node?.title || '无正文片段'}</span>
       <strong>{hitText(row?.hitCount)}</strong>
       {status === 'ignored' ? (
         <button type="button" onClick={() => onBind(row)}>
@@ -134,21 +171,21 @@ function BindingRow({ row, onBind, onClear }) {
 
 export function EntityMaintenanceWindow() {
   const initialDocId = initialDocIdFromLocation();
-  const [notice, setNotice] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [docs, setDocs] = useState([]);
-  const [docFilter, setDocFilter] = useState('');
-  const [scopeOpen, setScopeOpen] = useState(false);
-  const [scopeAllDocs, setScopeAllDocs] = useState(false);
-  const [selectedDocIds, setSelectedDocIds] = useState(() => (initialDocId ? [initialDocId] : []));
-  const [entityQuery, setEntityQuery] = useState('');
-  const [entities, setEntities] = useState([]);
-  const [selectedEntity, setSelectedEntity] = useState(null);
-  const [entityDetail, setEntityDetail] = useState(null);
-  const [bindingQuery, setBindingQuery] = useState('');
-  const [bindingSort, setBindingSort] = useState('node:asc');
-  const [bindingRows, setBindingRows] = useState([]);
-  const [manualNodeId, setManualNodeId] = useState('');
+  const [notice, setNotice] = useState<string>('');
+  const [busy, setBusy] = useState<boolean>(false);
+  const [docs, setDocs] = useState<DocListItem[]>([]);
+  const [docFilter, setDocFilter] = useState<string>('');
+  const [scopeOpen, setScopeOpen] = useState<boolean>(false);
+  const [scopeAllDocs, setScopeAllDocs] = useState<boolean>(false);
+  const [selectedDocIds, setSelectedDocIds] = useState<string[]>(() => (initialDocId ? [initialDocId] : []));
+  const [entityQuery, setEntityQuery] = useState<string>('');
+  const [entities, setEntities] = useState<EntityView[]>([]);
+  const [selectedEntity, setSelectedEntity] = useState<EntityView | null>(null);
+  const [entityDetail, setEntityDetail] = useState<EntityGetResult | null>(null);
+  const [bindingQuery, setBindingQuery] = useState<string>('');
+  const [bindingSort, setBindingSort] = useState<BindingSortValue>('node:asc');
+  const [bindingRows, setBindingRows] = useState<BindingRowView[]>([]);
+  const [manualNodeId, setManualNodeId] = useState<string>('');
 
   const selectedDocKey = selectedDocIds.join(',');
   const showEntityDocTitle = scopeAllDocs || selectedDocIds.length !== 1;
@@ -167,26 +204,26 @@ export function EntityMaintenanceWindow() {
     return doc ? `当前文档: ${docDisplayTitle(doc)}` : '当前文档';
   }, [docs, scopeAllDocs, selectedDocIds]);
 
-  function scopePayload() {
+  function scopePayload(): { allDocs: boolean; docIds: string[] } {
     return {
       allDocs: scopeAllDocs,
       docIds: scopeAllDocs ? [] : selectedDocIds
     };
   }
 
-  async function runBusy(task) {
+  async function runBusy<T>(task: () => Promise<T>): Promise<T | null> {
     setBusy(true);
     try {
       return await task();
     } catch (error) {
-      setNotice(error.message);
+      setNotice(String((error as { message?: string } | null | undefined)?.message || ''));
       return null;
     } finally {
       setBusy(false);
     }
   }
 
-  async function refreshEntities(options: any = {}) {
+  async function refreshEntities(options: { keepSelection?: boolean } = {}): Promise<EntityView[]> {
     const result = await fetchEntityList({
       readDatabase,
       ...scopePayload(),
@@ -201,7 +238,7 @@ export function EntityMaintenanceWindow() {
     return rows;
   }
 
-  async function refreshSelectedEntity(entity = selectedEntity) {
+  async function refreshSelectedEntity(entity: EntityView | null = selectedEntity): Promise<EntityGetResult | null> {
     if (!entity?.id || !entity?.docId) {
       setEntityDetail(null);
       setBindingRows([]);
@@ -216,7 +253,11 @@ export function EntityMaintenanceWindow() {
     return detail;
   }
 
-  async function refreshBindings(entity = selectedEntity, sortValue = bindingSort, queryValue = bindingQuery) {
+  async function refreshBindings(
+    entity: EntityView | null = selectedEntity,
+    sortValue: BindingSortValue = bindingSort,
+    queryValue: string = bindingQuery
+  ): Promise<EntityListBindingsResult | null> {
     if (!entity?.id || !entity?.docId) {
       setBindingRows([]);
       return null;
@@ -234,7 +275,7 @@ export function EntityMaintenanceWindow() {
     return result;
   }
 
-  async function selectEntity(entity) {
+  async function selectEntity(entity: EntityView) {
     setSelectedEntity(entity);
     const query = entity?.literal || '';
     setBindingQuery(query);
@@ -244,18 +285,18 @@ export function EntityMaintenanceWindow() {
     });
   }
 
-  async function changeBindingSort(value) {
+  async function changeBindingSort(value: BindingSortValue) {
     setBindingSort(value);
     await runBusy(() => refreshBindings(selectedEntity, value));
   }
 
-  function dragEntity(event, entity) {
+  function dragEntity(event: DragEvent<HTMLButtonElement>, entity: EntityView) {
     event.dataTransfer.setData('application/x-iftree-entity', entityDragPayload(entity));
     event.dataTransfer.setData('text/plain', entity.literal || '');
     event.dataTransfer.effectAllowed = 'copy';
   }
 
-  async function dropRelation(event, kind) {
+  async function dropRelation(event: DragEvent<HTMLDivElement>, kind: EntityLinkKind) {
     event.preventDefault();
     const source = entityFromDragEvent(event);
     if (!selectedEntity?.id || !source?.id) return;
@@ -276,7 +317,7 @@ export function EntityMaintenanceWindow() {
     });
   }
 
-  async function unlinkRelation(entity, kind) {
+  async function unlinkRelation(entity: EntityView, kind: EntityLinkKind) {
     if (!selectedEntity?.id || !entity?.id) return;
     await runBusy(async () => {
       await unlinkEntities({
@@ -302,11 +343,12 @@ export function EntityMaintenanceWindow() {
       return;
     }
     await runBusy(async () => {
+      // createEntity 返回 unknown（写入回执 IPC 边界）；用 EntityView 形态读 entity 字段。
       const result = await createEntity({
         writeDatabase,
         docId: selectedDocIds[0],
         literal
-      });
+      }) as { entity?: EntityView } | null;
       await refreshEntities();
       if (result?.entity) await selectEntity(result.entity);
     });
@@ -329,7 +371,7 @@ export function EntityMaintenanceWindow() {
     });
   }
 
-  async function clearRow(row) {
+  async function clearRow(row: BindingRowView) {
     if (!selectedEntity?.id || !row?.node?.id) return;
     await runBusy(async () => {
       await removeEntityNodeBinding({
@@ -342,7 +384,7 @@ export function EntityMaintenanceWindow() {
     });
   }
 
-  async function bindRow(row) {
+  async function bindRow(row: BindingRowView) {
     if (!selectedEntity?.id || !row?.node?.id) return;
     await runBusy(async () => {
       await bindEntityNode({
@@ -373,7 +415,7 @@ export function EntityMaintenanceWindow() {
     });
   }
 
-  function toggleDoc(docId) {
+  function toggleDoc(docId: unknown) {
     const id = String(docId || '').trim();
     if (!id) return;
     setScopeAllDocs(false);
@@ -384,9 +426,9 @@ export function EntityMaintenanceWindow() {
     ));
   }
 
-  function toggleAllDocs(checked) {
+  function toggleAllDocs(checked: boolean) {
     setScopeAllDocs(checked);
-    setSelectedDocIds(checked ? docs.map((doc) => doc.id) : []);
+    setSelectedDocIds(checked ? docs.map((doc) => String(doc.id)) : []);
     if (!checked) {
       setEntities([]);
       setSelectedEntity(null);
@@ -398,10 +440,11 @@ export function EntityMaintenanceWindow() {
   useEffect(() => {
     let alive = true;
     runBusy(async () => {
-      const rows = await documentRepository.listDocs();
+      // documentRepository.listDocs 返回 unknown（IPC 边界），实际是 normalizeDocRow 投影 = DocListItem[]。
+      const rows = await documentRepository.listDocs() as DocListItem[] | null | undefined;
       if (!alive) return;
       setDocs(rows || []);
-      if (!initialDocId && rows?.[0]?.id) setSelectedDocIds([rows[0].id]);
+      if (!initialDocId && rows?.[0]?.id) setSelectedDocIds([String(rows[0].id)]);
     });
     return () => {
       alive = false;
@@ -420,9 +463,13 @@ export function EntityMaintenanceWindow() {
   }, [scopeAllDocs, selectedDocKey]);
 
   useEffect(() => {
+    // rawIftreeApi 返回 Record<string, unknown-like>，setMenuHandler 是动态绑定的 IPC 桥，TS 看不见它的精确签名。
+    // 这里收口成本地 setter，注释里写清楚契约。
+    type MenuAction = { type?: string; docId?: unknown } | null | undefined;
     const api = rawIftreeApi();
-    if (typeof api.setMenuHandler !== 'function') return undefined;
-    api.setMenuHandler((action) => {
+    const setMenuHandler = api.setMenuHandler as ((callback: ((action: MenuAction) => void) | null) => unknown) | undefined;
+    if (typeof setMenuHandler !== 'function') return undefined;
+    setMenuHandler((action) => {
       if (action?.type !== 'entity-maintenance:focus') return;
       const docId = String(action.docId || '').trim();
       if (docId) {
@@ -430,7 +477,7 @@ export function EntityMaintenanceWindow() {
         setSelectedDocIds([docId]);
       }
     });
-    return () => api.setMenuHandler(null);
+    return () => { setMenuHandler(null); };
   }, []);
 
   const detailEntity = entityDetail?.entity || selectedEntity;
@@ -588,7 +635,7 @@ export function EntityMaintenanceWindow() {
                 value={bindingSort}
                 disabled={!selectedEntity}
                 aria-label="节点绑定排序"
-                onChange={(event) => changeBindingSort(event.target.value)}
+                onChange={(event) => changeBindingSort(event.target.value as BindingSortValue)}
               >
                 {BINDING_SORT_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>{option.label}</option>

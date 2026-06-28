@@ -1,7 +1,6 @@
-﻿// @ts-nocheck
 import { ChevronDown, ChevronRight
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from 'react';
 import { plainNodeNote } from '../../core/node-notes.js';
 import {
   depthOf, hasKnownChildren, nodeTypeLabel
@@ -13,6 +12,7 @@ import {
 } from '../lib/ui-utils.js';
 import { useScrollViewport } from '../hooks/useScrollViewport.js';
 import { parseSourceNodeText, renderSyntaxLine } from './SourceBlocks.jsx';
+import type { TreeNodeLike } from '../../core/tree.js';
 export const IDE_HEADER_HEIGHT = 22;
 
 export const IDE_ROW_MIN_HEIGHT = 24;
@@ -25,7 +25,67 @@ export const IDE_NODE_INDENT_WIDTH = 24;
 
 export const IDE_NODE_BASE_WIDTH = 52;
 
-function nodeIdSetHas(set, id) {
+// ── IPC 边界形态：复用 core/tree.TreeNodeLike + IDE 视图字段（title/note/childCount） ───
+export type IdeTreeNode = TreeNodeLike & {
+  title?: unknown;
+  note?: unknown;
+  childCount?: unknown;
+};
+
+export interface IdeAxiomLike {
+  id?: unknown;
+  label?: unknown;
+  content?: unknown;
+  [extra: string]: unknown;
+}
+
+type IdeNodeIdSet = Set<unknown> | null | undefined;
+
+type IdeColumn = 'node' | 'sentence';
+
+type ParsedSourceText = ReturnType<typeof parseSourceNodeText>;
+
+interface IdeRowExtras {
+  title?: string;
+  note?: string;
+}
+
+interface IdeNodeRow {
+  type: 'node';
+  key: string;
+  node: IdeTreeNode;
+  parsed: ParsedSourceText;
+  hasChildren: boolean;
+  expanded: boolean;
+  localDepth: number;
+  sentenceLabel: string;
+  title: string;
+  note: string;
+  height: number;
+}
+
+interface IdeSummaryRow {
+  type: 'summary';
+  key: string;
+  node: IdeTreeNode;
+  localDepth: number;
+  summary: string;
+  height: number;
+}
+
+type IdeVirtualRow = IdeNodeRow | IdeSummaryRow;
+
+interface BuildVisibleIdeRowsOptions {
+  baseDepth: number;
+  collapsed: IdeNodeIdSet;
+  expanded?: IdeNodeIdSet;
+  depthLimit: unknown;
+  sentenceLabelByNodeId?: Map<unknown, unknown> | null;
+  showTitles?: boolean;
+  showNotes?: boolean;
+}
+
+function nodeIdSetHas(set: IdeNodeIdSet, id: unknown): boolean {
   if (!set || id === null || id === undefined) return false;
   if (set.has(id)) return true;
   const text = String(id);
@@ -34,22 +94,25 @@ function nodeIdSetHas(set, id) {
   return Number.isInteger(number) && number > 0 && set.has(number);
 }
 
-export function ideRowHeight(parsed, extras: any = {}) {
+export function ideRowHeight(parsed: ParsedSourceText | null | undefined, extras: IdeRowExtras = {}): number {
   const codeLines = parsed?.codeLines?.length || 1;
   const titleLines = extras.title ? 1 : 0;
   const noteLines = extras.note ? Math.max(1, String(extras.note).split('\n').length) : 0;
   return Math.max(IDE_ROW_MIN_HEIGHT, (codeLines + titleLines + noteLines) * IDE_CODE_LINE_HEIGHT + 2);
 }
 
-export function buildVisibleIdeRows(nodes, { baseDepth, collapsed, expanded = new Set(), depthLimit, sentenceLabelByNodeId, showTitles = true, showNotes = true }) {
-  const rows = [];
+export function buildVisibleIdeRows(
+  nodes: IdeTreeNode[],
+  { baseDepth, collapsed, expanded = new Set(), depthLimit, sentenceLabelByNodeId, showTitles = true, showNotes = true }: BuildVisibleIdeRowsOptions
+): IdeVirtualRow[] {
+  const rows: IdeVirtualRow[] = [];
   const cappedDepth = Math.max(1, Number(depthLimit) || 1);
-  const visit = (node) => {
-    const parsed = parseSourceNodeText(node.text);
+  const visit = (node: IdeTreeNode): void => {
+    const parsed = parseSourceNodeText(String(node.text ?? ''));
     const title = showTitles ? String(node.title || '').trim() : '';
-    const note = showNotes ? plainNodeNote(node.note || '').trim() : '';
-    const hasChildren = hasKnownChildren(node);
-    const nodeDepth = depthOf(node.address || '1');
+    const note = showNotes ? plainNodeNote(String(node.note || '')).trim() : '';
+    const hasChildren = hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]);
+    const nodeDepth = depthOf(String(node.address || '1'));
     const localDepth = Math.max(0, nodeDepth - baseDepth);
     const userExpanded = nodeIdSetHas(expanded, node.id);
     const rowExpanded = hasChildren
@@ -57,13 +120,13 @@ export function buildVisibleIdeRows(nodes, { baseDepth, collapsed, expanded = ne
       && (nodeDepth < cappedDepth || userExpanded);
     rows.push({
       type: 'node',
-      key: `node-${node.id}`,
+      key: `node-${String(node.id ?? '')}`,
       node,
       parsed,
       hasChildren,
       expanded: rowExpanded,
       localDepth,
-      sentenceLabel: sentenceLabelByNodeId?.get(node.id) || parsed.lineLabel || '',
+      sentenceLabel: String(sentenceLabelByNodeId?.get(node.id) || parsed.lineLabel || ''),
       title,
       note,
       height: ideRowHeight(parsed, { title, note })
@@ -71,17 +134,33 @@ export function buildVisibleIdeRows(nodes, { baseDepth, collapsed, expanded = ne
     if (hasChildren && !rowExpanded) {
       rows.push({
         type: 'summary',
-        key: `summary-${node.id}`,
+        key: `summary-${String(node.id ?? '')}`,
         node,
         localDepth,
         summary: `${Math.max((node.children || []).length, Number(node.childCount ?? 0) || 0)} nodes`,
         height: IDE_ROW_MIN_HEIGHT
       });
     }
-    if (rowExpanded) node.children.forEach(visit);
+    if (rowExpanded && node.children) node.children.forEach(visit);
   };
   nodes.forEach(visit);
   return rows;
+}
+
+export interface IdeViewProps {
+  tree: TreeNodeLike | null | undefined;
+  selectedNodeId?: unknown;
+  setSelectedNodeId?: (id: unknown) => void;
+  collapsed?: IdeNodeIdSet;
+  expanded?: IdeNodeIdSet;
+  toggleCollapsed?: (id: unknown, options?: { promoteDepth?: boolean }) => void;
+  depthLimit?: unknown;
+  sentenceLabelByNodeId?: Map<unknown, unknown> | null;
+  axioms?: IdeAxiomLike[];
+  showTitles?: boolean;
+  showNotes?: boolean;
+  showAxioms?: boolean;
+  locateRequest?: { seq?: number; nodeId?: unknown } | null;
 }
 
 export function IdeView({
@@ -98,15 +177,15 @@ export function IdeView({
   showNotes = true,
   showAxioms = true,
   locateRequest = null
-}) {
-  const editorRef = useRef(null);
+}: IdeViewProps) {
+  const editorRef = useRef<HTMLDivElement | null>(null);
   const { scrollRef, viewport, onScroll } = useScrollViewport();
-  const roots = tree ? [tree] : [];
+  const roots: IdeTreeNode[] = tree ? [tree] : [];
   const baseDepth = roots.length > 0
-    ? Math.min(...roots.map((node) => depthOf(node.address || '1')))
+    ? Math.min(...roots.map((node) => depthOf(String(node.address || '1'))))
     : 1;
   const maxLocalDepth = maxVisibleIdeLocalDepth(roots, baseDepth, collapsed, expanded, depthLimit);
-  const [columnWidths, setColumnWidths] = useState(readIdeColumnWidths);
+  const [columnWidths, setColumnWidths] = useState<{ node: number; sentence: number }>(readIdeColumnWidths);
   const nodeColumnMinimumWidth = Math.max(
     IDE_COLUMN_LIMITS.node.min,
     maxLocalDepth * IDE_NODE_INDENT_WIDTH + IDE_NODE_BASE_WIDTH
@@ -164,7 +243,7 @@ export function IdeView({
     liveColumnWidthsRef.current = { node: nodeColumnWidth, sentence: sentenceColumnWidth };
   }, [nodeColumnWidth, sentenceColumnWidth]);
 
-  function startColumnResize(column, event) {
+  function startColumnResize(column: IdeColumn, event: ReactPointerEvent<HTMLButtonElement>): void {
     event.preventDefault();
     event.stopPropagation();
     try {
@@ -185,14 +264,14 @@ export function IdeView({
     );
     let latestWidth = startWidth;
     let frame = 0;
-    const apply = () => {
+    const apply = (): void => {
       frame = 0;
       editorRef.current?.style.setProperty(cssProperty, `${latestWidth}px`);
     };
     editorRef.current?.style.setProperty(cssProperty, `${startWidth}px`);
     liveColumnWidthsRef.current = { ...liveColumnWidthsRef.current, [column]: startWidth };
     document.body.classList.add('ide-resizing');
-    const move = (moveEvent) => {
+    const move = (moveEvent: PointerEvent): void => {
       moveEvent.preventDefault();
       latestWidth = clampIdeColumnWidth(startWidth + moveEvent.clientX - startX, min, max, startWidth);
       liveColumnWidthsRef.current = { ...liveColumnWidthsRef.current, [column]: latestWidth };
@@ -221,7 +300,7 @@ export function IdeView({
   }
 
   return (
-    <div className="ide-surface" ref={scrollRef} onScroll={onScroll}>
+    <div className="ide-surface" ref={scrollRef as RefObject<HTMLDivElement | null>} onScroll={onScroll}>
       <div
         ref={editorRef}
         className="ide-editor"
@@ -229,7 +308,7 @@ export function IdeView({
         style={{
           '--node-column-width': `${nodeColumnWidth}px`,
           '--sentence-column-width': `${sentenceColumnWidth}px`
-        }}
+        } as CSSProperties}
       >
         <div className="ide-header" role="presentation">
           <span>节点位置</span>
@@ -256,16 +335,23 @@ export function IdeView({
   );
 }
 
-export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed }) {
+export interface IdeRowProps {
+  row: IdeVirtualRow;
+  selectedNodeId?: unknown;
+  setSelectedNodeId?: (id: unknown) => void;
+  toggleCollapsed?: (id: unknown, options?: { promoteDepth?: boolean }) => void;
+}
+
+export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed }: IdeRowProps) {
   if (row.type === 'summary') {
     return (
       <button
         type="button"
         className="ide-fold-summary"
-        style={{ '--depth': row.localDepth + 1, minHeight: row.height }}
+        style={{ '--depth': row.localDepth + 1, minHeight: row.height } as CSSProperties}
         onClick={() => {
-          setSelectedNodeId(row.node.id);
-          toggleCollapsed(row.node.id, { promoteDepth: false });
+          setSelectedNodeId?.(row.node.id);
+          toggleCollapsed?.(row.node.id, { promoteDepth: false });
         }}
       >
         {row.summary}
@@ -277,8 +363,8 @@ export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed
   return (
     <div
       className={`ide-node ${selected ? 'selected' : ''}`}
-      style={{ '--depth': row.localDepth, minHeight: row.height }}
-      onClick={() => setSelectedNodeId(row.node.id)}
+      style={{ '--depth': row.localDepth, minHeight: row.height } as CSSProperties}
+      onClick={() => setSelectedNodeId?.(row.node.id)}
     >
       <span className="ide-node-cell">
         <button
@@ -287,13 +373,13 @@ export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed
           disabled={!row.hasChildren}
           onClick={(event) => {
             event.stopPropagation();
-            if (row.hasChildren) toggleCollapsed(row.node.id, { promoteDepth: false });
+            if (row.hasChildren) toggleCollapsed?.(row.node.id, { promoteDepth: false });
           }}
           title={row.expanded ? '折叠节点' : '展开节点'}
         >
           {row.hasChildren ? (row.expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span />}
         </button>
-        <span className="ide-address">{row.node.address}</span>
+        <span className="ide-address">{String(row.node.address ?? '')}</span>
       </span>
       <span className="ide-column-gap" />
       <span className="ide-line-label">{row.sentenceLabel}</span>
@@ -302,7 +388,7 @@ export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed
         {row.title ? (
           <span className="ide-node-title-line">{row.title}</span>
         ) : null}
-        {row.parsed.codeLines.map((line, index) => (
+        {row.parsed.codeLines.map((line: string, index: number) => (
           <span key={`${row.key}-${index}`} className="ide-code-line">
             {renderSyntaxLine(line, `${row.key}-${index}`)}
           </span>
@@ -311,18 +397,28 @@ export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed
           <span className="ide-node-note-line">{row.note}</span>
         ) : null}
       </code>
-      <span className="ide-node-kind">{nodeTypeLabel(row.node.nodeType)}</span>
+      <span className="ide-node-kind">{nodeTypeLabel(String(row.node.nodeType ?? ''))}</span>
     </div>
   );
 }
 
-export function IdeAxiomFrontMatter({ axioms = [] }) {
-  const rows = Array.isArray(axioms)
+export interface IdeAxiomFrontMatterProps {
+  axioms?: IdeAxiomLike[];
+}
+
+interface IdeAxiomRow {
+  key: string;
+  label: string;
+  content: string;
+}
+
+export function IdeAxiomFrontMatter({ axioms = [] }: IdeAxiomFrontMatterProps) {
+  const rows: IdeAxiomRow[] = Array.isArray(axioms)
     ? axioms
-      .map((axiom) => ({
-        key: axiom.id || axiom.label,
-        label: String(axiom.label || '').trim(),
-        content: String(axiom.content || '').trim()
+      .map((axiom): IdeAxiomRow => ({
+        key: String(axiom.id ?? axiom.label ?? ''),
+        label: String(axiom.label ?? '').trim(),
+        content: String(axiom.content ?? '').trim()
       }))
       .filter((axiom) => axiom.label || axiom.content)
     : [];
@@ -342,18 +438,24 @@ export function IdeAxiomFrontMatter({ axioms = [] }) {
   );
 }
 
-export function maxVisibleIdeLocalDepth(nodes, baseDepth, collapsed, expanded = new Set(), depthLimit) {
+export function maxVisibleIdeLocalDepth(
+  nodes: IdeTreeNode[],
+  baseDepth: number,
+  collapsed: IdeNodeIdSet,
+  expanded: IdeNodeIdSet = new Set(),
+  depthLimit: unknown
+): number {
   let maxDepth = 0;
   const cappedDepth = Math.max(1, Number(depthLimit) || 1);
-  const visit = (node) => {
-    const nodeDepth = depthOf(node.address || '1');
+  const visit = (node: IdeTreeNode): void => {
+    const nodeDepth = depthOf(String(node.address || '1'));
     maxDepth = Math.max(maxDepth, nodeDepth - baseDepth);
-    const hasChildren = hasKnownChildren(node);
+    const hasChildren = hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]);
     const rowExpanded = hasChildren
       && !nodeIdSetHas(collapsed, node.id)
       && (nodeDepth < cappedDepth || nodeIdSetHas(expanded, node.id));
     if (!rowExpanded) return;
-    node.children.forEach(visit);
+    if (node.children) node.children.forEach(visit);
   };
   nodes.forEach(visit);
   return Math.max(0, maxDepth);

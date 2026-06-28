@@ -1,8 +1,17 @@
-// @ts-nocheck
 import { callIftree, hasIftreeMethod } from './iftree-api.js';
 
+interface CreateImageAssetPayload {
+  docId: string;
+  nodeId: string | number;
+}
+
+interface ResolveImageSourcesPayload {
+  docId: string;
+  sources: string[];
+}
+
 export const assetRepository = {
-  createImageAsset(payload) {
+  createImageAsset(payload: CreateImageAssetPayload) {
     return callIftree('createImageAsset', payload);
   },
 
@@ -10,7 +19,7 @@ export const assetRepository = {
     return hasIftreeMethod('resolveImageSources');
   },
 
-  resolveImageSources(payload) {
+  resolveImageSources(payload: ResolveImageSourcesPayload) {
     return callIftree('resolveImageSources', payload);
   }
 };

@@ -1,11 +1,26 @@
-// @ts-nocheck
 import { type ElementType, useMemo } from 'react';
 
 import { parseMarkdownBlocks, renderTexMathToText } from '../../core/markdown.js';
 import { useResolvedImageSources } from '../hooks/useResolvedImages.js';
 
-export function MarkdownBlock({ markdown, docId }) {
-  const blocks = useMemo(() => parseMarkdownBlocks(markdown), [markdown]);
+type MarkdownInlineToken = {
+  type?: string;
+  text?: string;
+};
+
+type MarkdownBlockNode =
+  | { type: 'heading'; level: number; text: string }
+  | { type: 'image'; src: string; alt?: string }
+  | { type: 'math'; text: string }
+  | { type: 'paragraph'; children: MarkdownInlineToken[] };
+
+interface MarkdownBlockProps {
+  markdown: unknown;
+  docId?: string | null;
+}
+
+export function MarkdownBlock({ markdown, docId }: MarkdownBlockProps) {
+  const blocks = useMemo(() => parseMarkdownBlocks(markdown) as MarkdownBlockNode[], [markdown]);
   const resolvedImages = useResolvedImageSources(blocks, docId);
 
   return (
@@ -27,7 +42,7 @@ export function MarkdownBlock({ markdown, docId }) {
   );
 }
 
-export function renderInline(token, key) {
+export function renderInline(token: MarkdownInlineToken, key: number) {
   if (token.type === 'strong') return <strong key={key}>{token.text}</strong>;
   if (token.type === 'code') return <code key={key}>{token.text}</code>;
   if (token.type === 'math') return <span key={key} className="math-inline">{renderTexMathToText(token.text)}</span>;

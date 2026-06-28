@@ -9,7 +9,7 @@ import { createSpanAccumulator, addSentenceContainer } from './source-spans.js';
 
 const execFileAsync = promisify(execFile);
 
-export async function readChmSourceDocument(filePath: string, options: { granularity?: string } = {}) {
+export async function readChmSourceDocument(filePath: string, options: { granularity?: string } = {}): Promise<ChmSourceDocument> {
   const absoluteFilePath = resolve(filePath);
   const outputDir = join(tmpdir(), `iftree-chm-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(outputDir, { recursive: true });
@@ -32,7 +32,7 @@ export async function readChmSourceDocument(filePath: string, options: { granula
   }
 }
 
-type ChmRecord = {
+export interface ChmRecord {
   address: string;
   text: string;
   nodeType: string;
@@ -42,9 +42,27 @@ type ChmRecord = {
   vector: null;
   indexes?: number[];
   skipVector?: boolean;
-};
+  // 消费者按 SourceRecord 同款宽松访问（snake_case 别名兜底等），index sig 兜底。
+  [extra: string]: unknown;
+}
 
-function chmItemsToSourceDocument(items: { name: string; local?: string; level: number }[], outputDir: string, sourcePath: string, options: { granularity?: string } = {}) {
+// CHM 流读返回形态。pdfPages/pdfChars 在 CHM 路径恒为 undefined，
+// 字段保留为 optional 是为对齐 saveSourceDocument 等下游统一形参（pdf 路径会带值）。
+export interface ChmSourceDocument {
+  sourcePath: string;
+  sourceType: string;
+  structureSource: string;
+  intermediateFormat: null;
+  rawText: string;
+  rawMarkdown: string;
+  spans: import('./source-spans.js').SourceSpanRecord[];
+  records: ChmRecord[];
+  tocItemCount: number;
+  pdfPages?: unknown[];
+  pdfChars?: unknown[];
+}
+
+function chmItemsToSourceDocument(items: { name: string; local?: string; level: number }[], outputDir: string, sourcePath: string, options: { granularity?: string } = {}): ChmSourceDocument {
   const granularity = options.granularity === 'sentence' ? 'sentence' : 'paragraph';
   const records: ChmRecord[] = [];
   const acc = createSpanAccumulator(); // 载体重建 + 句位 spans（取代本地 rawParts/rawOffset/appendRawText）

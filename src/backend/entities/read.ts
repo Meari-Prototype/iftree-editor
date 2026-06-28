@@ -1,13 +1,19 @@
-// @ts-nocheck
 import { compareNodeAddress } from '../shared.js';
 import { keywordIndexRowsForDoc } from '../keyword-index.js';
+import type { EditBranchRow, EntityRow, NodeRow } from '../db/rows.js';
 import {
   formatEntity,
   normalizeEntityKey,
   normalizeLimit,
   normalizePositiveInteger,
   nodeRowsForDoc,
-  scanEntityHits
+  scanEntityHits,
+  type EntityState,
+  type EntityStore,
+  type FormattedEntity,
+  type ProjectedEntity,
+  type ProjectedEntityBinding,
+  type ProjectedEntityLink
 } from './shared.js';
 import {
   entityStateForRead,
@@ -21,22 +27,55 @@ export const ENTITY_READ_ACTIONS = Object.freeze([
   'entity.listBindings'
 ]);
 
-function sameRef(left, right) {
+type Payload = Record<string, unknown>;
+
+interface KeywordCtx {
+  ensureKeywordIndexRows?: (rows: unknown) => Promise<unknown> | unknown;
+  keywordSearch?: (params: { terms: string[]; docId: unknown }) => Promise<KeywordSearchHit[]> | KeywordSearchHit[];
+}
+
+interface KeywordSearchHit {
+  node_id?: string;
+  [key: string]: unknown;
+}
+
+export interface BindingNodeView {
+  id: NodeRow['id'];
+  docId: NodeRow['doc_id'];
+  address: NodeRow['address'];
+  depth: NodeRow['depth'];
+  title: string;
+  textPreview: string;
+  notePreview: string;
+}
+
+export interface BindingRow {
+  status: 'bound' | 'ignored';
+  source: 'literal' | 'manual' | 'ignored';
+  hitCount: number;
+  node: BindingNodeView;
+}
+
+type BindingSort = { by: 'node' | 'bm25'; direction: 'asc' | 'desc' };
+
+type EntityRowAlias = EntityRow;
+
+function sameRef(left: unknown, right: unknown): boolean {
   if (typeof left === 'string' || typeof right === 'string') return String(left) === String(right);
   return String(left) === String(right);
 }
 
-function rawEntityId(payload = {}) {
+function rawEntityId(payload: Payload = {}): unknown {
   return payload.entityId ?? payload.entity_id ?? payload.id ?? null;
 }
 
-function normalizeTerms(payload = {}) {
+function normalizeTerms(payload: Payload = {}): string[] {
   const source = Array.isArray(payload.terms)
     ? payload.terms
     : String(payload.keyword ?? payload.query ?? payload.q ?? payload.literal ?? '')
       .split(/\s+/);
-  const terms = [];
-  const seen = new Set();
+  const terms: string[] = [];
+  const seen = new Set<string>();
   for (const item of source) {
     const term = String(item || '').trim();
     const key = normalizeEntityKey(term);
@@ -47,15 +86,23 @@ function normalizeTerms(payload = {}) {
   return terms;
 }
 
-function docIdsFromPayload(payload = {}, options = {}) {
+interface DocIdScopeOptions {
+  required?: boolean;
+}
+
+function docIdsFromPayload(payload: Payload = {}, options: DocIdScopeOptions = {}): string[] | null {
   if (payload.allDocs === true || payload.all_docs === true || payload.scope === 'all') return null;
-  const rawDocIds = Array.isArray(payload.docIds)
+  const rawDocIds: unknown[] = Array.isArray(payload.docIds)
     ? payload.docIds
     : Array.isArray(payload.doc_ids)
       ? payload.doc_ids
       : [];
-  const docIds = rawDocIds.map((value) => normalizePositiveInteger(value)).filter(Boolean);
-  const docId = normalizePositiveInteger(payload.docId ?? payload.doc_id ?? payload.scopeDocId ?? payload.scope_doc_id);
+  const docIds = rawDocIds
+    .map((value) => normalizePositiveInteger(value))
+    .filter((value): value is string => Boolean(value));
+  const docId = normalizePositiveInteger(
+    payload.docId ?? payload.doc_id ?? payload.scopeDocId ?? payload.scope_doc_id
+  );
   if (docId) docIds.unshift(docId);
   const unique = [...new Set(docIds)];
   if (unique.length === 0 && options.required !== false) {
@@ -64,27 +111,28 @@ function docIdsFromPayload(payload = {}, options = {}) {
   return unique;
 }
 
-function branchForDoc(store, docId, payload = {}) {
-  const owner = payload.owner || payload.editBranchOwner || payload.edit_branch_owner || null;
-  return store.activeEditBranchForDoc?.(docId, owner) || null;
+function branchForDoc(store: EntityStore, docId: unknown, payload: Payload = {}): EditBranchRow | null {
+  const owner = payload.owner ?? payload.editBranchOwner ?? payload.edit_branch_owner ?? null;
+  const result = store.activeEditBranchForDoc?.(docId, owner);
+  return (result as EditBranchRow | null | undefined) ?? null;
 }
 
-function stateForPayload(store, payload = {}, docId = null) {
+function stateForPayload(store: EntityStore, payload: Payload = {}, docId: string | null = null): EntityState {
   const docIds = docId ? [docId] : docIdsFromPayload(payload, { required: false });
   const branch = docIds?.length === 1 ? branchForDoc(store, docIds[0], payload) : null;
   return entityStateForRead(store, branch);
 }
 
-function entityByRef(state, ref) {
+function entityByRef(state: EntityState, ref: unknown): ProjectedEntity | null {
   if (ref === null || ref === undefined || ref === '') return null;
   return state.entities.find((entity) => sameRef(entity.id, ref)) || null;
 }
 
-function filterEntities(state, payload = {}) {
+function filterEntities(state: EntityState, payload: Payload = {}): ProjectedEntity[] {
   const docIds = docIdsFromPayload(payload);
   const docSet = docIds ? new Set(docIds.map(String)) : null;
   const query = String(payload.query ?? payload.q ?? payload.literal ?? '').trim().toLocaleLowerCase();
-  const queryRank = (entity = {}) => {
+  const queryRank = (entity: ProjectedEntity): number => {
     if (!query) return 0;
     const key = String(entity.normalized_literal || '').toLocaleLowerCase();
     if (key === query) return 0;
@@ -99,15 +147,15 @@ function filterEntities(state, payload = {}) {
       || String(left.id).localeCompare(String(right.id), undefined, { numeric: true }));
 }
 
-function attachEntityHitCounts(store, rows = []) {
-  const byDoc = new Map();
+function attachEntityHitCounts(store: EntityStore, rows: ProjectedEntity[] = []): ProjectedEntity[] {
+  const byDoc = new Map<string, ProjectedEntity[]>();
   for (const row of rows) {
     const docId = String(row.doc_id);
     const group = byDoc.get(docId) || [];
     group.push(row);
     byDoc.set(docId, group);
   }
-  const counts = new Map();
+  const counts = new Map<string, number>();
   for (const [docId, entities] of byDoc.entries()) {
     const scan = scanEntityHits(nodeRowsForDoc(store, docId), entities);
     for (const entity of entities) counts.set(String(entity.id), scan.totals.get(String(entity.id)) || 0);
@@ -115,7 +163,13 @@ function attachEntityHitCounts(store, rows = []) {
   return rows.map((row) => ({ ...row, hit_count: counts.get(String(row.id)) || 0 }));
 }
 
-function listEntities(store, payload = {}) {
+export interface EntityListResult {
+  kind: 'entity.list';
+  returned: number;
+  rows: FormattedEntity[];
+}
+
+function listEntities(store: EntityStore, payload: Payload = {}): EntityListResult {
   const state = stateForPayload(store, payload);
   const rows = attachEntityHitCounts(store, filterEntities(state, payload))
     .slice(0, normalizeLimit(payload.limit, 100, 1000));
@@ -126,9 +180,18 @@ function listEntities(store, payload = {}) {
   };
 }
 
-function linkedEntityRows(state, entityRefs = [], kind = 'synonym') {
+type LinkedEntityRow = ProjectedEntity & {
+  kind: ProjectedEntityLink['kind'];
+  source_entity_id: ProjectedEntityLink['entity_a_id'];
+};
+
+function linkedEntityRows(
+  state: EntityState,
+  entityRefs: ReadonlyArray<unknown> = [],
+  kind: ProjectedEntityLink['kind'] = 'synonym'
+): LinkedEntityRow[] {
   const refs = new Set(entityRefs.map(String));
-  const rows = [];
+  const rows: LinkedEntityRow[] = [];
   for (const link of state.links) {
     if (link.kind !== kind) continue;
     const leftHit = refs.has(String(link.entity_a_id));
@@ -141,11 +204,11 @@ function linkedEntityRows(state, entityRefs = [], kind = 'synonym') {
   return rows;
 }
 
-function synonymGroupRows(state, store, entityRef) {
+function synonymGroupRows(state: EntityState, store: EntityStore, entityRef: unknown): ProjectedEntity[] {
   const root = entityByRef(state, entityRef);
   if (!root) return [];
-  const seen = new Set([String(root.id)]);
-  const queue = [root.id];
+  const seen = new Set<string>([String(root.id)]);
+  const queue: unknown[] = [root.id];
   while (queue.length > 0) {
     const current = queue.shift();
     for (const row of linkedEntityRows(state, [current], 'synonym')) {
@@ -163,10 +226,19 @@ function synonymGroupRows(state, store, entityRef) {
   return attachEntityHitCounts(store, rows);
 }
 
-function getEntity(store, payload = {}) {
+export interface EntityGetResult {
+  kind: 'entity.get';
+  entity: FormattedEntity | null;
+  synonyms?: FormattedEntity[];
+  related?: FormattedEntity[];
+}
+
+function getEntity(store: EntityStore, payload: Payload = {}): EntityGetResult {
   const ref = rawEntityId(payload);
   if (ref === null || ref === undefined || ref === '') throw new Error('entity.get requires entityId');
-  const baseEntity = normalizePositiveInteger(ref) ? store.db.prepare('SELECT doc_id FROM entities WHERE id = ?').get(ref) : null;
+  const baseEntity = normalizePositiveInteger(ref)
+    ? store.db!.prepare('SELECT doc_id FROM entities WHERE id = ?').get<Pick<EntityRowAlias, 'doc_id'>>(ref)
+    : null;
   const docId = normalizePositiveInteger(payload.docId ?? payload.doc_id ?? baseEntity?.doc_id);
   const state = stateForPayload(store, payload, docId);
   const group = synonymGroupRows(state, store, ref);
@@ -188,7 +260,12 @@ function getEntity(store, payload = {}) {
   };
 }
 
-function seedEntityRows(state, payload = {}) {
+interface SeedEntityRowsResult {
+  terms: string[];
+  rows: ProjectedEntity[];
+}
+
+function seedEntityRows(state: EntityState, payload: Payload = {}): SeedEntityRowsResult {
   const terms = normalizeTerms(payload);
   const keys = new Set(terms.map(normalizeEntityKey).filter(Boolean));
   if (keys.size === 0) return { terms, rows: [] };
@@ -204,11 +281,24 @@ function seedEntityRows(state, payload = {}) {
   };
 }
 
-function listRelated(store, payload = {}) {
+interface RelatedListRow {
+  relation: ProjectedEntityLink['kind'];
+  seed: FormattedEntity;
+  entity: FormattedEntity;
+}
+
+interface EntityListRelatedResult {
+  kind: 'entity.listRelated';
+  terms: string[];
+  returned: number;
+  rows: RelatedListRow[];
+}
+
+function listRelated(store: EntityStore, payload: Payload = {}): EntityListRelatedResult {
   const state = stateForPayload(store, payload);
   const { terms, rows: seeds } = seedEntityRows(state, payload);
-  const resultRows = [];
-  const seen = new Set();
+  const resultRows: RelatedListRow[] = [];
+  const seen = new Set<string>();
   for (const seed of seeds) {
     const group = synonymGroupRows(state, store, seed.id);
     const groupIds = new Set(group.map((row) => String(row.id)));
@@ -235,7 +325,9 @@ function listRelated(store, payload = {}) {
   };
 }
 
-function formatBindingNode(row = {}) {
+type BindingNodeSource = Pick<NodeRow, 'id' | 'doc_id' | 'address' | 'depth' | 'node_title' | 'text' | 'node_note'>;
+
+function formatBindingNode(row: BindingNodeSource): BindingNodeView {
   return {
     id: row.id,
     docId: row.doc_id,
@@ -247,7 +339,7 @@ function formatBindingNode(row = {}) {
   };
 }
 
-function normalizeBindingSort(payload = {}) {
+function normalizeBindingSort(payload: Payload = {}): BindingSort {
   const rawSort = String(payload.sort ?? payload.sortBy ?? payload.sort_by ?? payload.orderBy ?? payload.order_by ?? 'node')
     .trim()
     .toLowerCase();
@@ -256,20 +348,25 @@ function normalizeBindingSort(payload = {}) {
   const rawDirection = String(payload.sortDirection ?? payload.sort_direction ?? payload.direction ?? payload.dir ?? parts[1] ?? '')
     .trim()
     .toLowerCase();
-  const by = ['bm25', 'relevance', 'score'].includes(rawBy)
+  const by: BindingSort['by'] = ['bm25', 'relevance', 'score'].includes(rawBy)
     ? 'bm25'
     : ['node', 'address', 'body'].includes(rawBy)
       ? 'node'
       : 'node';
-  const direction = rawDirection === 'desc' || rawDirection === 'asc'
-    ? rawDirection
+  const direction: BindingSort['direction'] = rawDirection === 'desc' || rawDirection === 'asc'
+    ? (rawDirection as BindingSort['direction'])
     : by === 'bm25'
       ? 'desc'
       : 'asc';
   return { by, direction };
 }
 
-async function bm25RankByNodeId(store, entity, payload = {}, ctx = {}) {
+async function bm25RankByNodeId(
+  store: EntityStore,
+  entity: ProjectedEntity,
+  payload: Payload = {},
+  ctx: KeywordCtx = {}
+): Promise<Map<string, number>> {
   if (typeof ctx.ensureKeywordIndexRows !== 'function' || typeof ctx.keywordSearch !== 'function') return new Map();
   const terms = normalizeTerms({
     terms: payload.terms,
@@ -278,7 +375,7 @@ async function bm25RankByNodeId(store, entity, payload = {}, ctx = {}) {
   if (terms.length === 0) return new Map();
   await ctx.ensureKeywordIndexRows(keywordIndexRowsForDoc(store, entity.doc_id));
   const candidates = await ctx.keywordSearch({ terms, docId: entity.doc_id });
-  const ranks = new Map();
+  const ranks = new Map<string, number>();
   candidates.forEach((candidate, index) => {
     const nodeId = String(candidate.node_id || '');
     if (nodeId && !ranks.has(nodeId)) ranks.set(nodeId, index + 1);
@@ -286,16 +383,19 @@ async function bm25RankByNodeId(store, entity, payload = {}, ctx = {}) {
   return ranks;
 }
 
-function bindingSource(override, hitCount) {
+function bindingSource(
+  override: ProjectedEntityBinding | undefined,
+  hitCount: number
+): BindingRow['source'] {
   if (override?.status === 'ignored') return 'ignored';
   return hitCount > 0 ? 'literal' : 'manual';
 }
 
-function includeIgnoredBindings(payload = {}) {
+function includeIgnoredBindings(payload: Payload = {}): boolean {
   return payload.includeIgnored !== false && payload.include_ignored !== false;
 }
 
-function sortBindingRows(rows = [], sort = {}, ranks = new Map()) {
+function sortBindingRows(rows: BindingRow[] = [], sort: BindingSort, ranks: Map<string, number> = new Map()): BindingRow[] {
   return [...rows].sort((left, right) => {
     if (sort.by === 'bm25') {
       const leftRank = ranks.get(String(left.node.id)) ?? Number.POSITIVE_INFINITY;
@@ -313,10 +413,20 @@ function sortBindingRows(rows = [], sort = {}, ranks = new Map()) {
   });
 }
 
-async function listBindings(store, payload = {}, ctx = {}) {
+export interface EntityListBindingsResult {
+  kind: 'entity.listBindings';
+  entity: FormattedEntity | null;
+  sort?: BindingSort;
+  returned?: number;
+  rows: BindingRow[];
+}
+
+async function listBindings(store: EntityStore, payload: Payload = {}, ctx: KeywordCtx = {}): Promise<EntityListBindingsResult> {
   const ref = rawEntityId(payload);
   if (ref === null || ref === undefined || ref === '') throw new Error('entity.listBindings requires entityId');
-  const baseEntity = normalizePositiveInteger(ref) ? store.db.prepare('SELECT doc_id FROM entities WHERE id = ?').get(ref) : null;
+  const baseEntity = normalizePositiveInteger(ref)
+    ? store.db!.prepare('SELECT doc_id FROM entities WHERE id = ?').get<Pick<EntityRowAlias, 'doc_id'>>(ref)
+    : null;
   const docId = normalizePositiveInteger(payload.docId ?? payload.doc_id ?? baseEntity?.doc_id);
   const state = stateForPayload(store, payload, docId);
   const entity = entityByRef(state, ref);
@@ -324,12 +434,12 @@ async function listBindings(store, payload = {}, ctx = {}) {
   const sort = normalizeBindingSort(payload);
   const nodes = nodeRowsForDoc(store, entity.doc_id);
   const scanResult = scanEntityHits(nodes, [entity]);
-  const scan = scanResult.byNode.get(String(entity.id)) || new Map();
+  const scan = scanResult.byNode.get(String(entity.id)) || new Map<string, number>();
   const includeIgnored = includeIgnoredBindings(payload);
-  const overrides = new Map(state.bindings
+  const overrides = new Map<string, ProjectedEntityBinding>(state.bindings
     .filter((binding) => sameRef(binding.entity_id, entity.id))
     .map((binding) => [String(binding.node_id), binding]));
-  const rowsByNode = new Map();
+  const rowsByNode = new Map<string, BindingRow>();
 
   for (const node of nodes) {
     const nodeId = String(node.id);
@@ -349,11 +459,11 @@ async function listBindings(store, payload = {}, ctx = {}) {
   for (const [nodeId, override] of overrides.entries()) {
     if (rowsByNode.has(nodeId)) continue;
     if (override.status === 'ignored' && !includeIgnored) continue;
-    const node = store.db.prepare(`
+    const node = store.db!.prepare(`
       SELECT id, doc_id, address, depth, node_title, text, node_note
       FROM nodes
       WHERE id = ?
-    `).get(nodeId);
+    `).get<BindingNodeSource>(nodeId);
     if (!node) continue;
     rowsByNode.set(nodeId, {
       status: override.status,
@@ -363,7 +473,7 @@ async function listBindings(store, payload = {}, ctx = {}) {
     });
   }
 
-  const ranks = sort.by === 'bm25' ? await bm25RankByNodeId(store, entity, payload, ctx) : new Map();
+  const ranks = sort.by === 'bm25' ? await bm25RankByNodeId(store, entity, payload, ctx) : new Map<string, number>();
   const rows = sortBindingRows([...rowsByNode.values()], sort, ranks);
   return {
     kind: 'entity.listBindings',
@@ -374,7 +484,20 @@ async function listBindings(store, payload = {}, ctx = {}) {
   };
 }
 
-export function runEntityRead(store, payload = {}, action = '', ctx = {}) {
+export type EntityReadAction = 'entity.list' | 'entity.get' | 'entity.listRelated' | 'entity.listBindings';
+
+export type EntityReadResult =
+  | EntityListResult
+  | EntityGetResult
+  | EntityListRelatedResult
+  | EntityListBindingsResult;
+
+export function runEntityRead(
+  store: EntityStore,
+  payload: Payload = {},
+  action: string = '',
+  ctx: KeywordCtx = {}
+): EntityReadResult | Promise<EntityReadResult> {
   if (action === 'entity.list') return listEntities(store, payload);
   if (action === 'entity.get') return getEntity(store, payload);
   if (action === 'entity.listRelated') return listRelated(store, payload);

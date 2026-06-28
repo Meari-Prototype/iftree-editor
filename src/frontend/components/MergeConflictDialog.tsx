@@ -1,8 +1,35 @@
-// @ts-nocheck
 import { X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+import type { ChangeEvent } from 'react';
 
-const FIELD_LABELS = {
+type MergeConflict = Record<string, unknown> & { field: string };
+type MergeNode = Record<string, unknown> & {
+  id: string | number;
+  address?: string | number;
+  title?: string;
+  conflicts?: MergeConflict[];
+  resolution?: string;
+};
+// blocked 失配条目（后端 blockedConflicts 回带，仅渲染用）。
+type BlockedConflict = {
+  id?: string | number;
+  kind?: string;
+  address?: string | number;
+  reason?: string;
+};
+type ConflictItem = { node: MergeNode; conflict: MergeConflict };
+type PickChoice = 'ours' | 'theirs' | 'fill';
+type PickState = Record<string, { pick?: PickChoice; value?: string }>;
+type MergeConflictDialogProps = {
+  view?: Record<string, unknown> | null;
+  applying?: boolean;
+  error?: string;
+  onApply?: (resolutions: Array<{ id: string; field: string; pick: PickChoice; value?: string }>) => void;
+  onDiscard?: () => void;
+  onClose?: () => void;
+};
+
+const FIELD_LABELS: Record<string, string> = {
   text: '正文',
   node_title: '标题',
   node_note: '备注',
@@ -11,17 +38,17 @@ const FIELD_LABELS = {
   parent_id: '父节点'
 };
 
-function fieldLabel(field) {
+function fieldLabel(field: string) {
   if (field === '__node__') return '存在性（删除/修改）';
   if (field === '__parent__') return '挂载父节点（主干已删）';
   return FIELD_LABELS[field] || field;
 }
 
-const isFieldConflict = (conflict) => conflict.field !== '__node__' && conflict.field !== 'parent_id' && conflict.field !== '__parent__';
+const isFieldConflict = (conflict: MergeConflict) => conflict.field !== '__node__' && conflict.field !== 'parent_id' && conflict.field !== '__parent__';
 
 // 与后端 resolveConflictEntries 的 v1 边界对齐：parent_id 结构冲突、复活己删节点（主干删+分支改）、
 // 主干删父+分支在其下新增/移入（__parent__）不能在此自动应用。
-function conflictSupport(conflict) {
+function conflictSupport(conflict: MergeConflict): { resolvable: boolean; reason?: string } {
   if (conflict.field === 'parent_id') {
     return { resolvable: false, reason: '父节点重挂冲突需手动处理（v1 暂不支持在此裁决）' };
   }
@@ -34,40 +61,40 @@ function conflictSupport(conflict) {
   return { resolvable: true };
 }
 
-export function MergeConflictDialog({ view, applying = false, error = '', onApply, onDiscard, onClose }) {
+export function MergeConflictDialog({ view, applying = false, error = '', onApply, onDiscard, onClose }: MergeConflictDialogProps) {
   // blocked：非快进保存的逐条前置验证发现结构性失配（主干删了被改/被挂载的节点、并发移动、
   // 拆分/并入的内容漂移）——v1 不可裁，只能放弃本次编辑；取消可保留分支自行留存改动。
   const blocked = Boolean(view?.blocked);
-  const blockedConflicts = view?.blockedConflicts || [];
-  const conflictNodes = useMemo(
-    () => (view?.nodes || []).filter((node) => node.resolution === 'conflict'),
+  const blockedConflicts = (view?.blockedConflicts || []) as BlockedConflict[];
+  const conflictNodes = useMemo<MergeNode[]>(
+    () => ((view?.nodes || []) as MergeNode[]).filter((node) => node.resolution === 'conflict'),
     [view?.nodes]
   );
   const allConflicts = useMemo(() => {
-    const out = [];
+    const out: ConflictItem[] = [];
     for (const node of conflictNodes) {
       for (const conflict of node.conflicts || []) out.push({ node, conflict });
     }
     return out;
   }, [conflictNodes]);
 
-  const [picks, setPicks] = useState({});
+  const [picks, setPicks] = useState<PickState>({});
   useEffect(() => { setPicks({}); }, [view]);
 
   useEffect(() => {
-    const onKeyDown = (event) => { if (event.key === 'Escape') onClose?.(); };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose?.(); };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  const keyOf = (id, field) => `${id}::${field}`;
-  const setPick = (id, field, pick, fillSeed?: string) => {
+  const keyOf = (id: string | number, field: string) => `${id}::${field}`;
+  const setPick = (id: string | number, field: string, pick: PickChoice, fillSeed?: string) => {
     setPicks((cur) => ({
       ...cur,
       [keyOf(id, field)]: { pick, value: pick === 'fill' ? (cur[keyOf(id, field)]?.value ?? fillSeed ?? '') : (cur[keyOf(id, field)]?.value ?? '') }
     }));
   };
-  const setFill = (id, field, value) => {
+  const setFill = (id: string | number, field: string, value: string) => {
     setPicks((cur) => ({ ...cur, [keyOf(id, field)]: { pick: 'fill', value } }));
   };
 
@@ -83,19 +110,19 @@ export function MergeConflictDialog({ view, applying = false, error = '', onAppl
   const canApply = !applying && !hasUnresolvable && allChosen && allConflicts.length > 0;
 
   function buildResolutions() {
-    const out = [];
+    const out: Array<{ id: string; field: string; pick: PickChoice; value?: string }> = [];
     for (const { node, conflict } of allConflicts) {
       if (!conflictSupport(conflict).resolvable) continue;
       const p = picks[keyOf(node.id, conflict.field)];
       if (!p?.pick) continue;
-      const res: { id: string; field: string; pick: string; value?: string } = { id: String(node.id), field: conflict.field, pick: p.pick };
+      const res: { id: string; field: string; pick: PickChoice; value?: string } = { id: String(node.id), field: conflict.field, pick: p.pick };
       if (p.pick === 'fill') res.value = String(p.value ?? '');
       out.push(res);
     }
     return out;
   }
 
-  const resolutionErrors = view?.resolutionErrors || [];
+  const resolutionErrors = (view?.resolutionErrors || []) as Record<string, unknown>[];
 
   return (
     <div className="dialog-overlay merge-conflict-overlay" onMouseDown={() => onClose?.()}>
@@ -123,7 +150,7 @@ export function MergeConflictDialog({ view, applying = false, error = '', onAppl
         {error ? <div className="merge-conflict-state error">{error}</div> : null}
         {blocked ? (
           <div className="merge-conflict-state error">
-            {view?.message || '主干已被修改，无法保存，请放弃本次编辑'}
+            {(view?.message as string) || '主干已被修改，无法保存，请放弃本次编辑'}
             ——「取消」可保留编辑分支（先自行留存这些改动），「放弃本次编辑」将丢弃分支并退出。
           </div>
         ) : null}
@@ -171,13 +198,13 @@ export function MergeConflictDialog({ view, applying = false, error = '', onAppl
                     <button type="button" className={p?.pick === 'ours' ? 'active' : ''} onClick={() => setPick(node.id, conflict.field, 'ours')}>取主干</button>
                     <button type="button" className={p?.pick === 'theirs' ? 'active' : ''} onClick={() => setPick(node.id, conflict.field, 'theirs')}>取本分支</button>
                     {isFieldConflict(conflict) ? (
-                      <button type="button" className={p?.pick === 'fill' ? 'active' : ''} onClick={() => setPick(node.id, conflict.field, 'fill', conflict.ours ?? '')}>填值</button>
+                      <button type="button" className={p?.pick === 'fill' ? 'active' : ''} onClick={() => setPick(node.id, conflict.field, 'fill', String(conflict.ours ?? ''))}>填值</button>
                     ) : null}
                     {p?.pick === 'fill' ? (
                       <textarea
                         className="merge-fill"
                         value={p.value ?? ''}
-                        onChange={(event) => setFill(node.id, conflict.field, event.target.value)}
+                        onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setFill(node.id, conflict.field, event.target.value)}
                         placeholder="填入合并后的值"
                       />
                     ) : null}

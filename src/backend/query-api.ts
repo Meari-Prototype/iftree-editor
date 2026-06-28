@@ -1,11 +1,74 @@
-// @ts-nocheck
 import { parseJsonObject, compareNodeAddress } from './shared.js';
 import { runMemoryRead, MEMORY_READ_ACTIONS } from './memory/index.js';
 import { handleDebugOverviewQuery, handleDebugSqlQuery } from './handlers/read/debug.js';
 import { ENTITY_READ_ACTIONS, runEntityRead } from './entities/read.js';
 import { normalizeStableId } from './db/ids.js';
 import { buildAhoCorasickMatcher } from '../core/aho-corasick.js';
+import { bodyCharCount } from '../core/char-count.js';
 import { normalizeSemanticStatus } from './semantic-status.js';
+import { summarizeThreeWayMerge } from './merge-text.js';
+import type { IftreeStore } from './store/index.js';
+import type { AxiomRow, CommitRow, DocRow, NodeRow, RefRow, SourceDocumentRow, SourcePdfPageRow, SourceSpanRow } from './db/schema.js';
+import type { EditBranchRow } from './db/rows.js';
+import type { HistoryEntry } from './store/history.js';
+
+type RowObject = Record<string, unknown>;
+type Payload = RowObject;
+type QueryContext = RowObject & {
+  libraryRelativePath?: (path: string) => string;
+  libraryIndex?: (payload: Payload, docs: RowObject[]) => unknown;
+  libraryNavigation?: (payload: Payload, docs: RowObject[]) => unknown;
+  libraryTree?: (payload: Payload) => unknown;
+  vectorSearch?: (payload: RowObject) => Promise<RowObject[]> | RowObject[];
+  keywordSearch?: (payload: RowObject) => Promise<RowObject[]> | RowObject[];
+  ensureKeywordIndexReady?: (payload?: RowObject) => Promise<unknown> | unknown;
+};
+type CountRow = { count: number };
+type ContentNodeRow = NodeRow & {
+  child_count?: number;
+  subtree_text_chars?: number;
+  score?: number;
+  doc_title?: string;
+  source_type?: string | null;
+  original_path?: string | null;
+};
+type ContentDocRow = {
+  id: string;
+  title: string;
+  folder_id: number | null;
+  updated_at: string;
+  node_count: number;
+  max_depth: number | null;
+  text_chars: number;
+  source_type: string | null;
+  original_path: string | null;
+};
+type KeywordNodeRow = ContentNodeRow & { doc_title?: string; doc_kind?: string };
+type DocFilterRow = { id: string; agent?: string | null; host_anchor?: string | null; kind?: string | null; original_path?: string | null };
+type KeywordWhere = { sql: string; params: unknown[] };
+type KeywordHit = { row: KeywordNodeRow; hits: Set<string> };
+type CrossDocSearchRow = KeywordNodeRow & {
+  doc_folder_id?: number | null;
+  doc_updated_at?: string | null;
+};
+type CrossDocFormattedResult = RowObject & { doc: RowObject; node: RowObject };
+type FormattedContentNode = RowObject & {
+  id: string;
+  docId: string;
+  parentId: string | null;
+  address: string;
+  depth: number;
+  sortOrder: number;
+  type: string;
+  title: string;
+  childCount: number;
+  meta: RowObject & { textChars: number; subtreeTextChars: number };
+  children?: FormattedContentNode[];
+};
+type ContentTreeNode = FormattedContentNode;
+type ContentTreeBuildNode = FormattedContentNode & { children: ContentTreeBuildNode[] };
+type SnapshotLike = RowObject & { nodes?: Array<RowObject & { id?: unknown; address?: unknown }> };
+type CommitSnapshotRow = CommitRow & { snapshot?: string | null; diff?: string | null };
 
 const ACTIONS = Object.freeze([
   'query.actions',
@@ -35,7 +98,7 @@ const ACTIONS = Object.freeze([
   'editBranch.diffView',
   'editBranch.threeWayMerge',
   'doc.get',
-  'doc.exportMarkdown',
+  // 'doc.exportMarkdown' 已停用（未启用，待重新设计）——不再对外通告；分派入口保留并抛清晰停用错误。详见 NOW.md。
   'doc.getInfo',
   'doc.hasTreeDepth',
   'node.get',
@@ -54,32 +117,32 @@ const STABLE_ID_SCHEMA = Object.freeze({
   anyOf: [{ type: 'string' }, { type: 'number' }]
 });
 
-function normalizeQueryAction(value) {
+function normalizeQueryAction(value: unknown) {
   const action = String(value || 'debug.overview').trim();
   return ACTIONS.includes(action) ? action : '';
 }
 
-function normalizePositiveInteger(value, fallback = null) {
+function normalizePositiveInteger<T extends number | null = null>(value: unknown, fallback: T = null as T): number | T {
   const number = Math.floor(Number(value));
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
-function normalizeQueryId(value, fallback = null) {
+function normalizeQueryId(value: unknown, fallback: string | null = null) {
   return normalizeStableId(value, fallback);
 }
 
-function normalizeNonNegativeInteger(value, fallback = 0) {
+function normalizeNonNegativeInteger(value: unknown, fallback = 0) {
   const number = Math.floor(Number(value));
   return Number.isInteger(number) && number >= 0 ? number : fallback;
 }
 
-function normalizeLimit(value, fallback = 100, max = 1000) {
+function normalizeLimit(value: unknown, fallback = 100, max = 1000) {
   const number = Math.floor(Number(value));
   if (!Number.isInteger(number) || number <= 0) return fallback;
   return Math.min(max, number);
 }
 
-function pageRows(rows = [], offset = 0, limit = 100, maxLimit = 100) {
+function pageRows<T>(rows: T[] = [], offset = 0, limit = 100, maxLimit = 100) {
   const safeOffset = normalizeNonNegativeInteger(offset, 0);
   const safeLimit = normalizeLimit(limit, Math.min(100, maxLimit), maxLimit);
   const total = rows.length;
@@ -94,11 +157,53 @@ function pageRows(rows = [], offset = 0, limit = 100, maxLimit = 100) {
   };
 }
 
-function plainRow(row) {
-  return row ? { ...row } : null;
+// 泛型保留行类型：调用方传 NodeRow 拿 NodeRow（含 null 行兜底）。
+// 沿数据流总根：让 queryDoc 等下游能把真行类型一路透给前端。
+// 重载：非 null 入参 → 非 null 出参，让 `arr.map(plainRow)` 拿到非空数组而不是 `(T | null)[]`。
+function plainRow<T extends object>(row: T): T;
+function plainRow<T extends object>(row: T | null | undefined): T | null;
+function plainRow<T extends object>(row: T | null | undefined): T | null {
+  return row ? ({ ...row } as T) : null;
 }
 
-function summarizeTreeViewState(value) {
+// doc.list 的前端投影：DocRow 去掉 meta(JSON 字符串) 与 tree_view_state(JSON 字符串)，换成解析/汇总后的形态。
+// 前端 useDocumentState 与 DocBrowser 直接接此类型——沿数据流贯通真行类型，IPC 边界由此处显式声明收口。
+export interface TreeViewStateSummary {
+  depthLimit: number | null;
+  collapsedNodeCount: number;
+  expandedNodeCount: number;
+  outlineCollapsedNodeCount: number;
+}
+
+export type DocListItem = Omit<DocRow, 'meta' | 'tree_view_state'> & {
+  meta: Record<string, unknown>;
+  treeViewState: TreeViewStateSummary;
+  // store.listDocs() 子查询附带的整篇节点数（DocBrowser 列表显示「N 个节点」用）。
+  node_count: number;
+};
+
+// store.getDoc 内部投影：nodes 带 child_count（NodeWithChildCountRow）、refs 带地址辅助字段（store 层 map 加）、sourceSpans 带 node_address。
+// 沿数据流总根：queryDoc → IPC → useDocumentState 的 ProjectedDoc 接此真行类型，撑起整个前端投影类型化。
+export type DocGetNodeRow = NodeRow & { child_count: number; tree_depth?: number };
+export type DocGetRefRow = RefRow & { source_address: string | null; target_address: string | null };
+export type DocGetSourceSpanRow = SourceSpanRow & { node_address: string | null };
+
+export interface DocGetResult {
+  doc: DocRow | null;
+  nodes: DocGetNodeRow[];
+  axioms: AxiomRow[];
+  refs: DocGetRefRow[];
+  history: HistoryEntry[];
+  editBranch: EditBranchRow | null;
+  sourceDocument: SourceDocumentRow | null;
+  sourcePdfPages: SourcePdfPageRow[];
+  sourceSpans: DocGetSourceSpanRow[];
+  tree: ReturnType<IftreeStore['getDoc']> extends { tree: infer T } | null ? T : null;
+  treeDepthStats: ReturnType<IftreeStore['getDoc']> extends { treeDepthStats: infer T } | null ? T : never;
+  idByAddress: Record<string, string>;
+}
+
+function summarizeTreeViewState(value: unknown): TreeViewStateSummary {
   const state = parseJsonObject(value, {});
   return {
     depthLimit: Number(state.depthLimit) || null,
@@ -108,24 +213,24 @@ function summarizeTreeViewState(value) {
   };
 }
 
-function normalizeDocRow(row) {
+function normalizeDocRow(row: unknown): DocListItem | null {
   if (!row) return null;
-  const { meta, tree_view_state: treeViewStateRaw, ...rest } = row;
+  const { meta, tree_view_state: treeViewStateRaw, ...rest } = row as Partial<DocRow> & { node_count?: number } & RowObject;
   return {
-    ...rest,
+    ...(rest as Omit<DocRow, 'meta' | 'tree_view_state'> & { node_count: number }),
     meta: parseJsonObject(meta, {}),
     treeViewState: summarizeTreeViewState(treeViewStateRaw)
   };
 }
 
-function clipText(value, max = 240) {
+function clipText(value: unknown, max = 240) {
   const text = String(value || '');
   const limit = Math.max(0, Math.floor(Number(max) || 0));
   if (!limit || text.length <= limit) return text;
   return `${text.slice(0, Math.max(0, limit - 3))}...`;
 }
 
-function contentIncludeSet(payload = {}) {
+function contentIncludeSet(payload: Payload = {}) {
   const raw = Array.isArray(payload.include)
     ? payload.include
     : String(payload.include || '')
@@ -135,24 +240,25 @@ function contentIncludeSet(payload = {}) {
   return new Set(raw);
 }
 
-function contentDetail(payload = {}) {
+function contentDetail(payload: Payload = {}) {
   const detail = String(payload.detail || payload.mode || '').trim();
   return detail === 'summary' ? 'summary' : 'full';
 }
 
-function contentLimit(value, fallback = 1000, max = 10000) {
+function contentLimit(value: unknown, fallback = 1000, max = 10000) {
   if (Number(value) === 0) return 0;
   return normalizeLimit(value, fallback, max);
 }
 
-function nodeTextChars(row) {
-  return String(row?.node_title || '').length + String(row?.text || '').length + String(row?.node_note || '').length;
+function nodeTextChars(row: Partial<NodeRow> | null | undefined) {
+  // 忽略空白口径（见 core/char-count）：切分粒度不影响字数。与 SQL 侧 body_char_count UDF 同源。
+  return bodyCharCount(row?.node_title) + bodyCharCount(row?.text) + bodyCharCount(row?.node_note);
 }
 
-function attachVisibleSubtreeTextChars(rows = []) {
+function attachVisibleSubtreeTextChars<T extends ContentNodeRow>(rows: T[] = []) {
   const cloned = rows.map((row) => ({ ...row }));
   const byId = new Map(cloned.map((row) => [String(row.id), row]));
-  const childrenByParent = new Map();
+  const childrenByParent = new Map<string, Array<T & { subtree_text_chars?: number }>>();
   for (const row of cloned) {
     const parentId = String(row.parent_id || '');
     if (!byId.has(parentId)) continue;
@@ -160,10 +266,10 @@ function attachVisibleSubtreeTextChars(rows = []) {
     children.push(row);
     childrenByParent.set(parentId, children);
   }
-  const totals = new Map();
-  function subtreeTotal(row) {
+  const totals = new Map<string, number>();
+  function subtreeTotal(row: T & { subtree_text_chars?: number }): number {
     const id = String(row.id);
-    if (totals.has(id)) return totals.get(id);
+    if (totals.has(id)) return totals.get(id)!;
     const total = nodeTextChars(row)
       + (childrenByParent.get(id) || []).reduce((sum, child) => sum + subtreeTotal(child), 0);
     totals.set(id, total);
@@ -173,24 +279,24 @@ function attachVisibleSubtreeTextChars(rows = []) {
   return cloned;
 }
 
-function fullSubtreeTextCharsByNodeId(store, docId, nodeIds = []) {
-  const ids = [...new Set(nodeIds.map((value) => normalizeQueryId(value)).filter(Boolean))];
+function fullSubtreeTextCharsByNodeId(store: IftreeStore, docId: unknown, nodeIds: unknown[] = []) {
+  const ids = [...new Set(nodeIds.map((value) => normalizeQueryId(value)).filter((id): id is string => Boolean(id)))];
   if (ids.length === 0) return new Map();
   // 子树字数本质是一次后序聚合：取该文档全部节点的「自身字数」（只取长度、不取正文），
   // 按 depth 降序（自底向上）单遍 DP，每个节点把「自身 + 已累计子和」上交给父亲。
   // O(N) 一趟，避免旧实现「对每个种子各自递归展开整棵子树」——那会让深层节点被多个
   // 祖先种子重复累加，descendants 膨胀到 N×祖先深度，大库退化到分钟级。
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     SELECT id, parent_id,
-      LENGTH(COALESCE(node_title, ''))
-      + LENGTH(COALESCE(text, ''))
-      + LENGTH(COALESCE(node_note, '')) AS own
+      body_char_count(node_title)
+      + body_char_count(text)
+      + body_char_count(node_note) AS own
     FROM nodes
     WHERE doc_id = ?
     ORDER BY depth DESC
-  `).all(docId);
-  const childSum = new Map();
-  const total = new Map();
+  `).all<{ id: string; parent_id: string | null; own: number }>(docId);
+  const childSum = new Map<string, number>();
+  const total = new Map<string, number>();
   for (const row of rows) {
     const id = String(row.id);
     const subtree = (Number(row.own) || 0) + (childSum.get(id) || 0);
@@ -200,12 +306,12 @@ function fullSubtreeTextCharsByNodeId(store, docId, nodeIds = []) {
       childSum.set(parentId, (childSum.get(parentId) || 0) + subtree);
     }
   }
-  const result = new Map();
+  const result = new Map<string, number>();
   for (const id of ids) result.set(id, total.get(id) ?? 0);
   return result;
 }
 
-function attachFullSubtreeTextChars(store, docId, rows = []) {
+function attachFullSubtreeTextChars<T extends ContentNodeRow>(store: IftreeStore, docId: unknown, rows: T[] = []) {
   const totals = fullSubtreeTextCharsByNodeId(store, docId, rows.map((row) => row.id));
   return rows.map((row) => ({
     ...row,
@@ -213,7 +319,7 @@ function attachFullSubtreeTextChars(store, docId, rows = []) {
   }));
 }
 
-function groupMeta(rows = []) {
+function groupMeta(rows: ContentNodeRow[] = []) {
   const depths = rows.map((row) => Number(row.depth)).filter(Number.isFinite);
   const maxDepth = depths.length ? Math.max(...depths) : null;
   const minDepth = depths.length ? Math.min(...depths) : null;
@@ -227,10 +333,15 @@ function groupMeta(rows = []) {
   };
 }
 
-function formatContentNode(row, options = {}) {
+function formatContentNode(row: ContentNodeRow, options: {
+  include?: Set<string>;
+  detail?: string;
+  semanticStatusByDocId?: Record<string, unknown>;
+  previewChars?: unknown;
+} = {}): FormattedContentNode {
   const include = options.include || new Set();
   const detail = options.detail || 'full';
-  const node = {
+  const node: FormattedContentNode = {
     id: row.id,
     docId: row.doc_id,
     parentId: row.parent_id,
@@ -249,7 +360,7 @@ function formatContentNode(row, options = {}) {
   };
   const semantic = row.parent_id ? null : options.semanticStatusByDocId?.[row.doc_id];
   if (semantic) node.meta.semantic = semantic;
-  if (detail === 'summary') node.textPreview = clipText(row.text || '', options.previewChars || 240);
+  if (detail === 'summary') node.textPreview = clipText(row.text || '', Number(options.previewChars) || 240);
   else node.text = row.text || '';
   if (include.has('note') && row.node_note) node.note = row.node_note;
   if (include.has('tags')) {
@@ -266,14 +377,14 @@ function formatContentNode(row, options = {}) {
   return node;
 }
 
-function contentFormat(payload = {}) {
+function contentFormat(payload: Payload = {}) {
   const format = String(payload.format || payload.output || payload.view || '').trim();
   if (format === 'text' || format === 'plain_text' || format === 'body_text') return 'text';
   if (format === 'ascii_tree' || format === 'ascii' || format === 'tree_text' || format === 'text_tree') return 'ascii_tree';
   return 'json';
 }
 
-function subtreeBodyText(rows = []) {
+function subtreeBodyText(rows: Array<Pick<NodeRow, 'parent_id' | 'text'>> = []) {
   // 整棵子树正文 = 容器节点自身 + 子树（projectneed 4-16）：流式写入「一条消息一个节点」，
   // 消息正文可能落在之后挂了子节点的容器节点上，旧逻辑只取叶子会漏读。
   // 排除文档根（其 text 是文件名、非正文，parent_id 为 NULL）。
@@ -284,23 +395,23 @@ function subtreeBodyText(rows = []) {
     .join('\n');
 }
 
-function libraryIndexFormat(payload = {}) {
+function libraryIndexFormat(payload: Payload = {}) {
   const format = String(payload.format || payload.output || payload.view || '').trim();
   return format === 'json' ? 'json' : 'ascii_tree';
 }
 
-function cleanTreeLabel(value, limit = 80) {
+function cleanTreeLabel(value: unknown, limit = 80) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   return clipText(text, limit);
 }
 
-function normalizeKeywordTerms(payload = {}) {
+function normalizeKeywordTerms(payload: Payload = {}) {
   const source = Array.isArray(payload.terms)
     ? payload.terms
     : String(payload.keyword ?? payload.query ?? payload.q ?? '')
       .split(/\s+/);
-  const terms = [];
-  const seen = new Set();
+  const terms: string[] = [];
+  const seen = new Set<string>();
   for (const item of source) {
     const term = String(item || '').trim();
     if (!term || seen.has(term)) continue;
@@ -310,21 +421,21 @@ function normalizeKeywordTerms(payload = {}) {
   return terms;
 }
 
-function escapeLike(value = '') {
+function escapeLike(value: unknown = '') {
   return String(value).replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
-function asciiTreeLabel(node, options = {}) {
+function asciiTreeLabel(node: Partial<FormattedContentNode>, options: Payload = {}) {
   const address = cleanTreeLabel(node.address, 40);
-  const title = cleanTreeLabel(node.title || node.textPreview || node.text, options.previewChars || 80);
+  const title = cleanTreeLabel(node.title || node.textPreview || node.text, Number(options.previewChars) || 80);
   const childCount = Number(node.childCount ?? (Array.isArray(node.children) ? node.children.length : 0)) || 0;
   const suffix = childCount > 0 ? ` [children=${childCount}]` : '';
   return `${address}${title ? ` ${title}` : ''}${suffix}`.trim();
 }
 
-function contentNodesToAsciiTree(nodes = [], options = {}) {
-  const byId = new Map();
-  const roots = [];
+function contentNodesToAsciiTree(nodes: FormattedContentNode[] = [], options: Payload = {}) {
+  const byId = new Map<string, ContentTreeBuildNode>();
+  const roots: ContentTreeBuildNode[] = [];
   for (const node of nodes) {
     byId.set(String(node.id), { ...node, children: [] });
   }
@@ -336,50 +447,51 @@ function contentNodesToAsciiTree(nodes = [], options = {}) {
   return roots.map((root) => contentTreeToAsciiTree(root, options)).filter(Boolean).join('\n');
 }
 
-function contentTreeToAsciiTree(root, options = {}) {
+function contentTreeToAsciiTree(root: ContentTreeNode | null, options: Payload = {}) {
   if (!root) return '';
-  const lines = [];
-  function walk(node, prefix, childPrefix) {
+  const lines: string[] = [];
+  function walk(node: ContentTreeNode, prefix: string, childPrefix: string) {
     lines.push(`${prefix}${asciiTreeLabel(node, options)}`);
     const children = Array.isArray(node.children) ? node.children : [];
     for (let index = 0; index < children.length; index += 1) {
       const isLast = index === children.length - 1;
-      walk(children[index], `${childPrefix}${isLast ? '`-- ' : '|-- '}`, `${childPrefix}${isLast ? '    ' : '|   '}`);
+      const child = children[index];
+      if (child) walk(child, `${childPrefix}${isLast ? '`-- ' : '|-- '}`, `${childPrefix}${isLast ? '    ' : '|   '}`);
     }
   }
   walk(root, '', '');
   return lines.join('\n');
 }
 
-function rowsToContentTree(rows, options = {}) {
-  const byId = new Map();
-  let root = null;
+function rowsToContentTree(rows: ContentNodeRow[], options: Parameters<typeof formatContentNode>[1] = {}) {
+  const byId = new Map<string, ContentTreeBuildNode>();
+  let root: ContentTreeNode | null = null;
   for (const row of rows) {
     byId.set(String(row.id), { ...formatContentNode(row, options), children: [] });
   }
   for (const row of rows) {
     const node = byId.get(String(row.id));
     const parent = byId.get(String(row.parent_id || ''));
-    if (parent) parent.children.push(node);
-    else if (!root) root = node;
+    if (parent && node) parent.children.push(node);
+    else if (!root && node) root = node;
   }
   for (const node of byId.values()) {
-    if (node.children.length === 0) delete node.children;
+    if (node.children.length === 0) delete (node as FormattedContentNode).children;
   }
   return root;
 }
 
-function contentDocRows(store, payload = {}, ctx = {}) {
+function contentDocRows(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const include = contentIncludeSet(payload);
   const includeSource = include.has('source') || contentFormat(payload) === 'ascii_tree';
-  let rows = store.db.prepare(`
+  let rows = store.db!.prepare(`
     SELECT d.id,
       d.title,
       d.folder_id,
       d.updated_at,
       COUNT(n.id) AS node_count,
       MAX(n.depth) AS max_depth,
-      COALESCE(SUM(LENGTH(n.node_title) + LENGTH(n.text) + LENGTH(n.node_note)), 0) AS text_chars,
+      COALESCE(SUM(body_char_count(n.node_title) + body_char_count(n.text) + body_char_count(n.node_note)), 0) AS text_chars,
       sd.source_type,
       sd.original_path
     FROM docs d
@@ -387,7 +499,7 @@ function contentDocRows(store, payload = {}, ctx = {}) {
     LEFT JOIN source_documents sd ON sd.doc_id = d.id
     GROUP BY d.id
     ORDER BY d.folder_id IS NOT NULL, d.folder_id, d.doc_sort_order, d.updated_at DESC, d.id DESC
-  `).all();
+  `).all<ContentDocRow>();
   const query = String(payload.query ?? payload.q ?? '').trim().toLowerCase();
   let matchSource = '';
   if (query) {
@@ -405,11 +517,11 @@ function contentDocRows(store, payload = {}, ctx = {}) {
       const escaped = query.replace(/[\\%_]/g, (match) => `\\${match}`);
       const like = `%${escaped}%`;
       const contentDocIds = new Set(
-        store.db.prepare(`
+        store.db!.prepare(`
           SELECT DISTINCT doc_id FROM nodes
           WHERE node_title LIKE ? ESCAPE '\\' OR text LIKE ? ESCAPE '\\'
           LIMIT 50
-        `).all(like, like).map((row) => row.doc_id)
+        `).all<Pick<NodeRow, 'doc_id'>>(like, like).map((row) => row.doc_id)
       );
       rows = rows.filter((row) => contentDocIds.has(row.id));
       matchSource = 'content';
@@ -437,13 +549,13 @@ function contentDocRows(store, payload = {}, ctx = {}) {
   }));
 }
 
-function libraryRelativeSourcePath(row = {}, ctx = {}) {
+function libraryRelativeSourcePath(row: Partial<SourceDocumentRow> = {}, ctx: QueryContext = {}) {
   if (typeof ctx.libraryRelativePath !== 'function') return '';
   return ctx.libraryRelativePath(row.original_path || '') || '';
 }
 
-function contentNodeBaseRows(store, docId, whereSql, params = [], orderSql = 'nodes.depth, nodes.address, nodes.id') {
-  return store.db.prepare(`
+function contentNodeBaseRows(store: IftreeStore, docId: unknown, whereSql: string, params: unknown[] = [], orderSql = 'nodes.depth, nodes.address, nodes.id') {
+  return store.db!.prepare(`
     WITH selected_nodes AS (
       SELECT *
       FROM nodes
@@ -460,23 +572,23 @@ function contentNodeBaseRows(store, docId, whereSql, params = [], orderSql = 'no
     FROM selected_nodes
     LEFT JOIN child_counts ON child_counts.parent_id = selected_nodes.id
     ORDER BY ${orderSql}
-  `).all(docId, ...params, docId);
+  `).all<ContentNodeRow>(docId, ...params, docId);
 }
 
-function contentNodeRowsByIds(store, docId, nodeIds = []) {
-  const ids = [...new Set(nodeIds.map((value) => normalizeQueryId(value)).filter(Boolean))];
+function contentNodeRowsByIds(store: IftreeStore, docId: unknown, nodeIds: unknown[] = []): ContentNodeRow[] {
+  const ids = [...new Set(nodeIds.map((value) => normalizeQueryId(value)).filter((id): id is string => Boolean(id)))];
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => '?').join(', ');
   const rows = contentNodeBaseRows(store, docId, `id IN (${placeholders})`, ids, 'selected_nodes.id');
   const byId = new Map(rows.map((row) => [String(row.id), row]));
-  return ids.map((id) => byId.get(id)).filter(Boolean);
+  return ids.map((id) => byId.get(id)).filter((row): row is ContentNodeRow => Boolean(row));
 }
 
-function crossDocNodeRowsByIds(store, nodeIds = []) {
-  const ids = [...new Set(nodeIds.map((value) => normalizeQueryId(value)).filter(Boolean))];
+function crossDocNodeRowsByIds(store: IftreeStore, nodeIds: unknown[] = []): ContentNodeRow[] {
+  const ids = [...new Set(nodeIds.map((value) => normalizeQueryId(value)).filter((id): id is string => Boolean(id)))];
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => '?').join(', ');
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     WITH child_counts(parent_id, child_count) AS (
       SELECT parent_id, COUNT(*)
       FROM nodes
@@ -493,18 +605,18 @@ function crossDocNodeRowsByIds(store, nodeIds = []) {
     LEFT JOIN source_documents ON source_documents.doc_id = nodes.doc_id
     LEFT JOIN child_counts ON child_counts.parent_id = nodes.id
     WHERE nodes.id IN (${placeholders})
-  `).all(...ids, ...ids);
+  `).all<ContentNodeRow>(...ids, ...ids);
   const byId = new Map(rows.map((row) => [String(row.id), row]));
-  return ids.map((id) => byId.get(id)).filter(Boolean);
+  return ids.map((id) => byId.get(id)).filter((row): row is ContentNodeRow => Boolean(row));
 }
 
-function contentNodeRow(store, payload = {}) {
+function contentNodeRow(store: IftreeStore, payload: Payload = {}): ContentNodeRow | null {
   const node = queryNode(store, payload);
   if (!node) return null;
   return contentNodeRowsByIds(store, node.doc_id, [node.id])[0] || node;
 }
 
-function queryContentDocs(store, payload = {}, ctx = {}) {
+function queryContentDocs(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const docs = contentDocRows(store, payload, ctx);
   if (contentFormat(payload) === 'ascii_tree') {
     return {
@@ -525,42 +637,43 @@ function queryContentDocs(store, payload = {}, ctx = {}) {
   };
 }
 
-function queryLibraryIndex(store, payload = {}, ctx = {}) {
-  if (typeof ctx.libraryIndex !== 'function') throw new Error('library.index is not available');
+function queryLibraryIndex(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
+  const libraryIndex = ctx.libraryIndex;
+  if (typeof libraryIndex !== 'function') throw new Error('library.index is not available');
   return withLibrarySemanticMeta(store, librarySourceDocs(store, ctx))
-    .then((docs) => ctx.libraryIndex({ ...payload, format: libraryIndexFormat(payload) }, docs));
+    .then((docs) => libraryIndex({ ...payload, format: libraryIndexFormat(payload) }, docs));
 }
 
-function memoryAnchorByDocId(store, docIds = []) {
-  const ids = [...new Set(docIds.filter(Boolean))];
+function memoryAnchorByDocId(store: IftreeStore, docIds: unknown[] = []) {
+  const ids = [...new Set(docIds.map((id) => normalizeQueryId(id)).filter((id): id is string => Boolean(id)))];
   if (ids.length === 0) return {};
   const placeholders = ids.map(() => '?').join(',');
-  const rows = store.db
+  const rows = store.db!
     .prepare(`SELECT id, json_extract(meta,'$.memoryVolume.hostAnchor') AS hostAnchor FROM docs WHERE id IN (${placeholders})`)
-    .all(...ids);
+    .all<{ id: string; hostAnchor: string | null }>(...ids);
   return Object.fromEntries(rows.filter((row) => row.hostAnchor).map((row) => [row.id, row.hostAnchor]));
 }
 
-function librarySourceDocs(store, ctx = {}) {
+function librarySourceDocs(store: IftreeStore, ctx: QueryContext = {}) {
   const docs = contentDocRows(store, { include: ['source'] }, ctx)
     .filter((doc) => doc.source?.path)
     .map((doc) => ({
       docId: doc.docId,
       title: doc.title,
-      sourcePath: doc.source.path,
-      sourceType: doc.source.type,
+      sourcePath: String(doc.source?.path || ''),
+      sourceType: String(doc.source?.type || ''),
       meta: doc.meta
     }));
   const anchorById = memoryAnchorByDocId(store, docs.map((doc) => doc.docId));
   return docs.map((doc) => ({ ...doc, hostAnchor: anchorById[doc.docId] || null }));
 }
 
-async function semanticStatusByDocId(store, docIds = []) {
+async function semanticStatusByDocId(store: IftreeStore, docIds: unknown[] = []) {
   const ids = [...new Set(docIds.map((value) => normalizeQueryId(value)).filter(Boolean))];
   if (ids.length === 0) return {};
   // 读 docs.meta.semantic 持久化列（写入侧 refreshDocSemanticMeta 维护），免每次查 lance 的计算税。
   const placeholders = ids.map(() => '?').join(',');
-  const rows = store.db.prepare(`SELECT id, json_extract(meta, '$.semantic') AS semantic FROM docs WHERE id IN (${placeholders})`).all(...ids);
+  const rows = store.db!.prepare(`SELECT id, json_extract(meta, '$.semantic') AS semantic FROM docs WHERE id IN (${placeholders})`).all<{ id: string; semantic: string | null }>(...ids);
   const byId = new Map(rows.map((row) => [String(row.id), row.semantic]));
   return Object.fromEntries(ids.map((id) => {
     let parsed = {};
@@ -570,7 +683,7 @@ async function semanticStatusByDocId(store, docIds = []) {
   }));
 }
 
-async function withLibrarySemanticMeta(store, docs = []) {
+async function withLibrarySemanticMeta(store: IftreeStore, docs: RowObject[] = []) {
   if (docs.length === 0) return docs;
   const statusByDocId = await semanticStatusByDocId(store, docs.map((doc) => doc.docId));
   return docs.map((doc) => {
@@ -578,28 +691,30 @@ async function withLibrarySemanticMeta(store, docs = []) {
       ...doc,
       meta: {
         ...(doc.meta || {}),
-        semantic: statusByDocId[doc.docId] || normalizeSemanticStatus()
+        semantic: statusByDocId[String(doc.docId)] || normalizeSemanticStatus()
       }
     };
   });
 }
 
-function queryLibraryNavigation(store, payload = {}, ctx = {}) {
-  if (typeof ctx.libraryNavigation !== 'function') throw new Error('library.getNavigation is not available');
+function queryLibraryNavigation(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
+  const libraryNavigation = ctx.libraryNavigation;
+  if (typeof libraryNavigation !== 'function') throw new Error('library.getNavigation is not available');
   return withLibrarySemanticMeta(store, librarySourceDocs(store, ctx))
-    .then((docs) => ctx.libraryNavigation(payload, docs))
-    .then((result) => {
-      const docId = result?.doc?.id;
+    .then((docs) => libraryNavigation(payload, docs))
+    .then((result: unknown) => {
+      const resultObject = (result && typeof result === 'object' ? result : {}) as RowObject & { doc?: RowObject };
+      const docId = resultObject.doc?.id;
       const row = docId
-        ? store.db.prepare('SELECT tree_view_state FROM docs WHERE id = ?').get(docId)
+        ? store.db!.prepare('SELECT tree_view_state FROM docs WHERE id = ?').get<Pick<DocRow, 'tree_view_state'>>(docId)
         : null;
       return row
-        ? { ...result, doc: { ...result.doc, tree_view_state: row.tree_view_state } }
+        ? { ...resultObject, doc: { ...resultObject.doc, tree_view_state: row.tree_view_state } }
         : result;
     });
 }
 
-async function queryContentNode(store, payload = {}, ctx = {}) {
+async function queryContentNode(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   if (payload.subtree === true || payload.includeSubtree === true || payload.include_subtree === true) {
     return queryContentSubtree(store, payload, ctx);
   }
@@ -617,8 +732,8 @@ async function queryContentNode(store, payload = {}, ctx = {}) {
   } : { kind: 'content.getNode', node: null };
 }
 
-function subtreeRows(store, docId, rootId) {
-  return store.db.prepare(`
+function subtreeRows(store: IftreeStore, docId: unknown, rootId: unknown) {
+  return store.db!.prepare(`
     WITH RECURSIVE subtree(id, path) AS (
       SELECT id, printf('%010d', sort_order)
       FROM nodes
@@ -642,10 +757,10 @@ function subtreeRows(store, docId, rootId) {
     JOIN nodes ON nodes.id = subtree.id AND nodes.doc_id = ?
     LEFT JOIN child_counts ON child_counts.parent_id = nodes.id
     ORDER BY subtree.path
-  `).all(docId, rootId, docId, docId, docId);
+  `).all<ContentNodeRow>(docId, rootId, docId, docId, docId);
 }
 
-function subtreeAddressPredicate(root = {}) {
+function subtreeAddressPredicate(root: Partial<NodeRow> = {}) {
   const address = String(root.address || '');
   return {
     where: "(address = ? OR address LIKE ? ESCAPE '\\')",
@@ -653,9 +768,9 @@ function subtreeAddressPredicate(root = {}) {
   };
 }
 
-function subtreeTextScope(root = {}, relativeDepth = null) {
+function subtreeTextScope(root: Partial<NodeRow>, relativeDepth: number | null = null) {
   const predicate = subtreeAddressPredicate(root);
-  const params = /** @type {any[]} */ ([...predicate.params]);
+  const params: unknown[] = [...predicate.params];
   const clauses = [predicate.where];
   if (relativeDepth) {
     clauses.push('depth - ? < ?');
@@ -664,32 +779,32 @@ function subtreeTextScope(root = {}, relativeDepth = null) {
   return { where: clauses.join(' AND '), params };
 }
 
-function subtreeBodyTextRows(store, root = {}, relativeDepth = null) {
+function subtreeBodyTextRows(store: IftreeStore, root: ContentNodeRow, relativeDepth: number | null = null) {
   const scope = subtreeTextScope(root, relativeDepth);
-  return store.db.prepare(`
+  return store.db!.prepare(`
     SELECT nodes.*,
       (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id) AS child_count
     FROM nodes
     WHERE doc_id = ? AND ${scope.where}
-  `).all(root.doc_id, ...scope.params).sort(compareNodeAddress);
+  `).all<ContentNodeRow>(root.doc_id, ...scope.params).sort(compareNodeAddress);
 }
 
 // 各相对深度的 body 字数与节点数（read 口径），按 depth 升序。供 read 分层早停：从根逐层累加、取放得进 limit
 // 的最深一层；各层求和即整子树总字数/总节点数，故 text 路径只发这一次扫，不再单独 SUM 一遍整子树。
-function subtreeBodyTextLayers(store, root = {}, relativeDepth = null) {
+function subtreeBodyTextLayers(store: IftreeStore, root: ContentNodeRow, relativeDepth: number | null = null) {
   const scope = subtreeTextScope(root, relativeDepth);
-  return store.db.prepare(`
+  return store.db!.prepare(`
     SELECT depth,
       COUNT(*) AS node_count,
-      COALESCE(SUM(CASE WHEN nodes.parent_id IS NOT NULL THEN text_chars ELSE 0 END), 0) AS chars
+      COALESCE(SUM(CASE WHEN nodes.parent_id IS NOT NULL THEN body_char_count(nodes.text) ELSE 0 END), 0) AS chars
     FROM nodes
     WHERE doc_id = ? AND ${scope.where}
     GROUP BY depth
     ORDER BY depth
-  `).all(root.doc_id, ...scope.params);
+  `).all<{ depth: number; node_count: number; chars: number }>(root.doc_id, ...scope.params);
 }
 
-async function queryContentSubtree(store, payload = {}, ctx = {}) {
+async function queryContentSubtree(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const root = contentNodeRow(store, payload);
   if (!root) return { kind: 'content.getSubtree', root: null };
   const detail = contentDetail(payload);
@@ -790,7 +905,7 @@ async function queryContentSubtree(store, payload = {}, ctx = {}) {
   };
 }
 
-async function queryContentDepth(store, payload = {}, ctx = {}) {
+async function queryContentDepth(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const docId = requireDocId(payload);
   const minDepth = normalizePositiveInteger(payload.minDepth ?? payload.min_depth ?? payload.from ?? payload.depthFrom ?? payload.depth_from, 1);
   const maxDepth = normalizePositiveInteger(payload.maxDepth ?? payload.max_depth ?? payload.to ?? payload.depthTo ?? payload.depth_to, minDepth);
@@ -838,7 +953,7 @@ async function queryContentDepth(store, payload = {}, ctx = {}) {
   };
 }
 
-async function queryContentIndex(store, payload = {}, ctx = {}) {
+async function queryContentIndex(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const docId = normalizeQueryId(payload.docId ?? payload.doc_id, null);
   if (!docId) return queryContentDocs(store, payload);
   const depthLimit = normalizePositiveInteger(payload.depthLimit ?? payload.depth_limit ?? payload.depth, 2);
@@ -850,12 +965,12 @@ async function queryContentIndex(store, payload = {}, ctx = {}) {
     detail: 'summary'
   }, ctx);
   // 文档实际最大层数（供调用方判断默认 index 是否截断了更深的层、需不需要下钻）。
-  const maxDepthRow = store.db.prepare('SELECT MAX(depth) AS d FROM nodes WHERE doc_id = ?').get(docId);
+  const maxDepthRow = store.db!.prepare('SELECT MAX(depth) AS d FROM nodes WHERE doc_id = ?').get<{ d: number | null }>(docId);
   const docDepth = Math.max(Number(maxDepthRow?.d) || 0, depthLimit);
   return { ...result, kind: 'content.getIndex', indexDepth: depthLimit, docDepth };
 }
 
-function queryContentArticle(store, payload = {}) {
+function queryContentArticle(store: IftreeStore, payload: Payload = {}) {
   // 窗口上限 50000（与 store.getSourceWindow 的夹值一致）：调用方显式传超限的 limit/before 直接报错、
   // 要求传合规参数，而不是静默夹小——避免「要 8 万却只拿到 5 万」却不自知。
   // 前端走 source.getWindow 不经此处，其超额由 store 层静默夹兜底，不受此报错影响。
@@ -883,9 +998,14 @@ function queryContentArticle(store, payload = {}) {
   // 窗口触及原文两端时，在展示文本首/尾补可见标记，避免把「读到原文边界」误判成被截断。
   // 标记只加在 text 上；sourceSpans 的偏移仍相对未加标记的原始窗口。
   let text = result.raw_markdown;
+  // 锚点节点无原文出处（容器/标题节点）时不再静默退回 offset 0：store 已下钻子树首个有出处的后代，
+  // 仍无果才标 anchorResolved=false——此处显式提示，避免「拿第一回当锚点却悄悄返回版权页」。
+  if (result.anchorResolved === false) {
+    text = `[注意] 锚点节点无原文出处（可能是容器/标题节点且整棵子树都无 source span），已从文档开头返回原文窗口。\n\n${text}`;
+  }
   if (!result.hasBefore) text = `[原文开始]\n\n${text}`;
   if (!result.hasAfter) text = `${text}\n\n[原文结束]`;
-  const response = {
+  const response: RowObject = {
     kind: 'content.getArticle',
     docId: result.docId,
     window: {
@@ -893,22 +1013,25 @@ function queryContentArticle(store, payload = {}) {
       endOffset: result.endOffset,
       totalLength: result.totalLength,
       hasBefore: result.hasBefore,
-      hasAfter: result.hasAfter
+      hasAfter: result.hasAfter,
+      anchorResolved: result.anchorResolved !== false
     },
     text
   };
   if (wantSpans) {
     const allSpans = Array.isArray(result.sourceSpans) ? result.sourceSpans : [];
     response.spansTotal = allSpans.length;
-    // 每条 span 原本带与顶层 docId 相同的 doc_id，逐条重复纯属冗余——出口剥掉、节点级 node_id 保留；再按 spansCap 截。
-    response.sourceSpans = allSpans.slice(0, spansCap).map((span) => { const copy = { ...span }; delete copy.doc_id; return copy; });
+    // store 层投影出口已剥掉 doc_id（每条 span 与顶层 docId 重复纯属冗余）；这里只截再透传。
+    response.sourceSpans = allSpans
+      .filter((span): span is NonNullable<typeof span> => Boolean(span))
+      .slice(0, spansCap);
   }
   return response;
 }
 
-function keywordWhereSql(payload = {}, terms = [], options = {}) {
-  const clauses = [];
-  const params = [];
+function keywordWhereSql(payload: Payload = {}, terms: string[] = [], options: { termOperator?: string } = {}): KeywordWhere {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
   const docId = normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
   const allDocs = payload.allDocs === true || payload.all_docs === true || payload.scope === 'all';
   if (!allDocs) {
@@ -921,8 +1044,8 @@ function keywordWhereSql(payload = {}, terms = [], options = {}) {
     clauses.push('(n.address = ? OR n.address LIKE ? ESCAPE \'\\\')');
     params.push(scopeAddress, `${escapeLike(scopeAddress)}-%`);
   }
-  const termClauses = [];
-  const termParams = [];
+  const termClauses: string[] = [];
+  const termParams: unknown[] = [];
   for (const term of terms) {
     const like = `%${escapeLike(term)}%`;
     termClauses.push(`(
@@ -944,7 +1067,7 @@ function keywordWhereSql(payload = {}, terms = [], options = {}) {
   };
 }
 
-function normalizeKeywordMatchMode(payload = {}) {
+function normalizeKeywordMatchMode(payload: Payload = {}) {
   const mode = String(payload.matchMode ?? payload.match_mode ?? payload.operator ?? payload.op ?? '').trim().toLowerCase();
   if (mode === 'or') return 'or';
   // 节点级 AND（旧行为，要求所有词在同一节点共现，精确但长文档易漏）：显式 node/strict 才走。
@@ -953,7 +1076,7 @@ function normalizeKeywordMatchMode(payload = {}) {
   return 'doc';
 }
 
-function keywordHaystack(row = {}) {
+function keywordHaystack(row: Partial<NodeRow> = {}) {
   return [
     row.address,
     row.node_title,
@@ -975,12 +1098,25 @@ function countLiteralOccurrences(haystack = '', needle = '') {
   return count;
 }
 
-function keywordHitCount(row = {}, terms = []) {
+function keywordHitCount(row: Partial<NodeRow> = {}, terms: string[] = []) {
   const haystack = keywordHaystack(row);
   return terms.reduce((sum, term) => sum + countLiteralOccurrences(haystack, String(term || '').toLocaleLowerCase()), 0);
 }
 
-function parseListFilter(value) {
+function keywordHitSummary(row: Partial<NodeRow> = {}, terms: string[] = []) {
+  const haystack = keywordHaystack(row);
+  const termKeys = [...new Set(terms.map((term) => String(term || '').toLocaleLowerCase()).filter(Boolean))];
+  let score = 0;
+  let rowHits = 0;
+  for (const key of termKeys) {
+    const count = countLiteralOccurrences(haystack, key);
+    score += count;
+    if (count > 0) rowHits += 1;
+  }
+  return { score, rowHits, termCount: termKeys.length };
+}
+
+function parseListFilter(value: unknown): Set<string> | null {
   if (value === null || value === undefined) return null;
   const list = (Array.isArray(value) ? value : String(value).split(','))
     .map((item) => String(item || '').trim())
@@ -989,15 +1125,15 @@ function parseListFilter(value) {
 }
 
 // 文件夹范围归一化：统一 / 分隔、去首尾斜杠；空 → null。
-function normalizeFolderFilter(value) {
+function normalizeFolderFilter(value: unknown) {
   const text = String(value ?? '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
   return text || null;
 }
 
-function parseFolderFilterList(value) {
+function parseFolderFilterList(value: unknown) {
   if (value == null) return [];
   const list = Array.isArray(value) ? value : String(value).split(',');
-  const out = [];
+  const out: string[] = [];
   for (const item of list) {
     const folder = normalizeFolderFilter(item);
     if (folder) out.push(folder);
@@ -1006,25 +1142,25 @@ function parseFolderFilterList(value) {
 }
 
 // 文档源文件相对路径 rel 是否落在文件夹 folder 子树内（含 folder 本身）。
-function isUnderFolder(rel, folder) {
+function isUnderFolder(rel: unknown, folder: unknown) {
   if (!rel || !folder) return false;
   const path = String(rel).replace(/\\/g, '/').replace(/^\/+/, '');
   return path === folder || path.startsWith(`${folder}/`);
 }
 
-function memoryWorkspaceFromAnchor(anchor = '') {
+function memoryWorkspaceFromAnchor(anchor: unknown = '') {
   const matched = String(anchor || '').match(/[\\/]\.claude[\\/]projects[\\/]([^\\/#]+)/);
   return matched ? matched[1] : '';
 }
 
 // 文档级过滤：综合「元数据过滤（工作区/agent/类型）」与「文件夹范围（folder/excludeFolder）」，
 // 返回预算允许的 docId 集合；两者都无 → null（不限制）；都有 → 取交集。
-function resolveKeywordDocFilter(store, payload = {}, ctx = {}) {
+function resolveKeywordDocFilter(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}): Set<string> | null {
   const metaSet = resolveMetaDocFilter(store, payload);
   const folderSet = resolveFolderDocFilter(store, payload, ctx);
   if (!metaSet) return folderSet;
   if (!folderSet) return metaSet;
-  const allowed = new Set();
+  const allowed = new Set<string>();
   for (const id of metaSet) if (folderSet.has(id)) allowed.add(id);
   return allowed;
 }
@@ -1043,19 +1179,19 @@ function docKindCaseSql(docAlias = 'd') {
 
 // 元数据过滤（工作区 / agent / 文档类型）：无此类过滤时返回 null（不限制）。
 // 类型 kind：event=事件卷、memory=含受控节点的核心记忆、knowledge=其余知识文档。
-function resolveMetaDocFilter(store, payload = {}) {
+function resolveMetaDocFilter(store: IftreeStore, payload: Payload = {}) {
   const workspace = parseListFilter(payload.workspace ?? payload.workspaces);
   const agent = parseListFilter(payload.agent ?? payload.agents);
   const kind = parseListFilter(payload.kind ?? payload.kinds ?? payload.docKind);
   if (!workspace && !agent && !kind) return null;
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     SELECT d.id AS id,
       json_extract(d.meta,'$.memoryVolume.agent') AS agent,
       json_extract(d.meta,'$.memoryVolume.hostAnchor') AS host_anchor,
       ${docKindCaseSql('d')} AS kind
     FROM docs d
-  `).all();
-  const allowed = new Set();
+  `).all<DocFilterRow>();
+  const allowed = new Set<string>();
   for (const row of rows) {
     if (workspace && !workspace.has(memoryWorkspaceFromAnchor(row.host_anchor))) continue;
     if (agent && !agent.has(String(row.agent || ''))) continue;
@@ -1069,17 +1205,17 @@ function resolveMetaDocFilter(store, payload = {}) {
 // 「在某文件夹下开 allDocs」即检索该文件夹这篇大型虚拟文档。无 folder/excludeFolder 时返回 null。
 // 文档归属按其源文件的 library 相对路径前缀判定（ctx.libraryRelativePath 把绝对 sourcePath 还原成相对路径）。
 // 无源文件的虚拟/流式文档相对路径为空：folder 限定时被排除、纯 excludeFolder 时保留。
-function resolveFolderDocFilter(store, payload = {}, ctx = {}) {
+function resolveFolderDocFilter(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const folder = normalizeFolderFilter(payload.folder ?? payload.inFolder ?? payload.in_folder);
   const excludeFolders = parseFolderFilterList(payload.excludeFolder ?? payload.excludeFolders ?? payload.exclude_folder);
   if (!folder && excludeFolders.length === 0) return null;
   const relativePathFor = typeof ctx.libraryRelativePath === 'function' ? ctx.libraryRelativePath : null;
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     SELECT d.id AS id, sd.original_path AS original_path
     FROM docs d
     LEFT JOIN source_documents sd ON sd.doc_id = d.id
-  `).all();
-  const allowed = new Set();
+  `).all<DocFilterRow>();
+  const allowed = new Set<string>();
   for (const row of rows) {
     const rel = (row.original_path && relativePathFor) ? relativePathFor(row.original_path) : '';
     if (folder && !isUnderFolder(rel, folder)) continue;
@@ -1090,25 +1226,25 @@ function resolveFolderDocFilter(store, payload = {}, ctx = {}) {
 }
 
 // 相对路径是否落在 . 开头的隐藏文件夹下（任一路径段以 . 开头，如 .memory）。
-function docIsUnderHiddenPath(rel) {
+function docIsUnderHiddenPath(rel: unknown) {
   if (!rel) return false;
   return String(rel).replace(/\\/g, '/').replace(/^\/+/, '').split('/').some((seg) => seg.startsWith('.'));
 }
 
 // 跨文档检索默认排除 . 开头隐藏路径文档（projectneed 15-7-3，如事件卷锚所在的 .memory）。
 // includeHidden=true 或显式 kind=event 时不排除（"显式传参才看得到"）。返回要排除的 docId 集合；无可排除时 null。
-function resolveHiddenDocExclusion(store, payload = {}, ctx = {}) {
+function resolveHiddenDocExclusion(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   if (payload.includeHidden === true || payload.include_hidden === true) return null;
   const kind = parseListFilter(payload.kind ?? payload.kinds ?? payload.docKind);
   if (kind && kind.has('event')) return null;
   const relativePathFor = typeof ctx.libraryRelativePath === 'function' ? ctx.libraryRelativePath : null;
   if (!relativePathFor) return null;
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     SELECT d.id AS id, sd.original_path AS original_path
     FROM docs d
     LEFT JOIN source_documents sd ON sd.doc_id = d.id
-  `).all();
-  const hidden = new Set();
+  `).all<DocFilterRow>();
+  const hidden = new Set<string>();
   for (const row of rows) {
     const rel = row.original_path ? relativePathFor(row.original_path) : '';
     if (docIsUnderHiddenPath(rel)) hidden.add(String(row.id));
@@ -1116,7 +1252,7 @@ function resolveHiddenDocExclusion(store, payload = {}, ctx = {}) {
   return hidden.size ? hidden : null;
 }
 
-function keywordRowInScope(row = {}, payload = {}, docFilter = null) {
+function keywordRowInScope(row: KeywordNodeRow, payload: Payload = {}, docFilter: Set<string> | null = null) {
   const allDocs = payload.allDocs === true || payload.all_docs === true || payload.scope === 'all';
   const docId = normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
   if (!allDocs && docId && String(row.doc_id) !== String(docId)) return false;
@@ -1136,11 +1272,11 @@ function keywordRowInScope(row = {}, payload = {}, docFilter = null) {
   return true;
 }
 
-function keywordRowsByIds(store, ids = []) {
-  const orderedIds = [...new Set(ids.map((id) => normalizeQueryId(id)).filter(Boolean))];
+function keywordRowsByIds(store: IftreeStore, ids: unknown[] = []): KeywordNodeRow[] {
+  const orderedIds = [...new Set(ids.map((id) => normalizeQueryId(id)).filter((id): id is string => Boolean(id)))];
   if (orderedIds.length === 0) return [];
   const placeholders = orderedIds.map(() => '?').join(', ');
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     WITH matched AS (
       SELECT n.*,
         d.title AS doc_title,
@@ -1159,29 +1295,32 @@ function keywordRowsByIds(store, ids = []) {
       COALESCE(child_counts.child_count, 0) AS child_count
     FROM matched
     LEFT JOIN child_counts ON child_counts.parent_id = matched.id
-  `).all(...orderedIds);
+  `).all<KeywordNodeRow>(...orderedIds);
   const byId = new Map(rows.map((row) => [String(row.id), row]));
-  return orderedIds.map((id) => byId.get(id)).filter(Boolean);
+  return orderedIds.map((id) => byId.get(id)).filter((row): row is KeywordNodeRow => Boolean(row));
 }
 
 // 召回结果必须附带时间元数据（projectneed 15-12-6）：检索命中一律带 createdAt/updatedAt，
 // agent 采信前先看时间；树索引等导航输出不在此列。
-function includeWithTimestamps(include = new Set()) {
+function includeWithTimestamps(include: Set<string> = new Set()) {
   const next = new Set(include);
   next.add('timestamps');
   return next;
 }
 
-function formatKeywordResultRows(rows = [], terms = [], payload = {}, include = new Set()) {
+function formatKeywordResultRows(rows: KeywordNodeRow[] = [], terms: string[] = [], payload: Payload = {}, include: Set<string> = new Set()) {
   // includeLabels（find --labels，opt-in）：命中行附 doc 层级(event/memory/knowledge)与节点 trust，
   // 供调用方一眼分层/分信任；不开则不带这些字段，保持输出精简。
   const labels = payload?.includeLabels === true;
   return rows.map((row) => {
-    const node = formatContentNode({ ...row, score: keywordHitCount(row, terms) }, {
+    const hit = keywordHitSummary(row, terms);
+    const node = formatContentNode({ ...row, score: hit.score }, {
       detail: 'summary',
       include: includeWithTimestamps(include),
       previewChars: payload.previewChars ?? payload.preview_chars
     });
+    node.rowHits = hit.rowHits;
+    node.termCount = hit.termCount;
     if (labels) node.trustLevel = row.trust_level || null;
     return {
       doc: {
@@ -1197,23 +1336,23 @@ function formatKeywordResultRows(rows = [], terms = [], payload = {}, include = 
 // keyword 召回的候选行（轻量字段，供 Aho-Corasick 扫描与 scope 过滤）。
 // scope（docId / scopeAddress）在 SQL 层缩小；docFilter / trust / 时间窗在 keywordRowInScope 兜底。
 // allDocs 且无 docId 时取全库——keyword 字面召回接受全库扫，AC 扫描是线性的。
-function keywordScanRows(store, payload = {}) {
+function keywordScanRows(store: IftreeStore, payload: Payload = {}) {
   const { sql, params } = keywordWhereSql(payload, [], {});
-  return store.db.prepare(`
+  return store.db!.prepare(`
     SELECT n.id, n.doc_id, n.address, n.node_title, n.text, n.node_note, n.trust_level, n.updated_at, n.depth
     FROM nodes n
     JOIN docs d ON d.id = n.doc_id
     WHERE ${sql}
-  `).all(...params);
+  `).all<KeywordNodeRow>(...params);
 }
 
 // 用 Aho-Corasick 一次扫遍候选行，标出每行命中的词键集合。
 // 全量、不漏、不截断——这是 keyword「字面连续命中」的精确召回（projectneed 14-3-3）。
-function scanKeywordHits(rows = [], termKeys = []) {
+function scanKeywordHits(rows: KeywordNodeRow[] = [], termKeys: string[] = []) {
   const matcher = buildAhoCorasickMatcher(termKeys.map((key) => ({ key })));
-  const hitRows = [];
+  const hitRows: KeywordHit[] = [];
   for (const row of rows) {
-    const hits = new Set();
+    const hits = new Set<string>();
     matcher.scan(keywordHaystack(row), (pattern) => hits.add(pattern.key));
     if (hits.size > 0) hitRows.push({ row, hits });
   }
@@ -1223,7 +1362,7 @@ function scanKeywordHits(rows = [], termKeys = []) {
 // BM25 相关性分（node_id -> score），仅用于给已召回的命中排序、不参与召回。
 // FTS 不可用时返回 null（排序退化为命中量兜底）。rankLimit 决定参与 BM25 打分的候选规模，
 // 可由调用方显式调大；够不到的长尾由命中量兜底，不影响召回完整性。
-async function keywordBm25Scores(ctx = {}, terms = [], docId = null, rankLimit = 1000) {
+async function keywordBm25Scores(ctx: QueryContext = {}, terms: string[] = [], docId: string | null = null, rankLimit = 1000) {
   if (typeof ctx.keywordSearch !== 'function') return null;
   if (typeof ctx.ensureKeywordIndexReady === 'function') {
     try {
@@ -1231,7 +1370,7 @@ async function keywordBm25Scores(ctx = {}, terms = [], docId = null, rankLimit =
     } catch { /* 排序信号缺失只让排序退化，召回已由 AC 兜全 */ }
   }
   const candidates = await ctx.keywordSearch({ terms, docId, limit: rankLimit });
-  const scores = new Map();
+  const scores = new Map<string, number>();
   for (const candidate of candidates) {
     const id = String(candidate.node_id || '');
     if (id && !scores.has(id)) scores.set(id, Number(candidate.score) || 0);
@@ -1241,10 +1380,10 @@ async function keywordBm25Scores(ctx = {}, terms = [], docId = null, rankLimit =
 
 // 命中节点排序：BM25 分降序 → 命中词数降序 → 字面命中次数降序 → 地址升序。
 // BM25 缺分（FTS 未覆盖的长尾或索引缺失）按命中量兜底，保证次序稳定确定。
-function compareKeywordHits(left, right, scores, terms) {
+function compareKeywordHits(left: KeywordHit, right: KeywordHit, scores: Map<string, number> | null, terms: string[]) {
   if (scores) {
-    const leftScore = scores.has(String(left.row.id)) ? scores.get(String(left.row.id)) : -Infinity;
-    const rightScore = scores.has(String(right.row.id)) ? scores.get(String(right.row.id)) : -Infinity;
+    const leftScore = scores.has(String(left.row.id)) ? scores.get(String(left.row.id))! : -Infinity;
+    const rightScore = scores.has(String(right.row.id)) ? scores.get(String(right.row.id))! : -Infinity;
     if (leftScore !== rightScore) return rightScore - leftScore;
   }
   if (left.hits.size !== right.hits.size) return right.hits.size - left.hits.size;
@@ -1254,7 +1393,7 @@ function compareKeywordHits(left, right, scores, terms) {
   return String(left.row.address || '').localeCompare(String(right.row.address || ''));
 }
 
-async function queryContentKeyword(store, payload = {}, ctx = {}) {
+async function queryContentKeyword(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const terms = normalizeKeywordTerms(payload);
   if (terms.length === 0) return { kind: 'content.searchKeyword', terms, rows: [] };
   const termKeys = [...new Set(terms.map((term) => term.toLocaleLowerCase()).filter(Boolean))];
@@ -1271,14 +1410,14 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
     : normalizeQueryId(payload.scopeDocId ?? payload.scope_doc_id ?? payload.docId ?? payload.doc_id, null);
   // 跨文档（allDocs）默认排除 . 开头隐藏路径文档（15-7-3）；单篇显式定位（含定位到隐藏文档）不受限。
   const hiddenExcluded = docId ? null : resolveHiddenDocExclusion(store, payload, ctx);
-  const rowHidden = (row) => hiddenExcluded != null && hiddenExcluded.has(String(row.doc_id));
+  const rowHidden = (row: KeywordNodeRow) => hiddenExcluded != null && hiddenExcluded.has(String(row.doc_id));
   // 统计用：当前范围可检索的文档数（doc 级过滤 + 隐藏排除后的允许集 / 单篇=1 / 全库总数）。
   // 让 find 返回统计行能把"0 命中"区分成"范围本身就空"还是"范围内没命中"。
   const scopeDocs = docFilter
     ? [...docFilter].filter((id) => !(hiddenExcluded && hiddenExcluded.has(String(id)))).length
     : (docId
         ? 1
-        : Math.max(0, (Number(store.db.prepare('SELECT COUNT(*) AS c FROM docs').get()?.c) || 0) - (hiddenExcluded ? hiddenExcluded.size : 0)));
+        : Math.max(0, (Number(store.db!.prepare('SELECT COUNT(*) AS c FROM docs').get()?.c) || 0) - (hiddenExcluded ? hiddenExcluded.size : 0)));
 
   // 召回：Aho-Corasick 全量扫范围节点的字面命中（不漏、不截断）；scope/过滤在 JS 兜底。
   const candidateRows = keywordScanRows(store, payload)
@@ -1290,9 +1429,9 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
 
   if (matchMode === 'or') {
     // 按词分组：每组是命中该词的全部节点，组内按相关性排序、各自分页。
-    const groups = [];
-    const seen = new Set();
-    const flat = [];
+    const groups: RowObject[] = [];
+    const seen = new Set<string>();
+    const flat: RowObject[] = [];
     for (const term of terms) {
       const key = term.toLocaleLowerCase();
       const groupHits = hitRows
@@ -1337,11 +1476,11 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
   let ranked;
   if (matchMode === 'doc') {
     // 文档级 AND：保留命中「全部词」的文档（词可分散在不同节点），返回这些文档里命中任一词的节点。
-    const perDocKeys = new Map();
+    const perDocKeys = new Map<string, Set<string>>();
     for (const entry of hitRows) {
       const rowDocId = String(entry.row.doc_id);
-      if (!perDocKeys.has(rowDocId)) perDocKeys.set(rowDocId, new Set());
-      const keySet = perDocKeys.get(rowDocId);
+      if (!perDocKeys.has(rowDocId)) perDocKeys.set(rowDocId, new Set<string>());
+      const keySet = perDocKeys.get(rowDocId)!;
       for (const key of entry.hits) keySet.add(key);
     }
     ranked = hitRows.filter((entry) => (perDocKeys.get(String(entry.row.doc_id))?.size || 0) === termKeys.length);
@@ -1368,7 +1507,7 @@ async function queryContentKeyword(store, payload = {}, ctx = {}) {
   };
 }
 
-async function queryContentSearch(store, payload = {}, ctx = {}) {
+async function queryContentSearch(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const docId = normalizeQueryId(payload.docId ?? payload.doc_id, null);
   if (!docId || payload.allDocs === true || payload.all_docs === true || payload.scope === 'all') {
     return queryContentSearchAll(store, payload, ctx);
@@ -1392,11 +1531,11 @@ async function queryContentSearch(store, payload = {}, ctx = {}) {
       query,
       rows: results.map((result) => {
         const row = byId.get(String(result.node_id));
-        return row ? formatContentNode({ ...row, score: result.score }, { detail: 'summary', include: includeWithTimestamps(include) }) : null;
-      }).filter(Boolean)
+        return row ? formatContentNode({ ...row, score: Number(result.score) || 0 }, { detail: 'summary', include: includeWithTimestamps(include) }) : null;
+      }).filter((row): row is FormattedContentNode => Boolean(row))
     };
   }
-  const rows = store.searchNodes({ docId, query, limit });
+  const rows = store.searchNodes({ docId, query, limit }) as unknown as ContentNodeRow[];
   return {
     kind: 'content.search',
     mode: 'keyword',
@@ -1406,13 +1545,13 @@ async function queryContentSearch(store, payload = {}, ctx = {}) {
   };
 }
 
-function crossDocSearchRows(store, payload = {}) {
+function crossDocSearchRows(store: IftreeStore, payload: Payload = {}) {
   const query = String(payload.query ?? payload.q ?? '').trim();
   if (!query) return { query, rows: [], truncated: false };
   const limit = normalizeLimit(payload.limit, 20, 100);
   const escaped = query.replace(/[\\%_]/g, (match) => `\\${match}`);
   const like = `%${escaped}%`;
-  const rows = store.db.prepare(`
+  const rows = store.db!.prepare(`
     WITH matched AS (
       SELECT n.*,
         d.title AS doc_title,
@@ -1455,7 +1594,7 @@ function crossDocSearchRows(store, payload = {}) {
       depth,
       address,
       id
-  `).all(
+  `).all<CrossDocSearchRow>(
     like,
     like,
     like,
@@ -1472,10 +1611,10 @@ function crossDocSearchRows(store, payload = {}) {
   };
 }
 
-function formatCrossDocSearchRow(row, payload = {}, ctx = {}) {
-  const previewChars = payload.previewChars ?? payload.preview_chars ?? 240;
+function formatCrossDocSearchRow(row: CrossDocSearchRow, payload: Payload = {}, ctx: QueryContext = {}): CrossDocFormattedResult {
+  const previewChars = Number(payload.previewChars ?? payload.preview_chars) || 240;
   const text = row.text || '';
-  const node = {
+  const node: RowObject = {
     docId: row.doc_id,
     address: row.address,
     depth: row.depth,
@@ -1503,15 +1642,15 @@ function formatCrossDocSearchRow(row, payload = {}, ctx = {}) {
       docId: row.doc_id,
       title: row.doc_title || '',
       ...(payload.includeSource === true || payload.include_source === true || contentIncludeSet(payload).has('source')
-        ? { source: { type: row.source_type || '', path: libraryRelativeSourcePath(row, ctx) } }
+        ? { source: { type: row.source_type || '', path: libraryRelativeSourcePath(row as Partial<SourceDocumentRow>, ctx) } }
         : {})
     },
     node
   };
 }
 
-function crossDocSearchToAsciiTree(results = [], options = {}) {
-  const byDoc = new Map();
+function crossDocSearchToAsciiTree(results: CrossDocFormattedResult[] = [], options: Payload = {}) {
+  const byDoc = new Map<string, { doc: RowObject; rows: CrossDocFormattedResult[] }>();
   for (const result of results) {
     const docId = String(result.doc?.docId || '');
     if (!byDoc.has(docId)) {
@@ -1520,22 +1659,23 @@ function crossDocSearchToAsciiTree(results = [], options = {}) {
         rows: []
       });
     }
-    byDoc.get(docId).rows.push(result);
+    byDoc.get(docId)!.rows.push(result);
   }
-  const lines = [];
+  const lines: string[] = [];
   for (const group of byDoc.values()) {
-    const sourcePath = group.doc?.source?.path ? ` path=${cleanTreeLabel(group.doc.source.path, 120)}` : '';
+    const source = group.doc.source as RowObject | undefined;
+    const sourcePath = source?.path ? ` path=${cleanTreeLabel(source.path, 120)}` : '';
     lines.push(`doc#${group.doc.docId} ${cleanTreeLabel(group.doc.title || `Doc ${group.doc.docId}`, 90)}${sourcePath}`);
     for (let index = 0; index < group.rows.length; index += 1) {
       const result = group.rows[index];
       const isLast = index === group.rows.length - 1;
-      lines.push(`${isLast ? '`-- ' : '|-- '}${asciiTreeLabel(result.node, options)}`);
+      if (result) lines.push(`${isLast ? '`-- ' : '|-- '}${asciiTreeLabel(result.node as Partial<FormattedContentNode>, options)}`);
     }
   }
   return lines.join('\n');
 }
 
-async function queryContentSearchAll(store, payload = {}, ctx = {}) {
+async function queryContentSearchAll(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const query = String(payload.query ?? payload.q ?? '').trim();
   const mode = String(payload.searchMode ?? payload.search_mode ?? payload.mode ?? 'keyword').trim();
   if (!query) {
@@ -1556,11 +1696,11 @@ async function queryContentSearchAll(store, payload = {}, ctx = {}) {
     const formatted = results.map((result) => {
       const row = byId.get(String(result.node_id));
       if (!row || (hiddenExcluded && hiddenExcluded.has(String(row.doc_id)))) return null;
-      return formatCrossDocSearchRow({ ...row, score: result.score }, {
+      return formatCrossDocSearchRow({ ...row, score: Number(result.score) || 0 }, {
         ...payload,
         includeSource: true
       }, ctx);
-    }).filter(Boolean);
+    }).filter((row): row is CrossDocFormattedResult => Boolean(row));
     if (contentFormat(payload) === 'ascii_tree') {
       return {
         kind: 'content.searchAll',
@@ -1610,22 +1750,22 @@ async function queryContentSearchAll(store, payload = {}, ctx = {}) {
   };
 }
 
-function nodeWithChildCount(store, docId, nodeId) {
+function nodeWithChildCount(store: IftreeStore, docId: unknown, nodeId: unknown): ContentNodeRow | null {
   const normalizedDocId = normalizeQueryId(docId);
   const normalizedNodeId = normalizeQueryId(nodeId);
   if (!normalizedDocId || !normalizedNodeId) return null;
-  const node = store.db.prepare('SELECT * FROM nodes WHERE doc_id = ? AND id = ?')
-    .get(normalizedDocId, normalizedNodeId);
+  const node = store.db!.prepare('SELECT * FROM nodes WHERE doc_id = ? AND id = ?')
+    .get<NodeRow>(normalizedDocId, normalizedNodeId);
   if (!node) return null;
-  const childCount = Number(store.db.prepare(`
+  const childCount = Number(store.db!.prepare(`
     SELECT COUNT(*) AS count
     FROM nodes
     WHERE doc_id = ? AND parent_id = ?
-  `).get(normalizedDocId, normalizedNodeId)?.count || 0);
+  `).get<CountRow>(normalizedDocId, normalizedNodeId)?.count || 0);
   return { ...node, child_count: childCount };
 }
 
-function resolveAddress(store, docId, address) {
+function resolveAddress(store: IftreeStore, docId: unknown, address: unknown): ContentNodeRow | null {
   const normalizedDocId = normalizeQueryId(docId);
   const normalizedAddress = String(address || '').trim();
   const parts = normalizedAddress
@@ -1635,40 +1775,40 @@ function resolveAddress(store, docId, address) {
   if (!normalizedDocId || parts.length === 0 || parts.some((part) => !Number.isInteger(part) || part <= 0)) {
     return null;
   }
-  const stored = store.db.prepare('SELECT id FROM nodes WHERE doc_id = ? AND address = ?')
-    .get(normalizedDocId, normalizedAddress);
+  const stored = store.db!.prepare('SELECT id FROM nodes WHERE doc_id = ? AND address = ?')
+    .get<Pick<NodeRow, 'id'>>(normalizedDocId, normalizedAddress);
   if (stored) return nodeWithChildCount(store, normalizedDocId, stored.id);
 
-  let parentId = null;
-  let current = null;
+  let parentId: string | null = null;
+  let current: NodeRow | null = null;
   for (const ordinal of parts) {
-    current = store.db.prepare(`
+    current = store.db!.prepare(`
       SELECT *
       FROM nodes
       WHERE doc_id = ? AND parent_id IS ?
       ORDER BY sort_order, id
       LIMIT 1 OFFSET ?
-    `).get(normalizedDocId, parentId, ordinal - 1);
+    `).get<NodeRow>(normalizedDocId, parentId, ordinal - 1) ?? null;
     if (!current) return null;
     parentId = current.id;
   }
-  return nodeWithChildCount(store, normalizedDocId, current.id);
+  return current ? nodeWithChildCount(store, normalizedDocId, current.id) : null;
 }
 
-function requireDocId(payload = {}) {
+function requireDocId(payload: Payload = {}) {
   const docId = normalizeQueryId(payload.docId ?? payload.doc_id);
   if (!docId) throw new Error('read query requires docId for this action');
   return docId;
 }
 
 // 历史快照重建统一走 store.commitSnapshotFromRow（对象库展开 + 内联 meta；旧行回退读 snapshot/diff 列）。
-function historySnapshot(store, row = {}) {
+function historySnapshot(store: IftreeStore, row: CommitSnapshotRow) {
   return store.commitSnapshotFromRow(row);
 }
 
 // computeDiff 的 field-diff entry 只带 node_id；补 address（库的定位语言）供展示层用。
 // 删除的节点在 to 侧已不存在，故 to 优先、from 兜底；这些是实时算出的临时对象，不入库。
-function fillEntryAddresses(entries, toSnapshot, fromSnapshot) {
+function fillEntryAddresses(entries: RowObject[], toSnapshot: SnapshotLike | null, fromSnapshot: SnapshotLike | null) {
   const addressByNode = new Map();
   for (const node of toSnapshot?.nodes || []) addressByNode.set(node.id, node.address);
   for (const node of fromSnapshot?.nodes || []) if (!addressByNode.has(node.id)) addressByNode.set(node.id, node.address);
@@ -1679,25 +1819,25 @@ function fillEntryAddresses(entries, toSnapshot, fromSnapshot) {
   }
 }
 
-function historyEntryRow(store, ref, docId = null) {
+function historyEntryRow(store: IftreeStore, ref: unknown, docId: string | null = null): CommitSnapshotRow {
   const id = normalizeQueryId(ref, null);
   if (!id) throw new Error('history.diff requires commit id');
   const row = docId
-    ? store.db.prepare('SELECT * FROM commits WHERE id = ? AND doc_id = ?').get(id, docId)
-    : store.db.prepare('SELECT * FROM commits WHERE id = ?').get(id);
+    ? store.db!.prepare('SELECT * FROM commits WHERE id = ? AND doc_id = ?').get<CommitSnapshotRow>(id, docId)
+    : store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitSnapshotRow>(id);
   if (!row) throw new Error(`Commit not found: ${id}`);
   return row;
 }
 
-function historyMetaRow(row = {}) {
-  const rest = /** @type {Record<string, any>} */ ({ ...(row || {}) });
+function historyMetaRow(row: CommitSnapshotRow) {
+  const rest: RowObject = { ...(row as unknown as RowObject) };
   delete rest.diff;
   delete rest.snapshot;
   delete rest.meta;
   return rest;
 }
 
-function queryHistoryDiff(store, payload = {}) {
+function queryHistoryDiff(store: IftreeStore, payload: Payload = {}) {
   const docId = normalizeQueryId(payload.docId ?? payload.doc_id, null);
   const fromRef = payload.fromHistoryId ?? payload.from_history_id ?? payload.from;
   const toRef = payload.toHistoryId ?? payload.to_history_id ?? payload.to ?? payload.historyId ?? payload.history_id;
@@ -1707,10 +1847,10 @@ function queryHistoryDiff(store, payload = {}) {
   if (!fromRef) {
     // 单 ref：edit-branch 提交用存档的操作级条目（meta.entries；旧行回退 diff.entries）——它精确表达
     // 「本 commit 做了什么」、且首提交（无父）也有。无操作条目的 save/revert 提交现算「父→本」field-diff。
-    const stored = parseJsonObject(toRow.meta, null)?.entries ?? parseJsonObject(toRow.diff, null)?.entries;
-    let entries = Array.isArray(stored) ? stored : [];
+    const stored = parseJsonObject(toRow.meta, {}).entries ?? parseJsonObject(toRow.diff, {}).entries;
+    let entries: RowObject[] = Array.isArray(stored) ? stored as RowObject[] : [];
     if (entries.length === 0 && toRow.parent_commit_id) {
-      const parentRow = store.db.prepare('SELECT * FROM commits WHERE id = ?').get(toRow.parent_commit_id);
+      const parentRow = store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitSnapshotRow>(toRow.parent_commit_id);
       const parentSnapshot = parentRow ? historySnapshot(store, parentRow) : null;
       if (parentSnapshot?.nodes && toSnapshot?.nodes) {
         entries = store.computeDiff(parentSnapshot, toSnapshot);
@@ -1746,14 +1886,14 @@ function queryHistoryDiff(store, payload = {}) {
 
 // diff.refs（15-5-2 refA↔refB）：把任意两 ref（head 正文 / 历史 commit / 草稿）各解析成快照，按稳定 node id 配对比对。
 // head/草稿走 projectEditBranchDoc（统一地址口径），history 走存档快照；computeDiff 与 history.diff 同形（field/old/new）。
-function resolveRefSnapshot(store, ref = {}, fallbackDocId = null) {
+function resolveRefSnapshot(store: IftreeStore, ref: Payload = {}, fallbackDocId: string | null = null) {
   if (ref.head) {
     const docId = ref.docId ?? fallbackDocId;
     if (!docId) throw new Error('diff ref=head 需要 docId');
     return store.liveDocSnapshot(docId);
   }
   if (ref.historyId != null) {
-    const row = historyEntryRow(store, ref.historyId, ref.docId ?? fallbackDocId);
+    const row = historyEntryRow(store, ref.historyId, normalizeQueryId(ref.docId ?? fallbackDocId, null));
     const snap = historySnapshot(store, row);
     if (!snap?.nodes) throw new Error('diff ref 历史快照不可用（该 commit 无可恢复快照）');
     return snap;
@@ -1767,30 +1907,30 @@ function resolveRefSnapshot(store, ref = {}, fallbackDocId = null) {
   return store._projectedDocForBranch(branch);
 }
 
-function queryRefDiff(store, payload = {}) {
+function queryRefDiff(store: IftreeStore, payload: Payload = {}) {
   const fallbackDocId = normalizeQueryId(payload.docId ?? payload.doc_id, null);
-  const fromSnap = resolveRefSnapshot(store, payload.from ?? {}, fallbackDocId);
-  const toSnap = resolveRefSnapshot(store, payload.to ?? {}, fallbackDocId);
+  const fromSnap = resolveRefSnapshot(store, (payload.from ?? {}) as Payload, fallbackDocId);
+  const toSnap = resolveRefSnapshot(store, (payload.to ?? {}) as Payload, fallbackDocId);
   const entries = store.computeDiff(fromSnap, toSnap);
   fillEntryAddresses(entries, toSnap, fromSnap);
   return { kind: 'diff.refs', entries };
 }
 
 // 按 commit id 重建完整历史快照（db-shell 的 --at 等只读消费者用；走对象库展开，不再读 diff/snapshot 列）。
-function queryHistorySnapshot(store, payload = {}) {
+function queryHistorySnapshot(store: IftreeStore, payload: Payload = {}) {
   const commitId = normalizeQueryId(
     payload.commitId ?? payload.commit_id ?? payload.historyId ?? payload.history_id ?? payload.id,
     null
   );
   if (!commitId) throw new Error('history.snapshot requires commit id');
-  const row = store.db.prepare('SELECT * FROM commits WHERE id = ?').get(commitId);
+  const row = store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitSnapshotRow>(commitId);
   if (!row) throw new Error(`Commit not found: ${commitId}`);
   const snapshot = store.commitSnapshotFromRow(row);
   if (!snapshot?.nodes) throw new Error(`Commit is not restorable: ${commitId}`);
   return { kind: 'history.snapshot', commitId, doc_id: row.doc_id, snapshot };
 }
 
-function queryNodeHistory(store, payload = {}) {
+function queryNodeHistory(store: IftreeStore, payload: Payload = {}) {
   const docId = normalizeQueryId(payload.docId ?? payload.doc_id, null);
   const address = payload.address;
   if (!docId || address == null || address === '') {
@@ -1806,33 +1946,33 @@ function queryNodeHistory(store, payload = {}) {
   };
 }
 
-function sameDocHistory(left = {}, right = {}) {
+function sameDocHistory(left: Pick<CommitRow, 'doc_id'>, right: Pick<CommitRow, 'doc_id'>) {
   return String(left.doc_id) === String(right.doc_id);
 }
 
-function docInfo(store, payload = {}) {
+function docInfo(store: IftreeStore, payload: Payload = {}) {
   const docId = requireDocId(payload);
-  const doc = store.db.prepare(`
+  const doc = store.db!.prepare(`
     SELECT
       d.*,
       (SELECT COUNT(*) FROM nodes n WHERE n.doc_id = d.id) AS node_count,
       (SELECT COUNT(*) FROM axioms a WHERE a.doc_id = d.id) AS axiom_count
     FROM docs d
     WHERE d.id = ?
-  `).get(docId);
+  `).get<DocRow & { node_count: number; axiom_count: number }>(docId);
   if (!doc) return { doc: null };
-  const sourceDocument = store.db.prepare(`
+  const sourceDocument = store.db!.prepare(`
     SELECT doc_id, source_type, original_path, created_at, LENGTH(raw_markdown) AS raw_length
     FROM source_documents
     WHERE doc_id = ?
-  `).get(docId) || null;
-  const rootNode = store.db.prepare(`
+  `).get<Pick<SourceDocumentRow, 'doc_id' | 'source_type' | 'original_path' | 'created_at'> & { raw_length: number }>(docId) || null;
+  const rootNode = store.db!.prepare(`
     SELECT *
     FROM nodes
     WHERE doc_id = ? AND parent_id IS NULL
     ORDER BY sort_order, id
     LIMIT 1
-  `).get(docId) || null;
+  `).get<NodeRow>(docId) || null;
   return {
     doc: normalizeDocRow(doc),
     sourceDocument: plainRow(sourceDocument),
@@ -1840,73 +1980,77 @@ function docInfo(store, payload = {}) {
   };
 }
 
-function queryDoc(store, payload = {}) {
+function queryDoc(store: IftreeStore, payload: Payload = {}): DocGetResult | null {
   const docId = requireDocId(payload);
   const includeNodes = payload.includeNodes === true || payload.include_nodes === true;
   const includeSourceSpans = payload.includeSourceSpans === true || payload.include_source_spans === true;
   const data = store.getDoc(docId, {
     maxTreeDepth: payload.maxTreeDepth ?? payload.max_tree_depth,
     includeSourceSpans,
-    includeSourceDocumentContent: payload.includeSourceDocumentContent ?? payload.include_source_document_content
+    includeSourceDocumentContent: payload.includeSourceDocumentContent === true || payload.include_source_document_content === true
   });
   if (!data) return null;
+  // explicit lambda 让 TS 给 plainRow 推参时选「非 null 入 → 非 null 出」重载，否则 .map(plainRow) 会选更宽签名得到 (T|null)[]。
   return {
     ...data,
     doc: plainRow(data.doc),
-    nodes: includeNodes ? data.nodes.map(plainRow) : [],
-    axioms: data.axioms.map(plainRow),
-    refs: data.refs.map(plainRow),
-    history: data.history.map(plainRow),
+    nodes: includeNodes ? data.nodes.map((row) => plainRow(row)) : [],
+    axioms: data.axioms.map((row) => plainRow(row)),
+    // store.getDoc 内部 refs.map 已加 source_address/target_address，但 `let refs: RefRow[]` 声明吞了新字段——边界 cast 收紧到真投影。
+    refs: data.refs.map((row) => plainRow(row)) as DocGetRefRow[],
+    history: data.history.map((row) => plainRow(row)),
     editBranch: payload.includeEditBranch === false || payload.include_edit_branch === false
       ? null
-      : plainRow(store.activeEditBranchForDoc(docId, payload.owner ?? null)),
+      : plainRow(store.activeEditBranchForDoc(docId, typeof payload.owner === 'string' ? payload.owner : null)),
     sourceDocument: plainRow(data.sourceDocument),
-    sourcePdfPages: (data.sourcePdfPages || []).map(plainRow),
-    sourceSpans: includeSourceSpans ? (data.sourceSpans || []).map(plainRow) : [],
+    sourcePdfPages: (data.sourcePdfPages || []).map((row) => plainRow(row)),
+    sourceSpans: includeSourceSpans ? (data.sourceSpans || []).map((row) => plainRow(row)) : [],
     idByAddress: { ...(data.idByAddress || {}) }
   };
 }
 
-function queryDocExportMarkdown(store, payload = {}) {
-  const docId = requireDocId(payload);
-  if (typeof store.exportDocMarkdown !== 'function') {
-    throw new Error('doc.exportMarkdown is not available');
-  }
-  return {
-    kind: 'doc.exportMarkdown',
-    docId,
-    format: 'markdown',
-    text: store.exportDocMarkdown(docId)
-  };
+function queryDocExportMarkdown(_store: IftreeStore, _payload: Payload = {}) {
+  // 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，渲染有地址当标题/混入
+  // node_note 等功能错误，幂等与 import/export 对称设计未定。详见 NOW.md。store.exportDocMarkdown /
+  // core.renderDocMarkdown 实现暂留作重做参考，此入口先停。
+  throw new Error('doc.exportMarkdown 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，且渲染有地址当标题/混入 node_note 等功能错误，幂等与 import/export 对称设计未定。详见 NOW.md。');
 }
 
-function queryPendingEditBranches(store, payload = {}) {
+function queryPendingEditBranches(store: IftreeStore, payload: Payload = {}) {
   return {
     kind: 'editBranch.listPending',
-    branches: store.listActiveEditBranches(payload.owner ?? null).map(plainRow)
+    branches: store.listActiveEditBranches(typeof payload.owner === 'string' ? payload.owner : null).map(plainRow)
   };
 }
 
-function queryEditBranchDiffView(store, payload = {}) {
+function queryEditBranchDiffView(store: IftreeStore, payload: Payload = {}) {
   return store.getEditBranchDiffView({
     branchId: payload.branchId ?? payload.branch_id ?? null,
     shadowDocId: payload.shadowDocId ?? payload.shadow_doc_id ?? null,
     baseDocId: payload.baseDocId ?? payload.base_doc_id ?? null,
     owner: payload.owner ?? 'human',
-    changedOnly: payload.changedOnly ?? payload.changed_only ?? false
+    changedOnly: payload.changedOnly ?? payload.changed_only ?? false,
+    includeEntities: payload.includeEntities ?? payload.include_entities ?? false
   });
 }
 
-function queryThreeWayMerge(store, payload = {}) {
-  return store.computeThreeWayMerge({
+function queryThreeWayMerge(store: IftreeStore, payload: Payload = {}) {
+  const result = store.computeThreeWayMerge({
     branchId: payload.branchId ?? payload.branch_id ?? null,
     shadowDocId: payload.shadowDocId ?? payload.shadow_doc_id ?? null,
     baseDocId: payload.baseDocId ?? payload.base_doc_id ?? null,
     owner: payload.owner ?? 'human'
   });
+  const detail = String(payload.detail ?? payload.view ?? payload.format ?? '').trim().toLowerCase();
+  const raw = payload.raw === true || detail === 'raw' || detail === 'full';
+  if (raw) return result;
+  if (detail === 'summary' || payload.changedOnly === true || payload.changed_only === true) {
+    return summarizeThreeWayMerge(result as Parameters<typeof summarizeThreeWayMerge>[0], { maxNodes: normalizeLimit(payload.limit ?? payload.nodeLimit ?? payload.node_limit, 200, 10000) });
+  }
+  return result;
 }
 
-function queryNode(store, payload = {}) {
+function queryNode(store: IftreeStore, payload: Payload = {}): ContentNodeRow | null {
   const docId = requireDocId(payload);
   const nodeId = normalizeQueryId(payload.nodeId ?? payload.node_id);
   if (nodeId) return nodeWithChildCount(store, docId, nodeId);
@@ -1914,7 +2058,7 @@ function queryNode(store, payload = {}) {
   return null;
 }
 
-function queryChildren(store, payload = {}) {
+function queryChildren(store: IftreeStore, payload: Payload = {}) {
   const docId = requireDocId(payload);
   let parentId = payload.parentId ?? payload.parent_id ?? null;
   if ((parentId === null || parentId === undefined || parentId === '') && payload.address) {
@@ -1936,7 +2080,7 @@ function queryChildren(store, payload = {}) {
   };
 }
 
-function queryNodesPage(store, payload = {}) {
+function queryNodesPage(store: IftreeStore, payload: Payload = {}) {
   const result = store.getDocNodesPage({
     docId: requireDocId(payload),
     afterId: normalizeQueryId(payload.afterId ?? payload.after_id, null),
@@ -1948,7 +2092,7 @@ function queryNodesPage(store, payload = {}) {
   };
 }
 
-function querySearchNodes(store, payload = {}) {
+function querySearchNodes(store: IftreeStore, payload: Payload = {}) {
   const rows = store.searchNodes({
     docId: requireDocId(payload),
     query: payload.query ?? payload.q,
@@ -1960,7 +2104,7 @@ function querySearchNodes(store, payload = {}) {
   };
 }
 
-function queryStructureRows(store, payload = {}) {
+function queryStructureRows(store: IftreeStore, payload: Payload = {}) {
   const rows = store.getDocStructureRows({ docId: requireDocId(payload) }).map(plainRow);
   const limit = payload.limit === 0 ? 0 : normalizeLimit(payload.limit, 10000, 100000);
   return {
@@ -1970,7 +2114,7 @@ function queryStructureRows(store, payload = {}) {
   };
 }
 
-function querySourceWindow(store, payload = {}) {
+function querySourceWindow(store: IftreeStore, payload: Payload = {}) {
   const result = store.getSourceWindow({
     docId: requireDocId(payload),
     nodeId: payload.nodeId ?? payload.node_id ?? null,
@@ -1985,7 +2129,7 @@ function querySourceWindow(store, payload = {}) {
   } : null;
 }
 
-function payloadNodeIds(payload = {}) {
+function payloadNodeIds(payload: Payload = {}) {
   return Array.isArray(payload.nodeIds)
     ? payload.nodeIds
     : Array.isArray(payload.node_ids)
@@ -1993,14 +2137,14 @@ function payloadNodeIds(payload = {}) {
       : [];
 }
 
-function queryNodeTextBatch(store, payload = {}) {
+function queryNodeTextBatch(store: IftreeStore, payload: Payload = {}) {
   return store.getNodeTextBatch({
     docId: requireDocId(payload),
     nodeIds: payloadNodeIds(payload)
   }).map(plainRow);
 }
 
-function querySubtreeTextWindow(store, payload = {}) {
+function querySubtreeTextWindow(store: IftreeStore, payload: Payload = {}) {
   const result = store.getSubtreeTextWindow({
     docId: requireDocId(payload),
     nodeId: payload.nodeId ?? payload.node_id,
@@ -2014,14 +2158,14 @@ function querySubtreeTextWindow(store, payload = {}) {
   };
 }
 
-function querySubtreeSlotRange(store, payload = {}) {
+function querySubtreeSlotRange(store: IftreeStore, payload: Payload = {}) {
   return store.getSubtreeSlotRange({
     docId: requireDocId(payload),
     nodeId: payload.nodeId ?? payload.node_id
   }).map(plainRow);
 }
 
-function queryAncestorChain(store, payload = {}) {
+function queryAncestorChain(store: IftreeStore, payload: Payload = {}) {
   return store.getAncestorChain({
     docId: requireDocId(payload),
     nodeId: payload.nodeId ?? payload.node_id
@@ -2107,7 +2251,7 @@ export function databaseReadToolSchema() {
   };
 }
 
-export async function runDatabaseRead(store, payload = {}, ctx = {}) {
+export async function runDatabaseRead(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const action = normalizeQueryAction(payload.action || payload.type);
   if (!action) throw new Error(`Unknown read query action: ${payload.action || payload.type || ''}`);
 
@@ -2117,7 +2261,7 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
     return ctx.libraryTree(payload);
   }
   if (!store?.db) throw new Error('read query store is not available');
-  if (action === 'debug.sql') return handleDebugSqlQuery(store, payload);
+  if (action === 'debug.sql') return handleDebugSqlQuery(store as unknown as Parameters<typeof handleDebugSqlQuery>[0], payload);
   if (action === 'library.index') return queryLibraryIndex(store, payload, ctx);
   if (action === 'library.getNavigation') return queryLibraryNavigation(store, payload, ctx);
   if (action === 'content.listDocs') return queryContentDocs(store, payload, ctx);
@@ -2131,7 +2275,7 @@ export async function runDatabaseRead(store, payload = {}, ctx = {}) {
   if (action === 'content.searchAll') return queryContentSearchAll(store, payload, ctx);
   if (ENTITY_READ_ACTIONS.includes(action)) return runEntityRead(store, payload, action, ctx);
   if (MEMORY_READ_ACTIONS.includes(action)) return runMemoryRead(store, payload, action);
-  if (action === 'debug.overview') return handleDebugOverviewQuery(store);
+  if (action === 'debug.overview') return handleDebugOverviewQuery(store as unknown as Parameters<typeof handleDebugOverviewQuery>[0]);
   if (action === 'doc.list') return store.listDocs().map(normalizeDocRow);
   if (action === 'docFolder.list') return store.listDocFolders().map(plainRow);
   if (action === 'history.diff') return queryHistoryDiff(store, payload);

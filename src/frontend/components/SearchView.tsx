@@ -1,11 +1,28 @@
-﻿// @ts-nocheck
+﻿
 
+interface SearchResult {
+  node_id: string | number;
+  address?: string | null;
+  text?: string;
+  score?: unknown;
+  [key: string]: unknown;
+}
 
-function searchResultScore(score) {
+interface SearchResultGroup {
+  term: string;
+  rows?: SearchResult[];
+}
+
+interface SearchModeOption {
+  value: string;
+  label: string;
+}
+
+function searchResultScore(score: unknown): number {
   return Math.round((Number(score) || 0) * 1000) / 1000;
 }
 
-function SearchResultRows({ results, selectNode }) {
+function SearchResultRows({ results, selectNode }: { results?: SearchResult[]; selectNode: (nodeId: SearchResult['node_id'], result: SearchResult) => void }) {
   return (results || []).map((result) => (
     <button
       key={result.node_id}
@@ -33,6 +50,19 @@ export function SearchView({
   setMode = null,
   modeOptions = [],
   groups = []
+}: {
+  query: string;
+  setQuery: (query: string) => void;
+  results?: SearchResult[];
+  onSearch: () => void;
+  selectNode: (nodeId: SearchResult['node_id'], result: SearchResult) => void;
+  placeholder?: string;
+  disabled?: boolean;
+  disabledMessage?: string;
+  mode?: string | null;
+  setMode?: ((mode: string) => void) | null;
+  modeOptions?: SearchModeOption[];
+  groups?: SearchResultGroup[];
 }) {
   const canSwitchMode = typeof setMode === 'function' && modeOptions.length > 0;
   const groupedResults = Array.isArray(groups) ? groups : [];

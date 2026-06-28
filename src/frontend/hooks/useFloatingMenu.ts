@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { useEffect, useRef, useState } from 'react';
 
 // 单一浮层菜单 hook —— 按钮触发 + portal 菜单的通用骨架。
@@ -19,30 +18,54 @@ import { useEffect, useRef, useState } from 'react';
 // 不适用：CSS 锚点定位（AgentPanel ×3、common.tsx ×1，无 JS 位置计算）；
 //         鼠标坐标 + 挂载夹紧（MindMapView 右键/拖拽菜单）——定位机制不同。
 
-function computeMenuPosition(button, width, height, offset) {
+interface FloatingMenuSpec {
+  className?: string;
+  width?: number;
+  height?: number;
+}
+
+type FloatingMenuSpecs = (id: string) => FloatingMenuSpec | null | undefined;
+
+interface FloatingMenuOptions {
+  specs?: FloatingMenuSpecs;
+  offset?: number;
+}
+
+interface FloatingMenuPosition {
+  left: number;
+  top: number;
+  width?: number;
+}
+
+interface FloatingMenuEvent {
+  stopPropagation(): void;
+  currentTarget: HTMLElement;
+}
+
+function computeMenuPosition(button: HTMLElement, width: number | undefined, height: number | undefined, offset: number): FloatingMenuPosition {
   const rect = button.getBoundingClientRect();
-  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || width;
-  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || height;
-  const left = Math.max(8, Math.min(rect.right - width, viewportWidth - width - 8));
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || (width as number);
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || (height as number);
+  const left = Math.max(8, Math.min(rect.right - (width as number), viewportWidth - (width as number) - 8));
   const below = rect.bottom + offset;
-  const above = rect.top - height - offset;
-  const top = below + height <= viewportHeight - 8 ? below : Math.max(8, above);
+  const above = rect.top - (height as number) - offset;
+  const top = below + (height as number) <= viewportHeight - 8 ? below : Math.max(8, above);
   return { left, top, width };
 }
 
 export function useFloatingMenu({
   specs,
   offset = 6
-}: { specs?: any, offset?: number } = {}) {
-  const [openId, setOpenId] = useState(null);
-  const [position, setPosition] = useState(null);
-  const controlRef = useRef(null);
+}: FloatingMenuOptions = {}) {
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [position, setPosition] = useState<FloatingMenuPosition | null>(null);
+  const controlRef = useRef<HTMLElement | null>(null);
   // specs 一般是每次渲染新函数引用；用 ref 让 effect 不订阅它，只挂在 openId 上。
-  const specsRef = useRef(specs);
+  const specsRef = useRef<FloatingMenuSpecs | undefined>(specs);
   specsRef.current = specs;
-  const lookup = (id) => specsRef.current?.(id) || {};
+  const lookup = (id: string): FloatingMenuSpec => specsRef.current?.(id) || {};
 
-  function toggle(id, event) {
+  function toggle(id: string, event: FloatingMenuEvent) {
     event.stopPropagation();
     setOpenId((current) => {
       if (current === id) return null;
@@ -61,12 +84,13 @@ export function useFloatingMenu({
   useEffect(() => {
     if (!openId) return undefined;
     const menuClassName = lookup(openId).className;
-    const closeOnPointerDown = (event) => {
-      if (controlRef.current?.contains(event.target)) return;
-      if (menuClassName && event.target?.closest?.(`.${menuClassName}`)) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (controlRef.current?.contains(event.target as Node | null)) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (menuClassName && target?.closest?.(`.${menuClassName}`)) return;
       close();
     };
-    const closeOnEscape = (event) => {
+    const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') close();
     };
     window.addEventListener('pointerdown', closeOnPointerDown);

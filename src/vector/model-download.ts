@@ -1,4 +1,3 @@
-// @ts-nocheck
 export const DTYPE_SUFFIXES = Object.freeze({
   fp32: '',
   fp16: '_fp16',
@@ -29,25 +28,37 @@ const ROOT_MODEL_FILE_NAMES = new Set([
   'spiece.model'
 ]);
 
-function normalizeRepoPath(path) {
+interface ModelTreeEntry {
+  path?: unknown;
+  size?: unknown;
+  type?: string;
+  [key: string]: unknown;
+}
+
+interface SelectedModelFile extends ModelTreeEntry {
+  path: string;
+  size: number;
+}
+
+function normalizeRepoPath(path: unknown): string {
   return String(path || '').replace(/\\/g, '/').replace(/^\/+/, '');
 }
 
-function pathExtension(path) {
+function pathExtension(path: unknown): string {
   const name = normalizeRepoPath(path).split('/').pop() || '';
   const dot = name.lastIndexOf('.');
   return dot >= 0 ? name.slice(dot).toLowerCase() : '';
 }
 
-export function dtypeSuffix(dtype) {
-  return DTYPE_SUFFIXES[dtype] ?? DTYPE_SUFFIXES.fp32;
+export function dtypeSuffix(dtype: unknown): string {
+  return (DTYPE_SUFFIXES as Record<string, string>)[String(dtype)] ?? DTYPE_SUFFIXES.fp32;
 }
 
-export function modelOnnxFileName(dtype) {
+export function modelOnnxFileName(dtype: unknown): string {
   return `model${dtypeSuffix(dtype)}.onnx`;
 }
 
-export function repoIdUrlPath(modelName) {
+export function repoIdUrlPath(modelName: unknown): string {
   return String(modelName || '')
     .split('/')
     .filter(Boolean)
@@ -55,16 +66,16 @@ export function repoIdUrlPath(modelName) {
     .join('/');
 }
 
-export function huggingFaceTreeUrl(modelName) {
+export function huggingFaceTreeUrl(modelName: unknown): string {
   return `https://huggingface.co/api/models/${repoIdUrlPath(modelName)}/tree/main?recursive=true`;
 }
 
-export function huggingFaceResolveUrl(modelName, filePath) {
+export function huggingFaceResolveUrl(modelName: unknown, filePath: unknown): string {
   const encodedPath = normalizeRepoPath(filePath).split('/').map(encodeURIComponent).join('/');
   return `https://huggingface.co/${repoIdUrlPath(modelName)}/resolve/main/${encodedPath}`;
 }
 
-export function shouldDownloadTransformerFile(path, dtype) {
+export function shouldDownloadTransformerFile(path: unknown, dtype: unknown): boolean {
   const normalized = normalizeRepoPath(path);
   if (!normalized || normalized.startsWith('.') || normalized.includes('/.')) return false;
 
@@ -80,7 +91,7 @@ export function shouldDownloadTransformerFile(path, dtype) {
   return normalized.startsWith(`${onnxPath}_data`);
 }
 
-export function selectTransformerModelFiles(entries, dtype) {
+export function selectTransformerModelFiles(entries: unknown, dtype: unknown): SelectedModelFile[] {
   return (Array.isArray(entries) ? entries : [])
     .map((entry) => {
       if (typeof entry === 'string') return { path: normalizeRepoPath(entry), size: 0 };

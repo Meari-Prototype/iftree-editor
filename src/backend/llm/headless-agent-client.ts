@@ -1,18 +1,42 @@
-// @ts-nocheck
 import { spawn } from 'node:child_process';
+import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import type { Interface } from 'node:readline';
 
-function errorFromPayload(payload = {}) {
-  const error = new Error(payload.message || 'Headless Agent request failed');
-  if (payload.name) error.name = payload.name;
-  if (payload.stack) error.stack = payload.stack;
+type RequestPayload = Record<string, unknown>;
+type RequestOptions = { id?: unknown; onEvent?: (event: unknown) => void };
+type PipeChildProcess = ChildProcess & {
+  stdin: NodeJS.WritableStream;
+  stdout: NodeJS.ReadableStream;
+  stderr: NodeJS.ReadableStream;
+};
+
+interface HeadlessAgentClientOptions {
+  processPath?: string;
+  scriptPath?: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  onStderr?: (chunk: string) => void;
+}
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+  onEvent?: (event: unknown) => void;
+}
+
+function errorFromPayload(payload: RequestPayload = {}) {
+  const error = new Error(String(payload.message || 'Headless Agent request failed'));
+  if (payload.name) error.name = String(payload.name);
+  if (payload.stack) (error as { stack?: string }).stack = String(payload.stack);
   return error;
 }
 
-export function createHeadlessAgentClient(options = {}) {
-  const processPath = options.processPath || process.execPath;
+export function createHeadlessAgentClient(options: HeadlessAgentClientOptions = {}) {
+  const processPath = String(options.processPath || process.execPath);
   const scriptPath = options.scriptPath;
   if (!scriptPath) throw new Error('createHeadlessAgentClient requires scriptPath');
+  const resolvedScriptPath = scriptPath;
   const cwd = options.cwd || process.cwd();
   const env = {
     ...process.env,
@@ -20,33 +44,33 @@ export function createHeadlessAgentClient(options = {}) {
     ELECTRON_RUN_AS_NODE: '1',
     IFTREE_HEADLESS_AGENT: '1'
   };
-  let child = null;
-  let lineReader = null;
+  let child: PipeChildProcess | null = null;
+  let lineReader: Interface | null = null;
   let nextId = 1;
-  const pending = new Map();
+  const pending = new Map<string, PendingRequest>();
 
-  function rejectAll(error) {
+  function rejectAll(error: unknown): void {
     for (const item of pending.values()) item.reject(error);
     pending.clear();
   }
 
-  function ensureStarted() {
+  function ensureStarted(): PipeChildProcess {
     if (child && !child.killed && child.exitCode == null) return child;
-    const spawned = spawn(processPath, [scriptPath], {
+    const spawned = spawn(processPath, [resolvedScriptPath], {
       cwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true
-    });
+    } as SpawnOptions) as PipeChildProcess;
     child = spawned;
-    spawned.stderr.on('data', (chunk) => {
+    spawned.stderr.on('data', (chunk: Buffer) => {
       options.onStderr?.(chunk.toString());
     });
-    spawned.on('error', (error) => {
+    spawned.on('error', (error: Error) => {
       if (child !== spawned) return;
       rejectAll(error);
     });
-    spawned.on('exit', (code, signal) => {
+    spawned.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
       if (child !== spawned) return;
       child = null;
       lineReader = null;
@@ -55,38 +79,39 @@ export function createHeadlessAgentClient(options = {}) {
     });
     const reader = createInterface({ input: spawned.stdout, crlfDelay: Infinity });
     lineReader = reader;
-    reader.on('line', (line) => {
+    reader.on('line', (line: string) => {
       if (child !== spawned) return;
       const raw = String(line || '').trim();
       if (!raw) return;
-      let message = null;
+      let message: Record<string, unknown> | null = null;
       try {
-        message = JSON.parse(raw);
+        message = JSON.parse(raw) as Record<string, unknown>;
       } catch (error) {
-        rejectAll(new Error(`Invalid Headless Agent JSON: ${error.message}`));
+        rejectAll(new Error(`Invalid Headless Agent JSON: ${(error as { message?: unknown }).message}`));
         return;
       }
-      const id = message.id == null ? '' : String(message.id);
+      const parsed = message;
+      const id = parsed.id == null ? '' : String(parsed.id);
       const item = pending.get(id);
-      if (message.type === 'agent.stream') {
-        item?.onEvent?.(message.event || {});
+      if (parsed.type === 'agent.stream') {
+        item?.onEvent?.(parsed.event || {});
         return;
       }
       if (!item) return;
-      if (message.type === 'result') {
+      if (parsed.type === 'result') {
         pending.delete(id);
-        item.resolve(message.result);
+        item.resolve(parsed.result);
         return;
       }
-      if (message.type === 'error') {
+      if (parsed.type === 'error') {
         pending.delete(id);
-        item.reject(errorFromPayload(message.error || {}));
+        item.reject(errorFromPayload((parsed.error || {}) as RequestPayload));
       }
     });
     return spawned;
   }
 
-  function request(type, payload = {}, requestOptions = {}) {
+  function request(type: string, payload: unknown = {}, requestOptions: RequestOptions = {}) {
     const running = ensureStarted();
     const id = String(requestOptions.id || nextId++);
     const message = {

@@ -13,7 +13,8 @@ test('db find and keyword/query aliases search the fixture and reject unsupporte
     assert.equal(scopedLines[0], '[IFTreeEditor数据库读写测试样例]');
     // 命中行正文预览按设计截到 30 字（db-shell formatNodeLine：利于挑候选），不再断言全文。
     // 字面检索命中行末尾是命中次数 hit:N（语义检索才是相似度分数），见 docs/reference.md。
-    assert.match(scopedLines[1], /^ {2}1-1-7-1 文本 DBT_SEARCH_ONLY_ONCE.*hit:1 upd:/);
+    // 多词 AND 命中行还附 terms:命中词数/查询词数（单词查询为 1/1）。
+    assert.match(scopedLines[1], /^ {2}1-1-7-1 文本 DBT_SEARCH_ONLY_ONCE.*hit:1 terms:1\/1 upd:/);
     assert.match(scopedLines[2], /^— 命中 1 节点 \/ 1 文档/);
 
     const allDocs = stdoutOf(await runBashDb(dbPath, ['find', 'DBT_SEARCH_ONLY_ONCE', '--all-docs', '--uuid'], commandOptions));

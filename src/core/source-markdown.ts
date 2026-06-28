@@ -1,5 +1,63 @@
 import { splitSentenceSpans } from './sentence-split.js';
 import { appendSpans } from './source-spans.js';
+import type { SourceSpanRecord } from './source-spans.js';
+
+// ─── 解析中间产物形状（非 DB 行，纯内存）──────
+interface LineRange { start: number; end: number; }
+interface Line extends LineRange { text: string; }
+interface TableCell extends LineRange { text?: string; }
+interface TableCellWithText extends LineRange { text: string; }
+interface TableRow extends LineRange { separator: boolean; cells: TableCell[]; }
+interface SourceBlock {
+  type: string;
+  start: number;
+  end: number;
+  contentStart?: number;
+  contentEnd?: number;
+  level?: number;       // heading
+  language?: string;    // code
+  text?: string;        // code / math / heading
+  alt?: string;         // image
+  src?: string;         // image
+  lines?: Array<LineRange | null>;  // paragraph / blockquote / code（code 含空行 null）
+  items?: LineRange[];  // list
+  rows?: TableRow[];    // table / html_table
+}
+interface SourceDocument {
+  sourcePath: string | null;
+  sourceType: string;
+  rawMarkdown: string;
+  blocks: SourceBlock[];
+  spans: SourceSpanRecord[];
+}
+// 外部入参可能是 DB source_documents 行（snake）或已构建的 SourceDocument。
+type SourceDocumentLike = Partial<SourceDocument> & { raw_markdown?: string };
+interface StructureRecord {
+  address: string;
+  text: string;
+  nodeType: string;
+  trustLevel: unknown;
+  sourcePosition: number | null;
+  role: string;
+  skipVector: boolean;
+  vector: number[] | null;
+  index?: number;
+  indexes?: number[];
+  [key: string]: unknown;
+}
+interface RecordPatch {
+  text?: string;
+  nodeType?: string;
+  trustLevel?: unknown;
+  sourcePosition?: number | null;
+  role?: string;
+  skipVector?: boolean;
+  vector?: number[] | null;
+  index?: number | null;
+  indexes?: number[];
+}
+interface StructureOptions { granularity?: string; }
+interface SpanOptions { blocks?: SourceBlock[]; hardLineBreaks?: boolean; }
 
 export function normalizeSourceMarkdown(markdown: unknown) {
   return String(markdown || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
@@ -28,14 +86,14 @@ export function buildSourceDocument({ sourcePath = null, sourceType = 'md', rawM
   };
 }
 
-export function inspectMarkdownStructure(sourceDocumentOrMarkdown: any) {
-  const sourceDocument = typeof sourceDocumentOrMarkdown === 'string'
+export function inspectMarkdownStructure(sourceDocumentOrMarkdown: string | SourceDocumentLike) {
+  const sourceDocument: SourceDocumentLike = typeof sourceDocumentOrMarkdown === 'string'
     ? buildSourceDocument({ rawMarkdown: sourceDocumentOrMarkdown })
     : sourceDocumentOrMarkdown;
   const rawMarkdown = normalizeSourceMarkdown(sourceDocument?.rawMarkdown || sourceDocument?.raw_markdown || '');
   const blocks = sourceDocument?.blocks || parseSourceMarkdownBlocks(rawMarkdown);
-  const headings = blocks.filter((block: any) => block.type === 'heading');
-  const hasContentStructure = blocks.some((block: any) => block.type !== 'heading');
+  const headings = blocks.filter((block) => block.type === 'heading');
+  const hasContentStructure = blocks.some((block) => block.type !== 'heading');
   return {
     blockCount: blocks.length,
     headingCount: headings.length,
@@ -43,8 +101,8 @@ export function inspectMarkdownStructure(sourceDocumentOrMarkdown: any) {
   };
 }
 
-export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, options: any = {}) {
-  const sourceDocument = typeof sourceDocumentOrMarkdown === 'string'
+export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: string | SourceDocumentLike, options: StructureOptions = {}) {
+  const sourceDocument: SourceDocumentLike = typeof sourceDocumentOrMarkdown === 'string'
     ? buildSourceDocument({ rawMarkdown: sourceDocumentOrMarkdown })
     : sourceDocumentOrMarkdown;
   const rawMarkdown = normalizeSourceMarkdown(sourceDocument?.rawMarkdown || sourceDocument?.raw_markdown || '');
@@ -52,7 +110,7 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
   const spans = sourceDocument?.spans || sourceSpansFromMarkdown(rawMarkdown, { blocks });
   const spanReader = createSpanRangeReader(spans);
   const granularity = options.granularity === 'paragraph' ? 'paragraph' : 'sentence';
-  const records: any[] = [];
+  const records: StructureRecord[] = [];
   const counters = new Map<string, number>();
   const headingStack: { level: number; address: string }[] = [];
 
@@ -63,9 +121,9 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
     return key ? `${key}-${next}` : String(next);
   }
 
-  function addRecord(parentAddress: string, patch: any) {
+  function addRecord(parentAddress: string, patch: RecordPatch) {
     const address = nextAddress(parentAddress);
-    const record: any = {
+    const record: StructureRecord = {
       address,
       text: patch.text || '',
       nodeType: patch.nodeType || 'TEXT',
@@ -85,10 +143,10 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
     return headingStack.at(-1)?.address || '';
   }
 
-  function addHeading(block: any) {
+  function addHeading(block: SourceBlock) {
     const level = Math.max(1, Number(block.level) || 1);
     while (headingStack.length > 0 && headingStack.at(-1)!.level >= level) headingStack.pop();
-    const headingSpans = spanReader(block.contentStart, block.contentEnd);
+    const headingSpans = spanReader(block.contentStart ?? block.start, block.contentEnd ?? block.end);
     const firstSpan = headingSpans[0] || null;
     const record = addRecord(currentParentAddress(), {
       text: headingText(block, rawMarkdown),
@@ -107,7 +165,7 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
       addRecord(currentParentAddress(), {
         text: rawMarkdown.slice(start, end).trim(),
         index: Number.isFinite(firstIndex) ? firstIndex : null,
-        indexes: paragraphSpans.map((span: any) => span.sentence_index),
+        indexes: paragraphSpans.map((span) => span.sentence_index),
         sourcePosition: Number.isFinite(firstIndex) ? firstIndex - 0.5 : null,
         role: 'paragraph'
       });
@@ -116,7 +174,7 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
     const paragraph = addRecord(currentParentAddress(), {
       text: '',
       index: Number.isFinite(firstIndex) ? firstIndex : null,
-      indexes: paragraphSpans.map((span: any) => span.sentence_index),
+      indexes: paragraphSpans.map((span) => span.sentence_index),
       sourcePosition: Number.isFinite(firstIndex) ? firstIndex - 0.5 : null,
       role: 'paragraph',
       skipVector: true
@@ -141,13 +199,14 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
         skipVector: true
       });
     } else if (block.type === 'paragraph' || block.type === 'blockquote') {
-      const lines = block.lines || [];
+      const lines = (block.lines || []).filter((l): l is LineRange => l != null);
       if (lines.length > 0) addParagraphFromRange(lines[0].start, lines[lines.length - 1].end);
     } else if (block.type === 'list') {
       for (const item of block.items || []) addParagraphFromRange(item.start, item.end);
     } else if (block.type === 'table' || block.type === 'html_table') {
-      const hasHeaderSeparator = block.rows[1]?.separator === true;
-      const rows = hasHeaderSeparator ? block.rows.slice(2) : block.rows;
+      const allRows = block.rows || [];
+      const hasHeaderSeparator = allRows[1]?.separator === true;
+      const rows = hasHeaderSeparator ? allRows.slice(2) : allRows;
       for (const row of rows) {
         if (row.separator) continue;
         const cells = row.cells || [];
@@ -172,11 +231,11 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
 
   return records;
 
-  function addTextCodeParagraphs(block: any) {
-    let group: any[] = [];
+  function addTextCodeParagraphs(block: SourceBlock) {
+    let group: LineRange[] = [];
     function flush() {
       if (group.length > 0) {
-        addParagraphFromRange(group[0].start, group.at(-1).end);
+        addParagraphFromRange(group[0].start, group[group.length - 1].end);
         group = [];
       }
     }
@@ -191,10 +250,10 @@ export function buildMarkdownStructureRecords(sourceDocumentOrMarkdown: any, opt
   }
 }
 
-export function sourceSpansFromMarkdown(markdown: string, options: any = {}) {
+export function sourceSpansFromMarkdown(markdown: string, options: SpanOptions = {}) {
   const rawMarkdown = normalizeSourceMarkdown(markdown);
   const blocks = options.blocks || parseSourceMarkdownBlocks(rawMarkdown);
-  const spans: any[] = [];
+  const spans: SourceSpanRecord[] = [];
 
   function addRange(start: number, end: number) {
     const segment = rawMarkdown.slice(start, end);
@@ -215,16 +274,17 @@ export function sourceSpansFromMarkdown(markdown: string, options: any = {}) {
 
   for (const block of blocks) {
     if (block.type === 'heading') {
-      addExactRange(block.contentStart, block.contentEnd);
+      addExactRange(block.contentStart ?? block.start, block.contentEnd ?? block.end);
     } else if (block.type === 'math') {
-      addExactRange(block.contentStart, block.contentEnd);
+      addExactRange(block.contentStart ?? block.start, block.contentEnd ?? block.end);
     } else if (block.type === 'paragraph' || block.type === 'blockquote') {
       addLinesRange(block.lines);
     } else if (block.type === 'list') {
       for (const item of block.items || []) addRange(item.start, item.end);
     } else if (block.type === 'table' || block.type === 'html_table') {
-      const hasHeaderSeparator = block.rows[1]?.separator === true;
-      const rows = hasHeaderSeparator ? block.rows.slice(2) : block.rows;
+      const allRows = block.rows || [];
+      const hasHeaderSeparator = allRows[1]?.separator === true;
+      const rows = hasHeaderSeparator ? allRows.slice(2) : allRows;
       for (const row of rows) {
         if (row.separator) continue;
         for (const cell of row.cells) addRange(cell.start, cell.end);
@@ -236,16 +296,17 @@ export function sourceSpansFromMarkdown(markdown: string, options: any = {}) {
 
   return spans;
 
-  function addLinesRange(lines: any) {
-    if (!lines?.length) return;
-    addRange(lines[0].start, lines[lines.length - 1].end);
+  function addLinesRange(lines: Array<LineRange | null> | null | undefined) {
+    const arr = (lines || []).filter((l): l is LineRange => l != null);
+    if (!arr.length) return;
+    addRange(arr[0].start, arr[arr.length - 1].end);
   }
 }
 
 export function parseSourceMarkdownBlocks(markdown: string) {
   const rawMarkdown = normalizeSourceMarkdown(markdown);
   const lines = collectLines(rawMarkdown);
-  const blocks: any[] = [];
+  const blocks: SourceBlock[] = [];
   let index = 0;
 
   while (index < lines.length) {
@@ -259,7 +320,7 @@ export function parseSourceMarkdownBlocks(markdown: string) {
     if (isFenceStart(trimmed)) {
       const fence = trimmed.slice(0, 3);
       const startLine = line;
-      const codeLines: any[] = [];
+      const codeLines: Array<LineRange | null> = [];
       index += 1;
       while (index < lines.length && !lines[index].text.trim().startsWith(fence)) {
         codeLines.push(trimLineRange(lines[index]));
@@ -315,7 +376,7 @@ export function parseSourceMarkdownBlocks(markdown: string) {
     }
 
     if (isTableStart(lines, index)) {
-      const rows: any[] = [];
+      const rows: TableRow[] = [];
       const start = line.start;
       let end = line.end;
       while (index < lines.length && lines[index].text.trim() && lines[index].text.includes('|')) {
@@ -329,7 +390,7 @@ export function parseSourceMarkdownBlocks(markdown: string) {
     }
 
     if (listItemRange(line)) {
-      const items: any[] = [];
+      const items: LineRange[] = [];
       const start = line.start;
       let end = line.end;
       while (index < lines.length) {
@@ -344,7 +405,7 @@ export function parseSourceMarkdownBlocks(markdown: string) {
     }
 
     if (trimmed.startsWith('>')) {
-      const quoteLines: any[] = [];
+      const quoteLines: LineRange[] = [];
       const start = line.start;
       let end = line.end;
       while (index < lines.length && lines[index].text.trim().startsWith('>')) {
@@ -359,7 +420,7 @@ export function parseSourceMarkdownBlocks(markdown: string) {
       continue;
     }
 
-    const paragraphLines: any[] = [];
+    const paragraphLines: LineRange[] = [];
     const start = line.start;
     let end = line.end;
     while (index < lines.length && isParagraphLine(lines, index)) {
@@ -374,8 +435,8 @@ export function parseSourceMarkdownBlocks(markdown: string) {
   return blocks;
 }
 
-function collectLines(markdown: string) {
-  const lines: any[] = [];
+function collectLines(markdown: string): Line[] {
+  const lines: Line[] = [];
   let start = 0;
 
   while (start <= markdown.length) {
@@ -394,7 +455,7 @@ function isFenceStart(trimmed: string) {
   return trimmed.startsWith('```') || trimmed.startsWith('~~~');
 }
 
-function mathBlock(lines: any[], index: number, rawMarkdown: string) {
+function mathBlock(lines: Line[], index: number, rawMarkdown: string) {
   const line = lines[index];
   const trimmed = line.text.trim();
   const open = trimmed.startsWith('$$') ? '$$' : (trimmed.startsWith('\\[') ? '\\[' : null);
@@ -444,7 +505,7 @@ function mathBlock(lines: any[], index: number, rawMarkdown: string) {
   };
 }
 
-function headingBlock(line: any) {
+function headingBlock(line: Line) {
   const match = line.text.match(/^(\s*)(#{1,6})(\s+)(.+?)\s*$/);
   if (!match) return null;
   const markerLength = match[1].length + match[2].length + match[3].length;
@@ -462,12 +523,12 @@ function headingBlock(line: any) {
   };
 }
 
-function createSpanRangeReader(spans: any[]) {
-  const sorted = [...(spans || [])].sort((a: any, b: any) => a.start_offset - b.start_offset || a.sentence_index - b.sentence_index);
+function createSpanRangeReader(spans: SourceSpanRecord[]) {
+  const sorted = [...(spans || [])].sort((a, b) => a.start_offset - b.start_offset || a.sentence_index - b.sentence_index);
   let cursor = 0;
   return (start: number, end: number) => {
     while (cursor < sorted.length && sorted[cursor].end_offset <= start) cursor += 1;
-    const result: any[] = [];
+    const result: SourceSpanRecord[] = [];
     let idx = cursor;
     while (idx < sorted.length && sorted[idx].start_offset < end) {
       const span = sorted[idx];
@@ -478,14 +539,14 @@ function createSpanRangeReader(spans: any[]) {
   };
 }
 
-function isPlainTextCodeBlock(block: any) {
+function isPlainTextCodeBlock(block: SourceBlock) {
   const language = String(block?.language || '').trim().toLowerCase();
   return language === 'text' || language === 'txt' || language === 'plain' || language === 'plaintext';
 }
 
-function paragraphLineGroups(lines: any[]) {
-  const groups: any[][] = [];
-  let group: any[] = [];
+function paragraphLineGroups(lines: Array<LineRange | null>) {
+  const groups: LineRange[][] = [];
+  let group: LineRange[] = [];
   for (const line of lines || []) {
     if (!line) {
       if (group.length > 0) groups.push(group);
@@ -498,7 +559,7 @@ function paragraphLineGroups(lines: any[]) {
   return groups;
 }
 
-function headingText(block: any, rawMarkdown: string) {
+function headingText(block: SourceBlock, rawMarkdown: string) {
   if (block.text) return block.text;
   if (block.contentStart != null && block.contentEnd != null) {
     return rawMarkdown.slice(block.contentStart, block.contentEnd).trim();
@@ -506,12 +567,12 @@ function headingText(block: any, rawMarkdown: string) {
   return rawMarkdown.slice(block.start, block.end).trim();
 }
 
-function fencedCodeText(block: any) {
+function fencedCodeText(block: SourceBlock) {
   const fence = block.language ? `\`\`\`${block.language}` : '```';
   return `${fence}\n${block.text || ''}\n\`\`\``;
 }
 
-function imageBlock(line: any) {
+function imageBlock(line: Line) {
   const trimmed = line.text.trim();
   const match = trimmed.match(/^!\[([^\]]*)\]\(([^)]+)\)\s*$/);
   if (!match) return null;
@@ -524,7 +585,7 @@ function imageBlock(line: any) {
   };
 }
 
-function htmlTableBlock(lines: any[], index: number, rawMarkdown: string) {
+function htmlTableBlock(lines: Line[], index: number, rawMarkdown: string) {
   const line = lines[index];
   if (!/^<table\b/i.test(line.text.trim())) return null;
   let endIndex = index;
@@ -541,7 +602,7 @@ function htmlTableBlock(lines: any[], index: number, rawMarkdown: string) {
 
 function htmlTableRows(rawMarkdown: string, start: number, end: number) {
   const html = rawMarkdown.slice(start, end);
-  const rows: any[] = [];
+  const rows: TableRow[] = [];
   const rowPattern = /<tr\b[^>]*>[\s\S]*?<\/tr>/gi;
   for (const rowMatch of html.matchAll(rowPattern)) {
     const rowStart = start + rowMatch.index;
@@ -558,7 +619,7 @@ function htmlTableRows(rawMarkdown: string, start: number, end: number) {
 
 function htmlCellsForRange(rawMarkdown: string, start: number, end: number) {
   const html = rawMarkdown.slice(start, end);
-  const cells: any[] = [];
+  const cells: TableCell[] = [];
   const cellPattern = /<t[dh]\b[^>]*>[\s\S]*?<\/t[dh]>/gi;
   for (const cellMatch of html.matchAll(cellPattern)) {
     const opening = cellMatch[0].match(/^<t[dh]\b[^>]*>/i)?.[0] || '';
@@ -570,7 +631,7 @@ function htmlCellsForRange(rawMarkdown: string, start: number, end: number) {
   return cells;
 }
 
-function isTableStart(lines: any[], index: number) {
+function isTableStart(lines: Line[], index: number) {
   const current = lines[index]?.text || '';
   const next = lines[index + 1]?.text || '';
   return current.includes('|') && isTableSeparatorLine(next);
@@ -578,11 +639,11 @@ function isTableStart(lines: any[], index: number) {
 
 function isTableSeparatorLine(line: string) {
   const cells = splitTableCells(String(line || ''));
-  return cells.length > 0 && cells.every((cell: any) => /^:?-{3,}:?$/.test(cell.text.trim()));
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.text.trim()));
 }
 
-function tableRow(line: any) {
-  const cells = splitTableCells(line.text).map((cell: any) => ({
+function tableRow(line: Line): TableRow {
+  const cells = splitTableCells(line.text).map((cell) => ({
     ...cell,
     start: line.start + cell.start,
     end: line.start + cell.end
@@ -590,14 +651,14 @@ function tableRow(line: any) {
   return {
     start: line.start,
     end: line.end,
-    separator: cells.length > 0 && cells.every((cell: any) => /^:?-{3,}:?$/.test(cell.text.trim())),
+    separator: cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.text.trim())),
     cells
   };
 }
 
-function splitTableCells(lineText: string) {
+function splitTableCells(lineText: string): TableCellWithText[] {
   const raw = String(lineText || '');
-  const cells: any[] = [];
+  const cells: TableCellWithText[] = [];
   let segmentStart = 0;
   for (let idx = 0; idx <= raw.length; idx += 1) {
     if (idx !== raw.length && raw[idx] !== '|') continue;
@@ -611,7 +672,7 @@ function splitTableCells(lineText: string) {
   return cells;
 }
 
-function listItemRange(line: any) {
+function listItemRange(line: Line) {
   const match = line.text.match(/^(\s*)(?:[-*+•]\s+|\d+[.)]\s+)(.*)$/);
   if (!match) return null;
   const contentStart = line.start + match[0].length - match[2].length;
@@ -619,7 +680,7 @@ function listItemRange(line: any) {
   return range ? { start: range.start, end: range.end } : null;
 }
 
-function isParagraphLine(lines: any[], index: number) {
+function isParagraphLine(lines: Line[], index: number) {
   const line = lines[index];
   const trimmed = line.text.trim();
   if (!trimmed) return false;
@@ -635,7 +696,7 @@ function isParagraphLine(lines: any[], index: number) {
   return true;
 }
 
-function trimLineRange(line: any) {
+function trimLineRange(line: Line) {
   return trimAbsoluteRange(line.text, line.start, line.end);
 }
 

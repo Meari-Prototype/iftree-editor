@@ -1,8 +1,24 @@
-// @ts-nocheck
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useEffect, useRef } from 'react';
+import type { ReactNode } from 'react';
 
 import { depthOf, hasKnownChildren } from '../lib/doc-utils.js';
+
+interface OutlineTreeNode {
+  id?: unknown;
+  address?: unknown;
+  text?: ReactNode;
+  children?: OutlineTreeNode[];
+  [extra: string]: unknown;
+}
+
+interface OutlineNodeProps {
+  node: OutlineTreeNode;
+  selectedNodeId?: unknown;
+  collapsedOutlineNodeIds: Set<unknown>;
+  onToggle: (id: unknown) => void;
+  onSelect: (id: unknown) => void;
+}
 
 // 父节点驻留靠原生 position: sticky：每个节点一个 wrapper（行 + 子树），
 // 展开的父行按深度阶梯钉在容器顶部，子树滚完由 wrapper 底边把行推走，
@@ -19,10 +35,10 @@ function OutlineNode({
   collapsedOutlineNodeIds,
   onToggle,
   onSelect
-}) {
-  const hasChildren = hasKnownChildren(node);
+}: OutlineNodeProps) {
+  const hasChildren = hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]);
   const collapsedOutline = collapsedOutlineNodeIds.has(node.id);
-  const depth = depthOf(node.address);
+  const depth = depthOf(String(node.address ?? ''));
   const sticky = hasChildren && !collapsedOutline && depth <= OUTLINE_STICKY_MAX_DEPTH;
   return (
     <div className="outline-node">
@@ -51,12 +67,12 @@ function OutlineNode({
             <span className="outline-toggle-spacer" />
           )}
         </span>
-        <code>{node.address}</code>
-        <span>{node.text || '空节点'}</span>
+        <code>{String(node.address ?? '')}</code>
+        <span>{(node.text as ReactNode) || '空节点'}</span>
       </button>
-      {!collapsedOutline && (node.children || []).map((child) => (
+      {!collapsedOutline && (node.children || []).map((child: OutlineTreeNode) => (
         <OutlineNode
-          key={child.id}
+          key={String(child.id ?? '')}
           node={child}
           selectedNodeId={selectedNodeId}
           collapsedOutlineNodeIds={collapsedOutlineNodeIds}
@@ -74,15 +90,21 @@ export function OutlinePanel({
   collapsedOutlineNodeIds,
   onToggle,
   onSelect
+}: {
+  tree?: OutlineTreeNode | null;
+  selectedNodeId?: unknown;
+  collapsedOutlineNodeIds?: Set<unknown>;
+  onToggle?: (id: unknown) => void;
+  onSelect?: (id: unknown) => void;
 }) {
-  const listRef = useRef(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
   // 滚轮一格滚一行，且始终停在行格上：行格对齐后驻留底边永远贴着下一行
   // 的顶边，不出现被切一半的行。React 的 onWheel 是 passive 的，拦不住
   // 默认滚动，这里手动挂 non-passive 监听。
   useEffect(() => {
     const element = listRef.current;
     if (!element) return undefined;
-    const onWheel = (event) => {
+    const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       const direction = Math.sign(event.deltaY);
       if (!direction) return;
@@ -98,11 +120,11 @@ export function OutlinePanel({
     <section className="panel outline-panel">
       <header className="panel-header">目录</header>
       <div className="outline-list" ref={listRef}>
-        {tree && (
+        {tree && onToggle && onSelect && (
           <OutlineNode
             node={tree}
             selectedNodeId={selectedNodeId}
-            collapsedOutlineNodeIds={collapsedOutlineNodeIds}
+            collapsedOutlineNodeIds={collapsedOutlineNodeIds ?? new Set()}
             onToggle={onToggle}
             onSelect={onSelect}
           />

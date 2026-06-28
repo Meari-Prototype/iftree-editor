@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { handleStreamMutation } from '../handlers/write/doc.js';
 import {
   createMemoryVolume,
@@ -6,11 +5,25 @@ import {
   findSessionVolume,
   markMemoryVolumeDistilled
 } from './volumes.js';
+import type { IftreeStore } from '../store/index.js';
+
+type MemoryPayload = Record<string, unknown>;
+type MemoryNode = Record<string, unknown> & { children?: MemoryNode[] };
+type EffectList = Array<Record<string, unknown>>;
+
+interface MemoryMutationContext {
+  writeMemoryAnchor?: (payload: Record<string, unknown>) => unknown;
+  sessionVolumeNodes?: (hostAnchor: unknown) => MemoryNode[];
+  isVectorModuleEnabled?: () => boolean;
+  // mutation-api 的 MutationContext 带 [extra: string]: unknown 索引签名（refreshDoc 等其他字段
+  // 也走这里），需对得上才能直传 ctx。
+  [extra: string]: unknown;
+}
 
 // 建卷与节点写入不在同一事务（push 的事务在 store 内自管），先把最常见的违约拦在建卷前，
 // 避免写入失败留下空卷。
-function assertDeliverNodes(items) {
-  for (const item of items || []) {
+function assertDeliverNodes(items: MemoryNode[] | unknown): void {
+  for (const item of ((items || []) as MemoryNode[])) {
     const trust = item?.trust_level ?? item?.trustLevel ?? null;
     if (trust !== '不受控') {
       throw new Error('事件卷节点必须显式 trust_level=不受控（projectneed 15-10-3）');
@@ -21,7 +34,11 @@ function assertDeliverNodes(items) {
 }
 
 // 15-10-4：记忆卷落库即建库内实体锚；建不出就删掉刚建的卷、拒绝创建无锚卷（无锚即拒）。
-function anchorMemoryVolumeOrRollback(store, ctx, { docId, agent, sessionId, hostAnchor }) {
+function anchorMemoryVolumeOrRollback(
+  store: IftreeStore,
+  ctx: MemoryMutationContext,
+  { docId, agent, sessionId, hostAnchor }: Record<string, unknown>
+): void {
   if (typeof ctx?.writeMemoryAnchor !== 'function') {
     store.deleteDoc(docId);
     throw new Error('当前写入上下文未提供记忆卷建锚能力，拒绝创建无锚卷（projectneed 15-10-4）。');
@@ -31,10 +48,10 @@ function anchorMemoryVolumeOrRollback(store, ctx, { docId, agent, sessionId, hos
   } catch (error) {
     // 结构非法（锚落占位 _local / unknown-agent）：锚已建、卷已完整落库——不回滚，把报错冒泡引导用户
     // 迁移到正确工作区，或删除对象后用运维工具清理（projectneed 15-10-4 多租户隔离）。
-    if (error?.illegalMemoryLayout) throw error;
+    if ((error as { illegalMemoryLayout?: unknown } | null | undefined)?.illegalMemoryLayout) throw error;
     // 其余建锚失败（symlink 建不出等）仍回滚删卷（无锚即拒）。
     store.deleteDoc(docId);
-    throw new Error(`记忆卷建锚失败、已回滚（projectneed 15-10-4 非导航文档必有库内实体锚）：${error?.message || error}`);
+    throw new Error(`记忆卷建锚失败、已回滚（projectneed 15-10-4 非导航文档必有库内实体锚）：${(error as { message?: unknown } | null | undefined)?.message || error}`);
   }
 }
 
@@ -42,7 +59,7 @@ function anchorMemoryVolumeOrRollback(store, ctx, { docId, agent, sessionId, hos
 // deliverVolume = 一 session 一卷：纯规则解析 hostAnchor 指向的 session 文件成卷节点（不收 agent 复述），
 // 旧卷全删 + 完整重新导入。session 只追加 + 解析确定 → 节点位置恒常不变，「全删 + 重导」≡「增量追加」却
 // 甩掉声明地址 / 幂等键 / 抢锚那一摊（15-10-1）。节点写入复用 stream.push 同一条链（FTS/向量增量随行）。
-export async function handleMemoryMutation(store, payload, ctx, action, effects) {
+export async function handleMemoryMutation(store: IftreeStore, payload: MemoryPayload, ctx: MemoryMutationContext, action: string, effects: EffectList) {
   if (action === 'memory.deliverVolume') {
     // 请求级防抖：只抵消同一次请求的网络重试（省去无谓的重复重导）；同 session 的去重由下方身份兜底。
     const dedupeKey = payload.idempotencyKey ?? payload.idempotency_key ?? null;
@@ -66,7 +83,7 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
     // 抢锚那一摊（15-10-1）。封卷无需特判：session 文件停止增长后重导结果不再变，天然终态。
     const existing = findSessionVolume(store, { agent, sessionId });
     if (existing) {
-      store.db.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(existing.docId);
+      store.db!.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(existing.docId);
       store.deleteDoc(existing.docId);
     }
 
@@ -84,14 +101,17 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
       nodes,
       embed: payload.embed === true
     }, ctx, 'stream.push', effects);
+    // handleStreamMutation 是 union（stream.push/bulkBegin/bulkEnd/attachSource 各 variant），
+    // 我们 action='stream.push' 时回来的一定是 push variant，但 TS 看不出来——用 Record 视图取字段。
+    const pushedView = pushed as Record<string, unknown>;
     const result = {
       ok: true,
       action,
       docId: created.docId,
       title: created.title,
       volume: created.volume,
-      createdCount: pushed.createdCount,
-      created: pushed.created,
+      createdCount: pushedView.createdCount,
+      created: pushedView.created,
       overwrote: existing ? existing.docId : null,
       refresh: { kind: 'doc', docId: created.docId },
       sideEffects: effects
@@ -139,7 +159,7 @@ export async function handleMemoryMutation(store, payload, ctx, action, effects)
       action,
       docId,
       createdVolume,
-      createdCount: pushed.createdCount,
+      createdCount: (pushed as Record<string, unknown>).createdCount,
       refresh: { kind: 'doc', docId },
       sideEffects: effects
     };

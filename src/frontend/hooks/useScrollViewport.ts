@@ -1,13 +1,13 @@
-// @ts-nocheck
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { UIEvent } from 'react';
 
 export function useScrollViewport(defaultHeight = 800) {
-  const scrollRef = useRef(null);
+  const scrollRef = useRef<HTMLElement | null>(null);
   const frameRef = useRef(0);
-  const scheduledElementRef = useRef(null);
+  const scheduledElementRef = useRef<HTMLElement | null>(null);
   const [viewport, setViewport] = useState({ scrollTop: 0, height: defaultHeight });
 
-  const read = useCallback((element = scrollRef.current) => {
+  const read = useCallback((element: HTMLElement | null = scrollRef.current) => {
     if (!element) return;
     const next = {
       scrollTop: Math.round(element.scrollTop || 0),
@@ -18,7 +18,7 @@ export function useScrollViewport(defaultHeight = 800) {
     ));
   }, [defaultHeight]);
 
-  const schedule = useCallback((element = scrollRef.current) => {
+  const schedule = useCallback((element: HTMLElement | null = scrollRef.current) => {
     if (!element) return;
     scheduledElementRef.current = element;
     if (frameRef.current) return;
@@ -30,7 +30,7 @@ export function useScrollViewport(defaultHeight = 800) {
     });
   }, [read]);
 
-  const onScroll = useCallback((event) => {
+  const onScroll = useCallback((event: UIEvent<HTMLElement>) => {
     schedule(event.currentTarget);
   }, [schedule]);
 

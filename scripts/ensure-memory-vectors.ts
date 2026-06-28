@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 批量为「记忆卷」补建语义向量：一个 headless host 内遍历所有带 memoryVolume meta 的
 // 文档逐个 vector.ensureDoc，避免逐 doc 冷启 host 的开销。知识文档/压测语料不在范围内。
 // 用法：配好 IFTREE_EMBED_* 后 `electron scripts/ensure-memory-vectors.mjs`。
@@ -12,20 +11,30 @@ import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-cli
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const dbPath = process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite');
 
-function listMemoryDocs() {
+interface MemoryDocRow {
+  id: string;
+  title?: unknown;
+}
+
+interface EnsureDocResult {
+  missingInserted?: unknown;
+  vectorCountAfter?: unknown;
+}
+
+function listMemoryDocs(): MemoryDocRow[] {
   const db = new Database(dbPath, { readonly: true });
   try {
     return db
       .prepare(
         "SELECT id, title FROM docs WHERE json_extract(meta,'$.memoryVolume') IS NOT NULL ORDER BY created_at"
       )
-      .all();
+      .all() as unknown as MemoryDocRow[];
   } finally {
     db.close();
   }
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.versions.electron) {
     try {
       const { app } = await import('electron');
@@ -52,7 +61,7 @@ async function main() {
   try {
     for (const doc of docs) {
       try {
-        const result = await client.request('vector.ensureDoc', { payload: { docId: doc.id } });
+        const result = await client.request('vector.ensureDoc', { payload: { docId: doc.id } }) as EnsureDocResult;
         const add = Number(result?.missingInserted) || 0;
         inserted += add;
         done += 1;
@@ -60,9 +69,9 @@ async function main() {
         console.log(
           `[${done}/${docs.length}] +${add} (after=${result?.vectorCountAfter}) ${doc.id} ${title}`
         );
-      } catch (err) {
+      } catch (err: unknown) {
         failed += 1;
-        console.error(`[x] ${doc.id}: ${err?.message || err}`);
+        console.error(`[x] ${doc.id}: ${(err as { message?: string } | null | undefined)?.message || err}`);
       }
     }
     console.log(
@@ -76,7 +85,7 @@ async function main() {
 
 main()
   .then(() => exitProcess(0))
-  .catch(async (error) => {
-    console.error(error?.stack || error?.message || String(error));
+  .catch(async (error: unknown) => {
+    console.error((error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || String(error));
     await exitProcess(1);
   });

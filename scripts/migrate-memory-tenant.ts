@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 一次性迁移：给记忆区补租户层，修复多租户隔离（projectneed 15-10-4）。
 //  现状非法：事件卷锚直挂 .memory/<工作区>/（缺租户层）、长期核心记忆 memory/<x>.md（缺租户目录层）。
 //  迁移目标：.memory/<工作区>/<会话> → .memory/<租户>/<工作区>/<会话>（租户=该卷的 agent）；
@@ -20,7 +19,19 @@ const MEMORY_DIR = join(LIBRARY_ROOT, '.memory');
 const LONGTERM_DIR = join(LIBRARY_ROOT, 'memory');
 const SEP_MEM = `${sep}.memory${sep}`;
 
-function isSymlink(p) {
+interface MemoryTenantVolumeRow {
+  id: string;
+  agent?: unknown;
+  p: string;
+}
+
+interface LongtermPlan {
+  from: string;
+  to: string;
+  docId: unknown;
+}
+
+function isSymlink(p: string) {
   try { return lstatSync(p).isSymbolicLink(); } catch { return false; }
 }
 
@@ -31,12 +42,12 @@ async function main() {
       FROM docs d JOIN source_documents s ON s.doc_id = d.id
      WHERE json_extract(d.meta,'$.memoryVolume') IS NOT NULL AND s.original_path IS NOT NULL
      ORDER BY s.original_path
-  `).all();
+  `).all() as unknown as MemoryTenantVolumeRow[];
   const updatePath = db.prepare('UPDATE source_documents SET original_path = ? WHERE doc_id = ?');
   // 现有 agent 集 = 合法租户名；.memory 下第一段已是租户名的卷视为已合法、跳过。
   const tenants = new Set(volumes.map((v) => String(v.agent || '')).filter(Boolean));
 
-  const plan = [];
+  const plan: Array<{ id: string; oldPath: string; newPath: string }> = [];
   for (const v of volumes) {
     const agent = String(v.agent || '').trim();
     if (!agent) continue;
@@ -49,14 +60,14 @@ async function main() {
   }
 
   // 长期核心记忆：memory/<x>.md（直挂文件）→ memory/<x>/CLAUDE.md；同步可能存在的 DB 锚。
-  const longterm = [];
+  const longterm: LongtermPlan[] = [];
   if (existsSync(LONGTERM_DIR)) {
     for (const e of readdirSync(LONGTERM_DIR, { withFileTypes: true })) {
       if (e.isFile() && e.name.toLowerCase().endsWith('.md')) {
         const tenant = e.name.replace(/\.md$/i, '');
         const from = join(LONGTERM_DIR, e.name);
         const to = join(LONGTERM_DIR, tenant, 'CLAUDE.md');
-        const docRow = db.prepare('SELECT doc_id FROM source_documents WHERE original_path = ?').get(from);
+        const docRow = db.prepare('SELECT doc_id FROM source_documents WHERE original_path = ?').get(from) as { doc_id?: unknown } | undefined;
         longterm.push({ from, to, docId: docRow?.doc_id || null });
       }
     }
@@ -89,9 +100,9 @@ async function main() {
       if (existsSync(p.oldPath) || isSymlink(p.oldPath)) renameSync(p.oldPath, p.newPath);
       updatePath.run(p.newPath, p.id);
       done += 1;
-    } catch (error) {
+    } catch (error: unknown) {
       failed += 1;
-      console.error(`[x] ${p.id}: ${error.message}`);
+      console.error(`[x] ${p.id}: ${(error as { message?: string }).message}`);
     }
   }
   for (const l of longterm) {
@@ -99,8 +110,8 @@ async function main() {
       mkdirSync(dirname(l.to), { recursive: true });
       if (existsSync(l.from)) renameSync(l.from, l.to);
       if (l.docId) updatePath.run(l.to, l.docId);
-    } catch (error) {
-      console.error(`[x] longterm ${l.from}: ${error.message}`);
+    } catch (error: unknown) {
+      console.error(`[x] longterm ${l.from}: ${(error as { message?: string }).message}`);
     }
   }
   for (const e of readdirSync(MEMORY_DIR, { withFileTypes: true })) {
@@ -112,7 +123,7 @@ async function main() {
   db.close();
 }
 
-main().catch((error) => {
+main().catch((error: unknown) => {
   console.error('[migrate] 失败：', error);
   process.exitCode = 1;
 });

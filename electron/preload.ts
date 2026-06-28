@@ -1,16 +1,15 @@
-// @ts-nocheck
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import channels from './ipc-channels.js';
 
-let menuHandler = null;
+let menuHandler: ((action: unknown) => void) | null = null;
 
-ipcRenderer.on(channels.MENU_ACTION, (_event, action) => {
+ipcRenderer.on(channels.MENU_ACTION, (_event: IpcRendererEvent, action: unknown) => {
   if (menuHandler) menuHandler(action);
 });
 
-function wrap(channel) {
-  return (...args) => ipcRenderer.invoke(channel, ...args).catch((err) => {
-    const msg = String(err?.message || err || '');
+function wrap(channel: string) {
+  return (...args: unknown[]) => ipcRenderer.invoke(channel, ...args).catch((err: unknown) => {
+    const msg = String((err as { message?: unknown } | null | undefined)?.message || err || '');
     if (msg.includes('could not be cloned') || msg.includes('克隆') || msg.includes('circular') || msg.includes('stringify')) {
       throw new Error('操作失败：数据通信异常，请重启应用后重试');
     }
@@ -26,7 +25,7 @@ contextBridge.exposeInMainWorld('iftree', {
   getLauncherState: wrap(channels.LAUNCHER_STATE),
   startMainApp: wrap(channels.LAUNCHER_START),
   deleteLauncherDoc: wrap(channels.LAUNCHER_DELETE_DOC),
-  startupHeartbeat: (payload) => ipcRenderer.send(channels.STARTUP_HEARTBEAT, payload),
+  startupHeartbeat: (payload: unknown) => ipcRenderer.send(channels.STARTUP_HEARTBEAT, payload),
   getStartupOptions: wrap(channels.STARTUP_OPTIONS),
   captureE2EWindow: wrap(channels.E2E_CAPTURE_WINDOW),
   reportStartupSuccess: wrap(channels.STARTUP_SUCCESS),
@@ -59,19 +58,19 @@ contextBridge.exposeInMainWorld('iftree', {
   saveNodeLayoutSettings: wrap(channels.SETTINGS_SAVE_NODE_LAYOUT),
   chooseLocalModelRoot: wrap(channels.SETTINGS_CHOOSE_LOCAL_MODEL_ROOT),
   downloadVectorModel: wrap(channels.SETTINGS_DOWNLOAD_VECTOR_MODEL),
-  setMenuHandler: (handler) => { menuHandler = handler; },
-  onProgress: (callback) => {
-    const listener = (_event, data) => callback(data);
+  setMenuHandler: (handler: ((action: unknown) => void) | null) => { menuHandler = handler; },
+  onProgress: (callback: (data: unknown) => void) => {
+    const listener = (_event: IpcRendererEvent, data: unknown) => callback(data);
     ipcRenderer.on(channels.OP_PROGRESS, listener);
     return () => ipcRenderer.removeListener(channels.OP_PROGRESS, listener);
   },
-  onLibraryChanged: (callback) => {
+  onLibraryChanged: (callback: () => void) => {
     const listener = () => callback();
     ipcRenderer.on(channels.LIBRARY_CHANGED, listener);
     return () => ipcRenderer.removeListener(channels.LIBRARY_CHANGED, listener);
   },
-  onAgentStream: (callback) => {
-    const listener = (_event, payload) => callback(payload);
+  onAgentStream: (callback: (payload: unknown) => void) => {
+    const listener = (_event: IpcRendererEvent, payload: unknown) => callback(payload);
     ipcRenderer.on(channels.AGENT_STREAM, listener);
     return () => ipcRenderer.removeListener(channels.AGENT_STREAM, listener);
   },

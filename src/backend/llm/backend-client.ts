@@ -1,4 +1,3 @@
-// @ts-nocheck
 // 统一后端通信 SDK（解耦第 10 步 / projectneed 18-6-1 / §4.1 目标架构）：所有入口——渲染进程宿主
 // （electron main）、外部 agent（mcp-server）、内嵌 agent——都经这一个 SDK 与共享后端 host 通信。
 // SDK 把「怎么跟后端通信」的处理逻辑（连接、请求信封、流式订阅、请求观测）全收在这里，调用方只调
@@ -10,27 +9,56 @@
 // 请求观测（onDebug）也按入口裁剪：主进程注入（记每次请求 start/end），mcp-server 不注入。
 import { createSharedBackendClient } from './backend-pipe-client.js';
 import { createHeadlessAgentClient } from './headless-agent-client.js';
+import { resolveNodeExecutable } from './backend-discovery.js';
+
+type BackendClientMode = 'shared' | 'private';
+type RequestBody = Record<string, unknown>;
+type RequestOptions = Record<string, unknown> | undefined;
+
+interface BackendTransport {
+  request(type: string, body?: RequestBody, requestOptions?: RequestOptions): Promise<unknown>;
+  shutdown(): unknown;
+  close(): unknown;
+  pid?: unknown;
+  sharedBackendPid?: unknown;
+  mode?: string;
+}
+
+interface BackendClientOptions {
+  projectRoot?: string | null;
+  hostScriptPath?: string | null;
+  processPath?: string;
+  mode?: BackendClientMode;
+  env?: NodeJS.ProcessEnv;
+  onStderr?: ((chunk: unknown) => void) | null;
+  onStatus?: ((status: unknown) => void) | null;
+  onDebug?: ((event: Record<string, unknown>) => void) | null;
+}
+
+const createHeadlessAgentClientTyped = createHeadlessAgentClient as unknown as (options: Record<string, unknown>) => BackendTransport;
+const createSharedBackendClientTyped = createSharedBackendClient as unknown as (options: Record<string, unknown>) => BackendTransport;
 
 export function createBackendClient({
   projectRoot = null,
   hostScriptPath = null,
-  processPath = process.execPath,
+  processPath = resolveNodeExecutable(),
   mode = 'shared',
   env = process.env,
   onStderr = null,
   onStatus = null,
   onDebug = null
-} = {}) {
+}: BackendClientOptions = {}) {
   if (!projectRoot) throw new Error('createBackendClient requires projectRoot');
-  // processPath 决定 host 跑什么 runtime（路 B）：默认跟随父进程 execPath（mcp-server 由 node 起即 node host）；
-  // electron 主进程显式传真 node 路径，让 host 跑 node ABI、主进程自身不再 in-process 用 better-sqlite3。
+  // processPath 决定 host 跑什么 runtime（路 B）：host 必须 node ABI（better-sqlite3 只编 node）。默认经
+  // resolveNodeExecutable 解析真 node——无论本进程自己是 node 还是 electron（如 electron 启动的 mcp-server），
+  // host 恒为 node runtime，与「谁拉起它」解耦。调用方一般无需再传 processPath（压测等要 electron ABI 才显式覆盖）。
   const transport = mode === 'private'
-    ? createHeadlessAgentClient({ cwd: projectRoot, scriptPath: hostScriptPath, processPath, env, onStderr: onStderr || undefined })
-    : createSharedBackendClient({ projectRoot, hostScriptPath, processPath, env, onStderr, onStatus });
+    ? createHeadlessAgentClientTyped({ cwd: projectRoot, scriptPath: hostScriptPath, processPath, env, onStderr: onStderr || undefined })
+    : createSharedBackendClientTyped({ projectRoot, hostScriptPath, processPath, env, onStderr, onStatus });
 
   // 唯一的出站点：可选 onDebug 包住 transport.request 做计时 + start/end 观测（消除调用方各抄一套的
   // try/catch+计时模板）。requestOptions 透传给传输层（onEvent 流式回调原样转发，不在 SDK 缓冲）。
-  async function call(type, body = {}, requestOptions = undefined) {
+  async function call(type: string, body: RequestBody = {}, requestOptions: RequestOptions = undefined) {
     if (!onDebug) return transport.request(type, body, requestOptions);
     const startedAt = Date.now();
     onDebug({ type, phase: 'start', body });
@@ -46,49 +74,49 @@ export function createBackendClient({
 
   return {
     // —— 数据库 ——
-    databaseRead: (payload = {}) => call('database.read', { payload }),
-    databaseWrite: (payload = {}) => call('database.write', { payload }),
-    databaseRun: (command = {}, fallbackOperation = 'read') => call('database.run', { commandPayload: command || {}, fallbackOperation }),
-    dbShell: (argv = [], extra = {}) => call('db.shell', { argv, ...extra }),
-    updateSourceBinding: (payload = {}) => call('database.updateSourceBinding', { payload }),
+    databaseRead: (payload: unknown = {}) => call('database.read', { payload }),
+    databaseWrite: (payload: unknown = {}) => call('database.write', { payload }),
+    databaseRun: (command: unknown = {}, fallbackOperation = 'read') => call('database.run', { commandPayload: command || {}, fallbackOperation }),
+    dbShell: (argv: unknown[] = [], extra: RequestBody = {}) => call('db.shell', { argv, ...extra }),
+    updateSourceBinding: (payload: unknown = {}) => call('database.updateSourceBinding', { payload }),
 
     // —— source 只读（路 B：前端去 native，PDF 原件/高亮走后端 RPC）——
-    readPdfData: (docId) => call('source.readPdfData', { payload: { docId } }),
-    readPdfHighlights: (payload = {}) => call('source.readPdfHighlights', { payload }),
-    readPdfSpanRects: (docId) => call('source.readPdfSpanRects', { payload: { docId } }),
+    readPdfData: (docId: unknown) => call('source.readPdfData', { payload: { docId } }),
+    readPdfHighlights: (payload: unknown = {}) => call('source.readPdfHighlights', { payload }),
+    readPdfSpanRects: (docId: unknown) => call('source.readPdfSpanRects', { payload: { docId } }),
 
     // —— 导入 / 库 ——
-    importLibraryDocument: (payload = {}) => call('import.libraryDocument', { payload }),
-    smartImportTask: (payload = {}) => call('import.smartTask', { payload }),
-    deleteImportedDocument: (payload = {}) => call('import.deleteDocument', { payload }),
-    updateImportedSourcePaths: (payload = {}) => call('library.updateImportedSourcePaths', { payload }),
+    importLibraryDocument: (payload: unknown = {}) => call('import.libraryDocument', { payload }),
+    smartImportTask: (payload: unknown = {}) => call('import.smartTask', { payload }),
+    deleteImportedDocument: (payload: unknown = {}) => call('import.deleteDocument', { payload }),
+    updateImportedSourcePaths: (payload: unknown = {}) => call('library.updateImportedSourcePaths', { payload }),
 
     // —— 派生索引（向量）——
-    resetVectorStore: (payload = {}) => call('vector.resetStore', { payload }),
-    ensureDocVectors: (payload = {}, requestOptions) => call('vector.ensureDoc', { payload }, requestOptions),
+    resetVectorStore: (payload: unknown = {}) => call('vector.resetStore', { payload }),
+    ensureDocVectors: (payload: unknown = {}, requestOptions?: RequestOptions) => call('vector.ensureDoc', { payload }, requestOptions),
 
     // —— 摘要 ——
-    generateNodeSummary: (payload = {}) => call('summary.generateNode', { payload }),
-    cancelNodeSummary: (payload = {}) => call('summary.cancelNode', { payload }),
+    generateNodeSummary: (payload: unknown = {}) => call('summary.generateNode', { payload }),
+    cancelNodeSummary: (payload: unknown = {}) => call('summary.cancelNode', { payload }),
 
     // —— 记忆运维 ——
-    purgeOrphanedMemory: (options = {}) => call('memory.purgeOrphaned', options),
+    purgeOrphanedMemory: (options: RequestBody = {}) => call('memory.purgeOrphaned', options),
 
     // —— 内嵌 agent ——
-    runAgent: (payload = {}, requestOptions) => call('agent.run', { payload }, requestOptions),
-    runAgentTool: (payload = {}) => call('agent.tool', { payload }),
-    cancelAgent: (payload = {}) => call('agent.cancel', { payload }),
+    runAgent: (payload: unknown = {}, requestOptions?: RequestOptions) => call('agent.run', { payload }, requestOptions),
+    runAgentTool: (payload: unknown = {}) => call('agent.tool', { payload }),
+    cancelAgent: (payload: unknown = {}) => call('agent.cancel', { payload }),
     listAgentDiffs: () => call('agent.diffs', {}),
-    listAgentSessions: (payload = {}) => call('agent.sessions', { payload }),
-    getAgentSession: (payload = {}) => call('agent.session', { payload }),
-    deleteAgentSession: (payload = {}) => call('agent.deleteSession', { payload }),
-    applyAgentDiff: (payload) => call('agent.applyDiff', { payload }),
-    rejectAgentDiff: (payload) => call('agent.rejectDiff', { payload }),
+    listAgentSessions: (payload: unknown = {}) => call('agent.sessions', { payload }),
+    getAgentSession: (payload: unknown = {}) => call('agent.session', { payload }),
+    deleteAgentSession: (payload: unknown = {}) => call('agent.deleteSession', { payload }),
+    applyAgentDiff: (payload: unknown) => call('agent.applyDiff', { payload }),
+    rejectAgentDiff: (payload: unknown) => call('agent.rejectDiff', { payload }),
 
     // —— 生命周期 + 兜底 ——
     ping: () => call('ping', {}),
     // 兜底透传：尚未语义化的请求类型直接发（迁移期保险口；理想是逐步收成上面的具名方法）。
-    request: (type, body = {}, requestOptions) => call(type, body, requestOptions),
+    request: (type: string, body: RequestBody = {}, requestOptions?: RequestOptions) => call(type, body, requestOptions),
     shutdown: () => transport.shutdown(),
     close: () => transport.close(),
     get pid() {

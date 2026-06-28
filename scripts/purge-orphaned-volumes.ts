@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 运维：记忆卷校验扫除（projectneed 15-10-4「无锚的非法残留卷可被清除」）。
 //
 // 用法（推荐双击同目录 purge-orphaned-volumes.bat，它负责 electron ABI 那点环境）：
@@ -22,7 +21,34 @@ import { createSharedBackendClient } from '../src/backend/llm/backend-pipe-clien
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-const client = createSharedBackendClient({
+interface PurgedVolume {
+  title?: unknown;
+  agent?: unknown;
+  sessionId?: unknown;
+  docId?: unknown;
+  anchorPath?: unknown;
+}
+
+interface PurgeResult {
+  scanned?: unknown;
+  purged?: PurgedVolume[];
+}
+
+interface SharedBackendClientLike {
+  request(type: string, payload?: unknown, requestOptions?: unknown): Promise<unknown>;
+  shutdown(): Promise<unknown>;
+  close(): void;
+  mode?: unknown;
+}
+
+const createSharedBackendClientTyped = createSharedBackendClient as unknown as (options: {
+  projectRoot: string;
+  hostScriptPath: string;
+  onStderr: (text: string) => void;
+  onStatus: (text: string) => void;
+}) => SharedBackendClientLike;
+
+const client = createSharedBackendClientTyped({
   projectRoot: PROJECT_ROOT,
   hostScriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
   onStderr: (text) => process.stderr.write(text),
@@ -33,7 +59,7 @@ const client = createSharedBackendClient({
 const dryRun = process.argv.includes('--dry-run');
 
 try {
-  const result = await client.request('memory.purgeOrphaned', { dryRun });
+  const result = await client.request('memory.purgeOrphaned', { dryRun }) as PurgeResult;
   const purged = Array.isArray(result?.purged) ? result.purged : [];
   const verb = dryRun ? '将清除' : '已清除';
   const suffix = dryRun ? '（dry-run 预览，未实际删除）' : '';

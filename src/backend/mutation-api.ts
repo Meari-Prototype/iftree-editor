@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { handleAxiomMutation, handleRefMutation } from './handlers/write/axiom-ref.js';
 import { handleDocFolderMutation, handleDocMutation, handleStreamMutation } from './handlers/write/doc.js';
 import { handleMemoryMutation } from './memory/index.js';
@@ -8,6 +7,8 @@ import { plain } from './handlers/write/shared.js';
 import { editModeMismatchMessage } from './shared.js';
 import { ENTITY_WRITE_ACTIONS, runEntityWrite, stageEntityWrite } from './entities/write.js';
 import { NODE_TYPES, NODE_TYPE_LABELS } from '../core/node-model.js';
+import type { EditBranchRow } from './db/rows.js';
+import type { IftreeStore } from './store/index.js';
 
 const ACTIONS = Object.freeze([
   'mutation.actions',
@@ -63,7 +64,7 @@ const ACTIONS = Object.freeze([
   'history.certify',
   'history.revert',
   'objects.gc',
-  ...ENTITY_WRITE_ACTIONS,
+  ...ENTITY_WRITE_ACTIONS
 ]);
 
 const STABLE_ID_SCHEMA = Object.freeze({
@@ -76,16 +77,49 @@ const NODE_TYPE_SCHEMA = Object.freeze({
   description: `节点类型。中文输入请在 db shell/MCP edit payload 中写 node_type，由后端归一为内部码；当前内部码：${NODE_TYPES.join(', ')}；中文标签：${Object.values(NODE_TYPE_LABELS).join(' / ')}。`
 });
 
-function normalizeMutationAction(value) {
-  const action = String(value || '').trim();
-  return ACTIONS.includes(action) ? action : '';
+export type MutationPayload = Record<string, unknown>;
+export type MutationResult = Record<string, unknown>;
+type EffectList = Array<Record<string, unknown>>;
+
+// 写入入口的 store facade：IftreeStore 现在公开方法签名已整体收紧（store/index.ts:188- TailParameters），
+// MutationStore 直接 alias 到 IftreeStore，下游 handlers/* 也都用 IftreeStore——8 处 cast 同时清零。
+export type MutationStore = IftreeStore;
+
+export interface MutationContext {
+  editBranchOwner?: string;
+  editBranchBaseDocId?: unknown;
+  editBranchId?: unknown;
+  refreshDoc?: (docId: unknown, options?: unknown) => unknown;
+  maintainDerivedAfterWrite?: (
+    docId: unknown,
+    options?: Record<string, unknown>
+  ) => Promise<unknown> | unknown;
+  [extra: string]: unknown;
 }
 
-function requireStore(store) {
+// store.stage* / handlers 写出的 staged/result 形状很零散，这里给一个宽松形状：分发器只读出常用字段。
+type StagedShape = {
+  node?: Record<string, unknown> | null;
+  axiom?: Record<string, unknown> | null;
+  branch?: EditBranchRow | null;
+  changed?: boolean;
+  docId?: unknown;
+  insertedNodeId?: unknown;
+  insertedAxiomId?: unknown;
+  insertedRefId?: unknown;
+  [key: string]: unknown;
+};
+
+function normalizeMutationAction(value: unknown): string {
+  const action = String(value || '').trim();
+  return (ACTIONS as readonly string[]).includes(action) ? action : '';
+}
+
+function requireStore(store: MutationStore | null | undefined): asserts store is MutationStore {
   if (!store?.db) throw new Error('database_write store is not available');
 }
 
-export function databaseWriteActions() {
+export function databaseWriteActions(): string[] {
   return [...ACTIONS];
 }
 
@@ -182,7 +216,7 @@ export function databaseWriteToolSchema() {
   };
 }
 
-function shouldRouteToEditBranch(action) {
+function shouldRouteToEditBranch(action: string): boolean {
   if (action.startsWith('node.')) return true;
   if (action.startsWith('axiom.')) return true;
   if (action.startsWith('ref.')) return true;
@@ -192,7 +226,7 @@ function shouldRouteToEditBranch(action) {
 
 // 编辑模式互斥（projectneed 4-16-8）：增量编辑（流式写入）文档拒绝分支编辑/合并；只读文档拒绝一切编辑。
 // 流式写入自身（stream.push）的模式校验在 store.pushStreamNodes 内（含首推自建文档）。
-function guardEditMode(store, action, payload) {
+function guardEditMode(store: MutationStore, action: string, payload: MutationPayload): void {
   if (!(shouldRouteToEditBranch(action) || action.startsWith('editBranch.'))) return;
   const docId = store.docIdForMutationPayload(payload);
   if (!docId) return;
@@ -202,110 +236,143 @@ function guardEditMode(store, action, payload) {
   }
 }
 
-function requestedEditBranchOwner(payload = {}, ctx = {}) {
-  return ctx?.editBranchOwner || payload.editBranchOwner || payload.edit_branch_owner || '';
+function requestedEditBranchOwner(payload: MutationPayload = {}, ctx: MutationContext = {}): string {
+  return String(ctx.editBranchOwner ?? payload.editBranchOwner ?? payload.edit_branch_owner ?? '') || '';
 }
 
-function requestedEditBranchBaseDocId(payload = {}, ctx = {}) {
-  return ctx?.editBranchBaseDocId
+function requestedEditBranchBaseDocId(payload: MutationPayload = {}, ctx: MutationContext = {}): unknown {
+  return ctx.editBranchBaseDocId
     ?? payload.editBranchBaseDocId
     ?? payload.edit_branch_base_doc_id
     ?? null;
 }
 
-function requestedEditBranchId(payload = {}, ctx = {}) {
-  return ctx?.editBranchId ?? payload.editBranchId ?? payload.edit_branch_id ?? null;
+function requestedEditBranchId(payload: MutationPayload = {}, ctx: MutationContext = {}): unknown {
+  return ctx.editBranchId ?? payload.editBranchId ?? payload.edit_branch_id ?? null;
 }
 
-function activeEditBranchForMutation(store, payload = {}) {
+function activeEditBranchForMutation(store: MutationStore, payload: MutationPayload = {}): EditBranchRow | null {
   const docId = store.docIdForMutationPayload(payload);
   if (!docId) return null;
   // 无显式 owner 的 mutation = 人类在 GUI 直接编辑，路由到其 owner=human 分支；
   // llm 类写入必带 editBranchOwner（owner=llm:<会话>），不走此无主路径（A5-5 多分支）。
-  return store.activeEditBranchForBaseDoc(docId, 'human') || null;
+  return (store.activeEditBranchForBaseDoc(docId, 'human') as EditBranchRow | null) || null;
 }
 
-function stagedNodeUpdateResult(action, staged) {
+function stagedNodeUpdateResult(action: string, staged: StagedShape): MutationResult {
+  const docId = (staged.node?.doc_id as unknown)
+    ?? (staged.node?.docId as unknown)
+    ?? staged.branch?.base_doc_id
+    ?? null;
   return {
     ok: true,
     action,
-    docId: staged.node?.doc_id || staged.node?.docId || staged.branch?.base_doc_id || null,
+    docId,
     changed: Boolean(staged.changed),
-    refresh: { kind: 'node', docId: staged.node?.doc_id || staged.branch?.base_doc_id || null, nodeId: staged.node?.id || null },
+    refresh: { kind: 'node', docId, nodeId: (staged.node?.id as unknown) ?? null },
     node: plain(staged.node),
     editBranch: plain(staged.branch),
     skipDocsRefresh: true
   };
 }
 
-function stagedDocResult(action, staged, extras = {}) {
+const STAGED_DETAIL_KEYS = [
+  'nodeId',
+  'sourceNodeId',
+  'targetNodeId',
+  'newParentId',
+  'axiomId',
+  'refId',
+  'entityId',
+  'entityIds',
+  'kind',
+  'status',
+  'direction'
+] as const;
+
+function stagedDetails(staged: StagedShape = {}): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of STAGED_DETAIL_KEYS) {
+    if (staged[key] !== undefined) out[key] = staged[key];
+  }
+  return out;
+}
+
+function stagedDocResult(action: string, staged: StagedShape, extras: Record<string, unknown> = {}): MutationResult {
+  const docId = staged.docId ?? staged.branch?.base_doc_id ?? null;
   return {
     ok: true,
     action,
-    docId: staged.docId ?? staged.branch?.base_doc_id ?? null,
+    docId,
     changed: Boolean(staged.changed),
-    refresh: { kind: 'doc', docId: staged.docId ?? staged.branch?.base_doc_id ?? null },
+    refresh: { kind: 'doc', docId },
     editBranch: plain(staged.branch),
     skipDocsRefresh: true,
+    ...stagedDetails(staged),
     ...extras
   };
 }
 
-function dispatchEditBranchStage(store, branch, action, payload) {
-  if (action.startsWith('entity.')) return stageEntityWrite(store, branch, payload, action);
+function dispatchEditBranchStage(
+  store: MutationStore,
+  branch: EditBranchRow,
+  action: string,
+  payload: MutationPayload
+): MutationResult {
+  if (action.startsWith('entity.')) return stageEntityWrite(store, branch, payload, action) as unknown as MutationResult;
   switch (action) {
     case 'node.update':
-      return stagedNodeUpdateResult(action, store.stageEditBranchNodeUpdate(branch, payload));
+      return stagedNodeUpdateResult(action, store.stageEditBranchNodeUpdate(branch, payload) as StagedShape);
     case 'node.insert': {
-      const staged = store.stageEditBranchNodeInsert(branch, payload);
+      const staged = store.stageEditBranchNodeInsert(branch, payload) as StagedShape;
       return stagedDocResult(action, staged, {
         insertedNodeId: staged.insertedNodeId,
         node: plain(staged.node)
       });
     }
     case 'node.delete':
-      return stagedDocResult(action, store.stageEditBranchNodeDelete(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeDelete(branch, payload) as StagedShape);
     case 'node.move':
-      return stagedDocResult(action, store.stageEditBranchNodeMove(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeMove(branch, payload) as StagedShape);
     case 'node.promote':
-      return stagedDocResult(action, store.stageEditBranchNodePromote(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodePromote(branch, payload) as StagedShape);
     case 'node.split':
-      return stagedDocResult(action, store.stageEditBranchNodeSplit(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeSplit(branch, payload) as StagedShape);
     case 'node.mergeInto':
-      return stagedDocResult(action, store.stageEditBranchNodeMergeInto(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeMergeInto(branch, payload) as StagedShape);
     case 'node.mergePrevious':
-      return stagedDocResult(action, store.stageEditBranchNodeMergePrevious(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeMergePrevious(branch, payload) as StagedShape);
     case 'node.reparent':
-      return stagedDocResult(action, store.stageEditBranchNodeReparent(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeReparent(branch, payload) as StagedShape);
     case 'node.moveBefore':
-      return stagedDocResult(action, store.stageEditBranchNodeMoveBefore(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeMoveBefore(branch, payload) as StagedShape);
     case 'node.moveAfter':
-      return stagedDocResult(action, store.stageEditBranchNodeMoveAfter(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchNodeMoveAfter(branch, payload) as StagedShape);
     case 'axiom.add': {
-      const staged = store.stageEditBranchAxiomAdd(branch, payload);
+      const staged = store.stageEditBranchAxiomAdd(branch, payload) as StagedShape;
       return stagedDocResult(action, staged, {
         insertedAxiomId: staged.insertedAxiomId,
         axiom: plain(staged.axiom)
       });
     }
     case 'axiom.update': {
-      const staged = store.stageEditBranchAxiomUpdate(branch, payload);
+      const staged = store.stageEditBranchAxiomUpdate(branch, payload) as StagedShape;
       return stagedDocResult(action, staged, { axiom: plain(staged.axiom) });
     }
     case 'axiom.delete':
-      return stagedDocResult(action, store.stageEditBranchAxiomDelete(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchAxiomDelete(branch, payload) as StagedShape);
     case 'axiom.move':
-      return stagedDocResult(action, store.stageEditBranchAxiomMove(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchAxiomMove(branch, payload) as StagedShape);
     case 'ref.addNodeToNode': {
-      const staged = store.stageEditBranchRefAddNodeToNode(branch, payload);
+      const staged = store.stageEditBranchRefAddNodeToNode(branch, payload) as StagedShape;
       return stagedDocResult(action, staged, { insertedRefId: staged.insertedRefId });
     }
     case 'ref.addAxiomToNode': {
-      const staged = store.stageEditBranchRefAddAxiomToNode(branch, payload);
+      const staged = store.stageEditBranchRefAddAxiomToNode(branch, payload) as StagedShape;
       return stagedDocResult(action, staged, { insertedRefId: staged.insertedRefId });
     }
     case 'ref.delete':
-      return stagedDocResult(action, store.stageEditBranchRefDelete(branch, payload));
+      return stagedDocResult(action, store.stageEditBranchRefDelete(branch, payload) as StagedShape);
     default:
       throw new Error(`Edit branch staging not implemented for action: ${action}`);
   }
@@ -323,15 +390,23 @@ const KEYWORD_REBUILD_ACTIONS = new Set([
 
 // 写分发收尾的派生索引维护：主库只报告"哪篇文档怎么变了"，怎么维护派生索引交给向量模块
 // （ctx.maintainDerivedAfterWrite）。失败不阻塞写返回——关键词可重建、检索入口有缺失补建兜底。
-async function maintainDerivedIndexAfterWrite(ctx, store, action, result) {
+async function maintainDerivedIndexAfterWrite(
+  ctx: MutationContext | undefined,
+  store: MutationStore,
+  action: string,
+  result: MutationResult | null
+): Promise<void> {
   if (typeof ctx?.maintainDerivedAfterWrite !== 'function') return;
   if (!result || result.changed === false || result.applied === false) return;
   try {
     if (action === 'stream.bulkEnd') {
       // 批量导入结束：对本批写过的每篇文档统一维护一次（BM25 整篇重建；embed 决定建不建向量）。
-      for (const docId of result.touchedDocIds || []) {
+      const touched = Array.isArray(result.touchedDocIds) ? result.touchedDocIds : [];
+      for (const docId of touched) {
         await ctx.maintainDerivedAfterWrite(docId, { embed: result.embed === true });
       }
+      // 导入写了大量 lance 行、碎片增量大：按文档数累加脏度，触发后台回收（O(1) 计数，不阻塞写返回）。
+      store?.maintenance?.markDirty?.(touched.length || 1);
       return;
     }
     if (action === 'stream.push') {
@@ -346,16 +421,30 @@ async function maintainDerivedIndexAfterWrite(ctx, store, action, result) {
     } else if (action === 'doc.refreshAddresses') {
       await ctx.maintainDerivedAfterWrite(docId || null, { allDocs: !docId });
     } else if (KEYWORD_REBUILD_ACTIONS.has(action) && docId) {
-      await ctx.maintainDerivedAfterWrite(docId, {});
+      // merge/save 带 derivedSync（受影响节点集）→ BM25 增量同步；其余（doc.create/history.* 无 hint）整篇重建。
+      const sync = result.derivedSync as { touchedNodeIds?: unknown; deletedNodeIds?: unknown } | null;
+      await ctx.maintainDerivedAfterWrite(docId, sync
+        ? { touchedNodeIds: sync.touchedNodeIds, deletedNodeIds: sync.deletedNodeIds }
+        : {});
+      // 派生写产生 lance 碎片，计一次脏度（O(1)），由后台调度器低频回收。
+      store?.maintenance?.markDirty?.();
     }
   } catch (error) {
     if (Array.isArray(result.sideEffects)) {
-      result.sideEffects.push({ effect: 'derived.maintain', ok: false, error: error?.message || String(error) });
+      result.sideEffects.push({
+        effect: 'derived.maintain',
+        ok: false,
+        error: (error as { message?: string } | null | undefined)?.message || String(error)
+      });
     }
   }
 }
 
-export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
+export async function runDatabaseWrite(
+  store: MutationStore,
+  payload: MutationPayload = {},
+  ctx: MutationContext = {}
+): Promise<MutationResult> {
   const action = normalizeMutationAction(payload.action || payload.type);
   if (!action) throw new Error(`Unknown database_write action: ${payload.action || payload.type || ''}`);
   if (action === 'mutation.actions') return { actions: databaseWriteActions() };
@@ -372,11 +461,11 @@ export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
     // 显式 branchId 精确定位（多草稿并存时不靠 (baseDocId, owner) 唯一性）；缺省回退 beginEditBranch 的找/建。
     const routeBranchId = requestedEditBranchId(payload, ctx);
     const branch = routeBranchId != null
-      ? store.findEditBranch({ branchId: routeBranchId })
-      : store.beginEditBranch(
-        requestedEditBranchBaseDocId(payload, ctx) ?? store.docIdForMutationPayload(payload),
-        routeOwner
-      );
+      ? (store.findEditBranch({ branchId: routeBranchId }) as EditBranchRow | null)
+      : (store.beginEditBranch(
+          requestedEditBranchBaseDocId(payload, ctx) ?? store.docIdForMutationPayload(payload),
+          routeOwner
+        ) as EditBranchRow | null);
     if (!branch) throw new Error(`edit branch not found: branchId=${routeBranchId}`);
     return dispatchEditBranchStage(store, branch, action, payload);
   }
@@ -386,20 +475,34 @@ export async function runDatabaseWrite(store, payload = {}, ctx = {}) {
     return dispatchEditBranchStage(store, activeBranch, action, payload);
   }
 
-  const effects = [];
-  let result = null;
-  if (action.startsWith('docFolder.')) result = handleDocFolderMutation(store, payload, action, effects);
-  else if (action.startsWith('doc.') || action === 'treeView.update' || action.startsWith('editBranch.')) result = await handleDocMutation(store, payload, ctx, action, effects);
-  else if (action.startsWith('node.')) result = await handleNodeMutation(store, payload, ctx, action, effects);
-  else if (action.startsWith('axiom.')) result = handleAxiomMutation(store, payload, action, effects);
-  else if (action.startsWith('ref.')) result = handleRefMutation(store, payload, action, effects);
-  else if (action.startsWith('editorHistory.')) result = await handleEditorHistoryMutation(store, payload, ctx, action, effects);
-  else if (action.startsWith('history.')) result = await handleHistoryMutation(store, payload, ctx, action, effects);
-  else if (action.startsWith('entity.')) result = runEntityWrite(store, payload, action);
-  else if (action.startsWith('stream.')) result = await handleStreamMutation(store, payload, ctx, action, effects);
-  else if (action.startsWith('memory.')) result = await handleMemoryMutation(store, payload, ctx, action, effects);
+  const effects: EffectList = [];
+  let result: MutationResult | null = null;
+  // store / ctx 直传：MutationStore 现在是 IftreeStore alias，handlers/* 也都签 IftreeStore + WriteContext，
+  // 不再需要每处 `as unknown as Parameters<...>[0]` 中转。
+  if (action.startsWith('docFolder.')) result = handleDocFolderMutation(store, payload, action, effects) as MutationResult;
+  else if (action.startsWith('doc.') || action === 'treeView.update' || action.startsWith('editBranch.')) result = await handleDocMutation(store, payload, ctx, action, effects) as MutationResult;
+  else if (action.startsWith('node.')) result = await handleNodeMutation(store, payload, ctx, action, effects) as MutationResult;
+  else if (action.startsWith('axiom.')) result = handleAxiomMutation(store, payload, action, effects) as MutationResult;
+  else if (action.startsWith('ref.')) result = handleRefMutation(store, payload, action, effects) as MutationResult;
+  else if (action.startsWith('editorHistory.')) result = await handleEditorHistoryMutation(store, payload, ctx, action, effects) as MutationResult;
+  else if (action.startsWith('history.')) result = await handleHistoryMutation(store, payload, ctx, action, effects) as MutationResult;
+  else if (action.startsWith('entity.')) result = runEntityWrite(store, payload, action) as unknown as MutationResult;
+  else if (action.startsWith('stream.')) result = await handleStreamMutation(store, payload, ctx, action, effects) as MutationResult;
+  else if (action.startsWith('memory.')) result = await handleMemoryMutation(store, payload, ctx, action, effects) as MutationResult;
   else throw new Error(`Unhandled database_write action: ${action}`);
 
-  await maintainDerivedIndexAfterWrite(ctx, store, action, result);
-  return result;
+  // 派生索引维护（BM25 增量 / 碎片回收）对 KEYWORD_REBUILD_ACTIONS 后台执行——
+  // 避免 merge/save 等大文档操作的维护耗时阻塞写返回、超出 MCP 客户端超时窗口
+  // （主库事务已提交，客户端不知成功会重试 → 幂等灾难）。维护失败非致命：关键词
+  // 可重建、检索入口有缺失补建兜底。stream/delete/refreshAddresses 保持同步。
+  if (KEYWORD_REBUILD_ACTIONS.has(action)) {
+    maintainDerivedIndexAfterWrite(ctx, store, action, result).catch(() => {});
+  } else {
+    await maintainDerivedIndexAfterWrite(ctx, store, action, result);
+  }
+  // derivedSync 是给派生索引维护的内部 hint（merge/save 的受影响节点集），不进响应。
+  // fire-and-forget 路径：maintainDerivedIndexAfterWrite 在首个 await 前同步读取了
+  // derivedSync，此处删除不竞争。
+  if (result && typeof result === 'object' && 'derivedSync' in result) delete (result as Record<string, unknown>).derivedSync;
+  return result ?? {};
 }

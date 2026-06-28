@@ -1,4 +1,3 @@
-// @ts-nocheck
 // MCP 写动词/状态返回的紧凑文本渲染（projectneed 15-5-1-3：ASCII 非裸 JSON，--json 才裸传）。
 // 纯渲染、不改逻辑：吃后端原始返回，挑结果要点成几行人类可读文本，省 token。
 // 形态按数据走——状态摘要用键值行、节点树用缩进地址、列表用每项一行，不强求 ASCII tree。
@@ -6,22 +5,23 @@
 
 import { parseBranchEntryCounts } from './branch-status.js';
 import { clip, cell, clipRows } from './text-budget.js';
+import type { WriteResult, PushNode } from './write-result.js';
 
 // 通用写返回：commit/edit/draft·new/undo/redo/discard/rebase/cherry-pick/merge·yes/
 // vectors/certify/memory_distill/set_mode/bulk/revert/switch。挑结果要点，丢快照大字符串。
 /**
- * @param {any} res
+ * @param {unknown} res
  * @param {{ label?: string }} [opts]
  */
-export function formatWriteResult(res, { label } = {}) {
+export function formatWriteResult(res: WriteResult | null | undefined, { label }: { label?: string } = {}) {
   if (res == null) return '(空)';
   if (typeof res !== 'object') return String(res);
   if (res.ok === false || res.error) {
     const msg = res.error || res.message || '';
     return `${label || res.action || '失败'}  失败${msg ? '：' + clip(msg, 200) : ''}`;
   }
-  const lines = [];
-  const head = [label || res.action || 'result'];
+  const lines: string[] = [];
+  const head: string[] = [label || res.action || 'result'];
   if (res.changed === false) head.push('未改动');
   if (res.applied === true) head.push('applied');
   if (res.applied === false) head.push('未落库');
@@ -40,7 +40,7 @@ export function formatWriteResult(res, { label } = {}) {
 
   const n = res.node;
   if (n && typeof n === 'object') {
-    const tags = [];
+    const tags: string[] = [];
     if (n.address) tags.push(n.address);
     if (n.node_type) tags.push(n.node_type);
     if (n.trust_level) tags.push(`trust:${n.trust_level}`);
@@ -48,18 +48,41 @@ export function formatWriteResult(res, { label } = {}) {
     let line = `  node ${tags.join(' ')}`.replace(/\s+$/, '');
     if (n.text) line += `  「${clip(n.text)}」`;
     lines.push(line);
-    const meta = [];
+    const meta: string[] = [];
     if (n.node_title) meta.push(`title:「${clip(n.node_title, 40)}」`);
     if (n.node_note) meta.push(`note:「${clip(n.node_note, 40)}」`);
     if (meta.length) lines.push(`       ${meta.join('  ')}`);
   }
   if (res.insertedNodeId != null) lines.push(`  inserted:${res.insertedNodeId}`);
 
+  const actionFacts: string[] = [];
+  if (res.nodeId != null) actionFacts.push(`nodeId=${res.nodeId}`);
+  if (res.sourceNodeId != null) actionFacts.push(`sourceNodeId=${res.sourceNodeId}`);
+  if (res.targetNodeId != null) actionFacts.push(`targetNodeId=${res.targetNodeId}`);
+  if (res.newParentId != null) actionFacts.push(`newParentId=${res.newParentId}`);
+  if (res.axiomId != null) actionFacts.push(`axiomId=${res.axiomId}`);
+  if (res.refId != null) actionFacts.push(`refId=${res.refId}`);
+  if (res.entityId != null) actionFacts.push(`entityId=${res.entityId}`);
+  if (Array.isArray(res.entityIds) && res.entityIds.length) actionFacts.push(`entityIds=${res.entityIds.join(',')}`);
+  if (res.kind) actionFacts.push(`kind=${res.kind}`);
+  if (res.status) actionFacts.push(`status=${res.status}`);
+  if (res.direction) actionFacts.push(`direction=${res.direction}`);
+  if (actionFacts.length) lines.push(`  ${actionFacts.join('  ')}`);
+
   // 新增 axiom/ref/entity 回执带 tmp 句柄（草稿内 tmp-axiom-/tmp-ref-/tmp-entity-N），是同草稿内
   // 续操作要传的 id：entity.create→entityId、axiom.add→axiomId、ref.add*→refId（commit 时解析成真 id）。
   const ent = res.entity;
   if (ent && typeof ent === 'object' && ent.id != null) {
     lines.push(`  entity:${ent.id}${ent.literal ? `  「${clip(ent.literal, 40)}」` : ''}（bindNode 传 entityId=${ent.id}）`);
+  }
+  const ax = res.axiom;
+  if (ax && typeof ax === 'object' && ax.id != null) {
+    lines.push(`  axiom:${ax.id}${ax.content ? `  「${clip(String(ax.content), 40)}」` : ''}`);
+  }
+  const lk = res.link;
+  if (lk && typeof lk === 'object') {
+    const ids = [lk.entity_a_id, lk.entity_b_id].filter((value) => value != null).join('↔');
+    lines.push(`  link:${ids}${lk.kind ? `  [${lk.kind}]` : ''}`);
   }
   const rf = res.ref;
   if (rf && typeof rf === 'object' && rf.id != null) {
@@ -93,6 +116,10 @@ export function formatWriteResult(res, { label } = {}) {
   if (res.pragmas && typeof res.pragmas === 'object') {
     lines.push(`  ${Object.entries(res.pragmas).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   }
+  if (res.restoredPragmas && typeof res.restoredPragmas === 'object') {
+    lines.push(`  restored ${Object.entries(res.restoredPragmas).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+  }
+  if (res.checkpoint) lines.push(`  checkpoint:${res.checkpoint}`);
   // relink：只显示重绑后的新路径，绝不把后端附带的全库 docs 刷新列表 dump 出来（曾撑爆 token）。
   if (res.source && typeof res.source === 'object' && res.source.original_path) {
     lines.push(`  source:${res.source.original_path}`);
@@ -100,6 +127,10 @@ export function formatWriteResult(res, { label } = {}) {
   if (Array.isArray(res.touchedNodeIds) && res.touchedNodeIds.length) {
     const ids = res.touchedNodeIds.slice(0, 5).join(' ');
     lines.push(`  touched:${res.touchedNodeIds.length}节点 ${ids}${res.touchedNodeIds.length > 5 ? ' …' : ''}`);
+  }
+  if (Array.isArray(res.touchedDocIds) && res.touchedDocIds.length) {
+    const ids = res.touchedDocIds.slice(0, 5).join(' ');
+    lines.push(`  touched:${res.touchedDocIds.length}文档 ${ids}${res.touchedDocIds.length > 5 ? ' …' : ''}`);
   }
   const hist = res.doc && Array.isArray(res.doc.history) ? res.doc.history : null;
   if (hist && hist.length) {
@@ -124,16 +155,16 @@ export function formatWriteResult(res, { label } = {}) {
 }
 
 // push：新建/追加的节点子树，按缩进地址 + 稳定 id 列出。
-export function formatPushResult(res) {
+export function formatPushResult(res: WriteResult | null | undefined) {
   if (!res || res.ok === false || res.error) return formatWriteResult(res, { label: 'push' });
-  const lines = [];
-  const head = ['push'];
+  const lines: string[] = [];
+  const head: string[] = ['push'];
   if (res.docId) head.push(`doc:${res.docId}`);
   if (res.createdCount != null) head.push(`+${res.createdCount}节点`);
   if (res.createdRootId) head.push(`root:${res.createdRootId}`);
   lines.push(head.join('  '));
   if (res.parentId) lines.push(`  parent:${res.parentId}`);
-  const walk = (nodes, depth) => {
+  const walk = (nodes: PushNode[] | null | undefined, depth: number) => {
     for (const nd of nodes || []) {
       lines.push(`  ${'  '.repeat(depth)}${nd.address || ''}  ${nd.id || ''}`);
       if (Array.isArray(nd.children) && nd.children.length) walk(nd.children, depth + 1);
@@ -144,10 +175,10 @@ export function formatPushResult(res) {
 }
 
 // memory_deliver：卷标识 + 节点计数 + 卷元信息。
-export function formatDeliverResult(res) {
+export function formatDeliverResult(res: WriteResult | null | undefined) {
   if (!res || res.ok === false || res.error) return formatWriteResult(res, { label: 'memory_deliver' });
-  const lines = [];
-  const head = ['memory_deliver'];
+  const lines: string[] = [];
+  const head: string[] = ['memory_deliver'];
   if (res.docId) head.push(`卷:${res.docId}`);
   if (res.createdCount != null) head.push(`+${res.createdCount}节点`);
   lines.push(head.join('  '));
@@ -161,14 +192,15 @@ export function formatDeliverResult(res) {
 }
 
 // memory_volumes：每卷一行（状态/身份/标题/节点数/末次活动）。
-export function formatVolumeList(res) {
+export function formatVolumeList(res: WriteResult | null | undefined) {
+  const result = res as WriteResult;
   const vols = res && Array.isArray(res.volumes) ? res.volumes : [];
   if (!vols.length) return '(无记忆卷)';
-  const total = Number.isFinite(res?.total) ? res.total : vols.length;
+  const total = typeof result.total === 'number' ? result.total : vols.length;
   const head = total > vols.length
     ? `已列出最新 ${vols.length} 卷，共 ${total} 卷，统计库内总量请显式调大 limit 或用 sql COUNT`
     : `共 ${total} 卷`;
-  const lines = [`${head}${res.now ? '（now ' + res.now + '）' : ''}：`];
+  const lines = [`${head}${result.now ? '（now ' + result.now + '）' : ''}：`];
   for (const v of vols) {
     const last = v.lastActivityAt ? `  末活:${v.lastActivityAt}` : '';
     lines.push(`  ${v.docId}  ${v.state || ''}  ${v.agent || ''}/${v.sessionId || ''}  「${clip(v.title, 40)}」  nodes:${v.nodeCount ?? '?'}${last}`);
@@ -177,14 +209,15 @@ export function formatVolumeList(res) {
 }
 
 // sql：行数 + 每行 key=val（列不固定，按行渲染；长单元格截断）。
-export function formatSqlResult(res) {
+export function formatSqlResult(res: WriteResult) {
+  const result = res as WriteResult;
   const allRows = res && Array.isArray(res.rows) ? res.rows : [];
   const { rows, total, truncated } = clipRows(allRows);
-  const head = `${res.rowCount ?? total} 行${res.truncated ? '（后端已截）' : ''}${truncated ? `（仅渲染前 ${rows.length}，要全部传 json=true）` : ''}`;
+  const head = `${result.rowCount ?? total} 行${result.truncated ? '（后端已截）' : ''}${truncated ? `（仅渲染前 ${rows.length}，要全部传 json=true）` : ''}`;
   if (!rows.length) return head;
   const lines = [`${head}：`];
   for (const row of rows) {
-    lines.push('  ' + Object.entries(row).map(([k, v]) => `${k}=${cell(v)}`).join('  '));
+    lines.push('  ' + Object.entries(row as Record<string, unknown>).map(([k, v]) => `${k}=${cell(v)}`).join('  '));
   }
   return lines.join('\n');
 }

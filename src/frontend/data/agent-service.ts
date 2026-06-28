@@ -1,9 +1,11 @@
-// @ts-nocheck
 import { callIftree, hasIftreeMethod, onAgentStream } from './iftree-api.js';
 import { settingsRepository } from './settings-service.js';
 
+type AgentPayload = Record<string, unknown>;
+type AgentStreamCallback = (event: unknown) => void;
+
 export const agentRepository = {
-  onStream(callback) {
+  onStream(callback: AgentStreamCallback) {
     return onAgentStream(callback);
   },
 
@@ -11,15 +13,15 @@ export const agentRepository = {
     return hasIftreeMethod('onAgentStream');
   },
 
-  saveSettings(settings) {
+  saveSettings(settings: AgentPayload) {
     return settingsRepository.saveAgentSettings(settings);
   },
 
-  runAgentRequest(payload) {
+  runAgentRequest(payload: AgentPayload) {
     return callIftree('runAgent', payload);
   },
 
-  cancelAgentRequest(payload) {
+  cancelAgentRequest(payload: AgentPayload) {
     return callIftree('cancelAgent', payload);
   },
 
@@ -31,15 +33,15 @@ export const agentRepository = {
     return callIftree('listAgentDiffs');
   },
 
-  applyDiff(payload) {
+  applyDiff(payload: AgentPayload) {
     return callIftree('applyAgentDiff', payload);
   },
 
-  rejectDiff(payload) {
+  rejectDiff(payload: AgentPayload) {
     return callIftree('rejectAgentDiff', payload);
   },
 
-  listSessions(payload) {
+  listSessions(payload: AgentPayload) {
     return callIftree('listAgentSessions', payload);
   },
 
@@ -47,7 +49,7 @@ export const agentRepository = {
     return hasIftreeMethod('listAgentSessions');
   },
 
-  getSession(payload) {
+  getSession(payload: AgentPayload) {
     return callIftree('getAgentSession', payload);
   },
 
@@ -55,7 +57,7 @@ export const agentRepository = {
     return hasIftreeMethod('getAgentSession');
   },
 
-  deleteSession(payload) {
+  deleteSession(payload: AgentPayload) {
     return callIftree('deleteAgentSession', payload);
   },
 

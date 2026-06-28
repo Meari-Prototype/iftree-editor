@@ -1,13 +1,20 @@
-// @ts-nocheck
 import { RESIZE_RAIL_DRAG_THRESHOLD } from './doc-utils.js';
 
-export function startResizeRailGesture(event, {
+interface ResizeRailGestureOptions {
+  collapsed?: boolean;
+  onExpand?: () => void;
+  bodyClasses?: string[];
+  onDrag?: (event: PointerEvent, origin: { startX: number; startY: number }) => void;
+  onClick?: () => void;
+}
+
+export function startResizeRailGesture(event: PointerEvent, {
   collapsed = false,
   onExpand,
   bodyClasses = [],
   onDrag,
   onClick
-}) {
+}: ResizeRailGestureOptions) {
   event.preventDefault();
   if (collapsed) {
     onExpand?.();
@@ -19,7 +26,7 @@ export function startResizeRailGesture(event, {
   let dragged = false;
   if (bodyClasses.length) document.body.classList.add(...bodyClasses);
 
-  const move = (moveEvent) => {
+  const move = (moveEvent: PointerEvent) => {
     const distance = Math.max(Math.abs(moveEvent.clientX - startX), Math.abs(moveEvent.clientY - startY));
     if (distance > RESIZE_RAIL_DRAG_THRESHOLD) dragged = true;
     if (!dragged) return;

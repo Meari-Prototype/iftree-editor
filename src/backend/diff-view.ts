@@ -1,12 +1,33 @@
-// @ts-nocheck
 // 对比弹窗（编辑分支 diff / 公理 diff）的视图渲染层——从主库存储类（store.mjs）剥离（后端解耦第 1 步）。
 // 职责：把基线/投影节点树分类成差异行、折叠未改动子树成占位行、统计各状态计数、把节点行转成
 // 客户端 camelCase 别名、把公理（事实前提）伪装成对比视图的节点卡片。纯函数、零状态、不碰 db。
 import { classifyTreeDiff } from '../core/merkle-diff.js';
 
+type DiffRow = Record<string, unknown>;
+interface DiffItem {
+  row: DiffRow;
+  children: DiffItem[];
+  hasChangedDescendant?: boolean;
+}
+type DiffStats = Record<string, number> & {
+  added: number;
+  deleted: number;
+  modified: number;
+  moved: number;
+  unchanged: number;
+  collapsed: number;
+  visibleRows: number;
+  totalRows: number;
+};
+const classifyTreeDiffTyped = classifyTreeDiff as unknown as (
+  baseNodes: DiffRow[],
+  projectedNodes: DiffRow[],
+  options?: Record<string, unknown>
+) => { roots: DiffItem[]; items: DiffItem[] };
+
 // 节点行 → 客户端 camelCase 别名（doc_id→docId 等）。编辑分支暂存方法（store 内）与下面的 diff
 // 渲染共用：两者返回的都是「编辑分支节点的客户端形态」，故落在本模块单点维护。
-export function nodeRowWithClientAliases(row) {
+export function nodeRowWithClientAliases(row: DiffRow | null | undefined) {
   if (!row) return row;
   return {
     ...row,
@@ -25,7 +46,7 @@ export function nodeRowWithClientAliases(row) {
   };
 }
 
-function editBranchDiffNode(row) {
+function editBranchDiffNode(row: DiffRow | null | undefined) {
   if (!row) return null;
   const node = nodeRowWithClientAliases(row);
   return {
@@ -34,19 +55,19 @@ function editBranchDiffNode(row) {
   };
 }
 
-function flattenDiffTreeItem(item) {
+function flattenDiffTreeItem(item: DiffItem): DiffRow[] {
   const rows = [{ ...item.row }];
   for (const child of item.children) rows.push(...flattenDiffTreeItem(child));
   return rows;
 }
 
-function diffHiddenNodeCount(items) {
-  return items.reduce((sum, item) => sum + flattenDiffTreeItem(item).length, 0);
+function diffHiddenNodeCount(items: DiffItem[]) {
+  return items.reduce((sum: number, item: DiffItem) => sum + flattenDiffTreeItem(item).length, 0);
 }
 
-export function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], baseHashes = null) {
-  const { roots, items } = classifyTreeDiff(baseNodes, projectedNodes, baseHashes ? { baseHashes } : {});
-  const stats = {
+export function buildEditBranchDiffRows(baseNodes: DiffRow[] = [], projectedNodes: DiffRow[] = [], baseHashes: unknown = null) {
+  const { roots, items } = classifyTreeDiffTyped(baseNodes, projectedNodes, baseHashes ? { baseHashes } : {});
+  const stats: DiffStats = {
     added: 0,
     deleted: 0,
     modified: 0,
@@ -60,18 +81,18 @@ export function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], bas
   // （否则 move/reparent 挤动的邻居 sort_order 变化全算 modified，summary 报 2、stats 报 11 对不上）。
   const POSITION_ONLY_FIELDS = new Set(['sort_order', 'parent_id', 'address']);
   for (const item of items) {
-    item.row.left = editBranchDiffNode(item.row.left);
-    item.row.right = editBranchDiffNode(item.row.right);
+    item.row.left = editBranchDiffNode(item.row.left as DiffRow | null | undefined);
+    item.row.right = editBranchDiffNode(item.row.right as DiffRow | null | undefined);
     const fields = Array.isArray(item.row.changedFields) ? item.row.changedFields : [];
     if (item.row.status === 'modified' && fields.length > 0 && fields.every((f) => POSITION_ONLY_FIELDS.has(f))) {
       stats.moved += 1;
     } else {
-      stats[item.row.status] += 1;
+      stats[String(item.row.status)] += 1;
     }
     stats.totalRows += 1;
   }
 
-  function markChangedDescendants(item) {
+  function markChangedDescendants(item: DiffItem): boolean {
     let hasChangedDescendant = false;
     for (const child of item.children) {
       const childChanged = markChangedDescendants(child);
@@ -83,7 +104,7 @@ export function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], bas
 
   for (const root of roots) markChangedDescendants(root);
 
-  function collapsedRowFor(items) {
+  function collapsedRowFor(items: DiffItem[]) {
     const hiddenRows = items.flatMap(flattenDiffTreeItem);
     const first = hiddenRows[0];
     const last = hiddenRows[hiddenRows.length - 1];
@@ -98,9 +119,9 @@ export function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], bas
     };
   }
 
-  function renderItems(items) {
-    const rows = [];
-    let pending = [];
+  function renderItems(items: DiffItem[]): DiffRow[] {
+    const rows: DiffRow[] = [];
+    let pending: DiffItem[] = [];
     const flushPending = () => {
       if (pending.length === 0) return;
       const row = collapsedRowFor(pending);
@@ -110,7 +131,7 @@ export function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], bas
     };
 
     for (const item of items) {
-      const canCollapse = item.row.depth > 1
+      const canCollapse = Number(item.row.depth) > 1
         && item.row.status === 'unchanged'
         && !item.hasChangedDescendant;
       if (canCollapse) {
@@ -133,7 +154,7 @@ export function buildEditBranchDiffRows(baseNodes = [], projectedNodes = [], bas
 }
 
 // 公理（事实前提）卡片行：伪装成对比视图节点卡片的形状，address 用 A 标号。
-function axiomDiffCard(axiom) {
+function axiomDiffCard(axiom: DiffRow | null | undefined) {
   if (!axiom) return null;
   return {
     id: axiom.id,
@@ -155,10 +176,10 @@ function axiomDiffCard(axiom) {
 // 任一变即 modified；label 是地址不是内容（删除引发的重排不算修改）；
 // node_width/height/size_mode 是视图偏好，不进 diff（8-3-2-1）。
 // 未修改公理不显示也不进折叠计数（折叠条语义是"未修改节点"）。
-export function buildAxiomDiffRows(baseAxioms = [], projectedAxioms = []) {
+export function buildAxiomDiffRows(baseAxioms: DiffRow[] = [], projectedAxioms: DiffRow[] = []) {
   const AXIOM_DIFF_FIELDS = ['content', 'status', 'node_title', 'node_note'];
-  const rows = [];
-  const stats = { added: 0, deleted: 0, modified: 0 };
+  const rows: DiffRow[] = [];
+  const stats: Record<string, number> = { added: 0, deleted: 0, modified: 0 };
   const baseById = new Map(baseAxioms.map((axiom) => [String(axiom.id), axiom]));
   const seen = new Set();
   for (const proj of projectedAxioms) {
@@ -166,7 +187,7 @@ export function buildAxiomDiffRows(baseAxioms = [], projectedAxioms = []) {
     seen.add(id);
     const base = baseById.get(id) || null;
     let status = 'added';
-    let changedFields = [];
+    let changedFields: string[] = [];
     if (base) {
       changedFields = AXIOM_DIFF_FIELDS.filter((field) => String(base[field] ?? '') !== String(proj[field] ?? ''));
       status = changedFields.length ? 'modified' : 'unchanged';

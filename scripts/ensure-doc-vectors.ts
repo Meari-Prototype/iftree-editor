@@ -1,11 +1,27 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+interface VectorProgressEvent {
+  type?: unknown;
+  stage?: unknown;
+  docId?: unknown;
+  nodeCount?: unknown;
+  vectorCountBefore?: unknown;
+  staleCount?: unknown;
+  changedCount?: unknown;
+  staleDeleted?: unknown;
+  changedDeleted?: unknown;
+  missingCount?: unknown;
+  batchSize?: unknown;
+  missingInserted?: unknown;
+  scanned?: unknown;
+  vectorCountAfter?: unknown;
+}
 
 function docIdFromArg() {
   const value = String(process.argv[2] || '').trim();
@@ -15,7 +31,7 @@ function docIdFromArg() {
   return value;
 }
 
-function progressLine(event = {}) {
+function progressLine(event: VectorProgressEvent = {}) {
   if (event.type !== 'vector.ensureDoc.progress') return '';
   if (event.stage === 'scan') {
     return `[vector] scan doc=${event.docId} nodes=${event.nodeCount} vectorsBefore=${event.vectorCountBefore} stale=${event.staleCount} changed=${event.changedCount}`;
@@ -29,7 +45,7 @@ function progressLine(event = {}) {
   return '';
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.versions.electron) {
     try {
       const { app } = await import('electron');
@@ -52,7 +68,7 @@ async function main() {
   try {
     const result = await client.request('vector.ensureDoc', { payload: { docId } }, {
       onEvent: (event) => {
-        const line = progressLine(event);
+        const line = progressLine(event as VectorProgressEvent);
         if (line) console.log(line);
       }
     });
@@ -65,7 +81,7 @@ async function main() {
 
 main()
   .then(() => exitProcess(0))
-  .catch(async (error) => {
-    console.error(error?.stack || error?.message || String(error));
+  .catch(async (error: unknown) => {
+    console.error((error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || String(error));
     await exitProcess(1);
   });

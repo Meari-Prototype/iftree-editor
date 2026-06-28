@@ -1,26 +1,31 @@
-// @ts-nocheck
-import { isFlatTree } from '../../core/flat-tree.js';
-import { toTreeNode } from '../../core/node-model.js';
+import { FlatTree, isFlatTree } from '../../core/flat-tree.js';
+import { toTreeNode, type TreeNode } from '../../core/node-model.js';
 
-function compareNodeRows(left, right) {
-  if (left.sortOrder !== right.sortOrder) return left.sortOrder - right.sortOrder;
-  if (typeof left.id === 'number' && typeof right.id === 'number') return left.id - right.id;
+type FlatTreeRow = ReturnType<FlatTree['rowAtSlot']>;
+
+function compareNodeRows(left: TreeNode, right: TreeNode): number {
+  if (left.sortOrder !== right.sortOrder) return Number(left.sortOrder) - Number(right.sortOrder);
   return String(left.id).localeCompare(String(right.id));
 }
 
-function normalizeIndexNodeId(value) {
+function normalizeIndexNodeId(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   return String(value);
 }
 
-function addressDepth(address) {
+function addressDepth(address: unknown): number | null {
   const value = String(address || '').trim();
   if (!value) return null;
   return value.split('-').filter(Boolean).length || null;
 }
 
-function buildFlatTreeDepthStats(flatTree) {
-  const depthSet = new Set();
+interface DepthStats {
+  maxDepth: number;
+  depths: readonly number[];
+}
+
+function buildFlatTreeDepthStats(flatTree: FlatTree): DepthStats {
+  const depthSet = new Set<number>();
   let maxDepth = 0;
   for (let slot = 0; slot < flatTree.length; slot += 1) {
     const depth = Math.max(1, Number(flatTree.depths[slot]) || 1);
@@ -33,57 +38,84 @@ function buildFlatTreeDepthStats(flatTree) {
   });
 }
 
-function allFlatSlots(flatTree) {
+function allFlatSlots(flatTree: FlatTree): number[] {
   return Array.from({ length: flatTree.length }, (_value, slot) => slot);
 }
 
-function buildFlatNodeByIdProxy(flatTree) {
+interface FlatNodeByIdProxy {
+  get(id: unknown): FlatTreeRow | null;
+  has(id: unknown): boolean;
+  keys(): Array<string | null>;
+  values(): FlatTreeRow[];
+  entries(): Array<[string | null, FlatTreeRow]>;
+  [Symbol.iterator](): IterableIterator<[string | null, FlatTreeRow]>;
+}
+
+function buildFlatNodeByIdProxy(flatTree: FlatTree): FlatNodeByIdProxy {
   return Object.freeze({
-    get(id) {
+    get(id: unknown) {
       const slot = flatTree.slotOf(id);
       return slot >= 0 ? flatTree.rowAtSlot(slot) : null;
     },
-    has(id) {
+    has(id: unknown) {
       return flatTree.slotOf(id) >= 0;
     },
     keys() {
       return allFlatSlots(flatTree).map((slot) => flatTree.ids[slot]);
     },
     values() {
-      return allFlatSlots(flatTree).map((slot) => flatTree.rowAtSlot(slot)).filter(Boolean);
+      return allFlatSlots(flatTree)
+        .map((slot) => flatTree.rowAtSlot(slot))
+        .filter((row): row is NonNullable<FlatTreeRow> => Boolean(row));
     },
     entries() {
       return allFlatSlots(flatTree)
-        .map((slot) => [flatTree.ids[slot], flatTree.rowAtSlot(slot)])
-        .filter((entry) => Boolean(entry[1]));
+        .map((slot): [string | null, FlatTreeRow] => [flatTree.ids[slot], flatTree.rowAtSlot(slot)])
+        .filter((entry): entry is [string | null, NonNullable<FlatTreeRow>] => Boolean(entry[1]));
     },
     [Symbol.iterator]() {
       return this.entries()[Symbol.iterator]();
     }
-  });
+  }) as FlatNodeByIdProxy;
 }
 
-function buildFlatTreeIndex(flatTree) {
+export interface TreeIndex {
+  depthStats: DepthStats;
+  idByAddress: Readonly<Record<string, unknown>>;
+  addressById: Readonly<Record<string, string>>;
+  allIds(): Array<string | null>;
+  parentOf(id: unknown): unknown;
+  childrenOf(id: unknown): ReadonlyArray<unknown>;
+  siblingsAfter(id: unknown): ReadonlyArray<unknown>;
+  nodeOf(id: unknown): TreeNode | FlatTreeRow | null;
+  hasChildren(id: unknown): boolean;
+  descendantsOf(id: unknown): Array<TreeNode | FlatTreeRow>;
+  nodeById?: FlatNodeByIdProxy;
+}
+
+function buildFlatTreeIndex(flatTree: FlatTree): TreeIndex {
   const nodeById = buildFlatNodeByIdProxy(flatTree);
   const depthStats = buildFlatTreeDepthStats(flatTree);
-  const idByAddress = {};
-  const addressById = {};
+  const idByAddress: Record<string, unknown> = {};
+  const addressById: Record<string, string> = {};
   for (let slot = 0; slot < flatTree.length; slot += 1) {
     const id = flatTree.ids[slot];
     const address = String(flatTree.addresses?.[slot] || '').trim();
-    if (!address) continue;
+    if (!address || id === null) continue;
     idByAddress[address] = id;
     addressById[id] = address;
   }
 
-  function idsForSlots(slots) {
+  function idsForSlots(slots: number[]): ReadonlyArray<string | null> {
     return Object.freeze(slots.map((slot) => flatTree.ids[slot]));
   }
 
-  function descendantsOf(id) {
+  function descendantsOf(id: unknown): FlatTreeRow[] {
     const startSlot = flatTree.slotOf(id);
     if (startSlot < 0) return [];
-    return flatTree.slotsPreOrder(startSlot).map((slot) => flatTree.rowAtSlot(slot)).filter(Boolean);
+    return flatTree.slotsPreOrder(startSlot)
+      .map((slot) => flatTree.rowAtSlot(slot))
+      .filter((row): row is NonNullable<FlatTreeRow> => Boolean(row));
   }
 
   return Object.freeze({
@@ -94,18 +126,18 @@ function buildFlatTreeIndex(flatTree) {
     allIds() {
       return allFlatSlots(flatTree).map((slot) => flatTree.ids[slot]);
     },
-    parentOf(id) {
+    parentOf(id: unknown) {
       const slot = flatTree.slotOf(id);
       if (slot < 0) return null;
       const parentId = flatTree.parentIds[slot];
       return parentId === null ? null : parentId;
     },
-    childrenOf(id) {
+    childrenOf(id: unknown) {
       const slot = id === null || id === undefined ? -1 : flatTree.slotOf(id);
       if (slot < 0 && id !== null && id !== undefined) return [];
       return idsForSlots(flatTree.childSlots(slot));
     },
-    siblingsAfter(id) {
+    siblingsAfter(id: unknown) {
       const slot = flatTree.slotOf(id);
       if (slot < 0) return [];
       const parentId = flatTree.parentIds[slot];
@@ -115,10 +147,10 @@ function buildFlatTreeIndex(flatTree) {
       const index = siblings.indexOf(slot);
       return index < 0 ? [] : idsForSlots(siblings.slice(index + 1));
     },
-    nodeOf(id) {
+    nodeOf(id: unknown) {
       return nodeById.get(id) || null;
     },
-    hasChildren(id) {
+    hasChildren(id: unknown) {
       const slot = flatTree.slotOf(id);
       return slot >= 0 && Boolean(flatTree.firstChildSlot[slot] !== -1 || flatTree.childCounts[slot] > 0);
     },
@@ -126,15 +158,15 @@ function buildFlatTreeIndex(flatTree) {
   });
 }
 
-export function buildTreeIndex(nodes) {
-  if (isFlatTree(nodes)) return buildFlatTreeIndex(nodes);
+export function buildTreeIndex(nodes: unknown): TreeIndex {
+  if (isFlatTree(nodes)) return buildFlatTreeIndex(nodes as FlatTree);
 
-  const nodeById = new Map();
-  const parentById = new Map();
-  const childrenById = new Map();
-  const idByAddress = {};
-  const addressById = {};
-  const depthSet = new Set();
+  const nodeById = new Map<string, TreeNode>();
+  const parentById = new Map<string, string | null>();
+  const childrenById = new Map<string | null, TreeNode[]>();
+  const idByAddress: Record<string, string> = {};
+  const addressById: Record<string, string> = {};
+  const depthSet = new Set<number>();
   let maxDepth = 0;
 
   for (const raw of Array.isArray(nodes) ? nodes : []) {
@@ -142,8 +174,9 @@ export function buildTreeIndex(nodes) {
     if (!node) continue;
     nodeById.set(node.id, node);
     parentById.set(node.id, node.parentId);
-    if (!childrenById.has(node.parentId)) childrenById.set(node.parentId, []);
-    childrenById.get(node.parentId).push(node);
+    const childList = childrenById.get(node.parentId) || [];
+    childList.push(node);
+    childrenById.set(node.parentId, childList);
     if (node.address) {
       idByAddress[node.address] = node.id;
       addressById[node.id] = node.address;
@@ -155,7 +188,7 @@ export function buildTreeIndex(nodes) {
     }
   }
 
-  const childrenIdsById = new Map();
+  const childrenIdsById = new Map<string | null, ReadonlyArray<string>>();
   for (const [parentId, children] of childrenById) {
     const ids = children
       .sort(compareNodeRows)
@@ -163,13 +196,13 @@ export function buildTreeIndex(nodes) {
     childrenIdsById.set(parentId, Object.freeze(ids));
   }
 
-  const roots = childrenIdsById.get(null) || [];
-  const stack = roots.slice().reverse().map((id, index, source) => ({
+  const roots = (childrenIdsById.get(null) || []) as ReadonlyArray<string>;
+  const stack: Array<{ id: string; address: string }> = roots.slice().reverse().map((id, index, source) => ({
     id,
     address: String(source.length - index)
   }));
   while (stack.length > 0) {
-    const { id, address } = stack.pop();
+    const { id, address } = stack.pop()!;
     const node = nodeById.get(id);
     if (!node) continue;
     node.address = node.address || address;
@@ -189,23 +222,24 @@ export function buildTreeIndex(nodes) {
   const orderedIds = Object.freeze([...nodeById.values()]
     .sort(compareNodeRows)
     .map((node) => node.id));
-  const depthStats = Object.freeze({
+  const depthStats: DepthStats = Object.freeze({
     maxDepth,
     depths: Object.freeze([...depthSet].sort((a, b) => a - b))
   });
 
-  function descendantsOf(id) {
+  function descendantsOf(id: unknown): TreeNode[] {
     const key = normalizeIndexNodeId(id);
-    if (!nodeById.has(key)) return [];
-    const result = [nodeById.get(key)];
-    const stack = [...(childrenIdsById.get(key) || [])].reverse();
-    while (stack.length > 0) {
-      const currentId = stack.pop();
+    if (key === null || !nodeById.has(key)) return [];
+    const root = nodeById.get(key)!;
+    const result: TreeNode[] = [root];
+    const stackInner = [...(childrenIdsById.get(key) || [])].reverse();
+    while (stackInner.length > 0) {
+      const currentId = stackInner.pop()!;
       const node = nodeById.get(currentId);
       if (node) result.push(node);
       const children = childrenIdsById.get(currentId) || [];
       for (let index = children.length - 1; index >= 0; index -= 1) {
-        stack.push(children[index]);
+        stackInner.push(children[index]);
       }
     }
     return result;
@@ -218,25 +252,29 @@ export function buildTreeIndex(nodes) {
     allIds() {
       return [...orderedIds];
     },
-    parentOf(id) {
+    parentOf(id: unknown) {
       const key = normalizeIndexNodeId(id);
-      return parentById.has(key) ? parentById.get(key) : null;
+      return key !== null && parentById.has(key) ? parentById.get(key) ?? null : null;
     },
-    childrenOf(id) {
-      return childrenIdsById.get(normalizeIndexNodeId(id)) || [];
-    },
-    siblingsAfter(id) {
+    childrenOf(id: unknown) {
       const key = normalizeIndexNodeId(id);
-      if (!parentById.has(key)) return [];
-      const siblings = childrenIdsById.get(parentById.get(key)) || [];
+      return childrenIdsById.get(key) || [];
+    },
+    siblingsAfter(id: unknown) {
+      const key = normalizeIndexNodeId(id);
+      if (key === null || !parentById.has(key)) return [];
+      const parentKey = parentById.get(key) ?? null;
+      const siblings = childrenIdsById.get(parentKey) || [];
       const index = siblings.indexOf(key);
       return index < 0 ? [] : siblings.slice(index + 1);
     },
-    nodeOf(id) {
-      return nodeById.get(normalizeIndexNodeId(id)) || null;
-    },
-    hasChildren(id) {
+    nodeOf(id: unknown) {
       const key = normalizeIndexNodeId(id);
+      return key !== null ? nodeById.get(key) || null : null;
+    },
+    hasChildren(id: unknown) {
+      const key = normalizeIndexNodeId(id);
+      if (key === null) return false;
       const node = nodeById.get(key);
       return Boolean((childrenIdsById.get(key) || []).length || Number(node?.childCount) > 0);
     },
@@ -244,7 +282,26 @@ export function buildTreeIndex(nodes) {
   });
 }
 
-function readNumber(source, keys, fallback = 0) {
+interface PositionLike {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  cardHeight?: number;
+  card_height?: number;
+  [extra: string]: unknown;
+}
+
+interface Edge {
+  fromX: number;
+  fromY: number;
+  toX: number;
+  toY: number;
+  fromId: unknown;
+  toId: unknown;
+}
+
+function readNumber(source: PositionLike | null | undefined, keys: ReadonlyArray<string>, fallback: number = 0): number {
   for (const key of keys) {
     const value = Number(source?.[key]);
     if (Number.isFinite(value)) return value;
@@ -252,10 +309,14 @@ function readNumber(source, keys, fallback = 0) {
   return fallback;
 }
 
-export function buildEdgesFromPositions(positions, treeIndex, nodeIds = null) {
+export function buildEdgesFromPositions(
+  positions: Map<unknown, PositionLike> | unknown,
+  treeIndex: Pick<TreeIndex, 'childrenOf'> | null | undefined,
+  nodeIds: ReadonlyArray<unknown> | Set<unknown> | null = null
+): Edge[] {
   if (!(positions instanceof Map) || !treeIndex || typeof treeIndex.childrenOf !== 'function') return [];
-  const edges = [];
-  const ids = Array.isArray(nodeIds) || nodeIds instanceof Set ? [...nodeIds] : [...positions.keys()];
+  const edges: Edge[] = [];
+  const ids: unknown[] = Array.isArray(nodeIds) || nodeIds instanceof Set ? [...nodeIds] : [...positions.keys()];
   for (const nodeId of ids) {
     const pos = positions.get(nodeId);
     if (!pos) continue;

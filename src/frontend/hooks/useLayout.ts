@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { useCallback, useMemo, useRef, useState } from 'react';
 
 import { clampVerticalSplitSize } from '../../core/sidebar-split.js';
@@ -20,16 +19,16 @@ const RAIL_ANIMATION_MS = 220;
 export function useLayout() {
   const [leftWidth, setLeftWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [rightWidth, setRightWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
-  const [docPanelHeight, setDocPanelHeight] = useState(null);
+  const [docPanelHeight, setDocPanelHeight] = useState<number | null>(null);
   const [outlineCollapsedDown, setOutlineCollapsedDown] = useState(false);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
   const [leftRailAnimate, setLeftRailAnimate] = useState(false);
   const [rightRailAnimate, setRightRailAnimate] = useState(false);
 
-  const leftSidebarRef = useRef(null);
-  const docPanelRef = useRef(null);
-  const docPanelHeightBeforeCollapseRef = useRef(null);
+  const leftSidebarRef = useRef<HTMLDivElement | null>(null);
+  const docPanelRef = useRef<HTMLDivElement | null>(null);
+  const docPanelHeightBeforeCollapseRef = useRef<number | null>(null);
 
   const toggleLeft = useCallback(() => {
     setLeftRailAnimate(true);
@@ -62,7 +61,7 @@ export function useLayout() {
     setOutlineCollapsedDown(true);
   }, [docPanelHeight, outlineCollapsedDown]);
 
-  const startSidebarResize = useCallback((side, event) => {
+  const startSidebarResize = useCallback((side: 'left' | 'right', event: PointerEvent) => {
     const isLeft = side === 'left';
     const isCollapsed = isLeft ? leftCollapsed : rightCollapsed;
     const toggleSidebar = isLeft ? toggleLeft : toggleRight;
@@ -87,7 +86,7 @@ export function useLayout() {
     });
   }, [leftCollapsed, leftWidth, rightCollapsed, rightWidth, toggleLeft, toggleRight]);
 
-  const startDocOutlineResize = useCallback((event) => {
+  const startDocOutlineResize = useCallback((event: PointerEvent) => {
     const sidebar = leftSidebarRef.current;
     const docPanel = docPanelRef.current;
     if (!sidebar || !docPanel) return;

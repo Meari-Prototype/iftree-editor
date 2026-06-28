@@ -1,17 +1,45 @@
-﻿// @ts-nocheck
-
+﻿
 import { useEffect, useState } from 'react';
 
 
 import {
   DEFAULT_SUMMARY_STRATEGIES, normalizeSummaryStrategy,
-  summarySkipBelowCount, summaryStrategyLabel
+  summarySkipBelowCount, summaryStrategyLabel,
+  type SummaryItem
 } from '../lib/summary-utils.js';
 
 
-export function SummaryConfirmDialog({ request, onCancel, onConfirm }) {
-  const strategyIndex = Number.isInteger(request?.strategyIndex)
-    ? request.strategyIndex
+export interface SummaryStrategy {
+  id: string;
+  name: string;
+  skipBelowChars: number | string;
+  minWords: number | string;
+  maxWords: number | string;
+  ratioPercent: number | string;
+}
+
+export interface SummaryConfirmRequest {
+  strategyIndex?: number;
+  mode?: string;
+  strategyOptions?: unknown[];
+  strategy?: unknown;
+  summaryItems?: unknown[];
+  skippedGenerated?: unknown;
+  scopeLabel?: string;
+  targetLabel?: string;
+  selectedLabel?: string;
+}
+
+interface SummaryConfirmDialogProps {
+  request?: SummaryConfirmRequest | null;
+  onCancel: () => void;
+  onConfirm?: (strategy: SummaryStrategy) => void;
+}
+
+export function SummaryConfirmDialog({ request, onCancel, onConfirm }: SummaryConfirmDialogProps) {
+  const requestedStrategyIndex = request?.strategyIndex;
+  const strategyIndex = Number.isInteger(requestedStrategyIndex)
+    ? requestedStrategyIndex as number
     : (request?.mode === 'article' ? 0 : 1);
   const options = Array.isArray(request?.strategyOptions) && request.strategyOptions.length > 0
     ? request.strategyOptions.map((strategy, index) => normalizeSummaryStrategy(strategy, index))
@@ -26,7 +54,7 @@ export function SummaryConfirmDialog({ request, onCancel, onConfirm }) {
     setDraft(initial);
   }, [request]);
 
-  const updateNumber = (key, value) => {
+  const updateNumber = (key: keyof SummaryStrategy, value: string) => {
     setDraft((current) => (
       value === ''
         ? { ...current, [key]: '' }
@@ -36,11 +64,11 @@ export function SummaryConfirmDialog({ request, onCancel, onConfirm }) {
   const commitNumbers = () => {
     setDraft((current) => normalizeSummaryStrategy(current, strategyIndex));
   };
-  const selectStrategy = (id) => {
+  const selectStrategy = (id: string) => {
     const selected = options.find((strategy) => strategy.id === id);
     if (selected) setDraft(selected);
   };
-  const skippedShort = summarySkipBelowCount(request?.summaryItems || [], draft, strategyIndex);
+  const skippedShort = summarySkipBelowCount((request?.summaryItems || []) as SummaryItem[], draft, strategyIndex);
   const skippedGenerated = Number(request?.skippedGenerated || 0);
 
   return (
@@ -66,7 +94,7 @@ export function SummaryConfirmDialog({ request, onCancel, onConfirm }) {
           <select className="dialog-input" value={draft.id} onChange={(event) => selectStrategy(event.target.value)}>
             {options.map((strategy) => (
               <option key={strategy.id} value={strategy.id}>
-                {strategy.name}（{summaryStrategyLabel(strategy)}）
+                {strategy.name}（{summaryStrategyLabel(strategy as Parameters<typeof summaryStrategyLabel>[0])}）
               </option>
             ))}
           </select>

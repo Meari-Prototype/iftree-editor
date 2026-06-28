@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   ChevronDown,
   ChevronsDownUp,
@@ -14,11 +13,11 @@ import {
   Unlock
 } from 'lucide-react';
 import * as Tabs from '@radix-ui/react-tabs';
-import { useState } from 'react';
+import { type MouseEvent, type ReactNode, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import { DepthCollapseOneIcon, DepthExpandOneIcon, IconButton } from './common.jsx';
-import { SummaryConfirmDialog } from './SummaryConfirmDialog.jsx';
+import { SummaryConfirmDialog, type SummaryConfirmRequest, type SummaryStrategy } from './SummaryConfirmDialog.jsx';
 import { useFloatingMenu } from '../hooks/useFloatingMenu.js';
 
 const VIEW_MENU_WIDTH = 190;
@@ -29,12 +28,75 @@ const SUMMARY_MENU_WIDTH = 150;
 const SUMMARY_MENU_HEIGHT = 132;
 const MENU_OFFSET = 6;
 
+// 单一 useFloatingMenu 实例，按 id 互斥三套菜单（summary / view / diff）。
+type MenuId = 'summary' | 'view' | 'diff';
+
+interface MenuSpec {
+  className: string;
+  width: number;
+  height: number;
+}
+
 // 三套浮层菜单 id→{className,width,height} 映射。一次只开一个，单一 useFloatingMenu 实例互斥。
-const MENU_SPECS = {
+const MENU_SPECS: Record<MenuId, MenuSpec> = {
   summary: { className: 'summary-menu', width: SUMMARY_MENU_WIDTH, height: SUMMARY_MENU_HEIGHT },
   view: { className: 'view-options-menu', width: VIEW_MENU_WIDTH, height: VIEW_MENU_HEIGHT },
   diff: { className: 'diff-branch-menu', width: DIFF_MENU_WIDTH, height: DIFF_MENU_HEIGHT }
 };
+
+export type WorkspaceTab = 'tree' | 'ide' | 'rich' | 'entity' | 'search';
+
+// 编辑分支按钮的可选项（diff button menu 来源）。
+export interface DiffBranchOption {
+  id?: string | number;
+  owner?: string;
+  label?: string;
+  activeEntryCount?: number;
+  disabled?: boolean;
+}
+
+// setVisibleDepth 第二参，源自 useTreeViewState 的语义动作日志。
+interface VisibleDepthOptions {
+  clearAll?: boolean;
+  action?: 'collapseAll' | 'expandOne' | 'expandAll' | 'setDepth';
+}
+
+// children 可以是 ReactNode 也可以是 render-prop（接收 view 显示开关）。
+interface WorkspaceHeaderViewState {
+  viewShowLeftInfo: boolean;
+  viewShowTitles: boolean;
+  viewShowNotes: boolean;
+  viewShowAxioms: boolean;
+}
+
+export interface WorkspaceHeaderProps {
+  title?: string;
+  subtitle?: string;
+  activeTab: WorkspaceTab;
+  setActiveTab: (tab: string) => void;
+  undoEdit?: () => void;
+  redoEdit?: () => void;
+  undoDisabled?: boolean;
+  redoDisabled?: boolean;
+  treeEditMode?: boolean;
+  toggleTreeEditMode?: () => void;
+  hasTree: boolean;
+  busy?: boolean;
+  recomputeCurrentTreeView?: () => void;
+  setVisibleDepth: (depth: number | string, options?: VisibleDepthOptions) => void;
+  collapseVisibleDepthOne?: () => void;
+  visibleDepthLimit: number;
+  visibleDepthOptions: number[];
+  actualMaxDepth: number;
+  summaryNotesVisible?: boolean;
+  onToggleSummaryNotes?: () => void;
+  onGenerateSummary?: (mode: string) => Promise<SummaryConfirmRequest | null | undefined>;
+  onRunSummaryGeneration?: (request: SummaryConfirmRequest, strategy: SummaryStrategy) => void;
+  diffBranches?: DiffBranchOption[];
+  onOpenDiff?: (branch: DiffBranchOption) => void;
+  onOpenEntityMaintenance?: () => void;
+  children?: ReactNode | ((viewState: WorkspaceHeaderViewState) => ReactNode);
+}
 
 export function WorkspaceHeader({
   title,
@@ -63,13 +125,13 @@ export function WorkspaceHeader({
   onOpenDiff,
   onOpenEntityMaintenance,
   children
-}) {
-  const [summaryConfirm, setSummaryConfirm] = useState(null);
-  const [viewShowLeftInfo, setViewShowLeftInfo] = useState(true);
-  const [viewShowTitles, setViewShowTitles] = useState(true);
-  const [viewShowAxioms, setViewShowAxioms] = useState(true);
+}: WorkspaceHeaderProps) {
+  const [summaryConfirm, setSummaryConfirm] = useState<SummaryConfirmRequest | null>(null);
+  const [viewShowLeftInfo, setViewShowLeftInfo] = useState<boolean>(true);
+  const [viewShowTitles, setViewShowTitles] = useState<boolean>(true);
+  const [viewShowAxioms, setViewShowAxioms] = useState<boolean>(true);
 
-  const normalizedDiffBranches = Array.isArray(diffBranches) ? diffBranches : [];
+  const normalizedDiffBranches: DiffBranchOption[] = Array.isArray(diffBranches) ? diffBranches : [];
   const enabledDiffBranches = normalizedDiffBranches.filter((branch) => (
     !branch?.disabled && Number(branch?.activeEntryCount) > 0
   ));
@@ -77,18 +139,18 @@ export function WorkspaceHeader({
 
   // summary / view / diff 三套浮层菜单合一：单一 id-keyed 互斥。
   const menu = useFloatingMenu({
-    specs: (id) => MENU_SPECS[id] || null,
+    specs: (id: string) => MENU_SPECS[id as MenuId] || null,
     offset: MENU_OFFSET
   });
 
-  function openDiffBranch(branch) {
+  function openDiffBranch(branch: DiffBranchOption) {
     menu.close();
     onOpenDiff?.(branch);
   }
 
-  function chooseSummaryMode(mode) {
+  function chooseSummaryMode(mode: string) {
     menu.close();
-    onGenerateSummary?.(mode).then((request) => {
+    onGenerateSummary?.(mode)?.then((request) => {
       if (request) setSummaryConfirm(request);
     });
   }
@@ -188,7 +250,7 @@ export function WorkspaceHeader({
     );
   }
 
-  function toggleDiffMenu(event) {
+  function toggleDiffMenu(event: MouseEvent<HTMLButtonElement>) {
     event.stopPropagation();
     if (diffButtonDisabled) return;
     if (enabledDiffBranches.length === 1) {
@@ -198,11 +260,11 @@ export function WorkspaceHeader({
     menu.toggle('diff', event);
   }
 
-  function toggleSummaryMenu(event) {
+  function toggleSummaryMenu(event: MouseEvent<HTMLButtonElement>) {
     menu.toggle('summary', event);
   }
 
-  function toggleViewMenu(event) {
+  function toggleViewMenu(event: MouseEvent<HTMLButtonElement>) {
     menu.toggle('view', event);
   }
 

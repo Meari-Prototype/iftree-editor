@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   appendFileSync,
   existsSync,
@@ -45,7 +44,43 @@ import {
 
 const DEFAULT_TREE_SLICE_DEPTH = 1;
 
-function stripTree(node) {
+interface StrippedTreeNode {
+  id: unknown;
+  doc_id: unknown;
+  parent_id: unknown;
+  sort_order: unknown;
+  node_type: unknown;
+  text: unknown;
+  node_title: unknown;
+  node_note: unknown;
+  source_position: unknown;
+  child_count: unknown;
+  trust_level: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+  address: unknown;
+  children: StrippedTreeNode[];
+}
+
+interface TreeNodeLike {
+  id?: unknown;
+  doc_id?: unknown;
+  parent_id?: unknown;
+  sort_order?: unknown;
+  node_type?: unknown;
+  text?: unknown;
+  node_title?: unknown;
+  node_note?: unknown;
+  source_position?: unknown;
+  child_count?: unknown;
+  trust_level?: unknown;
+  created_at?: unknown;
+  updated_at?: unknown;
+  address?: unknown;
+  children?: TreeNodeLike[];
+}
+
+function stripTree(node: TreeNodeLike | null | undefined): StrippedTreeNode | null {
   if (!node) return null;
   return {
     id: node.id,
@@ -62,12 +97,52 @@ function stripTree(node) {
     created_at: node.created_at,
     updated_at: node.updated_at,
     address: node.address,
-    children: (node.children || []).map(stripTree)
+    children: (node.children || [])
+      .map((child) => stripTree(child))
+      .filter((child): child is StrippedTreeNode => child !== null)
   };
 }
 
-export function createHeadlessAgentHost(options = {}) {
+export interface HeadlessAgentHostOptions {
+  projectRoot?: string;
+  enqueueWrite?: ((task: () => unknown) => unknown) | null;
+  sendEvent?: ((event: Record<string, unknown>) => void) | null;
+  fetchers?: () => unknown[];
+}
+
+interface MaintenanceCapableStore {
+  maintenance?: {
+    setSerialize?: (enqueue: (task: () => unknown) => unknown) => void;
+    register: (name: string, handler: () => unknown) => void;
+    start: () => void;
+  } | null;
+}
+
+type RequestEnvelope = Record<string, unknown> & {
+  type?: unknown;
+  method?: unknown;
+  command?: unknown;
+  id?: unknown;
+  argv?: unknown[];
+  currentDocId?: unknown;
+  docId?: unknown;
+  databaseCommand?: Record<string, unknown>;
+  commandPayload?: Record<string, unknown>;
+  payload?: Record<string, unknown>;
+  fallbackOperation?: 'read' | 'write';
+  dryRun?: boolean;
+};
+
+type RequestHandler = (request: RequestEnvelope) => unknown;
+
+export interface HeadlessAgentHost {
+  handleRequest(request?: RequestEnvelope): Promise<unknown>;
+  close(): void;
+}
+
+export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}): HeadlessAgentHost {
   const projectRoot = resolve(options.projectRoot || process.cwd());
+  const enqueueWrite = typeof options.enqueueWrite === 'function' ? options.enqueueWrite : null;
   const libraryRoot = process.env.IFTREE_LIBRARY_ROOT || join(projectRoot, 'library');
   const workspaceRoot = join(projectRoot, '.iftree-llm-workspace');
   const workspaceBin = join(workspaceRoot, '.bin');
@@ -79,20 +154,27 @@ export function createHeadlessAgentHost(options = {}) {
   // 拿不到 .env 配置。这里在子进程内把 .env 灌进 process.env，只填未显式设置的键
   // （不覆盖外部注入），restart_backend 即可让 .env 生效，无需重连 MCP。
   for (const [dotEnvKey, dotEnvValue] of Object.entries(readDotEnv(envPath))) {
-    if (process.env[dotEnvKey] === undefined) process.env[dotEnvKey] = dotEnvValue;
+    if (process.env[dotEnvKey] === undefined && dotEnvValue !== undefined) process.env[dotEnvKey] = dotEnvValue;
   }
-  let database = null;
-  let agentStore = null;
-  let agentRuntime = null;
-  let llmWorkspaceState = null;
-  const dbShellState = {};
-  let vectorConfigCache = null;
-  const streamRequestIds = new Map();
+  type DatabaseService = ReturnType<typeof createDatabaseService>;
+  let database: DatabaseService | null = null;
+  let agentStore: AgentStore | null = null;
+  type AgentRuntime = ReturnType<typeof createAgentRuntime>;
+  let agentRuntime: AgentRuntime | null = null;
+  let llmWorkspaceState: ReturnType<ReturnType<typeof createLlmWorkspace>['refreshLlmWorkspaceState']> | null = null;
+  const dbShellState: Record<string, unknown> = {};
+  let vectorConfigCache: ReturnType<typeof normalizeVectorConfig> | null = null;
+  const streamRequestIds = new Map<string, unknown>();
 
-  function readProjectConfig() {
+  interface ProjectConfig {
+    debugLogging?: boolean;
+    [extra: string]: unknown;
+  }
+
+  function readProjectConfig(): ProjectConfig {
     if (!existsSync(configPath)) return {};
     try {
-      return JSON.parse(readFileSync(configPath, 'utf8')) || {};
+      return (JSON.parse(readFileSync(configPath, 'utf8')) as ProjectConfig) || {};
     } catch {
       return {};
     }
@@ -103,10 +185,10 @@ export function createHeadlessAgentHost(options = {}) {
   // 便于排查"上下文拼接 / 模型实际输出"。请求 body 不含 api key（key 在 HTTP header，不入日志）。
   // 日志层异常一律吞掉，绝不影响 agent 运行。
   const debugSessionStamp = new Date().toISOString().replace(/[:.]/g, '-');
-  function agentDebugLoggingEnabled() {
+  function agentDebugLoggingEnabled(): boolean {
     return process.env.IFTREE_DEBUG_LOGGING === '1' || readProjectConfig().debugLogging === true;
   }
-  function agentDebugLog(event, payload = {}) {
+  function agentDebugLog(event: string, payload: Record<string, unknown> = {}): void {
     if (!agentDebugLoggingEnabled()) return;
     try {
       const dir = join(projectRoot, '.iftree-debug');
@@ -134,17 +216,17 @@ export function createHeadlessAgentHost(options = {}) {
   // （md 小、保持「改后即时生效」、无需重启）。systemPromptSection 保留同名薄适配——
   // summary 与注入 agent 框架处沿用它，实现改为「按键取值 + {{占位}} 插值 + 缺省回退」。
   const getPromptCatalog = () => loadPromptCatalog(projectRoot);
-  const systemPromptSection = (name, fallback = '') => renderPrompt(getPromptCatalog(), name, {}, fallback);
+  const systemPromptSection = (name: string, fallback: string = ''): string => renderPrompt(getPromptCatalog(), name, {}, fallback);
 
   // 摘要子系统已下沉到 ./summary.mjs（解耦第 1b 步）：host 只注入「摘要 API 配置读取 / 提示词目录 /
   // 外部 fetch」，提示词拼装与 provider 协议调用收在模块内。requestHandlers 的 summary.* 转调它。
   const summaryService = createSummaryService({
-    activeLlmSummaryApi,
+    activeLlmSummaryApi: activeLlmSummaryApi as never,
     getPromptCatalog,
-    fetchers: () => options.fetchers?.() || []
+    fetchers: (() => options.fetchers?.() || []) as never
   });
 
-  function ensureLibraryRoot() {
+  function ensureLibraryRoot(): string {
     mkdirSync(libraryRoot, { recursive: true });
     return libraryRoot;
   }
@@ -152,7 +234,7 @@ export function createHeadlessAgentHost(options = {}) {
   const libraryFs = createLibraryFs({ ensureRoot: ensureLibraryRoot });
   const { libraryPath, listLibraryChildren, libraryRelativePathForAgent } = libraryFs;
 
-  function normalizeAgentLibraryPath(value = '') {
+  function normalizeAgentLibraryPath(value: unknown = ''): string {
     const raw = String(value || '').trim();
     if (/^[a-zA-Z]:[\\/]/.test(raw) || raw.startsWith('/') || raw.startsWith('\\')) {
       throw new Error('Agent 本地文件路径必须是 library 工作区相对路径');
@@ -167,45 +249,51 @@ export function createHeadlessAgentHost(options = {}) {
     return llmWorkspaceState;
   }
 
-  function dbPath() {
+  function dbPath(): string {
     return process.env.IFTREE_DB || join(databaseRoot, 'store.sqlite');
   }
 
-  function agentDbPath() {
+  function agentDbPath(): string {
     return join(databaseRoot, 'agent.sqlite');
   }
 
-  function appHome() {
+  function appHome(): string {
     // 默认锚工作区内（与 dbPath/agentDbPath 同根 databaseRoot），不再回落用户主目录 ~/.iftree。
     // 早期布局曾把向量/settings 放 ~/.iftree，导致 IFTREE_HOME 未设时向量库与 SQLite 分家
     // （SQLite 在工作区、向量回落 C 盘空库）。显式 IFTREE_HOME 仍可 override（压测等场景）。
     return process.env.IFTREE_HOME || databaseRoot;
   }
 
-  function settingsPath() {
+  function settingsPath(): string {
     return join(appHome(), 'settings.json');
   }
 
-  function readSettingsFile() {
+  interface UserSettings {
+    vector?: { enabled?: boolean; [extra: string]: unknown };
+    memory?: { enabled?: boolean; [extra: string]: unknown };
+    [extra: string]: unknown;
+  }
+
+  function readSettingsFile(): UserSettings {
     try {
-      return JSON.parse(readFileSync(settingsPath(), 'utf8').replace(/^\uFEFF/, '')) || {};
+      return (JSON.parse(readFileSync(settingsPath(), 'utf8').replace(/^﻿/, '')) as UserSettings) || {};
     } catch {
       return {};
     }
   }
 
-  function isVectorModuleEnabled(settings = readSettingsFile()) {
+  function isVectorModuleEnabled(settings: UserSettings = readSettingsFile()): boolean {
     const configured = settings?.vector?.enabled;
     return configured !== false;
   }
 
   // 记忆子系统开关（projectneed 15-10-5）：默认关闭，与向量模块并列。
   // 关闭时内置 agent 不挂载记忆常驻指令（见 agent-runtime 的 memory.schema gate）。
-  function isMemoryEnabled(settings = readSettingsFile()) {
+  function isMemoryEnabled(settings: UserSettings = readSettingsFile()): boolean {
     return settings?.memory?.enabled === true;
   }
 
-  function lanceDbPath() {
+  function lanceDbPath(): string {
     return join(appHome(), 'vectors', 'nodes.lance');
   }
 
@@ -223,7 +311,7 @@ export function createHeadlessAgentHost(options = {}) {
 
   const derivedIndexes = createDerivedIndexReconciler({
     lanceDbPath,
-    getStore: () => getDatabase().getStore(),
+    getStore: () => getDatabase().getStore() as never,
     getVectorConfig,
     isVectorModuleEnabled,
     vectorDisabledMessage: '向量模块已由用户禁用',
@@ -239,14 +327,14 @@ export function createHeadlessAgentHost(options = {}) {
     return derivedIndexes.readContext();
   }
 
-  function memoryAnchorTargetWorkspace(anchor) {
+  function memoryAnchorTargetWorkspace(anchor: unknown): { targetPath: string; workspace: string } {
     const raw = String(anchor || '');
     const targetPath = raw.split('#')[0].trim();
     const matched = targetPath.match(/[\\/]\.claude[\\/]projects[\\/]([^\\/]+)[\\/]/);
     return { targetPath, workspace: matched ? matched[1] : '' };
   }
 
-  function sanitizeAnchorSegment(value, fallback) {
+  function sanitizeAnchorSegment(value: unknown, fallback: string): string {
     const text = String(value || '').replace(/[\\/:*?"<>|]+/g, '_').trim();
     // 纯 . / .. 是路径跳转（join 会规约、.. 能逃出 .memory 锚目录），空段同样非法——一律落占位 fallback，
     // 再由 isLegalEventVolumeLayout 当占位拦下报错（健壮性：畸形 agent/工作区不许穿透成目录跳转）。
@@ -254,11 +342,17 @@ export function createHeadlessAgentHost(options = {}) {
     return text;
   }
 
+  interface WriteMemoryAnchorInput {
+    docId?: unknown;
+    agent?: unknown;
+    sessionId?: unknown;
+    hostAnchor?: unknown;
+  }
+
   // 记忆卷库内实体锚（projectneed 15-10-4）：library/.memory/<身份>/<工作区>/<会话>.jsonl
   // 作 symlink 指向宿主原始记录（jsonl / agent.sqlite，允许悬空）；无可用目标则落真实占位文件，绝不留无锚。
   // 建链后写 source_documents；任何失败抛出，由调用方回滚删卷（无锚即拒，15-10-4）。
-  /** @param {{ docId?: any, agent?: any, sessionId?: any, hostAnchor?: any }} [args] */
-  function writeMemoryAnchor({ docId, agent, sessionId, hostAnchor } = {}) {
+  function writeMemoryAnchor({ docId, agent, sessionId, hostAnchor }: WriteMemoryAnchorInput = {}): string {
     if (!docId) throw new Error('writeMemoryAnchor requires docId');
     const { targetPath, workspace } = memoryAnchorTargetWorkspace(hostAnchor);
     const tenant = sanitizeAnchorSegment(agent, PLACEHOLDER_TENANT);
@@ -277,11 +371,11 @@ export function createHeadlessAgentHost(options = {}) {
       throw new Error(`session 文件不存在、无法锚定：${targetPath || '(空)'}（不接受悬空锚，projectneed 15-10-4）`);
     }
     symlinkSync(targetPath, linkPath, 'file');
-    getDatabase().getStore().setMemoryAnchorSource(docId, linkPath);
+    (getDatabase().getStore() as { setMemoryAnchorSource: (docId: unknown, linkPath: string) => unknown }).setMemoryAnchorSource(docId, linkPath);
     // 多租户隔离校验（projectneed 15-10-4）：锚落占位目录（_local / unknown-agent）即结构非法。锚已写、
     // 卷已落库——抛 illegalMemoryLayout 让投递报错但不回滚（卷留下由用户迁移或清理），绝不静默接受游离 / 跨 agent 混放。
     if (!isLegalEventVolumeLayout(tenant, ws)) {
-      const error = /** @type {Error & { illegalMemoryLayout?: boolean }} */ (new Error(illegalEventVolumeMessage({ tenant, workspace: ws, linkPath })));
+      const error = new Error(illegalEventVolumeMessage({ tenant, workspace: ws, linkPath })) as Error & { illegalMemoryLayout?: boolean };
       error.illegalMemoryLayout = true;
       throw error;
     }
@@ -291,11 +385,11 @@ export function createHeadlessAgentHost(options = {}) {
   // 事件卷投递的纯规则解析（projectneed 15-10）：读 hostAnchor 指向的真实 session 文件、启发式解析成
   // turn messages、转成卷节点——与内置 agent 落卷同一条 volumeNodesFromTurnMessages 路径，确定可重复。
   // 文件不存在/解析不出对话即抛（不空卷直接造）。memory 模块经此 ctx 拿节点、不直接碰 fs/llm。
-  function sessionVolumeNodes(hostAnchor) {
+  function sessionVolumeNodes(hostAnchor: unknown) {
     const { targetPath } = memoryAnchorTargetWorkspace(hostAnchor);
     if (!targetPath) throw new Error('事件卷必须提供 hostAnchor 指向真实 session 文件（不接受悬空锚，projectneed 15-10-4）');
     if (!existsSync(targetPath)) throw new Error(`session 文件不存在、无法导入：${targetPath}`);
-    const nodes = volumeNodesFromTurnMessages(messagesFromClaudeTranscript(readFileSync(targetPath, 'utf8')));
+    const nodes = volumeNodesFromTurnMessages(messagesFromClaudeTranscript(readFileSync(targetPath, 'utf8')) as never);
     if (!nodes.length) throw new Error(`session 文件解析不出任何对话回合、无法成卷：${targetPath}`);
     return nodes;
   }
@@ -309,13 +403,37 @@ export function createHeadlessAgentHost(options = {}) {
     };
   }
 
-  function getAgentStore() {
+  function getAgentStore(): AgentStore {
     if (!agentStore) agentStore = new AgentStore(agentDbPath());
     return agentStore;
   }
 
-  function refreshDoc(docId, options = {}) {
-    const data = getDatabase().getStore().getDoc(docId, {
+  interface RefreshDocOptions {
+    full?: boolean;
+    maxTreeDepth?: number | null;
+    includeSourceSpans?: boolean;
+    includeSourceDocumentContent?: boolean;
+    includeNodes?: boolean;
+  }
+
+  interface DocFetchResult {
+    doc: Record<string, unknown>;
+    nodes: Array<Record<string, unknown>>;
+    tree: TreeNodeLike | null;
+    axioms: Array<Record<string, unknown>>;
+    refs: Array<Record<string, unknown>>;
+    history: Array<Record<string, unknown>>;
+    sourceDocument?: Record<string, unknown> | null;
+    sourcePdfPages?: Array<Record<string, unknown>>;
+    sourceSpans?: Array<Record<string, unknown>>;
+    treeDepthStats?: Record<string, unknown> | null;
+    idByAddress: Record<string, unknown>;
+  }
+
+  function refreshDoc(docId: unknown, options: RefreshDocOptions = {}): Record<string, unknown> | null {
+    const data = (getDatabase().getStore() as {
+      getDoc: (docId: unknown, options: Record<string, unknown>) => DocFetchResult | null;
+    }).getDoc(docId, {
       maxTreeDepth: options.full === true ? null : (options.maxTreeDepth || DEFAULT_TREE_SLICE_DEPTH),
       includeSourceSpans: options.includeSourceSpans === true,
       includeSourceDocumentContent: options.includeSourceDocumentContent === true
@@ -336,18 +454,28 @@ export function createHeadlessAgentHost(options = {}) {
     };
   }
 
-  function notifyLibraryChanged() {
+  function notifyLibraryChanged(): void {
     options.sendEvent?.({ type: 'library.changed' });
   }
 
-  function getDatabase() {
+  // 维护接线：scheduler 在主库（store）位置、只派发信号。这里注册向量模块的 handler（自给自足），注入
+  // 单写队列做硬串行，并启动后台 tick。主库自己的 handler 已在 IftreeStore 构造时注册（互不内联）。
+  function attachMaintenance(store: MaintenanceCapableStore): void {
+    if (!store?.maintenance) return;
+    if (enqueueWrite) store.maintenance.setSerialize?.(enqueueWrite);
+    store.maintenance.register('derived', () => derivedIndexes.runMaintenance());
+    store.maintenance.start();
+  }
+
+  function getDatabase(): DatabaseService {
     if (!database) {
       database = createDatabaseService({
         dbPath: dbPath(),
         libraryRoot,
         readContext: databaseReadContext,
-        writeContext: databaseWriteContext
-      });
+        writeContext: databaseWriteContext,
+        seed: (store: MaintenanceCapableStore) => attachMaintenance(store)
+      } as Parameters<typeof createDatabaseService>[0]);
     }
     return database;
   }
@@ -356,10 +484,10 @@ export function createHeadlessAgentHost(options = {}) {
   // createLibraryDocumentService（解耦第 1c 步）：host 只注入 store / 写信封 / 派生索引维护 / 刷新 /
   // library 通知 / 路径解析，落库仍直接走 store 整篇建库能力。解构出同名句柄，下方注入与注册表沿用。
   const libraryDocService = createLibraryDocumentService({
-    getStore: () => getDatabase().getStore(),
-    runWrite: (payload) => getDatabase().run({ operation: 'write', payload }, 'write'),
+    getStore: () => getDatabase().getStore() as never,
+    runWrite: (payload) => getDatabase().run({ operation: 'write', payload }, 'write') as Promise<{ ok?: boolean; changed?: unknown } | null | undefined>,
     maintainDerivedAfterWrite: derivedIndexes.maintainDerivedAfterWrite,
-    refreshDoc,
+    refreshDoc: refreshDoc as (docId: string, options?: Record<string, unknown>) => Record<string, unknown>,
     notifyLibraryChanged,
     libraryPath,
     treeSliceDepth: DEFAULT_TREE_SLICE_DEPTH
@@ -374,18 +502,18 @@ export function createHeadlessAgentHost(options = {}) {
   // 删除走正规链路：先删 source 行解锚（deleteDoc 守卫据此放行），再 deleteImportedDocument
   // 连带清 SQLite（refs/nodes/source 行）；LanceDB 派生索引不在此碰，留给自检/reconcile 对齐。
   // 解锚与删卷非同一事务，但可重入：中途中断留下的「无 source 行」卷下轮扫描仍按脱锚清除。
-  async function purgeOrphanedMemoryVolumes({ dryRun = false } = {}) {
+  async function purgeOrphanedMemoryVolumes({ dryRun = false }: { dryRun?: boolean } = {}) {
     // 转发给 memory 模块，注入 host 的文件系统判断（lstat 不解引用）与正规删除入口。
-    return purgeMemoryVolumes(getDatabase().getStore(), {
+    return purgeMemoryVolumes(getDatabase().getStore() as never, {
       anchorExists: anchorPathExists,
       deleteDoc: deleteImportedDocument,
       dryRun
-    });
+    } as never);
   }
 
   // lstatSync 不解引用：路径本身（含悬空 symlink、空占位文件）存在即视为「锚还在」，
   // 仅当锚文件被真正删除（lstat 抛 ENOENT）才判脱锚。
-  function anchorPathExists(anchorPath) {
+  function anchorPathExists(anchorPath: string): boolean {
     try {
       return Boolean(lstatSync(anchorPath));
     } catch {
@@ -393,21 +521,24 @@ export function createHeadlessAgentHost(options = {}) {
     }
   }
 
-  function sendAgentStream(requestId, event) {
-    const id = streamRequestIds.get(requestId);
+  function sendAgentStream(requestId: unknown, event: Record<string, unknown>): void {
+    const id = streamRequestIds.get(String(requestId));
     options.sendEvent?.({
       id,
       type: 'agent.stream',
       event: { requestId, ...event }
-    });
+    } as Record<string, unknown>);
   }
 
-  function getAgentRuntime() {
+  function getAgentRuntime(): AgentRuntime {
     if (!agentRuntime) {
+      // host 实际签名（refreshDoc(docId: unknown, options?) → Record<string, unknown> | null；sdk.request body: Record<string, unknown>）
+      // 与 AgentRuntimeDeps（refreshDoc(docId: string) → AgentDoc | null；body: AnyRecord）结构同质但 TS narrow 差异——
+      // 单点 as unknown as 必要边界 cast，让对象字面量从 host 形态映射到 agent runtime 真签名。
       agentRuntime = createAgentRuntime({
         // in-process SDK 句柄：agent 框架经它发 request 信封访问后端（与外部 agent 经 MCP 同契约），
         // 不再直连 database 实例。封装 host 的 handleRequest、in-process 直调，保持流式回调与单进程。
-        sdk: { request: (type, body = {}) => handleRequest({ type, ...body }) },
+        sdk: { request: (type: string, body: Record<string, unknown> = {}) => handleRequest({ type, ...body }) },
         getAgentStore,
         refreshDoc,
         readAgentSettings,
@@ -426,12 +557,12 @@ export function createHeadlessAgentHost(options = {}) {
         notifyLibraryChanged,
         updateImportedSourcePaths,
         debugLog: agentDebugLog
-      });
+      } as unknown as Parameters<typeof createAgentRuntime>[0]);
     }
     return agentRuntime;
   }
 
-  async function runAgent(payload = {}, requestId = '') {
+  async function runAgent(payload: Record<string, unknown> = {}, requestId: unknown = ''): Promise<unknown> {
     const agentRequestId = String(payload.requestId || requestId || `headless-${Date.now()}`).trim();
     streamRequestIds.set(agentRequestId, requestId);
     try {
@@ -439,9 +570,10 @@ export function createHeadlessAgentHost(options = {}) {
       // 选填，空则不限定文档；合法 UUID 原样通过。MCP(agent.run) 与 CLI(askAgent) 都汇入此处，一处解析覆盖两路。
       let nextPayload = payload;
       if (payload.docId != null && String(payload.docId).trim() !== '') {
-        nextPayload = { ...payload, docId: await resolveDocRef(getDatabase(), payload.docId) };
+        nextPayload = { ...payload, docId: await resolveDocRef(getDatabase() as never, payload.docId) };
       }
-      return await getAgentRuntime().runAgent({ ...nextPayload, requestId: agentRequestId });
+      const runtime = getAgentRuntime() as unknown as { runAgent: (payload: Record<string, unknown>) => Promise<unknown> };
+      return await runtime.runAgent({ ...nextPayload, requestId: agentRequestId });
     } finally {
       streamRequestIds.delete(agentRequestId);
     }
@@ -449,30 +581,30 @@ export function createHeadlessAgentHost(options = {}) {
 
   // 薄 dispatch 注册表（解耦第 10 步）：请求类型 → 处理函数。host 是编排层，每个 handler 接 request、
   // 调对应域模块（store / import / vector / summary / agent / memory），自身不含业务。加动词＝加一项、不接 if 链。
-  const requestHandlers = {
+  const requestHandlers: Record<string, RequestHandler> = {
     ping: () => ({ ok: true, pid: process.pid }),
-    'db.shell': (request) => runDbShellArgv(getDatabase(), request.argv || [], {
+    'db.shell': (request) => runDbShellArgv(getDatabase() as never, ((request.argv as unknown[]) || []) as never, {
       currentDocId: request.currentDocId ?? request.docId,
       shellState: dbShellState,
       importLibraryDocument,
       deleteImportedDocument,
-      ensureDocVectors: (payload = {}) => {
+      ensureDocVectors: (payload: Record<string, unknown> = {}) => {
         const docId = normalizeStableId(payload.docId ?? payload.doc_id, null);
         if (!docId) throw new Error('db vectors requires docId');
         return derivedIndexes.ensureDocVectors(docId);
       },
-      askAgent: (payload = {}) => runAgent(payload, request.id),
-      agentTool: (payload = {}) => getAgentRuntime().runTool(payload)
-    }),
-    'database.run': (request) => getDatabase().run(request.databaseCommand || request.commandPayload || request.payload || {}, request.fallbackOperation || 'read'),
-    'database.read': (request) => getDatabase().run({ operation: 'read', payload: request.payload || {} }, 'read'),
-    'database.write': (request) => getDatabase().run({ operation: 'write', payload: request.payload || {} }, 'write'),
+      askAgent: (payload: Record<string, unknown> = {}) => runAgent(payload, request.id),
+      agentTool: (payload: Record<string, unknown> = {}) => (getAgentRuntime() as unknown as { runTool: (p: Record<string, unknown>) => unknown }).runTool(payload)
+    } as never),
+    'database.run': (request) => getDatabase().run((request.databaseCommand || request.commandPayload || request.payload || {}) as never, (request.fallbackOperation || 'read') as 'read' | 'write'),
+    'database.read': (request) => getDatabase().run({ operation: 'read', payload: request.payload || {} } as never, 'read'),
+    'database.write': (request) => getDatabase().run({ operation: 'write', payload: request.payload || {} } as never, 'write'),
     // source 只读（路 B：前端去 native，PDF 原件/高亮也走后端 RPC，内部调既有 store 方法）。
     'source.readPdfData': (request) => {
-      const docId = normalizeStableId(request.payload?.docId ?? request.docId, null);
+      const docId = normalizeStableId((request.payload?.docId as unknown) ?? request.docId, null);
       if (!docId) return null;
-      const sourceDocument = getDatabase().getStore().db
-        .prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(docId);
+      const store = getDatabase().getStore() as { db: { prepare: (sql: string) => { get: (...params: unknown[]) => { source_type?: string; original_path?: string | null } | undefined } } };
+      const sourceDocument = store.db.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get(docId);
       if (!sourceDocument || sourceDocument.source_type !== 'pdf' || !sourceDocument.original_path) return null;
       return {
         fileName: basename(sourceDocument.original_path),
@@ -480,70 +612,71 @@ export function createHeadlessAgentHost(options = {}) {
       };
     },
     'source.readPdfHighlights': (request) => {
-      const docId = normalizeStableId(request.payload?.docId ?? request.docId, null);
+      const docId = normalizeStableId((request.payload?.docId as unknown) ?? request.docId, null);
       if (!docId) return [];
-      const payload = request.payload || {};
+      const payload = (request.payload || {}) as { ranges?: Array<{ start: unknown; end: unknown }>; startOffset?: unknown; endOffset?: unknown };
       const ranges = Array.isArray(payload.ranges)
         ? payload.ranges
         : [{ start: payload.startOffset, end: payload.endOffset }];
-      return getDatabase().getStore().getPdfHighlightRects(docId, ranges);
+      return (getDatabase().getStore() as { getPdfHighlightRects: (docId: string, ranges: unknown[]) => unknown[] }).getPdfHighlightRects(docId, ranges);
     },
     'source.readPdfSpanRects': (request) => {
-      const docId = normalizeStableId(request.payload?.docId ?? request.docId, null);
+      const docId = normalizeStableId((request.payload?.docId as unknown) ?? request.docId, null);
       if (!docId) return [];
-      return getDatabase().getStore().getPdfSpanHitRects(docId);
+      return (getDatabase().getStore() as { getPdfSpanHitRects: (docId: string) => unknown[] }).getPdfSpanHitRects(docId);
     },
     'import.libraryDocument': (request) => importLibraryDocument(request.payload || {}),
     'import.smartTask': (request) => smartImportTask(request.payload || {}),
     'import.deleteDocument': (request) => deleteImportedDocument(request.payload || {}),
     'memory.purgeOrphaned': (request) => purgeOrphanedMemoryVolumes({ dryRun: request.dryRun === true }),
-    'database.updateSourceBinding': (request) => getDatabase().updateSourceBinding(request.payload || {}),
+    'database.updateSourceBinding': (request) => (getDatabase() as { updateSourceBinding: (payload: Record<string, unknown>) => unknown }).updateSourceBinding(request.payload || {}),
     'library.updateImportedSourcePaths': (request) => {
-      const payload = request.payload || {};
-      updateImportedSourcePaths(payload.fromPath ?? payload.from, payload.toPath ?? payload.to, payload.isDirectory === true);
+      const payload = (request.payload || {}) as { fromPath?: string; from?: string; toPath?: string; to?: string; isDirectory?: boolean };
+      updateImportedSourcePaths(payload.fromPath ?? payload.from ?? '', payload.toPath ?? payload.to ?? '', payload.isDirectory === true);
       notifyLibraryChanged();
       return { ok: true };
     },
     'vector.resetStore': async (request) => {
-      await derivedIndexes.resetVectorStoreTable(Number(request.payload?.dimensions) || getVectorConfig().dimensions);
+      await derivedIndexes.resetVectorStoreTable(Number((request.payload as { dimensions?: unknown })?.dimensions) || getVectorConfig().dimensions);
       return { ok: true };
     },
     'vector.ensureDoc': (request) => {
-      const docId = normalizeStableId(request.payload?.docId ?? request.payload?.doc_id ?? request.docId ?? request.doc_id, null);
+      const payload = request.payload || {};
+      const docId = normalizeStableId((payload as Record<string, unknown>).docId ?? (payload as Record<string, unknown>).doc_id ?? request.docId ?? (request as Record<string, unknown>).doc_id, null);
       if (!docId) throw new Error('vector.ensureDoc requires docId');
       return derivedIndexes.ensureDocVectors(docId, {
         onProgress: (event) => options.sendEvent?.({
           id: request.id,
           type: 'agent.stream',
           event: { type: 'vector.ensureDoc.progress', ...event }
-        })
+        } as Record<string, unknown>)
       });
     },
     'summary.generateNode': (request) => summaryService.generateNodeSummary(request.payload || {}),
     'summary.cancelNode': (request) => summaryService.cancelNodeSummary(request.payload || {}),
     'agent.run': (request) => runAgent(request.payload || {}, request.id),
-    'agent.tool': (request) => getAgentRuntime().runTool(request.payload || {}),
-    'agent.cancel': (request) => getAgentRuntime().cancelAgentRequest(request.payload || {}),
-    'agent.diffs': () => getAgentRuntime().listAgentDiffs(),
-    'agent.sessions': (request) => getAgentRuntime().listAgentSessions(request.payload || {}),
-    'agent.session': (request) => getAgentRuntime().getAgentSession(request.payload || {}),
-    'agent.deleteSession': (request) => getAgentRuntime().deleteAgentSession(request.payload || {}),
-    'agent.applyDiff': (request) => getAgentRuntime().applyAgentDiff(request.payload?.diffId ?? request.payload),
-    'agent.rejectDiff': (request) => getAgentRuntime().rejectAgentDiff(request.payload?.diffId ?? request.payload),
+    'agent.tool': (request) => (getAgentRuntime() as unknown as { runTool: (p: Record<string, unknown>) => unknown }).runTool(request.payload || {}),
+    'agent.cancel': (request) => (getAgentRuntime() as unknown as { cancelAgentRequest: (p: Record<string, unknown>) => unknown }).cancelAgentRequest(request.payload || {}),
+    'agent.diffs': () => (getAgentRuntime() as unknown as { listAgentDiffs: () => unknown }).listAgentDiffs(),
+    'agent.sessions': (request) => (getAgentRuntime() as unknown as { listAgentSessions: (p: Record<string, unknown>) => unknown }).listAgentSessions(request.payload || {}),
+    'agent.session': (request) => (getAgentRuntime() as unknown as { getAgentSession: (p: Record<string, unknown>) => unknown }).getAgentSession(request.payload || {}),
+    'agent.deleteSession': (request) => (getAgentRuntime() as unknown as { deleteAgentSession: (p: Record<string, unknown>) => unknown }).deleteAgentSession(request.payload || {}),
+    'agent.applyDiff': (request) => (getAgentRuntime() as unknown as { applyAgentDiff: (p: unknown) => unknown }).applyAgentDiff((request.payload as { diffId?: unknown })?.diffId ?? request.payload),
+    'agent.rejectDiff': (request) => (getAgentRuntime() as unknown as { rejectAgentDiff: (p: unknown) => unknown }).rejectAgentDiff((request.payload as { diffId?: unknown })?.diffId ?? request.payload),
     shutdown: () => {
       close();
       return { ok: true };
     }
   };
 
-  async function handleRequest(request = {}) {
+  async function handleRequest(request: RequestEnvelope = {}): Promise<unknown> {
     const type = String(request.type || request.method || request.command || '').trim();
     const handler = requestHandlers[type];
     if (!handler) throw new Error(`Unknown headless agent request: ${type || '(empty)'}`);
     return handler(request);
   }
 
-  function close() {
+  function close(): void {
     if (database) database.close();
     database = null;
     if (agentStore) agentStore.close();

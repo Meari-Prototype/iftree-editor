@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +7,26 @@ import { createDatabaseService } from '../src/backend/database-service.js';
 import { normalizeDatabaseCommand } from '../src/backend/database-command.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+type CommandPayload = Record<string, unknown>;
+type DatabaseCommandInput = {
+  help?: boolean;
+  operation?: string;
+  payload?: CommandPayload;
+} & Record<string, unknown>;
+type NormalizedCommand = {
+  operation: 'read' | 'write';
+  payload: CommandPayload;
+};
+type CommandResult = Record<string, unknown> & {
+  format?: unknown;
+  text?: unknown;
+};
+type ErrorLike = { stack?: string; message?: string };
+
+function errorLike(error: unknown): ErrorLike {
+  return error && typeof error === 'object' ? error as ErrorLike : { message: String(error) };
+}
 
 function defaultDbPath() {
   return process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite');
@@ -39,13 +58,13 @@ function printHelp() {
   ].join('\n'));
 }
 
-function parseJson(text) {
+function parseJson<T = unknown>(text: unknown): T {
   const raw = String(text || '').trim();
   if (!raw) throw new Error('JSON command is required');
-  return JSON.parse(raw);
+  return JSON.parse(raw) as T;
 }
 
-function parseValue(value) {
+function parseValue(value: unknown): unknown {
   const raw = String(value ?? '');
   if (raw === 'true') return true;
   if (raw === 'false') return false;
@@ -57,8 +76,8 @@ function parseValue(value) {
   return raw;
 }
 
-function parseFlags(argv) {
-  const payload = {};
+function parseFlags(argv: string[]): CommandPayload {
+  const payload: CommandPayload = {};
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
     if (!key.startsWith('--')) continue;
@@ -74,18 +93,18 @@ function parseFlags(argv) {
   return payload;
 }
 
-function defaultActionForOperation(operation) {
+function defaultActionForOperation(operation: string) {
   return operation === 'write' ? 'mutation.actions' : 'query.actions';
 }
 
-function normalizeActionShortcut(operation, action) {
+function normalizeActionShortcut(operation: string, action: string) {
   return action === 'actions' || !action ? defaultActionForOperation(operation) : action;
 }
 
-function parseCommand(argv) {
+function parseCommand(argv: string[]): DatabaseCommandInput {
   const first = argv[0] || '';
   if (!first || first === 'help' || first === '--help' || first === '-h') return { help: true };
-  if (first === '--stdin') return parseJson(readFileSync(0, 'utf8'));
+  if (first === '--stdin') return parseJson<DatabaseCommandInput>(readFileSync(0, 'utf8'));
   if (first === 'tree') {
     const payload = parseFlags(argv.slice(1));
     return {
@@ -158,14 +177,14 @@ function parseCommand(argv) {
     return {
       operation: first,
       payload: payloadText.startsWith('{')
-        ? parseJson(payloadText)
+        ? parseJson<CommandPayload>(payloadText)
         : { action: normalizeActionShortcut(first, payloadText) }
     };
   }
-  return parseJson(argv.join(' '));
+  return parseJson<DatabaseCommandInput>(argv.join(' '));
 }
 
-async function exitProcess(code) {
+async function exitProcess(code: number) {
   if (process.versions.electron) {
     try {
       const { app } = await import('electron');
@@ -188,7 +207,7 @@ async function main() {
     return;
   }
 
-  const normalized = normalizeDatabaseCommand(command, 'read');
+  const normalized = normalizeDatabaseCommand(command, 'read') as unknown as NormalizedCommand;
   const action = normalized.payload?.action || normalized.payload?.type;
   const dbPath = resolve(defaultDbPath());
   if (action !== 'query.actions' && action !== 'mutation.actions' && action !== 'library.getTree' && !existsSync(dbPath)) {
@@ -201,7 +220,7 @@ async function main() {
     initOptions: normalized.operation === 'read' ? { readonly: true, migrate: false } : {}
   });
   try {
-    const result = await database.run(normalized);
+    const result = await database.run(normalized as unknown as Parameters<typeof database.run>[0]) as CommandResult;
     if (result?.format === 'ascii_tree' && typeof result.text === 'string') console.log(result.text);
     else console.log(JSON.stringify(result, null, 2));
   } finally {
@@ -211,7 +230,8 @@ async function main() {
 
 main()
   .then(() => exitProcess(0))
-  .catch(async (error) => {
-    console.error(error?.stack || error?.message || String(error));
+  .catch(async (error: unknown) => {
+    const failure = errorLike(error);
+    console.error(failure.stack || failure.message || String(error));
     await exitProcess(1);
   });

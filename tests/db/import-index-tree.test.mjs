@@ -22,7 +22,8 @@ test('db import, index, and tree expose the imported fixture and reject bad args
     // —— index --folder --uuid：组头带文件名 + #docId + 字数 + semantic 状态 ——
     const indexText = stdoutOf(await runBashDb(dbPath, ['index', '--folder', 'generated', '--uuid']));
     assert.match(indexText, new RegExp(`${fixtureTitle}\\.md #${docId}`));
-    assert.match(indexText, /\(2233字\) \[semantic:missing 0\/\d+\]/);
+    // 字数口径＝忽略空白（core/char-count.bodyCharCount）：切分粒度不影响字数。raw 2233 去空白后 2088。
+    assert.match(indexText, /\(2088字\) \[semantic:missing 0\/\d+\]/);
 
     // —— index 无 folder 值报错 ——
     const indexMissingFolderValue = await runBashDb(dbPath, ['index', '--folder'], { expectFailure: true });

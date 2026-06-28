@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 清理 LanceDB 派生索引（关键词/向量）里主库已不存在 doc 的孤儿行。
 // 孤儿来源：隔离前的 tests/db 运行与手动 db import 把临时 sqlite 的 docId
 // 写进了共享 ~/.iftree 的 LanceDB。
@@ -22,7 +21,7 @@ import Database from 'better-sqlite3';
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TABLES = ['nodes_keyword', 'nodes_vec'];
 
-function quoteValue(value) {
+function quoteValue(value: unknown) {
   return `'${String(value ?? '').replace(/'/g, "''")}'`;
 }
 
@@ -50,14 +49,14 @@ async function main() {
   const lancePath = lanceDbPath();
   console.log(`索引库: ${lancePath}`);
 
-  const validIdSet = new Set();
+  const validIdSet = new Set<string>();
   for (const sqlitePath of mainDbCandidates()) {
     if (!existsSync(sqlitePath)) {
       console.log(`主库: ${sqlitePath}（不存在，跳过）`);
       continue;
     }
     const db = new Database(sqlitePath, { readonly: true, fileMustExist: true });
-    const ids = db.prepare('SELECT id FROM docs').all().map((row) => String(row.id));
+    const ids = (db.prepare('SELECT id FROM docs').all() as Array<{ id?: unknown }>).map((row) => String(row.id));
     db.close();
     for (const id of ids) validIdSet.add(id);
     console.log(`主库: ${sqlitePath}（${ids.length} 个文档）`);
@@ -83,7 +82,7 @@ async function main() {
     console.log(`\n[${name}] 总行数 ${total}，孤儿行 ${orphanCount}`);
     if (orphanCount === 0) continue;
 
-    const orphanRows = await table.query().where(orphanPredicate).select(['doc_id']).limit(200000).toArray();
+    const orphanRows = await table.query().where(orphanPredicate).select(['doc_id']).limit(200000).toArray() as Array<{ doc_id?: unknown }>;
     const orphanDocIds = [...new Set(orphanRows.map((row) => String(row.doc_id)))];
     console.log(`[${name}] 孤儿 doc（${orphanDocIds.length} 个）:`);
     for (const docId of orphanDocIds) console.log(`  ${docId}`);
@@ -98,7 +97,7 @@ async function main() {
   if (!apply) console.log('\ndry-run 完成，未做任何修改；加 --yes 执行删除。');
 }
 
-main().catch((error) => {
-  console.error(error?.message || error);
+main().catch((error: unknown) => {
+  console.error((error as { message?: string } | null | undefined)?.message || error);
   process.exit(1);
 });

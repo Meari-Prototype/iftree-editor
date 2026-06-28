@@ -1,11 +1,80 @@
-// @ts-nocheck
 import { X } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 
 import { diffTextSegments } from '../../core/text-diff.js';
 import { nodeTypeLabel } from '../lib/doc-utils.js';
 
-const FIELD_LABELS = {
+// IPC 边界形态（editBranch.diffView 返回，字段全 optional 兼容 nodeRowWithClientAliases / axiomDiffCard 两种来源）。
+export interface DiffViewNode {
+  id?: unknown;
+  address?: string;
+  text?: unknown;
+  title?: string;
+  nodeTitle?: string;
+  note?: string;
+  nodeNote?: string;
+  nodeType?: string;
+  node_type?: string;
+  trustLevel?: unknown;
+  trust_level?: unknown;
+  sortOrder?: unknown;
+  sort_order?: unknown;
+  sourcePosition?: unknown;
+  source_position?: unknown;
+  status?: string;
+  [extra: string]: unknown;
+}
+
+export type DiffViewSide = 'left' | 'right';
+export type DiffRowKind = 'node' | 'axiom' | 'collapsed';
+export type DiffRowStatus = 'added' | 'deleted' | 'modified' | 'unchanged' | 'collapsed' | string;
+
+export interface DiffViewRow {
+  key: string;
+  kind: DiffRowKind;
+  status: DiffRowStatus;
+  address?: string;
+  depth?: number;
+  left?: DiffViewNode | null;
+  right?: DiffViewNode | null;
+  changedFields?: string[];
+  hiddenRows?: DiffViewRow[];
+  hiddenCount?: number;
+  [extra: string]: unknown;
+}
+
+export interface DiffViewStats {
+  added?: number;
+  deleted?: number;
+  modified?: number;
+  moved?: number;
+  unchanged?: number;
+  collapsed?: number;
+  unchangedCollapsed?: number;
+  visibleRows?: number;
+  totalRows?: number;
+  hiddenRows?: number;
+  activeEntryCount?: number;
+  undoneEntryCount?: number;
+  undoDepth?: number;
+  redoDepth?: number;
+  changedOnly?: boolean;
+  [extra: string]: unknown;
+}
+
+export interface EditBranchDiffViewModel {
+  kind?: string;
+  branch?: { id?: unknown; owner?: unknown; [extra: string]: unknown } | null;
+  baseDoc?: { id?: unknown; title?: string; [extra: string]: unknown } | null;
+  projectedDoc?: { id?: unknown; baseDocId?: unknown; title?: string; [extra: string]: unknown } | null;
+  stats?: DiffViewStats;
+  rows?: DiffViewRow[];
+  entries?: unknown[];
+  mergeBase?: unknown;
+  [extra: string]: unknown;
+}
+
+const FIELD_LABELS: Record<string, string> = {
   text: '正文',
   node_title: '标题',
   node_note: '备注',
@@ -19,14 +88,14 @@ const FIELD_LABELS = {
   status: '状态'
 };
 
-const AXIOM_STATUS_LABELS = { pending: '待确认', confirmed: '已确认' };
+const AXIOM_STATUS_LABELS: Record<string, string> = { pending: '待确认', confirmed: '已确认' };
 
 // 卡片本体只展示长文本字段（标题/正文/备注）；这些短值字段的差异在本体上不可见，
 // footer 必须带上本侧值、左右各取各的，对照才看得出改了什么（信任: 未标注 ↔ 信任: 受控）。
 // parent_id 不在列：移动差异由同址对齐与占位行呈现，uuid 本身没有可读性。
 const VALUE_BADGE_FIELDS = new Set(['node_type', 'trust_level', 'sort_order', 'source_position', 'status']);
 
-function fieldValueLabel(node, field) {
+function fieldValueLabel(node: DiffViewNode | null | undefined, field: string): string {
   if (field === 'node_type') return nodeTypeLabel(node?.nodeType || node?.node_type || 'TEXT');
   if (field === 'trust_level') {
     const value = String(node?.trustLevel ?? node?.trust_level ?? '').trim();
@@ -44,31 +113,31 @@ function fieldValueLabel(node, field) {
   return '';
 }
 
-function ownerLabel(owner) {
+function ownerLabel(owner: unknown): string {
   return String(owner || 'human').split('#')[0].split(':')[0] === 'llm' ? 'LLM' : 'human';
 }
 
-function statusLabel(status) {
+function statusLabel(status: DiffRowStatus | undefined): string {
   if (status === 'added') return '新增';
   if (status === 'deleted') return '删除';
   if (status === 'modified') return '修改';
   return '未改';
 }
 
-function nodeTitle(node) {
+function nodeTitle(node: DiffViewNode | null | undefined): string {
   return String(node?.nodeTitle || node?.title || '').trim();
 }
 
-function nodeText(node) {
+function nodeText(node: DiffViewNode | null | undefined): string {
   return String(node?.text || '').trim();
 }
 
-function nodeNote(node) {
+function nodeNote(node: DiffViewNode | null | undefined): string {
   return String(node?.nodeNote || node?.note || '').trim();
 }
 
-function expandedRows(rows, expandedKeys) {
-  const result = [];
+function expandedRows(rows: DiffViewRow[] | null | undefined, expandedKeys: Set<string>): DiffViewRow[] {
+  const result: DiffViewRow[] = [];
   for (const row of rows || []) {
     result.push(row);
     if (row.kind === 'collapsed' && expandedKeys.has(row.key)) {
@@ -80,9 +149,15 @@ function expandedRows(rows, expandedKeys) {
   return result;
 }
 
+interface InlineDiffTextProps {
+  before: string;
+  after: string;
+  side: DiffViewSide;
+}
+
 // 片段级高亮（修改行专用）：同一节点旧/新文本做字符级 diff，
 // 左卡片渲染 equal+del（删除片段红遮罩），右卡片渲染 equal+ins（新增片段绿遮罩）。
-function InlineDiffText({ before, after, side }) {
+function InlineDiffText({ before, after, side }: InlineDiffTextProps) {
   const segments = useMemo(() => diffTextSegments(before, after), [before, after]);
   const skip = side === 'left' ? 'ins' : 'del';
   const visible = segments.filter((segment) => segment.type !== skip);
@@ -93,7 +168,15 @@ function InlineDiffText({ before, after, side }) {
   ));
 }
 
-function DiffNodeCard({ node, side, row }) {
+interface DiffNodeCardProps {
+  node: DiffViewNode | null | undefined;
+  side: DiffViewSide;
+  row: DiffViewRow;
+}
+
+type FieldPicker = (node: DiffViewNode | null | undefined) => string;
+
+function DiffNodeCard({ node, side, row }: DiffNodeCardProps) {
   const emptyText = side === 'left' ? '右侧新增' : '左侧删除';
   if (!node) {
     return (
@@ -108,7 +191,7 @@ function DiffNodeCard({ node, side, row }) {
   const isAxiom = row.kind === 'axiom';
   // 修改行且两侧都在：长文本字段按片段染色；新增/删除行保持整卡绿/红。
   const inline = row.status === 'modified' && row.left && row.right;
-  const renderField = (pick, fallback = '') => {
+  const renderField = (pick: FieldPicker, fallback = '') => {
     const leftValue = pick(row.left);
     const rightValue = pick(row.right);
     const own = side === 'left' ? leftValue : rightValue;
@@ -139,10 +222,16 @@ function DiffNodeCard({ node, side, row }) {
   );
 }
 
-function DiffRow({ row, expanded, onToggle }) {
+interface DiffRowProps {
+  row: DiffViewRow;
+  expanded: boolean;
+  onToggle: (key: string) => void;
+}
+
+function DiffRow({ row, expanded, onToggle }: DiffRowProps) {
   if (row.kind === 'collapsed') {
     return (
-      <div className="edit-branch-diff-row collapsed" style={{ '--diff-depth': row.depth || 1 }}>
+      <div className="edit-branch-diff-row collapsed" style={{ '--diff-depth': row.depth || 1 } as CSSProperties}>
         <button type="button" onClick={() => onToggle(row.key)}>
           {expanded ? '收起' : '展开'} {row.hiddenCount || 0} 个未修改节点
         </button>
@@ -152,7 +241,7 @@ function DiffRow({ row, expanded, onToggle }) {
   return (
     <div
       className={`edit-branch-diff-row ${row.status || 'unchanged'}`}
-      style={{ '--diff-depth': row.depth || 1 }}
+      style={{ '--diff-depth': row.depth || 1 } as CSSProperties}
       data-address={row.address}
     >
       <DiffNodeCard node={row.left} side="left" row={row} />
@@ -161,8 +250,15 @@ function DiffRow({ row, expanded, onToggle }) {
   );
 }
 
-export function EditBranchDiffDialog({ view, loading = false, error = '', onClose }) {
-  const [expandedKeys, setExpandedKeys] = useState(() => new Set());
+export interface EditBranchDiffDialogProps {
+  view: EditBranchDiffViewModel | null | undefined;
+  loading?: boolean;
+  error?: string;
+  onClose?: () => void;
+}
+
+export function EditBranchDiffDialog({ view, loading = false, error = '', onClose }: EditBranchDiffDialogProps) {
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set());
   const rows = useMemo(() => expandedRows(view?.rows || [], expandedKeys), [view?.rows, expandedKeys]);
 
   useEffect(() => {
@@ -170,14 +266,14 @@ export function EditBranchDiffDialog({ view, loading = false, error = '', onClos
   }, [view?.branch?.id]);
 
   useEffect(() => {
-    const onKeyDown = (event) => {
+    const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') onClose?.();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  function toggleCollapsed(key) {
+  function toggleCollapsed(key: string): void {
     setExpandedKeys((current) => {
       const next = new Set(current);
       if (next.has(key)) next.delete(key);

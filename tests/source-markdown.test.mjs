@@ -168,3 +168,37 @@ test('buildMarkdownStructureRecords groups markdown into headings, paragraphs, a
     { address: '1-2-1-1', text: 'Fourth sentence.', index: 6, role: 'sentence', skipVector: false, sourcePosition: 6 }
   ]);
 });
+
+import { bodyCharCount } from '../dist/src/core/char-count.js';
+
+test('bodyCharCount 忽略全部空白（空格/制表/换行/全角空格）', () => {
+  assert.equal(bodyCharCount('a b\tc\nd　e'), 5); // 　为全角空格 U+3000
+  assert.equal(bodyCharCount(''), 0);
+  assert.equal(bodyCharCount(null), 0);
+  assert.equal(bodyCharCount(undefined), 0);
+  assert.equal(bodyCharCount('  \n\t　 '), 0);
+});
+
+test('切分粒度（paragraph/sentence）不影响正文字数：忽略空白口径下两种 mode 字数一致', () => {
+  // 句间用空格/换行分隔，paragraph 模式整段 slice 会保留这些空白、sentence 模式逐句 trim 会丢弃。
+  // 按 bodyCharCount（忽略空白）计数，两种 mode 的正文字数必须相等——这是「切分不该改变字数」的不变量。
+  const rawMarkdown = [
+    '# 标题',
+    '',
+    '第一句。  第二句！  第三句？',
+    '还有换行后的一句。',
+    '',
+    '第二段第一句。第二段第二句。',
+    '',
+    '# 第二标题 ABC def',
+    '',
+    '末段唯一句无句号结尾'
+  ].join('\n');
+  const source = buildSourceDocument({ rawMarkdown });
+  const sumBody = (recs) => recs.reduce((n, r) => n + bodyCharCount(r.text), 0);
+  const para = buildMarkdownStructureRecords(source, { granularity: 'paragraph' });
+  const sent = buildMarkdownStructureRecords(source, { granularity: 'sentence' });
+  // 旧口径（含空白）下 para > sent（差即句间空白）；新口径下必须相等。
+  assert.equal(sumBody(para), sumBody(sent), 'paragraph 与 sentence 模式的忽略空白字数应相等');
+  assert.ok(sumBody(para) > 0, '字数应为正');
+});

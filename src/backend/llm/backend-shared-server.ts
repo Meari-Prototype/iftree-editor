@@ -1,4 +1,3 @@
-// @ts-nocheck
 // 共享后端的本地管道服务端（projectneed 18-6-1）。
 // 协议沿用 15-8 的 JSON-L 请求/响应 + 流式事件，只换传输层：stdio 是父子一对一管道，
 // 结构上不能多客户端共享；这里用 net 本地管道（win 命名管道 / posix unix socket）。
@@ -6,26 +5,51 @@
 // （c<连接序号>:<原 id>），宿主回流的响应与流事件按重写 id 找回连接、还原原 id 下发。
 // 请求执行沿用单队列全局串行（单写者语义），取消/摘要类请求照旧插队。
 import { createServer, connect } from 'node:net';
+import type { Server, Socket } from 'node:net';
 import { createInterface } from 'node:readline';
+import type { Interface } from 'node:readline';
 import { unlinkSync } from 'node:fs';
 
 const IMMEDIATE_TYPES = new Set(['ping', 'agent.cancel', 'summary.cancelNode', 'summary.generateNode']);
 
-function errorPayload(error) {
+type JsonEnvelope = Record<string, unknown> & {
+  id?: unknown;
+  type?: unknown;
+  payload?: (Record<string, unknown> & { action?: unknown }) | null;
+};
+type ErrorWithCode = Error & { code?: string };
+type ErrorLike = { name?: string; message?: string; stack?: string; code?: string };
+type Route = {
+  write: (message: JsonEnvelope, callback?: () => void) => void;
+  origId: string;
+};
+type RequestHandler = (request: JsonEnvelope) => Promise<unknown>;
+type ShutdownHandler = () => Promise<unknown> | unknown;
+type SharedBackendServerOptions = {
+  handleRequest?: RequestHandler | null;
+  onShutdown?: ShutdownHandler | null;
+};
+
+function errorLike(error: unknown): ErrorLike {
+  return error && typeof error === 'object' ? error as ErrorLike : { message: String(error) };
+}
+
+function errorPayload(error: unknown) {
+  const failure = errorLike(error);
   return {
-    name: error?.name || 'Error',
-    message: error?.message || String(error),
-    stack: error?.stack || ''
+    name: failure.name || 'Error',
+    message: failure.message || String(error),
+    stack: failure.stack || ''
   };
 }
 
 // 判活探测：能连上同名管道说明已有共享后端在跑。用于监听被拒后区分「活人占用（让位）」
 // 与「posix 陈尸文件（清掉重试）」；也供测试自检。
-export function probeBackendPipe(pipeName, timeoutMs = 500) {
+export function probeBackendPipe(pipeName: string, timeoutMs = 500): Promise<boolean> {
   return new Promise((resolveProbe) => {
     let settled = false;
     const socket = connect(pipeName);
-    const finish = (alive) => {
+    const finish = (alive: boolean) => {
       if (settled) return;
       settled = true;
       socket.destroy();
@@ -38,29 +62,31 @@ export function probeBackendPipe(pipeName, timeoutMs = 500) {
   });
 }
 
-export function createSharedBackendServer({ handleRequest = null, onShutdown = null } = {}) {
+export function createSharedBackendServer({ handleRequest = null, onShutdown = null }: SharedBackendServerOptions = {}) {
   if (typeof handleRequest !== 'function') throw new Error('createSharedBackendServer requires handleRequest');
-  let server = null;
+  const requestHandler = handleRequest;
+  const shutdownHandler = onShutdown;
+  let server: Server | null = null;
   let connSeq = 0;
-  let queue = Promise.resolve();
+  let queue: Promise<unknown> = Promise.resolve();
   let shuttingDown = false;
   // bulk 独占闸门：异步写 pragma 挂在共享连接上、对所有客户端生效（store.beginBulkImport），
   // 所以开启必须独占——有其他客户端在线即拒；期间其他连接的写一律拒；独占者掉线自动恢复安全设置。
-  let bulkOwnerConn = null;
-  const routes = new Map();
-  const sockets = new Set();
+  let bulkOwnerConn: number | null = null;
+  const routes = new Map<string, Route>();
+  const sockets = new Set<Socket>();
 
-  function sendEvent(envelope = {}) {
+  function sendEvent(envelope: JsonEnvelope = {}) {
     const route = routes.get(String(envelope.id ?? ''));
     if (!route) return;
     route.write({ ...envelope, id: route.origId });
   }
 
-  function handleConnection(socket) {
+  function handleConnection(socket: Socket) {
     const connId = ++connSeq;
     sockets.add(socket);
-    const ownedIds = new Set();
-    let rl = null;
+    const ownedIds = new Set<string>();
+    let rl: Interface | null = null;
     const dropConnection = () => {
       rl?.close();
       sockets.delete(socket);
@@ -70,7 +96,7 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
         // 独占者掉线：不能让后端永久停在异步写（其余客户端还会被闸门永久拒写），排队补一个 end。
         bulkOwnerConn = null;
         if (!shuttingDown) {
-          queue = queue.then(() => handleRequest({
+          queue = queue.then(() => requestHandler({
             id: `c${connId}:auto-bulk-end`,
             type: 'database.write',
             payload: { action: 'stream.bulkEnd' }
@@ -83,7 +109,7 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
     socket.on('close', dropConnection);
     socket.on('error', () => { /* close 紧随其后 */ });
 
-    const write = (message, callback) => {
+    const write = (message: JsonEnvelope, callback?: () => void) => {
       if (socket.destroyed) {
         callback?.();
         return;
@@ -99,7 +125,7 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
     rl.on('line', (line) => {
       const raw = String(line || '').trim();
       if (!raw || shuttingDown) return;
-      let request = null;
+      let request: JsonEnvelope;
       try {
         request = JSON.parse(raw);
       } catch (error) {
@@ -128,12 +154,12 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
       ownedIds.add(serverId);
       const run = async () => {
         try {
-          const result = await handleRequest({ ...request, id: serverId });
+          const result = await requestHandler({ ...request, id: serverId });
           if (type === 'shutdown') {
             shuttingDown = true;
             // 先把响应冲出去再退场，避免 exit 截断缓冲。
-            await new Promise((resolveWrite) => write({ id: origId, type: 'result', result }, resolveWrite));
-            await onShutdown?.();
+            await new Promise<void>((resolveWrite) => write({ id: origId, type: 'result', result }, resolveWrite));
+            await shutdownHandler?.();
             return;
           }
           write({ id: origId, type: 'result', result });
@@ -153,10 +179,10 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
 
   }
 
-  function listenOnce(pipeName) {
+  function listenOnce(pipeName: string): Promise<void> {
     return new Promise((resolveListen, rejectListen) => {
       const candidate = createServer(handleConnection);
-      const onError = (error) => {
+      const onError = (error: ErrorWithCode) => {
         candidate.close();
         rejectListen(error);
       };
@@ -169,10 +195,9 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
     });
   }
 
-  function backendExistsError(pipeName) {
-    const error = new Error(`已有共享后端在监听：${pipeName}`);
-    // @ts-ignore 自定义错误码
-    error.code = 'IFTREE_BACKEND_EXISTS';
+  function backendExistsError(pipeName: string): ErrorWithCode {
+    const error = new Error(`已有共享后端在监听：${pipeName}`) as ErrorWithCode;
+    (error as { code?: string }).code = 'IFTREE_BACKEND_EXISTS';
     return error;
   }
 
@@ -181,12 +206,13 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
   // 文件 unlink 掉，先者从此无人可达又永不退出（孤儿）。listen-first 让操作系统当裁判：
   // 同时抢只有一个 bind 成功，输家探测到赢家后让位；unlink 只发生在「监听被拒且探测
   // 无人应答」之后，删的必然是陈尸。残余窗口只剩陈尸+双启动+特定交错的三重巧合。
-  async function listen(pipeName) {
+  async function listen(pipeName: string) {
     try {
       await listenOnce(pipeName);
       return;
-    } catch (error) {
-      if (error?.code !== 'EADDRINUSE' && error?.code !== 'EACCES') throw error;
+    } catch (error: unknown) {
+      const failure = errorLike(error);
+      if (failure.code !== 'EADDRINUSE' && failure.code !== 'EACCES') throw error;
     }
     if (await probeBackendPipe(pipeName)) throw backendExistsError(pipeName);
     if (process.platform !== 'win32') {
@@ -195,9 +221,10 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
     }
     try {
       await listenOnce(pipeName);
-    } catch (error) {
+    } catch (error: unknown) {
+      const failure = errorLike(error);
       // 重试又被占：窗口里有人抢先 bind 成功，判活后让位。
-      if ((error?.code === 'EADDRINUSE' || error?.code === 'EACCES') && await probeBackendPipe(pipeName)) {
+      if ((failure.code === 'EADDRINUSE' || failure.code === 'EACCES') && await probeBackendPipe(pipeName)) {
         throw backendExistsError(pipeName);
       }
       throw error;
@@ -213,10 +240,20 @@ export function createSharedBackendServer({ handleRequest = null, onShutdown = n
     server = null;
   }
 
+  // 单写队列入队：把任务串到与请求同一条 queue 后执行，供 host 后台维护与正常写硬串行
+  //（避免维护和写撞 LanceDB manifest / SQLite 写锁）。维护失败不卡死后续请求。
+  function enqueue(task: () => Promise<unknown> | unknown) {
+    const run = () => Promise.resolve().then(task);
+    const result = queue.then(run, run);
+    queue = result.catch(() => { /* 维护失败不阻塞队列 */ });
+    return result;
+  }
+
   return {
     listen,
     sendEvent,
     close,
+    enqueue,
     get connectionCount() {
       return sockets.size;
     }

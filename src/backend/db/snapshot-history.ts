@@ -1,15 +1,22 @@
-// @ts-nocheck
 // 公理比对字段与编辑分支 diff（store.buildAxiomDiffRows）保持一致，避免两套 diff 体系分叉。
 const AXIOM_DIFF_FIELDS = ['content', 'status', 'node_title', 'node_note'];
 
-function shortSnapshotId(id) {
+type SnapshotRow = Record<string, unknown> & { id?: unknown; address?: unknown; parent_id?: unknown; sort_order?: unknown; text?: unknown };
+interface SnapshotPayload {
+  nodes?: SnapshotRow[];
+  axioms?: SnapshotRow[];
+  refs?: SnapshotRow[];
+}
+type SnapshotDiffEntry = Record<string, unknown>;
+
+function shortSnapshotId(id: unknown): string {
   const value = String(id ?? '');
   return value ? value.slice(0, 8) : '?';
 }
 
 // 引用边的人读描述：端点为节点时用地址（快照节点带 address），否则用 类型#短id。
-function describeSnapshotRef(ref, addressById) {
-  const end = (type, id) => (type === 'node'
+function describeSnapshotRef(ref: SnapshotRow, addressById: Map<unknown, unknown>): string {
+  const end = (type: unknown, id: unknown) => (type === 'node'
     ? (addressById.get(id) || shortSnapshotId(id))
     : `${type || '?'}#${shortSnapshotId(id)}`);
   return `${ref.ref_kind || 'ref'} ${end(ref.source_type, ref.source_id)}→${end(ref.target_type, ref.target_id)}`;
@@ -19,8 +26,8 @@ function describeSnapshotRef(ref, addressById) {
 // 节点逐字段、公理逐字段、引用纯增删。实体（术语库）不在快照、也不归文档 diff 管——
 // 它有自己的变更通道，不从文档 diff 查。entry 统一为 field-diff 形态（无 kind，
 // 靠 node_id/axiom_id/ref_id + field/old/new），由 formatDiffText 渲染。
-export function computeSnapshotDiff(prevSnapshot, currentSnapshot) {
-  const entries = [];
+export function computeSnapshotDiff(prevSnapshot: SnapshotPayload, currentSnapshot: SnapshotPayload): SnapshotDiffEntry[] {
+  const entries: SnapshotDiffEntry[] = [];
   const prevById = new Map((prevSnapshot.nodes || []).map((node) => [node.id, node]));
   const currById = new Map((currentSnapshot.nodes || []).map((node) => [node.id, node]));
   // source_position 不入 diff（路径丙）：它是 source_spans 表的冗余加速键、导入元数据，不是节点生命周期字段；
@@ -37,18 +44,18 @@ export function computeSnapshotDiff(prevSnapshot, currentSnapshot) {
   // 操作意图，但有个判据——insert/delete 必然改变父下子集，主动调序不会。故同父 sort_order
   // 变化只有在「该父子集前后不变」时才认作移动，否则是连带、不报，避免在列表头插一个节点
   // 就把后面所有兄弟刷成「移」的噪声。
-  const childSetByParent = (nodes) => {
-    const map = new Map();
+  const childSetByParent = (nodes: SnapshotRow[] | undefined) => {
+    const map = new Map<string, Set<string>>();
     for (const node of nodes || []) {
       const key = node.parent_id == null ? 'root' : String(node.parent_id);
       if (!map.has(key)) map.set(key, new Set());
-      map.get(key).add(String(node.id));
+      map.get(key)!.add(String(node.id));
     }
     return map;
   };
   const prevKids = childSetByParent(prevSnapshot.nodes);
   const currKids = childSetByParent(currentSnapshot.nodes);
-  const sameSiblingSet = (parentKey) => {
+  const sameSiblingSet = (parentKey: string) => {
     const a = prevKids.get(parentKey);
     const b = currKids.get(parentKey);
     if (!a || !b || a.size !== b.size) return false;
@@ -125,7 +132,7 @@ export function computeSnapshotDiff(prevSnapshot, currentSnapshot) {
   return entries;
 }
 
-export function assertRestorableSnapshotPayload(snapshot) {
+export function assertRestorableSnapshotPayload(snapshot: SnapshotPayload | null | undefined): SnapshotRow[] {
   const snapshotNodes = Array.isArray(snapshot?.nodes) ? snapshot.nodes : [];
   const rootCount = snapshotNodes.filter((node) => node?.parent_id === null || node?.parentId === null).length;
   if (snapshotNodes.length === 0 || rootCount !== 1) {

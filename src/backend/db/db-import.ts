@@ -1,4 +1,3 @@
-// @ts-nocheck
 // 库级导入：把导出的 dump 灌进一个已建好 schema 的空库（db 含表/索引/触发器）。
 // 整表照搬 + 字段对齐（共有列才搬、缺列走 DEFAULT、派生列由触发器和首次访问重算）+ 非法值现场规范化。
 // id 有值复用（整数主键或 UUID 都原样）、空则重生 UUIDv7——0.5.0 live 的 id 都齐，实践中全复用，引用天然自洽。
@@ -12,7 +11,30 @@ import { normalizeNodeType } from '../../core/node-model.js';
 const GENERATED_PARAGRAPH_TITLE = /^段\d+\s*[·・]\s*\d+句$/u;
 
 // 非法值现场规范化（per-table 逐行钩子；吸收原启动期三类清洗里的单行规范化部分）。
-const TRANSFORMS = {
+type ImportValue = string | number | bigint | Buffer | null;
+type ImportRow = Record<string, ImportValue>;
+
+interface ImportTableDump {
+  columns?: string[];
+  rows?: ImportValue[][];
+}
+
+interface ImportDump {
+  tables?: Record<string, ImportTableDump>;
+}
+
+interface ImportDatabaseLike {
+  prepare(sql: string): {
+    all(...params: unknown[]): Array<Record<string, unknown>>;
+    run(...params: unknown[]): unknown;
+  };
+  pragma(source: string): unknown;
+  transaction<T extends (...args: unknown[]) => unknown>(fn: T): T;
+}
+
+type ImportTransform = (row: ImportRow) => void;
+
+const TRANSFORMS: Record<string, ImportTransform> = {
   nodes(row) {
     row.node_type = normalizeNodeType(row.node_type);
     if (GENERATED_PARAGRAPH_TITLE.test(String(row.node_title ?? '').trim())) row.node_title = '';
@@ -26,12 +48,12 @@ const TRANSFORMS = {
 };
 
 // id 规则：有值复用、空则重生 UUIDv7。
-function resolveId(value) {
+function resolveId(value: ImportValue | undefined): ImportValue {
   return value === null || value === undefined || value === '' ? newStableId() : value;
 }
 
 // 跨表清洗（整库搬完后跑一次）：公理不得把根节点当「事实前提」，按最新规则删除这类非法引用。
-function postImportCleanup(db) {
+function postImportCleanup(db: ImportDatabaseLike): void {
   db.prepare(`
     DELETE FROM refs
     WHERE source_type = 'axiom' AND target_type = 'node' AND ref_kind = '事实前提'
@@ -43,11 +65,11 @@ function postImportCleanup(db) {
   `).run();
 }
 
-function importTable(db, name, table, transform) {
+function importTable(db: ImportDatabaseLike, name: string, table: ImportTableDump, transform?: ImportTransform): number {
   const rows = table.rows || [];
   if (rows.length === 0) return 0;
-  const targetColumns = new Set(
-    db.prepare(`PRAGMA table_info("${name}")`).all().map((col) => col.name)
+  const targetColumns = new Set<string>(
+    db.prepare(`PRAGMA table_info("${name}")`).all().map((col) => String(col.name))
   );
   const sourceColumns = table.columns || [];
   const shared = sourceColumns.filter((col) => targetColumns.has(col));
@@ -59,7 +81,7 @@ function importTable(db, name, table, transform) {
 
   let count = 0;
   for (const rawRow of rows) {
-    const row = {};
+    const row: ImportRow = {};
     sourceColumns.forEach((col, i) => { row[col] = rawRow[i]; });
     if (hasId) row.id = resolveId(row.id);
     if (transform) transform(row);
@@ -71,10 +93,10 @@ function importTable(db, name, table, transform) {
 
 // dump = { schema_version, exported_at, tables }；db 须已建好最新 schema 的空库。
 // 返回 { counts: { <table>: n }, violations: [...] }，violations 非空即有悬挂外键。
-export function importDatabase(db, dump, { transforms = TRANSFORMS } = {}) {
+export function importDatabase(db: ImportDatabaseLike, dump: ImportDump, { transforms = TRANSFORMS }: { transforms?: Record<string, ImportTransform> } = {}) {
   const tables = dump.tables || {};
   db.pragma('foreign_keys = OFF');
-  const counts = {};
+  const counts: Record<string, number> = {};
   const run = db.transaction(() => {
     for (const [name, table] of Object.entries(tables)) {
       counts[name] = importTable(db, name, table, transforms[name]);

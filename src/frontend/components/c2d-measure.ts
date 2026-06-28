@@ -1,9 +1,14 @@
-// @ts-nocheck
 // c2d-measure.mjs
 // Pure layout computation and DOM measurement for C2DMapView.
 // No React, no side effects — takes inputs, returns data.
 
-import { getChildren } from '../../core/node-model.js';
+import type { C2DBlock, C2DGroup, C2DColumn, C2DTreeIndex, ConnectorLine } from './c2d-types.js';
+
+// c2d 视角下 byId/byAddress/childrenOf 已是 Map<string, C2DBlock>，直接走 Map 访问；
+// 不绕 node-model 的 getChildren（那是 TreeNode 视角 + normalizeNodeId 兜底，c2d 的 id 全链路 string 已规范）。
+function childrenOf(index: C2DTreeIndex, parentId: string | null): C2DBlock[] {
+  return index.childrenOf.get(parentId) || [];
+}
 
 export const COLUMN_GAP = 40;
 // 按钮尺寸有两处来源：这里（测量用）和 styles.css 的 var(--c2d-expand-button-size, 32px) 兜底值，改动须同步。
@@ -11,23 +16,65 @@ export const EXPAND_BTN = 32;
 export const EXPAND_ICON = 30;
 export const TEXT_CHAR_LIMIT = 3000;
 
-export function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+interface RectLike {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+  width: number;
+  height: number;
+}
+
+interface ConnectorBounds {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+interface ContentStatsValue {
+  words: number;
+  charsNoSpace: number;
+  charsWithSpace: number;
+}
+
+interface StatsEntry {
+  own: ContentStatsValue;
+  words: number;
+  charsNoSpace: number;
+  charsSum: number;
+  nonEmptyCount: number;
+  nodeCount: number;
+  maxDepth: number;
+}
+
+export type StatsIndex = Map<string, StatsEntry>;
+
+interface NodeStats {
+  own: ContentStatsValue;
+  subtree: ContentStatsValue;
+  subtreeNodeCount: number;
+  remainingDepth: number;
+  nextDepthWidth: number;
+}
+
+export function clamp(v: number, lo: number, hi: number): number { return Math.max(lo, Math.min(hi, v)); }
 
 // 自动居中（卡位）：节点能放进视野时正常居中；放不下（超长节点）时不再
 // 居中，而是让顶部贴住视野上沿——否则节点头顶的字数统计、地址会被裁掉。
 // rawTop 是纯居中算出的 scrollTop，topOffset 是节点（或首卡）的 offsetTop。
 // 不超过视野高度时 rawTop 本就 <= topOffset，取 min 不影响居中；
 // 超长节点 rawTop > topOffset，取 min 退化为顶部贴边。
-export function clampCenterScrollTop(rawTop, topOffset, scrollMax) {
+export function clampCenterScrollTop(rawTop: number, topOffset: number, scrollMax: number): number {
   return clamp(Math.min(rawTop, topOffset), 0, scrollMax);
 }
 
-function connectorCurve(x1, y1, x2, y2) {
+function connectorCurve(x1: number, y1: number, x2: number, y2: number): string {
   const cx = (x1 + x2) / 2;
   return `M ${x1} ${y1} C ${cx} ${y1} ${cx} ${y2} ${x2} ${y2}`;
 }
 
-function connectorBounds(x1, y1, x2, y2) {
+function connectorBounds(x1: number, y1: number, x2: number, y2: number): ConnectorBounds {
   return {
     left: Math.min(x1, x2),
     top: Math.min(y1, y2),
@@ -36,19 +83,19 @@ function connectorBounds(x1, y1, x2, y2) {
   };
 }
 
-export function deriveColumns(root, expanded, index) {
+export function deriveColumns(root: C2DBlock | null | undefined, expanded: Set<string>, index: C2DTreeIndex): C2DColumn[] {
   if (!root) return [];
-  const columns = [{ groups: [{ parent: null, blocks: [root] }] }];
-  let parents = expanded.has(root.address) ? [root] : [];
+  const columns: C2DColumn[] = [{ groups: [{ parent: null, blocks: [root] }] }];
+  let parents: C2DBlock[] = expanded.has(root.address) ? [root] : [];
   while (parents.length > 0) {
-    const groups = [];
-    const next = [];
+    const groups: C2DGroup[] = [];
+    const next: C2DBlock[] = [];
     for (const p of parents) {
-      const children = getChildren(index, p.id);
+      const children = childrenOf(index,p.id);
       if (!children?.length) continue;
       groups.push({ parent: p, blocks: children });
       for (const c of children) {
-        if (expanded.has(c.address) && c.childCount > 0) next.push(c);
+        if (expanded.has(c.address) && (c.childCount ?? 0) > 0) next.push(c);
       }
     }
     if (!groups.length) break;
@@ -58,7 +105,7 @@ export function deriveColumns(root, expanded, index) {
   return columns;
 }
 
-function clippedBand(top, bottom, stripRect, viewportRect) {
+function clippedBand(top: number, bottom: number, stripRect: RectLike, viewportRect: RectLike): { top: number; bottom: number } | null {
   const clippedTop = clamp(top, viewportRect.top, viewportRect.bottom);
   const clippedBottom = clamp(bottom, viewportRect.top, viewportRect.bottom);
   if (clippedBottom <= clippedTop) return null;
@@ -68,7 +115,17 @@ function clippedBand(top, bottom, stripRect, viewportRect) {
   };
 }
 
-function pushConnector(lines, key, parentEl, firstChildEl, lastChildEl, x1, x2, stripRect, viewportRect) {
+function pushConnector(
+  lines: ConnectorLine[],
+  key: string,
+  parentEl: Element | null | undefined,
+  firstChildEl: Element | null | undefined,
+  lastChildEl: Element | null | undefined,
+  x1: number,
+  x2: number,
+  stripRect: RectLike,
+  viewportRect: RectLike
+) {
   if (!parentEl || !firstChildEl || !lastChildEl) return;
   const pr = parentEl.getBoundingClientRect();
   const fr = firstChildEl.getBoundingClientRect();
@@ -93,15 +150,15 @@ function pushConnector(lines, key, parentEl, firstChildEl, lastChildEl, x1, x2, 
 }
 
 // 子树正文预览：从内存索引遍历子孙，累积到上限即停（不含节点自身）。
-export function subtreePreviewText(index, nodeId, limit = TEXT_CHAR_LIMIT) {
-  const parts = [];
+export function subtreePreviewText(index: C2DTreeIndex, nodeId: string, limit: number = TEXT_CHAR_LIMIT): string {
+  const parts: string[] = [];
   let total = 0;
-  const stack = getChildren(index, nodeId).slice().reverse();
+  const stack: C2DBlock[] = childrenOf(index,nodeId).slice().reverse();
   while (stack.length > 0 && total < limit) {
-    const n = stack.pop();
-    const chunk = n.text || '';
+    const n = stack.pop()!;
+    const chunk = String(n.text || '');
     if (chunk) { parts.push(chunk); total += chunk.length + 1; }
-    const children = getChildren(index, n.id);
+    const children = childrenOf(index,n.id);
     for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
   }
   return parts.join('\n').slice(0, limit);
@@ -114,15 +171,14 @@ export function subtreePreviewText(index, nodeId, limit = TEXT_CHAR_LIMIT) {
 // 再统计」——words / charsNoSpace 可直接逐节点求和；charsWithSpace 需补回
 // join 分隔符数（非空片段数 - 1）。
 
-export function nodeContentText(node) {
+export function nodeContentText(node: C2DBlock | null | undefined): string {
   return [node?.title, node?.text, node?.note]
     .map((part) => String(part || '').trim())
     .filter(Boolean)
     .join('\n');
 }
 
-/** @returns {import('./c2d-types').ContentStats} */
-export function contentStats(text) {
+export function contentStats(text: unknown): ContentStatsValue {
   const value = String(text || '');
   const wordMatches = value.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]|[\p{L}\p{N}]+/gu) || [];
   const noSpace = value.replace(/\s+/g, '');
@@ -134,29 +190,27 @@ export function contentStats(text) {
 }
 
 // toTreeNode 保证树内节点 depth ≥ 1，|| 1 只兜缺字段的非常规输入。
-function nodeDepthOf(node) {
+function nodeDepthOf(node: C2DBlock | null | undefined): number {
   return Math.max(1, Number(node?.depth) || 1);
 }
 
-/** @returns {import('./c2d-types').StatsIndex} */
-export function buildStatsIndex(index) {
-  /** @type {import('./c2d-types').StatsIndex} */
-  const result = new Map();
+export function buildStatsIndex(index: C2DTreeIndex | null | undefined): StatsIndex {
+  const result: StatsIndex = new Map();
   const root = index?.root;
-  if (!root) return result;
+  if (!index || !root) return result;
   // 前序入栈展平后逆序聚合：子节点必然先于父节点被处理。
-  const order = [];
-  const stack = [root];
+  const order: C2DBlock[] = [];
+  const stack: C2DBlock[] = [root];
   while (stack.length > 0) {
-    const node = stack.pop();
+    const node = stack.pop()!;
     order.push(node);
-    const children = getChildren(index, node.id);
+    const children = childrenOf(index,node.id);
     for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
   }
   for (let i = order.length - 1; i >= 0; i--) {
     const node = order[i];
     const own = contentStats(nodeContentText(node));
-    const entry = {
+    const entry: StatsEntry = {
       own,
       words: own.words,
       charsNoSpace: own.charsNoSpace,
@@ -165,7 +219,7 @@ export function buildStatsIndex(index) {
       nodeCount: 1,
       maxDepth: nodeDepthOf(node)
     };
-    for (const child of getChildren(index, node.id)) {
+    for (const child of childrenOf(index,node.id)) {
       const c = result.get(child.id);
       if (!c) continue;
       entry.words += c.words;
@@ -181,11 +235,11 @@ export function buildStatsIndex(index) {
 }
 
 // 不在树索引里的块（事实前提）走单节点兜底：subtree 即自身。
-/**
- * @param {import('./c2d-types').StatsIndex | null | undefined} statsIndex
- * @returns {import('./c2d-types').NodeStats}
- */
-export function statsForNode(statsIndex, index, node) {
+export function statsForNode(
+  statsIndex: StatsIndex | null | undefined,
+  index: C2DTreeIndex | null | undefined,
+  node: C2DBlock | null | undefined
+): NodeStats {
   const entry = node ? statsIndex?.get(node.id) : null;
   const own = entry ? entry.own : contentStats(nodeContentText(node));
   if (!entry) {
@@ -194,7 +248,7 @@ export function statsForNode(statsIndex, index, node) {
       subtree: own,
       subtreeNodeCount: 1,
       remainingDepth: 0,
-      nextDepthWidth: node ? getChildren(index, node.id).length : 0
+      nextDepthWidth: node && index ? childrenOf(index,node.id).length : 0
     };
   }
   return {
@@ -206,11 +260,17 @@ export function statsForNode(statsIndex, index, node) {
     },
     subtreeNodeCount: entry.nodeCount,
     remainingDepth: Math.max(0, entry.maxDepth - nodeDepthOf(node)),
-    nextDepthWidth: getChildren(index, node.id).length
+    nextDepthWidth: node && index ? childrenOf(index,node.id).length : 0
   };
 }
 
-export function measureConnectorLines(stripEl, surfaceEl, colElsMap, cardsMap, columns) {
+export function measureConnectorLines(
+  stripEl: HTMLElement | null | undefined,
+  surfaceEl: HTMLElement | null | undefined,
+  colElsMap: Map<number, HTMLElement>,
+  cardsMap: Map<string, HTMLElement>,
+  columns: C2DColumn[]
+): { lines: ConnectorLine[]; w: number; h: number } {
   if (!stripEl || !surfaceEl || columns.length < 2) {
     return { lines: [], w: 1, h: 1 };
   }
@@ -218,7 +278,7 @@ export function measureConnectorLines(stripEl, surfaceEl, colElsMap, cardsMap, c
   const h = Math.max(1, surfaceEl.clientHeight);
   const sr = stripEl.getBoundingClientRect();
   const vr = surfaceEl.getBoundingClientRect();
-  const lines = [];
+  const lines: ConnectorLine[] = [];
   for (let i = 0; i < columns.length; i++) {
     const col = columns[i];
     const curEl = colElsMap.get(i);
@@ -253,13 +313,17 @@ export function measureConnectorLines(stripEl, surfaceEl, colElsMap, cardsMap, c
   return { lines, w, h };
 }
 
-export function measureButtonTops(columns, colElsMap, cardsMap) {
-  const result = new Map();
+export function measureButtonTops(
+  columns: C2DColumn[],
+  colElsMap: Map<number, HTMLElement>,
+  cardsMap: Map<string, HTMLElement>
+): Map<string, number> {
+  const result = new Map<string, number>();
   columns.forEach((col, ci) => {
     const colEl = colElsMap.get(ci);
     if (!colEl) return;
-    for (const b of col.groups.flatMap(g => g.blocks)) {
-      if (b.childCount <= 0) continue;
+    for (const b of col.groups.flatMap((g) => g.blocks)) {
+      if ((b.childCount ?? 0) <= 0) continue;
       const el = cardsMap.get(b.address);
       if (!el) continue;
       const cardR = el.getBoundingClientRect();

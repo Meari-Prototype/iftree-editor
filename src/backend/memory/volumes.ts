@@ -1,4 +1,3 @@
-// @ts-nocheck
 // 完整记忆 · session 卷（projectneed 15-10）：卷就是普通文档，卷性记在 docs.meta.memoryVolume。
 // 状态机：active →(末次活动+24h 无更新即视为收尾) sealed →(再 +24h 冷却) distillable →(提炼动作) distilled。
 // 前三态由时间戳确定性推导，per-卷独立、无全局游标（15-11-5）；物理封卷（edit_mode=readonly +
@@ -7,43 +6,49 @@
 // 中途提炼（"记一下"，15-11-5）记 distilledAt 但不封卷；封卷前的 distilledAt 只算快照备注，
 // 卷封卷冷却后照常回到 distillable（尾段仍待提炼）。
 
+// type-only import 不产生运行时循环：store/index.ts → memory/index → memory/volumes 是运行时链；
+// 反向只取 IftreeStore 类型签名，编译期解析。
+import type { IftreeStore } from '../store/index.js';
+
 export const VOLUME_SEAL_IDLE_MS = 24 * 60 * 60 * 1000;
 export const VOLUME_DISTILL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const VOLUME_STATES = Object.freeze(['active', 'sealed', 'distillable', 'distilled']);
 
-function parseMetaJson(meta) {
+type RowObject = Record<string, unknown>;
+
+function parseMetaJson(meta: unknown) {
   if (!meta) return {};
   if (typeof meta === 'object') return meta;
   try {
-    return JSON.parse(meta) || {};
+    return JSON.parse(meta as string) || {};
   } catch {
     return {};
   }
 }
 
-export function memoryVolumeMetaOf(docMeta) {
+export function memoryVolumeMetaOf(docMeta: unknown) {
   const volume = parseMetaJson(docMeta).memoryVolume;
   return volume && typeof volume === 'object' ? volume : null;
 }
 
-function parseIsoMs(value) {
+function parseIsoMs(value: unknown) {
   const ms = Date.parse(String(value || ''));
   return Number.isFinite(ms) ? ms : null;
 }
 
 // SQLite CURRENT_TIMESTAMP 是 UTC 'YYYY-MM-DD HH:MM:SS'；统一在 SQL 侧转 epoch，避免 JS 按本地时区误读。
-function lastActivityMsOf(store, docId) {
-  const row = store.db.prepare(`
+function lastActivityMsOf(store: IftreeStore, docId: unknown) {
+  const row = store.db!.prepare(`
     SELECT MAX(strftime('%s', created_at)) AS node_ts FROM nodes WHERE doc_id = ?
   `).get(docId);
-  const docRow = store.db.prepare(`
+  const docRow = store.db!.prepare(`
     SELECT strftime('%s', created_at) AS doc_ts FROM docs WHERE id = ?
   `).get(docId);
   const seconds = Math.max(Number(row?.node_ts) || 0, Number(docRow?.doc_ts) || 0);
   return seconds * 1000;
 }
 
-export function deriveVolumeState(volume, lastActivityMs, nowMs) {
+export function deriveVolumeState(volume: RowObject | null, lastActivityMs: number, nowMs: number) {
   const physicalSealMs = parseIsoMs(volume?.sealedAt);
   const sealAtMs = physicalSealMs ?? (lastActivityMs + VOLUME_SEAL_IDLE_MS);
   const distillableAtMs = sealAtMs + VOLUME_DISTILL_COOLDOWN_MS;
@@ -64,7 +69,7 @@ export function deriveVolumeState(volume, lastActivityMs, nowMs) {
   };
 }
 
-function volumeRow(store, docRow, nowMs) {
+function volumeRow(store: IftreeStore, docRow: RowObject, nowMs: number) {
   const volume = memoryVolumeMetaOf(docRow.meta);
   if (!volume) return null;
   const lastActivityMs = Math.max(
@@ -92,8 +97,8 @@ function volumeRow(store, docRow, nowMs) {
   };
 }
 
-function selectVolumeDocRows(store) {
-  return store.db.prepare(`
+function selectVolumeDocRows(store: IftreeStore) {
+  return store.db!.prepare(`
     SELECT docs.id, docs.title, docs.meta, docs.edit_mode, docs.created_at,
            strftime('%s', docs.created_at) AS doc_created_ts,
            (SELECT COUNT(*) FROM nodes WHERE nodes.doc_id = docs.id) AS node_count,
@@ -105,7 +110,7 @@ function selectVolumeDocRows(store) {
 }
 
 // limit 默认 5：日常"开工先看最近发生过什么"只需最近几卷（最新优先）；全量列表是管理动作，显式调大 limit 才给。
-export function listMemoryVolumes(store, { state = null, agent = null, sessionId = null, limit = 5, nowMs = Date.now() } = {}) {
+export function listMemoryVolumes(store: IftreeStore, { state = null, agent = null, sessionId = null, limit = 5, nowMs = Date.now() }: { state?: string | null; agent?: string | null; sessionId?: string | null; limit?: number; nowMs?: number } = {}) {
   const wantState = state ? String(state).trim() : null;
   if (wantState && !VOLUME_STATES.includes(wantState)) {
     throw new Error(`未知卷状态：${wantState}；只能是 ${VOLUME_STATES.join(' / ')}`);
@@ -133,8 +138,8 @@ export function listMemoryVolumes(store, { state = null, agent = null, sessionId
 // 不走 selectVolumeDocRows——那是管理视图的查询，对每卷拖着节点 COUNT/MAX 统计，
 // 而卷只增不删、这里每个对话回合都要问一次，成本会随总卷数单调涨；
 // 这里只需要最新一卷的 meta 与编辑模式，json_extract 过滤 + LIMIT 1 即停。
-export function findActiveSessionVolume(store, { agent = null, sessionId = null } = {}) {
-  const row = store.db.prepare(`
+export function findActiveSessionVolume(store: IftreeStore, { agent = null, sessionId = null }: { agent?: unknown; sessionId?: unknown } = {}) {
+  const row = store.db!.prepare(`
     SELECT id, meta, edit_mode FROM docs
     WHERE json_extract(meta, '$.memoryVolume.agent') = ?
       AND json_extract(meta, '$.memoryVolume.sessionId') = ?
@@ -151,8 +156,8 @@ export function findActiveSessionVolume(store, { agent = null, sessionId = null 
 // 该 session 的卷（不管封没封）：一 session 一卷的幂等依据——deliverVolume 投递前据此查重，
 // 已有就返回首投的卷、绝不新建第二个（根除「重投抢锚造孤儿卷」）。与 findActiveSessionVolume 的
 // 区别：那个只认未封活跃卷（中途追加用），这个认任何状态、只回答「这个 session 投过没有」。
-export function findSessionVolume(store, { agent = null, sessionId = null } = {}) {
-  const row = store.db.prepare(`
+export function findSessionVolume(store: IftreeStore, { agent = null, sessionId = null }: { agent?: unknown; sessionId?: unknown } = {}) {
+  const row = store.db!.prepare(`
     SELECT id, title, meta FROM docs
     WHERE json_extract(meta, '$.memoryVolume.agent') = ?
       AND json_extract(meta, '$.memoryVolume.sessionId') = ?
@@ -165,32 +170,34 @@ export function findSessionVolume(store, { agent = null, sessionId = null } = {}
   return { docId: row.id, title: row.title, volume };
 }
 
-function mergeVolumeMeta(store, docId, patch) {
-  const docRow = store.db.prepare('SELECT id, meta FROM docs WHERE id = ?').get(docId);
+function mergeVolumeMeta(store: IftreeStore, docId: unknown, patch: RowObject) {
+  const docRow = store.db!.prepare('SELECT id, meta FROM docs WHERE id = ?').get(docId);
   if (!docRow) throw new Error(`Doc not found: ${docId}`);
   const meta = parseMetaJson(docRow.meta);
   const volume = meta.memoryVolume && typeof meta.memoryVolume === 'object' ? meta.memoryVolume : null;
   if (!volume) throw new Error(`文档 ${docId} 不是记忆卷`);
   meta.memoryVolume = { ...volume, ...patch };
-  store.db.prepare('UPDATE docs SET meta = ? WHERE id = ?').run(JSON.stringify(meta), docId);
+  store.db!.prepare('UPDATE docs SET meta = ? WHERE id = ?').run(JSON.stringify(meta), docId);
   return meta.memoryVolume;
 }
 
 // 卷必带元信息（15-10-1）：agent 身份 + session id 必填；宿主原始记录锚允许悬空（15-10-2）。
-export function createMemoryVolume(store, {
+export function createMemoryVolume(store: IftreeStore, {
   title = null,
   agent = null,
   sessionId = null,
   hostAnchor = null,
   startedAt = null,
   endedAt = null
-} = {}) {
+}: { title?: unknown; agent?: unknown; sessionId?: unknown; hostAnchor?: unknown; startedAt?: unknown; endedAt?: unknown } = {}) {
   const agentName = String(agent || '').trim();
   const session = String(sessionId ?? '').trim();
   if (!agentName) throw new Error('记忆卷必须带 agent 身份（15-10-1）');
   if (!session) throw new Error('记忆卷必须带 session id（15-10-1）');
-  const startIso = parseIsoMs(startedAt) !== null ? new Date(parseIsoMs(startedAt)).toISOString() : new Date().toISOString();
-  const endIso = parseIsoMs(endedAt) !== null ? new Date(parseIsoMs(endedAt)).toISOString() : null;
+  const startMs = parseIsoMs(startedAt);
+  const startIso = startMs !== null ? new Date(startMs).toISOString() : new Date().toISOString();
+  const endMs = parseIsoMs(endedAt);
+  const endIso = endMs !== null ? new Date(endMs).toISOString() : null;
   const docTitle = String(title || '').trim() || `记忆卷 ${agentName} ${startIso.slice(0, 10)} #${session}`;
   const volume = {
     agent: agentName,
@@ -210,7 +217,7 @@ export function createMemoryVolume(store, {
 
 // 物理封卷到期扫描：把"末次活动+24h 已过"的卷落成 readonly（结构保证不可变，15-10-1）。
 // sealedAt 写逻辑时点（末次活动+24h）而非扫描时刻，保证可提炼判定与扫描节奏无关。
-export function sealDueMemoryVolumes(store, { nowMs = Date.now() } = {}) {
+export function sealDueMemoryVolumes(store: IftreeStore, { nowMs = Date.now() }: { nowMs?: number } = {}) {
   const sealed = [];
   for (const docRow of selectVolumeDocRows(store)) {
     const volume = memoryVolumeMetaOf(docRow.meta);
@@ -235,9 +242,9 @@ export function sealDueMemoryVolumes(store, { nowMs = Date.now() } = {}) {
 
 // 提炼状态标记（15-11-5）：默认守冷却期（封卷+24h，不抢在反转前固化）；
 // force=用户明确指示（"记一下"）立即触发——活跃卷上是"截至当下快照"备注、不封卷。
-export function markMemoryVolumeDistilled(store, { docId = null, force = false, nowMs = Date.now() } = {}) {
+export function markMemoryVolumeDistilled(store: IftreeStore, { docId = null, force = false, nowMs = Date.now() }: { docId?: unknown; force?: boolean; nowMs?: number } = {}) {
   if (!docId) throw new Error('memory.markDistilled requires docId');
-  const docRow = store.db.prepare('SELECT id, title, meta FROM docs WHERE id = ?').get(docId);
+  const docRow = store.db!.prepare('SELECT id, title, meta FROM docs WHERE id = ?').get(docId);
   if (!docRow) throw new Error(`Doc not found: ${docId}`);
   const volume = memoryVolumeMetaOf(docRow.meta);
   if (!volume) throw new Error(`文档 ${docId} 不是记忆卷`);
@@ -275,8 +282,8 @@ export function markMemoryVolumeDistilled(store, { docId = null, force = false, 
 // LEFT JOIN：连「source 行已缺失」的中间态卷（上一轮解锚后未及删卷）也照样列出，
 // anchorPath 取 null——同样按脱锚处理，保证扫除可重入、不漏。
 // 只取定位与锚路径、不拖节点统计：扫除是一次性运维，逐卷核一次文件存在性即可。
-export function listMemoryVolumeAnchors(store) {
-  const rows = store.db.prepare(`
+export function listMemoryVolumeAnchors(store: IftreeStore) {
+  const rows = store.db!.prepare(`
     SELECT docs.id AS doc_id, docs.title AS title, docs.meta AS meta,
            source_documents.original_path AS anchor_path
     FROM docs
@@ -302,6 +309,6 @@ export function listMemoryVolumeAnchors(store) {
 // 从「卷+锚路径」列表里挑出脱锚卷（实体锚已被人工删除，projectneed 15-10-4 可清除）。
 // anchorExists 由调用方注入（host 用 lstat 不解引用，判锚路径本身在不在）——隔离文件系统、便于单测。
 // 锚路径缺失（无 source 行）一律算脱锚：覆盖「解锚后未及删卷」的中间态，保证扫除可重入、不漏。
-export function selectOrphanedMemoryVolumes(volumes, anchorExists) {
+export function selectOrphanedMemoryVolumes(volumes: Array<{ anchorPath?: string | null }>, anchorExists: (path: string) => boolean) {
   return volumes.filter((volume) => !volume.anchorPath || !anchorExists(volume.anchorPath));
 }

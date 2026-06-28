@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 迁移 .memory 物理锚（projectneed 15-10）：
 //  (A) 事件卷：把 .memory/ 下的 .md 全文实体换成指向「宿主原始 jsonl」的 symlink，
 //      并按 hostAnchor 里的工作区切子目录 .memory/<workspace>/。正文已在 DB，物理只留锚。
@@ -16,14 +15,34 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DB_PATH = process.env.IFTREE_DB || join(ROOT, 'database', 'store.sqlite');
 const APPLY = process.argv.includes('--apply');
 
-function parseHostAnchor(anchor) {
+interface MemoryVolumeAnchorRow {
+  id: string;
+  hostAnchor?: unknown;
+  originalPath: string;
+}
+
+interface MemoryDocAnchorRow {
+  id: string;
+  originalPath: string;
+}
+
+interface AnchorPlan {
+  id: string;
+  from: string;
+  link: string;
+  target: string;
+  workspace: string;
+  targetExists: boolean;
+}
+
+function parseHostAnchor(anchor: unknown) {
   const raw = String(anchor || '');
   const targetPath = raw.split('#')[0];
   const matched = targetPath.match(/[\\/]\.claude[\\/]projects[\\/]([^\\/]+)[\\/]/);
   return { targetPath, workspace: matched ? matched[1] : null };
 }
 
-function isSymlink(path) {
+function isSymlink(path: string) {
   try {
     return lstatSync(path).isSymbolicLink();
   } catch {
@@ -43,18 +62,18 @@ function main() {
           AND s.original_path IS NOT NULL
         ORDER BY s.original_path`
     )
-    .all();
+    .all() as unknown as MemoryVolumeAnchorRow[];
   const memoryDoc = db
     .prepare(
       `SELECT d.id, s.original_path AS originalPath
          FROM docs d JOIN source_documents s ON s.doc_id = d.id
         WHERE d.title = 'CLAUDE CODE记忆库' AND s.original_path IS NOT NULL`
     )
-    .get();
+    .get() as unknown as MemoryDocAnchorRow | undefined;
   const updatePath = db.prepare('UPDATE source_documents SET original_path = ? WHERE doc_id = ?');
 
-  const plan = [];
-  const byWorkspace = {};
+  const plan: AnchorPlan[] = [];
+  const byWorkspace: Record<string, number> = {};
   let missingTarget = 0;
   let unparsed = 0;
   for (const vol of volumes) {
@@ -113,9 +132,9 @@ function main() {
       rmSync(p.from, { force: true });
       updatePath.run(p.link, p.id);
       done += 1;
-    } catch (error) {
+    } catch (error: unknown) {
       failed += 1;
-      console.error(`[x] ${p.id} ${basename(p.from)}: ${error.message}`);
+      console.error(`[x] ${p.id} ${basename(p.from)}: ${(error as { message?: string }).message}`);
     }
   }
   if (memoryDoc && memTarget) {
@@ -123,8 +142,8 @@ function main() {
       mkdirSync(dirname(memTarget), { recursive: true });
       renameSync(memoryDoc.originalPath, memTarget);
       updatePath.run(memTarget, memoryDoc.id);
-    } catch (error) {
-      console.error(`[x] CLAUDE记忆库 move: ${error.message}`);
+    } catch (error: unknown) {
+      console.error(`[x] CLAUDE记忆库 move: ${(error as { message?: string }).message}`);
     }
   }
   console.log(`[migrate] 完成 done=${done} failed=${failed} dangling(悬空但已建链)=${dangling}`);

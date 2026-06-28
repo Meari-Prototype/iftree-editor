@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } from 'electron';
 import {
   appendFileSync,
@@ -15,9 +14,12 @@ import {
 } from 'node:fs';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import type { FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { NativeImage, OpenDialogOptions } from 'electron';
 
 import {
   DEFAULT_VECTOR_CONFIG,
@@ -27,6 +29,7 @@ import {
 } from '../src/vector/embeddings.js';
 import { normalizeDocMeta, resolveMarkdownImageUrl, workspaceSearchRoots } from '../src/core/image-paths.js';
 import { createBackendClient } from '../src/backend/llm/backend-client.js';
+import { resolveNodeExecutable } from '../src/backend/llm/backend-discovery.js';
 import {
   clampNumber,
   normalizeAgentToolSettings
@@ -59,6 +62,71 @@ import {
 } from '../src/backend/library-fs.js';
 import channels from './ipc-channels.js';
 
+type RowObject = Record<string, unknown>;
+type HeadlessAgentClient = ReturnType<typeof createBackendClient>;
+// 对齐 backend/llm/settings.ts 的 EnvMap：readDotEnv 内部实际只赋 string，但类型签名容
+// undefined 值；这里也保持同一形状，下面 readDotEnvFile() 返回值直接接住、无需 cast。
+type DotEnvMap = Record<string, string | undefined>;
+type ProjectConfig = RowObject & {
+  llm?: RowObject;
+  renderMode?: string;
+  forceHardwareAcceleration?: boolean;
+  debugLogging?: boolean;
+};
+type SettingsFile = RowObject & {
+  vector?: RowObject & { enabled?: boolean };
+  memory?: RowObject & { enabled?: boolean };
+  nodeLayout?: NodeLayoutByView;
+  node_layout?: NodeLayoutByView;
+};
+type NodeLayoutByView = {
+  tree: ReturnType<typeof normalizeNodeLayout>;
+  flow: ReturnType<typeof normalizeNodeLayout>;
+};
+type VectorConfig = ReturnType<typeof normalizeVectorConfig>;
+type RectLike = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  imageHeight?: number;
+};
+type CaptureAnalysis = RowObject & {
+  ok: boolean;
+  width: number;
+  height: number;
+  hasDarkLoadingOverlay: boolean;
+  overlayDarkPixels: number;
+  overlaySamplePixels: number;
+  mainCanvasDarkPixels: number;
+  textProbeRectCount: number;
+  textDarkPixels: number;
+  textRectsWithDark: number;
+  textInkPixels: number;
+  textRectsWithInk: number;
+  hasReadableTextPixels: boolean;
+  edgeProbeRectCount: number;
+  edgeColorPixels: number;
+  edgeRectsWithColor: number;
+  hasBezierCurvePixels: boolean;
+  fontShot?: RowObject;
+};
+type BackendDebugEvent = {
+  type?: string;
+  phase?: string;
+  body?: { payload?: unknown; commandPayload?: unknown };
+  ok?: boolean;
+  ms?: number;
+  result?: unknown;
+  error?: unknown;
+};
+const createLlmSettingsReaderForMain = createLlmSettingsReader as unknown as (options: {
+  envPath: string;
+  configPath: string;
+  readEnv: () => DotEnvMap;
+  readProjectConfig: () => ProjectConfig;
+}) => ReturnType<typeof createLlmSettingsReader>;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PROJECT_ROOT = resolve(__dirname, '..', '..');
@@ -89,24 +157,24 @@ if (FORCE_HARDWARE_ACCELERATION) {
   app.commandLine.appendSwitch('force_high_performance_gpu');
 }
 
-let mainWindow = null;
-let launcherWindow = null;
-let entityMaintenanceWindow = null;
-let launchedMainProcess = null;
-let launcherPollTimer = null;
-let launcherLastFailure = null;
+let mainWindow: BrowserWindow | null = null;
+let launcherWindow: BrowserWindow | null = null;
+let entityMaintenanceWindow: BrowserWindow | null = null;
+let launchedMainProcess: ChildProcess | null = null;
+let launcherPollTimer: NodeJS.Timeout | null = null;
+let launcherLastFailure: RowObject | null = null;
 let mainStartupSucceeded = false;
-let headlessAgentClient = null;
-let llmWorkspaceState = null;
-let vectorConfigCache = null;
-let nodeLayoutConfigCache = null;
-const imageUrlCache = new Map();
-let libraryWatcher = null;
-let libraryWatchTimer = null;
+let headlessAgentClient: HeadlessAgentClient | null = null;
+let llmWorkspaceState: unknown = null;
+let vectorConfigCache: VectorConfig | null = null;
+let nodeLayoutConfigCache: NodeLayoutByView | null = null;
+const imageUrlCache = new Map<string, string>();
+let libraryWatcher: FSWatcher | null = null;
+let libraryWatchTimer: NodeJS.Timeout | null = null;
 const VECTOR_MODULE_DISABLED_REASON = '向量模块已由用户禁用';
 let cspConfigured = false;
 
-function normalizedPathKey(targetPath) {
+function normalizedPathKey(targetPath: string) {
   return resolve(targetPath).toLowerCase();
 }
 
@@ -119,7 +187,7 @@ function configuredStartUrlOrigin() {
   }
 }
 
-function isDistIndexUrl(url) {
+function isDistIndexUrl(url: URL) {
   if (url.protocol !== 'file:') return false;
   try {
     return normalizedPathKey(fileURLToPath(url)) === normalizedPathKey(DIST_INDEX_PATH);
@@ -128,7 +196,7 @@ function isDistIndexUrl(url) {
   }
 }
 
-function isAllowedAppNavigationUrl(rawUrl) {
+function isAllowedAppNavigationUrl(rawUrl: string) {
   try {
     const url = new URL(rawUrl);
     if (url.protocol === 'about:' && url.href === 'about:blank') return true;
@@ -140,7 +208,7 @@ function isAllowedAppNavigationUrl(rawUrl) {
   }
 }
 
-function isExternalLinkUrl(rawUrl) {
+function isExternalLinkUrl(rawUrl: string) {
   try {
     const url = new URL(rawUrl);
     return EXTERNAL_LINK_PROTOCOLS.has(url.protocol) && !isAllowedAppNavigationUrl(rawUrl);
@@ -149,18 +217,18 @@ function isExternalLinkUrl(rawUrl) {
   }
 }
 
-function openExternalLink(rawUrl) {
+function openExternalLink(rawUrl: string) {
   if (!isExternalLinkUrl(rawUrl)) return;
   shell.openExternal(rawUrl).catch((error) => {
     appendDebugLog('backend', {
       event: 'window.open_external_failed',
-      message: error?.message || String(error || ''),
+      message: (error as { message?: string } | null | undefined)?.message || String(error || ''),
       sourceId: rawUrl
     });
   });
 }
 
-function attachExternalNavigationGuards(win) {
+function attachExternalNavigationGuards(win: BrowserWindow | null) {
   if (!win || win.isDestroyed()) return;
   const { webContents } = win;
   webContents.setWindowOpenHandler(({ url }) => {
@@ -210,32 +278,38 @@ function configureContentSecurityPolicy() {
   });
 }
 
-function sendProgress(data) {
+function sendProgress(data: unknown) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(channels.OP_PROGRESS, data);
   }
 }
 
-function sendAgentStream(requestId, event) {
+function sendAgentStream(requestId: unknown, event: RowObject) {
   if (!requestId || !mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send(channels.AGENT_STREAM, { requestId, ...event });
 }
 
-function isVectorModuleEnabled(settings = readSettingsFile()) {
+function showOpenDialogForMain(options: OpenDialogOptions) {
+  return mainWindow && !mainWindow.isDestroyed()
+    ? dialog.showOpenDialog(mainWindow, options)
+    : dialog.showOpenDialog(options);
+}
+
+function isVectorModuleEnabled(settings: SettingsFile = readSettingsFile()) {
   const configured = settings?.vector?.enabled;
   return configured !== false;
 }
 
 // 记忆子系统开关（projectneed 15-10-5）：默认关闭，与向量模块并列。
-function isMemoryEnabled(settings = readSettingsFile()) {
+function isMemoryEnabled(settings: SettingsFile = readSettingsFile()) {
   return settings?.memory?.enabled === true;
 }
 
-function memorySettingsPayload(settings = readSettingsFile()) {
+function memorySettingsPayload(settings: SettingsFile = readSettingsFile()) {
   return { enabled: isMemoryEnabled(settings) };
 }
 
-let dotEnvCache = null;
+let dotEnvCache: DotEnvMap | null = null;
 
 function projectEnvPath() {
   return join(PROJECT_ROOT, '.env');
@@ -245,21 +319,21 @@ function projectConfigPath() {
   return join(PROJECT_ROOT, 'iftree.config.json');
 }
 
-function readDotEnv() {
+function readDotEnv(): DotEnvMap {
   if (dotEnvCache) return dotEnvCache;
   dotEnvCache = readDotEnvFile(projectEnvPath());
   return dotEnvCache;
 }
 
-function encodeDotEnvValue(value) {
+function encodeDotEnvValue(value: unknown) {
   return String(value ?? '').replace(/\r?\n/g, '\\n');
 }
 
-function writeDotEnvValues(values) {
+function writeDotEnvValues(values: Record<string, string | null | undefined>) {
   const envPath = projectEnvPath();
   const keys = Object.keys(values || {});
   const removeKeys = new Set(keys.filter((key) => values[key] === null));
-  const seen = new Set();
+  const seen = new Set<string>();
   const raw = existsSync(envPath)
     ? readFileSync(envPath, 'utf8')
     : '# IFTreeEditor 环境配置\n';
@@ -284,7 +358,7 @@ function writeDotEnvValues(values) {
   dotEnvCache = null;
 }
 
-function readProjectConfig() {
+function readProjectConfig(): ProjectConfig {
   const configPath = projectConfigPath();
   if (!existsSync(configPath)) return {};
   try {
@@ -294,7 +368,7 @@ function readProjectConfig() {
   }
 }
 
-function writeProjectConfig(patch = {}) {
+function writeProjectConfig(patch: ProjectConfig = {}) {
   const current = readProjectConfig();
   const next = {
     ...current,
@@ -311,7 +385,7 @@ function writeProjectConfig(patch = {}) {
 
 // LLM 三套设置读取统一走共享读取器（src/backend/llm/settings.mjs）。
 // main 进程注入带缓存的 .env 读取（writeDotEnvValues 写入后置空缓存失效）。
-const llmSettings = createLlmSettingsReader({
+const llmSettings = createLlmSettingsReaderForMain({
   envPath: projectEnvPath(),
   configPath: projectConfigPath(),
   readEnv: readDotEnv,
@@ -331,7 +405,7 @@ function debugLoggingEnabled() {
 // 本机时间的 ISO 8601 带时区偏移格式：例 "2026-05-28T15:30:45.123+08:00"
 // 既能直观看出本地时间，又保留时区信息可还原 UTC。
 function localIsoTimestamp(date = new Date()) {
-  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
   const offsetTotalMinutes = -date.getTimezoneOffset();
   const offsetSign = offsetTotalMinutes >= 0 ? '+' : '-';
   const absOffset = Math.abs(offsetTotalMinutes);
@@ -345,7 +419,7 @@ function localIsoTimestamp(date = new Date()) {
 // 文件名安全的本地时间戳，用于 .iftree-debug 下的 session 文件名（精度到秒，不含时区后缀）。
 // 冒号在 Windows 文件名里非法，统一用 - 替代。
 function localFileSafeTimestamp(date = new Date()) {
-  const pad = (n) => String(n).padStart(2, '0');
+  const pad = (n: number) => String(n).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
     + `T${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
 }
@@ -355,7 +429,7 @@ function debugLogPath() {
   return join(PROJECT_ROOT, '.iftree-debug', `${DEBUG_SESSION_ID}.jsonl`);
 }
 
-function appendDebugLog(source, payload = {}) {
+function appendDebugLog(source: string, payload: RowObject = {}) {
   if (!debugLoggingEnabled()) return false;
   try {
     const target = debugLogPath();
@@ -364,7 +438,7 @@ function appendDebugLog(source, payload = {}) {
       ts: localIsoTimestamp(),
       pid: process.pid,
       source,
-      ...debugValueSummary(payload)
+      ...(debugValueSummary(payload) as RowObject)
     })}\n`, 'utf8');
     return true;
   } catch {
@@ -372,18 +446,18 @@ function appendDebugLog(source, payload = {}) {
   }
 }
 
-function debugErrorSummary(error) {
-  return String(error?.message || error || '').slice(0, 240);
+function debugErrorSummary(error: unknown) {
+  return String((error as { message?: string } | null | undefined)?.message || error || '').slice(0, 240);
 }
 
-function normalizeMainDocId(value, fallback = null) {
+function normalizeMainDocId(value: unknown, fallback: string | null = null) {
   return normalizeStableId(value, fallback);
 }
 
 const DEFAULT_TREE_SLICE_DEPTH = 1;
 
 
-function writeLlmSummarySettings(payload = {}) {
+function writeLlmSummarySettings(payload: RowObject = {}) {
   const current = readLlmSummarySettings();
   const next = normalizeLlmSummarySettings({
     ...current,
@@ -435,7 +509,7 @@ function writeLlmSummarySettings(payload = {}) {
   return readLlmSummarySettings();
 }
 
-function writeAgentSettings(payload = {}) {
+function writeAgentSettings(payload: RowObject = {}) {
   const currentAgent = readAgentSettings();
   const current = readSharedLlmSettings();
   const next = normalizeLlmSummarySettings({
@@ -505,10 +579,10 @@ function listLibraryTree() {
   };
 }
 
-async function moveLibraryEntry(payload = {}) {
-  const sourceRel = normalizeLibraryRelativePath(payload.sourceRelativePath);
+async function moveLibraryEntry(payload: RowObject = {}) {
+  const sourceRel = normalizeLibraryRelativePath(String(payload.sourceRelativePath || ''));
   if (!sourceRel) throw new Error('Cannot move the library root');
-  const targetFolderRel = normalizeLibraryRelativePath(payload.targetFolderRelativePath);
+  const targetFolderRel = normalizeLibraryRelativePath(String(payload.targetFolderRelativePath || ''));
   const source = libraryPath(sourceRel);
   const targetFolder = libraryPath(targetFolderRel);
   const sourceStat = statSync(source);
@@ -558,13 +632,13 @@ function stopLibraryWatcher() {
 // 数据库三口的请求观测：旧实现在每个 IPC handler 里各抄一套 try/catch + 计时 + start/end；现下沉到
 // 统一 SDK 的 onDebug 回调（SDK 出站点统一触发），这里只决定「记什么」——保持只观测数据库读 / 写 /
 // 跑三口、沿用既有 event 名（run 记作 database.command）与 debugValueSummary 截断，行为不变。
-/** @param {{ type?: string, phase?: string, body?: { payload?: any, commandPayload?: any }, ok?: boolean, ms?: number, result?: any, error?: any }} arg */
-function backendDebugLogger({ type, phase, body = {}, ok, ms, result, error }) {
+/** @param {{ type?: string, phase?: string, body?: { payload?: unknown, commandPayload?: unknown }, ok?: boolean, ms?: number, result?: unknown, error?: unknown }} arg */
+function backendDebugLogger({ type, phase, body = {}, ok, ms, result, error }: BackendDebugEvent) {
   const spec = {
     'database.read': { event: 'database.read', payload: body.payload },
     'database.write': { event: 'database.write', payload: body.payload },
     'database.run': { event: 'database.command', payload: body.commandPayload }
-  }[type];
+  }[String(type || '') as 'database.read' | 'database.write' | 'database.run'];
   if (!spec) return;
   if (phase === 'start') {
     appendDebugLog('backend', { event: `${spec.event}.start`, payload: debugValueSummary(spec.payload || {}) });
@@ -579,23 +653,8 @@ function backendDebugLogger({ type, phase, body = {}, ok, ms, result, error }) {
   });
 }
 
-// 后端 host 跑 node runtime（路 B）：electron 主进程拉起 host 不能继承 electron execPath（那会让 host 是
-// electron-as-node、要 electron ABI 的 better-sqlite3）。自动在 PATH 里找真 node，不要求手配 env
-// （IFTREE_BACKEND_NODE 仅作可选覆盖）；找不到就报清晰错误、不静默回退 electron。
-function resolveNodeExecutable() {
-  const explicit = String(process.env.IFTREE_BACKEND_NODE || '').trim();
-  if (explicit && existsSync(explicit)) return explicit;
-  const exeName = process.platform === 'win32' ? 'node.exe' : 'node';
-  const pathSep = process.platform === 'win32' ? ';' : ':';
-  for (const dir of String(process.env.PATH || '').split(pathSep)) {
-    const trimmed = dir.trim();
-    if (!trimmed) continue;
-    const candidate = join(trimmed, exeName);
-    if (existsSync(candidate)) return candidate;
-  }
-  throw new Error('未找到 node 可执行文件：headless 后端需 node runtime（把 node 加入 PATH，或设 IFTREE_BACKEND_NODE 指向 node 可执行）。');
-}
-
+// resolveNodeExecutable 已下沉到 backend-discovery，作 createBackendClient 的默认（host 恒 node runtime，
+// 与「谁拉起它」解耦）。下方仍显式传 processPath，保留「主进程拉起 host 必须 node ABI」的意图可读。
 function getHeadlessAgentClient() {
   if (!headlessAgentClient) {
     // 解耦第 10 步：主进程经统一 backend-client SDK 连共享管道后端（与 mcp-server 写档同一个 host
@@ -615,20 +674,20 @@ function getHeadlessAgentClient() {
   return headlessAgentClient;
 }
 
-function headlessDatabaseRead(payload = {}) {
+function headlessDatabaseRead(payload: unknown = {}) {
   return getHeadlessAgentClient().databaseRead(payload);
 }
 
-function headlessDatabaseWrite(payload = {}) {
+function headlessDatabaseWrite(payload: unknown = {}) {
   return getHeadlessAgentClient().databaseWrite(payload);
 }
 
-function headlessDatabaseRun(command = {}, fallbackOperation = 'read') {
+function headlessDatabaseRun(command: unknown = {}, fallbackOperation = 'read') {
   return getHeadlessAgentClient().databaseRun(command, fallbackOperation);
 }
 
 async function ensureHeadlessAgentStarted() {
-  const result = await getHeadlessAgentClient().ping();
+  const result = await getHeadlessAgentClient().ping() as RowObject;
   console.log(`[headless-agent] started pid=${result?.pid || getHeadlessAgentClient().pid || ''}`);
   return result;
 }
@@ -656,7 +715,7 @@ function settingsPath() {
   return join(appHome(), 'settings.json');
 }
 
-function readSettingsFile() {
+function readSettingsFile(): SettingsFile {
   try {
     return JSON.parse(readFileSync(settingsPath(), 'utf8').replace(/^\uFEFF/, ''));
   } catch {
@@ -664,7 +723,7 @@ function readSettingsFile() {
   }
 }
 
-function writeSettingsFile(settings) {
+function writeSettingsFile(settings: SettingsFile) {
   mkdirSync(dirname(settingsPath()), { recursive: true });
   writeFileSync(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
 }
@@ -677,7 +736,7 @@ function getVectorConfig() {
   return vectorConfigCache;
 }
 
-function vectorSettingsPayload(config = getVectorConfig(), runtime = {}) {
+function vectorSettingsPayload(config: VectorConfig = getVectorConfig(), runtime: RowObject = {}) {
   return {
     ...config,
     enabled: isVectorModuleEnabled(),
@@ -694,7 +753,7 @@ function vectorSettingsPayload(config = getVectorConfig(), runtime = {}) {
   };
 }
 
-function normalizeNodeLayoutSettingsByView(value = {}) {
+function normalizeNodeLayoutSettingsByView(value: Partial<NodeLayoutByView> = {}): NodeLayoutByView {
   return {
     tree: normalizeNodeLayout(value?.tree || DEFAULT_NODE_LAYOUT),
     flow: normalizeNodeLayout(value?.flow || value?.tree || DEFAULT_NODE_LAYOUT)
@@ -709,14 +768,14 @@ function getNodeLayoutConfig() {
   return nodeLayoutConfigCache;
 }
 
-function nodeLayoutSettingsPayload(config = getNodeLayoutConfig()) {
+function nodeLayoutSettingsPayload(config: NodeLayoutByView = getNodeLayoutConfig()) {
   return {
     tree: { ...(config.tree || {}) },
     flow: { ...(config.flow || {}) }
   };
 }
 
-async function fetchModelFileList(config) {
+async function fetchModelFileList(config: VectorConfig) {
   const response = await fetch(huggingFaceTreeUrl(config.modelName));
   if (!response.ok) {
     throw new Error(`读取 Hugging Face 模型文件列表失败：${response.status} ${response.statusText}`);
@@ -729,7 +788,7 @@ async function fetchModelFileList(config) {
   return files;
 }
 
-async function downloadFile(url, targetPath, progress) {
+async function downloadFile(url: string, targetPath: string, progress?: (bytes: number) => void) {
   const response = await fetch(url);
   if (!response.ok || !response.body) {
     throw new Error(`下载失败：${response.status} ${response.statusText} ${url}`);
@@ -756,7 +815,7 @@ async function downloadFile(url, targetPath, progress) {
   }
 }
 
-async function downloadVectorModelToRoot(config, downloadRoot) {
+async function downloadVectorModelToRoot(config: VectorConfig, downloadRoot: string) {
   const root = resolve(downloadRoot);
   mkdirSync(root, { recursive: true });
   const files = await fetchModelFileList(config);
@@ -782,7 +841,7 @@ async function downloadVectorModelToRoot(config, downloadRoot) {
       continue;
     }
 
-    await downloadFile(huggingFaceResolveUrl(config.modelName, file.path), targetPath, (bytes) => {
+    await downloadFile(huggingFaceResolveUrl(config.modelName, file.path), targetPath, (bytes: number) => {
       loaded += bytes;
       sendProgress({
         label: `下载 ${config.label}：${file.path}`,
@@ -796,11 +855,11 @@ async function downloadVectorModelToRoot(config, downloadRoot) {
   return root;
 }
 
-async function resetVectorStoreTable(dimensions) {
+async function resetVectorStoreTable(dimensions: unknown) {
   await getHeadlessAgentClient().resetVectorStore({ dimensions });
 }
 
-async function saveVectorConfig(patch = {}) {
+async function saveVectorConfig(patch: RowObject = {}) {
   const current = getVectorConfig();
   const next = normalizeVectorConfig({ ...current, ...patch });
   const modelChanged = current.modelId !== next.modelId;
@@ -831,14 +890,14 @@ async function saveVectorConfig(patch = {}) {
   return vectorSettingsPayload(next);
 }
 
-function saveMemoryConfig(patch = {}) {
+function saveMemoryConfig(patch: RowObject = {}) {
   const settings = readSettingsFile();
   settings.memory = { ...(settings.memory || {}), enabled: patch?.enabled === true };
   writeSettingsFile(settings);
   return memorySettingsPayload(settings);
 }
 
-function saveNodeLayoutConfig(patch = {}) {
+function saveNodeLayoutConfig(patch: RowObject = {}) {
   const settings = readSettingsFile();
   const current = normalizeNodeLayoutSettingsByView(settings.nodeLayout || settings.node_layout);
   const next = normalizeNodeLayoutSettingsByView(
@@ -859,7 +918,7 @@ function saveNodeLayoutConfig(patch = {}) {
   return nodeLayoutSettingsPayload(nodeLayoutConfigCache);
 }
 
-function assetsDir(docId) {
+function assetsDir(docId: unknown) {
   return join(appHome(), 'assets', `doc-${docId}`);
 }
 
@@ -895,7 +954,7 @@ function e2eScreenshotPath() {
   return join(parsed.dir, `${parsed.name}.png`);
 }
 
-function countDarkPixels(bitmap, width, rect, step = 1) {
+function countDarkPixels(bitmap: Uint8Array, width: number, rect: RectLike, step = 1) {
   const left = Math.floor(clampNumber(rect.x, 0, width, 0));
   const top = Math.floor(clampNumber(rect.y, 0, rect.imageHeight || 0, 0));
   const right = Math.ceil(clampNumber(rect.x + rect.width, 0, width, 0));
@@ -916,7 +975,7 @@ function countDarkPixels(bitmap, width, rect, step = 1) {
   return { dark, total, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
 }
 
-function countTextInkPixels(bitmap, width, rect, step = 1) {
+function countTextInkPixels(bitmap: Uint8Array, width: number, rect: RectLike, step = 1) {
   const left = Math.floor(clampNumber(rect.x, 0, width, 0));
   const top = Math.floor(clampNumber(rect.y, 0, rect.imageHeight || 0, 0));
   const right = Math.ceil(clampNumber(rect.x + rect.width, 0, width, 0));
@@ -937,7 +996,7 @@ function countTextInkPixels(bitmap, width, rect, step = 1) {
   return { ink, total, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
 }
 
-function countBezierPixels(bitmap, width, rect, step = 1) {
+function countBezierPixels(bitmap: Uint8Array, width: number, rect: RectLike, step = 1) {
   const left = Math.floor(clampNumber(rect.x, 0, width, 0));
   const top = Math.floor(clampNumber(rect.y, 0, rect.imageHeight || 0, 0));
   const right = Math.ceil(clampNumber(rect.x + rect.width, 0, width, 0));
@@ -960,7 +1019,7 @@ function countBezierPixels(bitmap, width, rect, step = 1) {
   return { edge, total, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
 }
 
-function analyzeE2ECapture(image, textProbeRects = [], edgeProbeRects = [], contentSize = {}) {
+function analyzeE2ECapture(image: NativeImage, textProbeRects: unknown[] = [], edgeProbeRects: unknown[] = [], contentSize: Partial<RectLike> = {}): CaptureAnalysis {
   const size = image.getSize();
   const width = Math.max(1, Number(size.width) || 1);
   const height = Math.max(1, Number(size.height) || 1);
@@ -989,7 +1048,7 @@ function analyzeE2ECapture(image, textProbeRects = [], edgeProbeRects = [], cont
   let textRectsWithDark = 0;
   let textInkPixels = 0;
   let textRectsWithInk = 0;
-  for (const rect of Array.isArray(textProbeRects) ? textProbeRects.slice(0, 30) : []) {
+  for (const rect of Array.isArray(textProbeRects) ? textProbeRects.slice(0, 30) as Array<Partial<RectLike>> : []) {
     const probe = {
       x: Number(rect?.x || 0) * scaleX,
       y: Number(rect?.y || 0) * scaleY,
@@ -1011,7 +1070,7 @@ function analyzeE2ECapture(image, textProbeRects = [], edgeProbeRects = [], cont
   let edgeProbeRectCount = 0;
   let edgeColorPixels = 0;
   let edgeRectsWithColor = 0;
-  for (const rect of Array.isArray(edgeProbeRects) ? edgeProbeRects.slice(0, 30) : []) {
+  for (const rect of Array.isArray(edgeProbeRects) ? edgeProbeRects.slice(0, 30) as Array<Partial<RectLike>> : []) {
     const probe = {
       x: Number(rect?.x || 0) * scaleX,
       y: Number(rect?.y || 0) * scaleY,
@@ -1055,7 +1114,7 @@ function analyzeE2ECapture(image, textProbeRects = [], edgeProbeRects = [], cont
   };
 }
 
-async function captureZoomedE2EWindow(win) {
+async function captureZoomedE2EWindow(win: BrowserWindow) {
   const target = process.env.IFTREE_E2E_FONT_SCREENSHOT_PATH;
   if (!target) return null;
   const steps = Math.max(1, Number(process.env.IFTREE_E2E_FONT_ZOOM_STEPS) || 5);
@@ -1111,8 +1170,9 @@ async function captureZoomedE2EWindow(win) {
 
 async function launcherDocs() {
   const result = await headlessDatabaseRead({ action: 'doc.list' });
-  const docs = Array.isArray(result) ? result : (result?.rows || result?.docs || []);
-  return docs.map((doc) => ({
+  const resultObject = (result && typeof result === 'object' ? result : {}) as RowObject;
+  const docs = Array.isArray(result) ? result : (Array.isArray(resultObject.rows) ? resultObject.rows : (Array.isArray(resultObject.docs) ? resultObject.docs : []));
+  return docs.map((doc: RowObject) => ({
     id: doc.id,
     title: doc.title || `Doc ${doc.id}`,
     node_count: doc.node_count ?? doc.nodeCount ?? 0,
@@ -1269,7 +1329,7 @@ function launcherHtml() {
     document.getElementById('refresh').addEventListener('click', load);
     load().catch((error) => {
       statusEl.textContent = '';
-      showFailure({ message: error.message || String(error) });
+      showFailure({ message: (error as { message?: string }).message || String(error) });
     });
   </script>
 </body>
@@ -1282,7 +1342,7 @@ async function loadLauncherPage() {
   showWindowForE2E(launcherWindow);
 }
 
-function showWindowForE2E(win) {
+function showWindowForE2E(win: BrowserWindow) {
   if (!win || win.isDestroyed()) return;
   if (process.env.IFTREE_E2E_NO_FOCUS === '1' && typeof win.showInactive === 'function') {
     win.showInactive();
@@ -1342,11 +1402,11 @@ function killLaunchedMainProcess() {
   child.kill('SIGKILL');
 }
 
-function showLauncherFailure(failure) {
+function showLauncherFailure(failure: RowObject) {
   launcherLastFailure = failure;
   if (launcherWindow && !launcherWindow.isDestroyed()) {
     launcherWindow.show();
-    loadLauncherPage().catch((error) => console.error(`[launcher] failed to load: ${error.stack || error.message}`));
+    loadLauncherPage().catch((error) => console.error(`[launcher] failed to load: ${(error as { stack?: string }).stack || (error as { message?: string }).message}`));
   }
 }
 
@@ -1381,7 +1441,7 @@ function startLauncherPoll() {
   launcherPollTimer = setInterval(pollLauncherStartup, 1000);
 }
 
-function startMainAppFromLauncher(payload = {}) {
+function startMainAppFromLauncher(payload: RowObject = {}) {
   if (launchedMainProcess && launchedMainProcess.exitCode === null && !launchedMainProcess.signalCode) {
     return { ok: true, alreadyRunning: true };
   }
@@ -1490,10 +1550,10 @@ async function createWindow() {
   mainWindow.webContents.on('preload-error', (_event, preloadPath, error) => {
     appendDebugLog('renderer', {
       event: 'renderer.preload_error',
-      message: error?.message || String(error || ''),
+      message: (error as { message?: string } | null | undefined)?.message || String(error || ''),
       sourceId: preloadPath
     });
-    console.error(`[preload-error] ${preloadPath}: ${error.stack || error.message}`);
+    console.error(`[preload-error] ${preloadPath}: ${(error as { stack?: string }).stack || (error as { message?: string }).message}`);
   });
 
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
@@ -1541,7 +1601,7 @@ async function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     console.log('[window] ready-to-show');
-    showWindowForE2E(mainWindow);
+    if (mainWindow) showWindowForE2E(mainWindow);
   });
 
   if (process.env.ELECTRON_START_URL) {
@@ -1560,7 +1620,7 @@ async function createWindow() {
   console.log(`[window] loaded ${mainWindow.webContents.getURL()}`);
 }
 
-async function openEntityMaintenanceWindow(payload = {}) {
+async function openEntityMaintenanceWindow(payload: RowObject = {}) {
   const docId = normalizeMainDocId(payload?.docId ?? payload?.doc_id, null);
   if (entityMaintenanceWindow && !entityMaintenanceWindow.isDestroyed()) {
     entityMaintenanceWindow.show();
@@ -1623,7 +1683,7 @@ async function openEntityMaintenanceWindow(payload = {}) {
   return { ok: true, reused: false };
 }
 
-async function refreshDoc(docId, options = {}) {
+async function refreshDoc(docId: unknown, options: RowObject = {}) {
   const data = await headlessDatabaseRead({
     action: 'doc.get',
     docId,
@@ -1632,30 +1692,31 @@ async function refreshDoc(docId, options = {}) {
     includeSourceSpans: options.includeSourceSpans === true,
     includeSourceDocumentContent: options.includeSourceDocumentContent === true
   });
-  if (!data) return null;
+  if (!data || typeof data !== 'object') return null;
+  const dataObject = data as RowObject;
   const includeNodes = options.includeNodes === true;
   const includeSourceSpans = options.includeSourceSpans === true;
   // Ensure plain JSON-compatible return for IPC
   return {
-    doc: { ...data.doc },
-    nodes: includeNodes ? data.nodes.map((n) => ({ ...n })) : [],
-    tree: data.tree ? stripTree(data.tree) : null,
-    axioms: data.axioms.map((a) => ({ ...a })),
-    refs: data.refs.map((r) => ({ ...r })),
-    history: data.history.map((h) => ({ ...h })),
-    sourceDocument: data.sourceDocument ? { ...data.sourceDocument } : null,
-    sourcePdfPages: (data.sourcePdfPages || []).map((p) => ({ ...p })),
-    sourceSpans: includeSourceSpans ? (data.sourceSpans || []).map((s) => ({ ...s })) : [],
-    treeDepthStats: data.treeDepthStats ? { ...data.treeDepthStats } : null,
-    idByAddress: { ...data.idByAddress }
+    doc: { ...((dataObject.doc && typeof dataObject.doc === 'object' ? dataObject.doc : {}) as RowObject) },
+    nodes: includeNodes ? ((Array.isArray(dataObject.nodes) ? dataObject.nodes : []) as RowObject[]).map((n) => ({ ...n })) : [],
+    tree: dataObject.tree ? stripTree(dataObject.tree as RowObject) : null,
+    axioms: ((Array.isArray(dataObject.axioms) ? dataObject.axioms : []) as RowObject[]).map((a) => ({ ...a })),
+    refs: ((Array.isArray(dataObject.refs) ? dataObject.refs : []) as RowObject[]).map((r) => ({ ...r })),
+    history: ((Array.isArray(dataObject.history) ? dataObject.history : []) as RowObject[]).map((h) => ({ ...h })),
+    sourceDocument: dataObject.sourceDocument && typeof dataObject.sourceDocument === 'object' ? { ...(dataObject.sourceDocument as RowObject) } : null,
+    sourcePdfPages: ((Array.isArray(dataObject.sourcePdfPages) ? dataObject.sourcePdfPages : []) as RowObject[]).map((p) => ({ ...p })),
+    sourceSpans: includeSourceSpans ? ((Array.isArray(dataObject.sourceSpans) ? dataObject.sourceSpans : []) as RowObject[]).map((s) => ({ ...s })) : [],
+    treeDepthStats: dataObject.treeDepthStats && typeof dataObject.treeDepthStats === 'object' ? { ...(dataObject.treeDepthStats as RowObject) } : null,
+    idByAddress: { ...((dataObject.idByAddress && typeof dataObject.idByAddress === 'object' ? dataObject.idByAddress : {}) as RowObject) }
   };
 }
 
-async function importFilePaths(filePaths = [], options = {}) {
-  const imported = [];
+async function importFilePaths(filePaths: unknown[] = [], options: RowObject = {}) {
+  const imported: RowObject[] = [];
   const paths = Array.isArray(filePaths) ? filePaths : [];
   for (const filePath of paths) {
-    const relativePath = libraryRelativePathForAgent(filePath);
+    const relativePath = libraryRelativePathForAgent(String(filePath || ''));
     if (!relativePath) throw new Error('请选择 library 文件夹内的文件');
     const result = await getHeadlessAgentClient().importLibraryDocument({
       relativePath,
@@ -1664,9 +1725,10 @@ async function importFilePaths(filePaths = [], options = {}) {
       overlap: options.overlap,
       embed: options.embed
     });
-    const docs = Array.isArray(result?.imported)
-      ? result.imported
-      : [{ docId: result?.docId, title: result?.title, nodeCount: result?.nodeCount }];
+    const resultObject = (result && typeof result === 'object' ? result : {}) as RowObject;
+    const docs = Array.isArray(resultObject.imported)
+      ? resultObject.imported as RowObject[]
+      : [{ docId: resultObject.docId, title: resultObject.title, nodeCount: resultObject.nodeCount }];
     for (const doc of docs) {
       if (!doc?.docId) continue;
       imported.push({
@@ -1682,7 +1744,7 @@ async function importFilePaths(filePaths = [], options = {}) {
   return imported;
 }
 
-function stripTree(node) {
+function stripTree(node: RowObject | null): RowObject | null {
   if (!node) return null;
   return {
     id: node.id,
@@ -1699,7 +1761,7 @@ function stripTree(node) {
     created_at: node.created_at,
     updated_at: node.updated_at,
     address: node.address,
-    children: (node.children || []).map(stripTree)
+    children: (Array.isArray(node.children) ? node.children as RowObject[] : []).map(stripTree)
   };
 }
 
@@ -1805,7 +1867,7 @@ function registerIpc() {
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, image.toPNG());
     const contentBounds = win.getContentBounds();
-    const result = /** @type {Record<string, any>} */ ({
+    const result = /** @type {Record<string, unknown>} */ ({
       ...analyzeE2ECapture(image, payload?.textProbeRects || [], payload?.edgeProbeRects || [], {
         width: contentBounds.width,
         height: contentBounds.height
@@ -1891,7 +1953,7 @@ function registerIpc() {
   ipcMain.handle(channels.SETTINGS_SAVE_NODE_LAYOUT, (_event, payload) => saveNodeLayoutConfig(payload || {}));
 
   ipcMain.handle(channels.SETTINGS_CHOOSE_LOCAL_MODEL_ROOT, async () => {
-    const result = await dialog.showOpenDialog(mainWindow, {
+    const result = await showOpenDialogForMain({
       title: '选择本地 ONNX 模型目录',
       properties: ['openDirectory']
     });
@@ -1903,7 +1965,7 @@ function registerIpc() {
     const config = getVectorConfig();
     const defaultPath = join(appHome(), 'models');
     mkdirSync(defaultPath, { recursive: true });
-    const result = await dialog.showOpenDialog(mainWindow, {
+    const result = await showOpenDialogForMain({
       title: `下载 ${config.label} 模型到本地目录`,
       defaultPath,
       properties: ['openDirectory', 'createDirectory']
@@ -1934,11 +1996,12 @@ function registerIpc() {
   });
 
   ipcMain.handle(channels.SOURCE_READ_PDF_HIGHLIGHTS, (_event, payload) => {
-    const docId = normalizeMainDocId(payload?.docId, null);
+    const payloadObject = (payload && typeof payload === 'object' ? payload : {}) as RowObject;
+    const docId = normalizeMainDocId(payloadObject.docId, null);
     if (!docId) return [];
-    const ranges = Array.isArray(payload?.ranges)
-      ? payload.ranges
-      : [{ start: payload?.startOffset, end: payload?.endOffset }];
+    const ranges = Array.isArray(payloadObject.ranges)
+      ? payloadObject.ranges
+      : [{ start: payloadObject.startOffset, end: payloadObject.endOffset }];
     return getHeadlessAgentClient().readPdfHighlights({ docId, ranges });
   });
 
@@ -1949,23 +2012,25 @@ function registerIpc() {
   });
 
   ipcMain.handle(channels.SUMMARY_GENERATE_NODE, async (_event, payload) => {
-    const requestId = String(payload?.requestId || '').trim();
+    const payloadObject = (payload && typeof payload === 'object' ? payload : {}) as RowObject;
+    const requestId = String(payloadObject.requestId || '').trim();
     const reportProgress = !requestId;
     if (reportProgress) sendProgress({ label: '生成摘要...', step: 0, total: 0 });
     try {
-      return await getHeadlessAgentClient().generateNodeSummary(payload || {});
+      return await getHeadlessAgentClient().generateNodeSummary(payloadObject);
     } finally {
       if (reportProgress) sendProgress({ done: true });
     }
   });
   ipcMain.handle(channels.SUMMARY_CANCEL_NODE, (_event, payload) => {
-    const requestId = String(payload?.requestId || '').trim();
+    const payloadObject = (payload && typeof payload === 'object' ? payload : {}) as RowObject;
+    const requestId = String(payloadObject.requestId || '').trim();
     if (!requestId) return { ok: false, canceled: false, reason: 'missing requestId' };
     return getHeadlessAgentClient().cancelNodeSummary({ requestId });
   });
 
   ipcMain.handle(channels.AGENT_RUN, async (_event, payload) => getHeadlessAgentClient().runAgent(payload || {}, {
-    onEvent: (event) => sendAgentStream(event.requestId, event)
+    onEvent: (event: RowObject) => sendAgentStream(event.requestId, event)
   }));
   ipcMain.handle(channels.AGENT_CANCEL, (_event, payload) => getHeadlessAgentClient().cancelAgent(payload || {}));
 
@@ -1979,7 +2044,8 @@ function registerIpc() {
   ipcMain.handle(channels.AGENT_REJECT_DIFF, (_event, payload) => getHeadlessAgentClient().rejectAgentDiff(payload || {}));
 
   ipcMain.handle(channels.ASSET_CREATE_IMAGE, async (_event, payload) => {
-    const result = await dialog.showOpenDialog(mainWindow, {
+    const payloadObject = (payload && typeof payload === 'object' ? payload : {}) as RowObject;
+    const result = await showOpenDialogForMain({
       title: '添加图片附件',
       properties: ['openFile'],
       filters: [
@@ -1987,11 +2053,11 @@ function registerIpc() {
         { name: '所有文件', extensions: ['*'] }
       ]
     });
-    if (result.canceled || !result.filePaths[0]) return await refreshDoc(payload.docId);
+    if (result.canceled || !result.filePaths[0]) return await refreshDoc(payloadObject.docId);
 
     const source = result.filePaths[0];
     const parsed = parse(source);
-    const targetDir = assetsDir(payload.docId);
+    const targetDir = assetsDir(payloadObject.docId);
     mkdirSync(targetDir, { recursive: true });
     const safeName = `${Date.now()}-${parsed.base.replace(/[<>:"/\\|?*]/g, '_')}`;
     const target = join(targetDir, safeName);
@@ -1999,30 +2065,34 @@ function registerIpc() {
 
     const node = await headlessDatabaseRead({
       action: 'node.get',
-      docId: payload.docId,
-      nodeId: payload.nodeId
+      docId: payloadObject.docId,
+      nodeId: payloadObject.nodeId
     });
-    if (!node) throw new Error(`Node not found: ${payload.nodeId}`);
-    const relative = `assets/doc-${payload.docId}/${safeName}`;
-    const nextText = `${node.text || ''}\n\n![${parsed.name}](${relative})`.trim();
+    const nodeObject = (node && typeof node === 'object' ? node : {}) as RowObject;
+    if (!node) throw new Error(`Node not found: ${payloadObject.nodeId}`);
+    const relative = `assets/doc-${payloadObject.docId}/${safeName}`;
+    const nextText = `${nodeObject.text || ''}\n\n![${parsed.name}](${relative})`.trim();
     await headlessDatabaseWrite({
       action: 'node.update',
-      docId: payload.docId,
-      nodeId: payload.nodeId,
+      docId: payloadObject.docId,
+      nodeId: payloadObject.nodeId,
       text: nextText
     });
-    return await refreshDoc(payload.docId);
+    return await refreshDoc(payloadObject.docId);
   });
 
   ipcMain.handle(channels.ASSET_RESOLVE_IMAGE_SOURCES, async (_event, payload) => {
-    const docId = normalizeMainDocId(payload?.docId, null);
-    const sources = Array.isArray(payload?.sources) ? payload.sources : [];
+    const payloadObject = (payload && typeof payload === 'object' ? payload : {}) as RowObject;
+    const docId = normalizeMainDocId(payloadObject.docId, null);
+    const sources = Array.isArray(payloadObject.sources) ? payloadObject.sources.map((source) => String(source || '')) : [];
     if (!docId || sources.length === 0) return {};
 
     const info = await headlessDatabaseRead({ action: 'doc.getInfo', docId });
-    const docMeta = normalizeDocMeta(info?.doc?.meta);
+    const infoObject = (info && typeof info === 'object' ? info : {}) as RowObject;
+    const infoDoc = (infoObject.doc && typeof infoObject.doc === 'object' ? infoObject.doc : {}) as RowObject;
+    const docMeta = normalizeDocMeta(infoDoc.meta as Parameters<typeof normalizeDocMeta>[0]);
     const searchRoots = workspaceSearchRoots(docMeta.sourcePath);
-    const resolved = {};
+    const resolved: Record<string, string | undefined> = {};
 
     for (const source of sources) {
       const key = `${docId}\n${source}`;
@@ -2041,8 +2111,9 @@ function registerIpc() {
   });
 
   ipcMain.handle(channels.IMPORT_CHOOSE_FILE, async (_event, payload) => {
-    const mode = normalizeImportMode(payload?.mode);
-    const result = await dialog.showOpenDialog(mainWindow, {
+    const payloadObject = (payload && typeof payload === 'object' ? payload : {}) as RowObject;
+    const mode = normalizeImportMode(payloadObject.mode);
+    const result = await showOpenDialogForMain({
       title: '导入 chm、txt、md、pdf 或 docx',
       defaultPath: ensureLibraryRoot(),
       properties: ['openFile', 'multiSelections'],

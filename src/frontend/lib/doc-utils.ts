@@ -1,9 +1,11 @@
-// @ts-nocheck
-import { DEFAULT_NODE_LAYOUT, MAX_DEPTH_LIMIT, normalizeNodeLayout } from '../../core/mindmap.js';
-import { flattenTree, maxTreeDepth } from '../../core/tree.js';
+import { DEFAULT_NODE_LAYOUT, MAX_DEPTH_LIMIT, normalizeNodeLayout, type NodeLayout } from '../../core/mindmap.js';
+import { flattenTree, maxTreeDepth, type TreeNodeLike } from '../../core/tree.js';
 import { collapsedForDepthLimit } from '../../core/tree-ui.js';
 import { boundsFromNodes, fitCameraToBounds } from '../../core/viewport.js';
 import { NODE_TYPE_LABELS as CORE_NODE_TYPE_LABELS } from '../../core/node-model.js';
+import type { DocListItem as BackendDocListItem } from '../../backend/query-api.js';
+import type { DocFolderRow } from '../../backend/db/schema.js';
+import type { LibraryEntry } from '../../backend/library-fs.js';
 
 export const TRUST_LEVELS = ['', '受控', '不受控'];
 export const DEFAULT_SIDEBAR_WIDTH = 280;
@@ -52,39 +54,133 @@ export const CONTEXT_MENU_SEPARATOR_HEIGHT = 9;
 export const CONTEXT_SUBMENU_PADDING_Y = 12;
 export const NODE_TYPE_LABELS = CORE_NODE_TYPE_LABELS;
 
-export function depthOf(address = '1') {
+export interface RefRow {
+  id?: unknown;
+  source_type?: string;
+  source_id?: unknown;
+  target_type?: string;
+  target_id?: unknown;
+  ref_kind?: string;
+  source_address?: string;
+  target_address?: string;
+  [extra: string]: unknown;
+}
+
+export interface DocLike {
+  doc?: { id?: unknown; tree_view_state?: unknown; folder_id?: unknown; [extra: string]: unknown };
+  tree?: TreeNodeLike | null;
+  loadedTreeDepth?: number;
+  treeDepthStats?: { maxDepth?: number; depths?: number[]; root?: { subtreeMaxDepth?: number } } | null;
+  sourceDocument?: Record<string, unknown> | null;
+  title?: string;
+  meta?: string | Record<string, unknown> | null;
+  [extra: string]: unknown;
+}
+
+export interface SourceWindow {
+  docId?: unknown;
+  sourceDocument?: Record<string, unknown> | null;
+  [extra: string]: unknown;
+}
+
+export interface DepthStats {
+  maxDepth: number;
+  depths: number[];
+  counts?: Map<number, number>;
+  root?: { subtreeMaxDepth?: number };
+  [extra: string]: unknown;
+}
+
+interface TreeViewStateRaw {
+  depthLimit?: unknown;
+  collapsedNodeIds?: unknown;
+  expandedNodeIds?: unknown;
+  outlineCollapsedNodeIds?: unknown;
+  [extra: string]: unknown;
+}
+
+export interface TreeViewState {
+  depthLimit: number;
+  collapsed: Set<string>;
+  expanded: Set<string>;
+  outlineCollapsed: Set<string> | null;
+}
+
+// doc-utils 沿数据流接 backend 真行类型：DocBrowserFolder = DocFolderRow（数据库行）、DocListItem = backend 投影。
+// 内部不再保留宽松 unknown 字段——本文件 DocBrowser-only 函数（buildDocBrowser/filterLibraryTree/...）字段
+// 都在真类型范围内，零兼容损失。
+type DocBrowserFolder = DocFolderRow;
+type DocListItem = BackendDocListItem;
+
+interface DocBrowserItem {
+  type: 'folder' | 'doc';
+  folder?: DocBrowserFolder;
+  doc?: DocListItem;
+  depth: number;
+  children?: DocBrowserItem[];
+}
+
+interface Camera { x: number; y: number; scale: number }
+interface Viewport { width?: number; height?: number; w?: number; h?: number }
+interface Rect { x: number; y: number; width: number; height: number }
+interface MindMapNode {
+  id?: unknown;
+  address?: string;
+  depth?: number;
+  kind?: string;
+  width?: number;
+  height?: number;
+  cardHeight?: number;
+  x?: number;
+  y?: number;
+  [extra: string]: unknown;
+}
+
+// LibraryItem 收紧成 LibraryEntry（backend 真类型，沿数据流贯通）。原来 unknown indexer 给 isSupportedLibraryImport
+// 等宽容形参的能力没人用，去掉无成本。
+type LibraryItem = LibraryEntry;
+
+export function depthOf(address: string = '1'): number {
   return address.split('-').length;
 }
 
-export function isFactAxiomRef(ref) {
+// 形参用 minimal duck-type，兼容 doc-utils.RefRow（宽松形态）与 schema.RefRow / DocGetRefRow（真行类型）。
+export function isFactAxiomRef(ref: { source_type?: string; target_type?: string; ref_kind?: string } | null | undefined): boolean {
   return ref?.source_type === 'axiom' &&
     ref?.target_type === 'node' &&
     String(ref?.ref_kind || '') === '事实前提';
 }
 
-export function clampDepthLimit(value, maxDepth) {
+export function clampDepthLimit(value: unknown, maxDepth: unknown): number {
   const max = Math.max(1, Number(maxDepth) || 1);
   return Math.min(max, Math.max(1, Number(value) || 1));
 }
 
-export function clampFlowDepthLimit(value, maxDepth) {
+export function clampFlowDepthLimit(value: unknown, maxDepth: unknown): number {
   const max = Math.max(1, Number(maxDepth) || 1);
   const min = Math.min(2, max);
   return Math.min(max, Math.max(min, Number(value) || min));
 }
 
-function rootMetadataDepthForDoc(doc) {
+function rootMetadataDepthForDoc(doc: DocLike | null | undefined): number | null {
   const rootDepth = Number(
     doc?.treeDepthStats?.root?.subtreeMaxDepth
   );
   return Number.isFinite(rootDepth) && rootDepth > 0 ? rootDepth : null;
 }
 
-export function normalizeNodeLayoutSettingsByView(value) {
-  if (value?.tree || value?.flow) {
+interface NodeLayoutSettingsRaw {
+  tree?: unknown;
+  flow?: unknown;
+  [extra: string]: unknown;
+}
+
+export function normalizeNodeLayoutSettingsByView(value: NodeLayoutSettingsRaw | unknown): { tree: NodeLayout; flow: NodeLayout } {
+  const settings = (value && typeof value === 'object' ? value as NodeLayoutSettingsRaw : {});
+  if (settings.tree || settings.flow) {
     return {
-      tree: normalizeNodeLayout(value.tree || DEFAULT_NODE_LAYOUT),
-      flow: normalizeNodeLayout(value.flow || value.tree || DEFAULT_NODE_LAYOUT)
+      tree: normalizeNodeLayout(settings.tree || DEFAULT_NODE_LAYOUT),
+      flow: normalizeNodeLayout(settings.flow || settings.tree || DEFAULT_NODE_LAYOUT)
     };
   }
   const shared = normalizeNodeLayout(value || DEFAULT_NODE_LAYOUT);
@@ -94,30 +190,30 @@ export function normalizeNodeLayoutSettingsByView(value) {
   };
 }
 
-export function fullDepthForDoc(doc) {
+export function fullDepthForDoc(doc: DocLike | null | undefined): number {
   // 取元数据、treeDepthStats 和实际 tree 三者的最大值——
   // 本地新增节点后元数据可能还没更新，但 tree 已经包含新深度，
   // 单独信任元数据会让下拉框漏掉新深度选项。
   const rootDepth = rootMetadataDepthForDoc(doc);
   const indexedDepth = Number(doc?.treeDepthStats?.maxDepth);
   const treeDepth = maxTreeDepth(doc?.tree);
-  const candidates = [rootDepth, indexedDepth, treeDepth].filter((v) => Number.isFinite(v) && v > 0);
+  const candidates = [rootDepth, indexedDepth, treeDepth].filter((v): v is number => Number.isFinite(v) && (v as number) > 0);
   if (!candidates.length) return 1;
   return Math.min(MAX_DEPTH_LIMIT, Math.max(1, Math.max(...candidates)));
 }
 
-export function loadedDepthForDoc(doc) {
+export function loadedDepthForDoc(doc: DocLike | null | undefined): number {
   const explicit = Number(doc?.loadedTreeDepth);
   return Math.min(MAX_DEPTH_LIMIT, Math.max(1, Number.isFinite(explicit) && explicit > 0
     ? explicit
     : maxTreeDepth(doc?.tree)));
 }
 
-export function depthStatsForTree(tree) {
-  const counts = new Map();
+export function depthStatsForTree(tree: TreeNodeLike | null | undefined): DepthStats {
+  const counts = new Map<number, number>();
   let maxDepth = 1;
   for (const node of flattenTree(tree)) {
-    const depth = depthOf(node.address || '1');
+    const depth = depthOf(String(node.address || '1'));
     maxDepth = Math.max(maxDepth, depth);
     counts.set(depth, (counts.get(depth) || 0) + 1);
   }
@@ -125,12 +221,29 @@ export function depthStatsForTree(tree) {
   return { maxDepth: Math.min(MAX_DEPTH_LIMIT, maxDepth), depths, counts };
 }
 
-export function treeLoadDepthForView(depth) {
+export function treeLoadDepthForView(depth: unknown): number {
   return Math.min(MAX_TREE_LOAD_DEPTH, Math.max(DEFAULT_TREE_LOAD_DEPTH, Math.floor(Number(depth) || DEFAULT_TREE_LOAD_DEPTH)));
 }
 
-export function treeDocRequest(docId, depth = DEFAULT_TREE_LOAD_DEPTH, options = {}) {
-  const request = {
+interface TreeDocRequest {
+  docId: unknown;
+  maxTreeDepth: number;
+  includeNodes: boolean;
+  includeSourceSpans: boolean;
+  includeSourceDocumentContent: boolean;
+  includeEditBranch?: boolean;
+  [extra: string]: unknown;
+}
+
+interface TreeDocRequestOptions {
+  includeNodes?: boolean;
+  includeSourceSpans?: boolean;
+  includeSourceDocumentContent?: boolean;
+  includeEditBranch?: boolean;
+}
+
+export function treeDocRequest(docId: unknown, depth: number = DEFAULT_TREE_LOAD_DEPTH, options: TreeDocRequestOptions = {}): TreeDocRequest {
+  const request: TreeDocRequest = {
     docId,
     maxTreeDepth: treeLoadDepthForView(depth),
     includeNodes: options.includeNodes === true,
@@ -141,11 +254,11 @@ export function treeDocRequest(docId, depth = DEFAULT_TREE_LOAD_DEPTH, options =
   return request;
 }
 
-export function sameDocId(left, right) {
+export function sameDocId(left: unknown, right: unknown): boolean {
   return normalizeDocId(left) === normalizeDocId(right);
 }
 
-export function mergeSourceWindow(current, sourceWindow) {
+export function mergeSourceWindow(current: DocLike | null | undefined, sourceWindow: SourceWindow | null | undefined): DocLike | null | undefined {
   if (!current || !sourceWindow || !sameDocId(current?.doc?.id, sourceWindow.docId)) return current;
   const sourceDocument = sourceWindow.sourceDocument
     ? { ...(current.sourceDocument || {}), ...sourceWindow.sourceDocument }
@@ -157,21 +270,21 @@ export function mergeSourceWindow(current, sourceWindow) {
   };
 }
 
-export function docDepthStats(doc) {
+export function docDepthStats(doc: DocLike | null | undefined): DepthStats {
   const stats = doc?.treeDepthStats || depthStatsForTree(doc?.tree);
   // 同 fullDepthForDoc：本地新增节点后元数据滞后，必须用三者最大值。
   const rootDepth = rootMetadataDepthForDoc(doc);
   const indexedDepth = Number(stats?.maxDepth);
   const treeDepth = maxTreeDepth(doc?.tree);
-  const candidates = [rootDepth, indexedDepth, treeDepth].filter((v) => Number.isFinite(v) && v > 0);
+  const candidates = [rootDepth, indexedDepth, treeDepth].filter((v): v is number => Number.isFinite(v) && (v as number) > 0);
   const maxDepth = candidates.length
     ? Math.min(MAX_DEPTH_LIMIT, Math.max(1, Math.max(...candidates)))
     : 1;
   // depths：合并 stats.depths 和实际 tree 计算出的 depths，并补齐到 maxDepth；
   // 否则下拉框选项跟不上新增节点后的深度。
-  const fromStats = Array.isArray(stats?.depths) ? stats.depths : [];
+  const fromStats = Array.isArray(stats?.depths) ? stats!.depths : [];
   const fromTree = depthStatsForTree(doc?.tree).depths;
-  const merged = new Set();
+  const merged = new Set<number>();
   for (const d of [...fromStats, ...fromTree]) {
     const n = Math.max(1, Math.floor(Number(d) || 1));
     if (n >= 1 && n <= maxDepth) merged.add(n);
@@ -186,22 +299,22 @@ export function docDepthStats(doc) {
   };
 }
 
-export function hasKnownChildren(node) {
-  return Boolean(node && (((node.children || []).length > 0) || Number(node.childCount ?? 0) > 0));
+export function hasKnownChildren(node: TreeNodeLike | null | undefined): boolean {
+  return Boolean(node && (((node.children || []).length > 0) || Number((node as { childCount?: unknown }).childCount ?? 0) > 0));
 }
 
-export function parseTreeViewState(value) {
+export function parseTreeViewState(value: unknown): TreeViewStateRaw {
   try {
     if (!value) return {};
     const parsed = typeof value === 'string' ? JSON.parse(value) : value;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as TreeViewStateRaw : {};
   } catch {
     return {};
   }
 }
 
-export function idSetFromArray(value) {
-  const ids = new Set();
+export function idSetFromArray(value: unknown): Set<string> {
+  const ids = new Set<string>();
   for (const item of Array.isArray(value) ? value : []) {
     const id = normalizeDocId(item);
     if (id) ids.add(id);
@@ -209,7 +322,7 @@ export function idSetFromArray(value) {
   return ids;
 }
 
-export function treeViewStateFromDoc(doc, maxDepth = 1) {
+export function treeViewStateFromDoc(doc: DocLike | null | undefined, maxDepth: number = 1): TreeViewState {
   const raw = parseTreeViewState(doc?.doc?.tree_view_state);
   const actualMaxDepth = Math.max(1, Number(maxDepth) || fullDepthForDoc(doc));
   const fallbackDepth = actualMaxDepth;
@@ -223,10 +336,17 @@ export function treeViewStateFromDoc(doc, maxDepth = 1) {
   };
 }
 
-export function treeViewStatePayload(depthLimit, collapsed, expanded, outlineCollapsed = null) {
-  const idList = (value) => [...(value || new Set())]
+interface TreeViewStatePayload {
+  depthLimit: number;
+  collapsedNodeIds: string[];
+  expandedNodeIds: string[];
+  outlineCollapsedNodeIds: string[];
+}
+
+export function treeViewStatePayload(depthLimit: unknown, collapsed: Set<unknown> | null | undefined, expanded: Set<unknown> | null | undefined, outlineCollapsed: Set<unknown> | null = null): TreeViewStatePayload {
+  const idList = (value: Set<unknown> | null | undefined): string[] => [...(value || new Set<unknown>())]
     .map(normalizeDocId)
-    .filter(Boolean);
+    .filter((value): value is string => Boolean(value));
   return {
     depthLimit: Math.max(1, Number(depthLimit) || 1),
     collapsedNodeIds: idList(collapsed),
@@ -235,7 +355,19 @@ export function treeViewStatePayload(depthLimit, collapsed, expanded, outlineCol
   };
 }
 
-export function promoteTreeViewDepthIfLayerExpanded(tree, depthLimit, collapsed, expanded, maxDepth = MAX_DEPTH_LIMIT) {
+interface PromoteTreeViewResult {
+  depthLimit: number;
+  collapsed: Set<unknown>;
+  expanded: Set<unknown>;
+}
+
+export function promoteTreeViewDepthIfLayerExpanded(
+  tree: TreeNodeLike | null | undefined,
+  depthLimit: unknown,
+  collapsed: Set<unknown> | unknown[] | null | undefined,
+  expanded: Set<unknown> | unknown[] | null | undefined,
+  maxDepth: number = MAX_DEPTH_LIMIT
+): PromoteTreeViewResult | null {
   if (!tree) return null;
   const currentDepth = Math.max(1, Number(depthLimit) || 1);
   const capDepth = Math.min(MAX_DEPTH_LIMIT, Math.max(1, Number(maxDepth) || MAX_DEPTH_LIMIT));
@@ -244,7 +376,7 @@ export function promoteTreeViewDepthIfLayerExpanded(tree, depthLimit, collapsed,
   const expandedIds = expanded instanceof Set ? expanded : new Set(expanded || []);
   const nodes = flattenTree(tree);
   const expandableLayerNodes = nodes.filter((node) => (
-    depthOf(node.address || '1') === currentDepth && hasKnownChildren(node)
+    depthOf(String(node.address || '1')) === currentDepth && hasKnownChildren(node)
   ));
   if (expandableLayerNodes.length === 0) return null;
   const allExpanded = expandableLayerNodes.every((node) => (
@@ -254,10 +386,10 @@ export function promoteTreeViewDepthIfLayerExpanded(tree, depthLimit, collapsed,
 
   const nextDepthLimit = Math.min(capDepth, currentDepth + 1);
   const nodesById = new Map(nodes.map((node) => [node.id, node]));
-  const nextExpanded = new Set();
+  const nextExpanded = new Set<unknown>();
   for (const id of expandedIds) {
     const node = nodesById.get(id);
-    if (!node || depthOf(node.address || '1') >= nextDepthLimit) nextExpanded.add(id);
+    if (!node || depthOf(String(node.address || '1')) >= nextDepthLimit) nextExpanded.add(id);
   }
   return {
     depthLimit: nextDepthLimit,
@@ -266,14 +398,19 @@ export function promoteTreeViewDepthIfLayerExpanded(tree, depthLimit, collapsed,
   };
 }
 
-export function hasVisibleNodesBeyondDepth(tree, depthLimit, collapsed, expanded) {
+export function hasVisibleNodesBeyondDepth(
+  tree: TreeNodeLike | null | undefined,
+  depthLimit: unknown,
+  collapsed: Set<unknown> | unknown[] | null | undefined,
+  expanded: Set<unknown> | unknown[] | null | undefined
+): boolean {
   if (!tree) return false;
   const limit = Math.max(1, Number(depthLimit) || 1);
   const collapsedIds = collapsed instanceof Set ? collapsed : new Set(collapsed || []);
   const expandedIds = expanded instanceof Set ? expanded : new Set(expanded || []);
   let found = false;
 
-  function walk(node, depth, forcedVisible = false) {
+  function walk(node: TreeNodeLike | null | undefined, depth: number, forcedVisible: boolean = false): void {
     if (!node || found) return;
     if (depth > limit && !forcedVisible) return;
     if (depth > limit) {
@@ -290,12 +427,12 @@ export function hasVisibleNodesBeyondDepth(tree, depthLimit, collapsed, expanded
   return found;
 }
 
-export function hasKnownNodesBeyondLoadedDepth(tree, loadedDepth) {
+export function hasKnownNodesBeyondLoadedDepth(tree: TreeNodeLike | null | undefined, loadedDepth: unknown): boolean {
   const depth = Math.max(1, Number(loadedDepth) || 1);
-  return flattenTree(tree).some((node) => depthOf(node.address || '1') >= depth && hasKnownChildren(node));
+  return flattenTree(tree).some((node) => depthOf(String(node.address || '1')) >= depth && hasKnownChildren(node));
 }
 
-export function compareAddress(left = '', right = '') {
+export function compareAddress(left: string = '', right: string = ''): number {
   const a = String(left).split('-').map(Number);
   const b = String(right).split('-').map(Number);
   const size = Math.max(a.length, b.length);
@@ -306,24 +443,26 @@ export function compareAddress(left = '', right = '') {
   return 0;
 }
 
-export function nodeTypeLabel(type) {
-  return NODE_TYPE_LABELS[type] || type || '文本';
+export function nodeTypeLabel(type: unknown): string {
+  const labels = NODE_TYPE_LABELS as Record<string, string>;
+  const key = String(type || '');
+  return labels[key] || key || '文本';
 }
 
-export function docParentKey(folderId) {
+export function docParentKey(folderId: unknown): string {
   return folderId === null || folderId === undefined || folderId === '' ? 'root' : String(folderId);
 }
 
-export function limitDocFolderName(value) {
+export function limitDocFolderName(value: unknown): string {
   return Array.from(String(value ?? '')).slice(0, MAX_DOC_FOLDER_NAME_LENGTH).join('');
 }
 
-export function normalizeDocFolderName(value) {
+export function normalizeDocFolderName(value: unknown): string {
   const trimmed = String(value ?? '').trim();
   return limitDocFolderName(trimmed || DEFAULT_DOC_FOLDER_NAME);
 }
 
-export function compareDocListItems(left, right) {
+export function compareDocListItems(left: DocListItem, right: DocListItem): number {
   const leftOrder = Number(left.doc_sort_order || 0);
   const rightOrder = Number(right.doc_sort_order || 0);
   if (leftOrder !== rightOrder) return leftOrder - rightOrder;
@@ -331,19 +470,26 @@ export function compareDocListItems(left, right) {
     || String(right.id || '').localeCompare(String(left.id || ''));
 }
 
-export function buildDocBrowser(folders = [], docs = []) {
-  const foldersByParent = new Map();
-  const docsByFolder = new Map();
+interface DocBrowserResult {
+  items: DocBrowserItem[];
+  flatFolders: Array<DocBrowserFolder & { depth: number }>;
+}
+
+export function buildDocBrowser(folders: DocBrowserFolder[] = [], docs: DocListItem[] = []): DocBrowserResult {
+  const foldersByParent = new Map<string, DocBrowserFolder[]>();
+  const docsByFolder = new Map<string, DocListItem[]>();
 
   for (const folder of folders) {
     const key = docParentKey(folder.parent_id);
-    if (!foldersByParent.has(key)) foldersByParent.set(key, []);
-    foldersByParent.get(key).push(folder);
+    const list = foldersByParent.get(key) || [];
+    list.push(folder);
+    foldersByParent.set(key, list);
   }
   for (const doc of docs) {
     const key = docParentKey(doc.folder_id);
-    if (!docsByFolder.has(key)) docsByFolder.set(key, []);
-    docsByFolder.get(key).push(doc);
+    const list = docsByFolder.get(key) || [];
+    list.push(doc);
+    docsByFolder.set(key, list);
   }
 
   for (const group of foldersByParent.values()) {
@@ -355,10 +501,10 @@ export function buildDocBrowser(folders = [], docs = []) {
   }
   for (const group of docsByFolder.values()) group.sort(compareDocListItems);
 
-  const flatFolders = [];
-  const buildItems = (parentId, depth) => {
+  const flatFolders: Array<DocBrowserFolder & { depth: number }> = [];
+  const buildItems = (parentId: unknown, depth: number): DocBrowserItem[] => {
     const key = docParentKey(parentId);
-    const items = [];
+    const items: DocBrowserItem[] = [];
     for (const folder of foldersByParent.get(key) || []) {
       flatFolders.push({ ...folder, depth });
       items.push({
@@ -377,36 +523,36 @@ export function buildDocBrowser(folders = [], docs = []) {
   return { items: buildItems(null, 0), flatFolders };
 }
 
-export function normalizeFsPath(value = '') {
+export function normalizeFsPath(value: unknown = ''): string {
   return String(value || '').replace(/\\/g, '/').toLocaleLowerCase();
 }
 
-export function isSupportedLibraryImport(item) {
+export function isSupportedLibraryImport(item: LibraryItem | null | undefined): boolean {
   if (!item || item.type !== 'file') return true;
   return SUPPORTED_LIBRARY_IMPORT_EXTENSIONS.has(String(item.extension || '').toLocaleLowerCase());
 }
 
-export function docSourcePath(doc) {
+export function docSourcePath(doc: DocLike | null | undefined): string {
   const meta = doc?.meta;
-  if (meta && typeof meta === 'object' && !Array.isArray(meta)) return meta.sourcePath || '';
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) return String((meta as { sourcePath?: unknown }).sourcePath || '');
   try {
-    return JSON.parse(meta || '{}')?.sourcePath || '';
+    return JSON.parse(String(meta || '{}'))?.sourcePath || '';
   } catch {
     return '';
   }
 }
 
-export function fileNameFromPath(value = '') {
+export function fileNameFromPath(value: unknown = ''): string {
   return String(value || '').split(/[\\/]/).filter(Boolean).pop() || '';
 }
 
-export function fileExtensionFromPath(value = '') {
+export function fileExtensionFromPath(value: unknown = ''): string {
   const name = fileNameFromPath(value);
   const dot = name.lastIndexOf('.');
   return dot > 0 ? name.slice(dot) : '';
 }
 
-export function docDisplayTitle(doc) {
+export function docDisplayTitle(doc: DocLike | null | undefined): string {
   const title = String(doc?.title || '').trim();
   const extension = fileExtensionFromPath(docSourcePath(doc));
   if (!title) return fileNameFromPath(docSourcePath(doc)) || '';
@@ -416,11 +562,11 @@ export function docDisplayTitle(doc) {
   return title;
 }
 
-export function libraryCollapseKey(relativePath = '') {
+export function libraryCollapseKey(relativePath: string = ''): string {
   return `library:${relativePath || 'root'}`;
 }
 
-export function filterLibraryTree(item, query) {
+export function filterLibraryTree(item: LibraryItem | null | undefined, query: unknown): LibraryItem | null {
   if (!item) return null;
   const trimmed = String(query || '').trim().toLocaleLowerCase();
   if (!trimmed) return item;
@@ -428,13 +574,13 @@ export function filterLibraryTree(item, query) {
   if (item.type !== 'folder') return ownMatch ? item : null;
   const children = (item.children || [])
     .map((child) => filterLibraryTree(child, trimmed))
-    .filter(Boolean);
+    .filter((child): child is LibraryItem => Boolean(child));
   return ownMatch || children.length > 0 || item.relativePath === ''
     ? { ...item, children }
     : null;
 }
 
-export function libraryFolderCollapseKeys(item, keys = []) {
+export function libraryFolderCollapseKeys(item: LibraryItem | null | undefined, keys: string[] = []): string[] {
   for (const child of item?.children || []) {
     if (child.type !== 'folder') continue;
     keys.push(libraryCollapseKey(child.relativePath));
@@ -443,11 +589,11 @@ export function libraryFolderCollapseKeys(item, keys = []) {
   return keys;
 }
 
-export function defaultCollapsedOutlineIds(tree) {
-  const ids = new Set();
-  const visit = (node) => {
+export function defaultCollapsedOutlineIds(tree: TreeNodeLike | null | undefined): Set<unknown> {
+  const ids = new Set<unknown>();
+  const visit = (node: TreeNodeLike | null | undefined): void => {
     if (!node) return;
-    if (depthOf(node.address || '1') >= 2 && hasKnownChildren(node)) {
+    if (depthOf(String(node.address || '1')) >= 2 && hasKnownChildren(node)) {
       ids.add(node.id);
     }
     for (const child of node.children || []) visit(child);
@@ -456,26 +602,27 @@ export function defaultCollapsedOutlineIds(tree) {
   return ids;
 }
 
-export function buildParagraphLabelMap(tree) {
+export function buildParagraphLabelMap(tree: TreeNodeLike | null | undefined): Map<string, string> {
   const nodes = flattenTree(tree)
     .map((node) => ({
       id: String(node.id || ''),
-      position: Number(node.sourcePosition ?? node.source_position)
+      position: Number((node as { sourcePosition?: unknown; source_position?: unknown }).sourcePosition
+        ?? (node as { source_position?: unknown }).source_position)
     }))
     .filter((item) => item.id && Number.isFinite(item.position) && !Number.isInteger(item.position))
     .sort((left, right) => left.position - right.position || left.id.localeCompare(right.id));
   return new Map(nodes.map((item, index) => [item.id, String(index + 1)]));
 }
 
-export function isEditableTarget(target) {
+export function isEditableTarget(target: { closest?: (selector: string) => Element | null } | null | undefined): boolean {
   return Boolean(target?.closest?.('input, textarea, select, [contenteditable="true"]'));
 }
 
-export function clamp(value, min, max) {
+export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-export function normalizeDocId(docId) {
+export function normalizeDocId(docId: unknown): string | null {
   if (docId === null || docId === undefined) return null;
   const text = String(docId).trim();
   if (/^\d+$/.test(text) && Number(text) <= 0) return null;
@@ -483,7 +630,7 @@ export function normalizeDocId(docId) {
   return null;
 }
 
-export function readPersistedActiveDocId() {
+export function readPersistedActiveDocId(): string | null {
   if (typeof window === 'undefined') return null;
   try {
     return normalizeDocId(window.localStorage?.getItem(ACTIVE_DOC_STORAGE_KEY));
@@ -492,7 +639,7 @@ export function readPersistedActiveDocId() {
   }
 }
 
-export function persistActiveDocId(docId) {
+export function persistActiveDocId(docId: unknown): void {
   if (typeof window === 'undefined') return;
   try {
     const value = normalizeDocId(docId);
@@ -503,12 +650,12 @@ export function persistActiveDocId(docId) {
   }
 }
 
-export function summaryNotesVisibleStorageKey(docId) {
+export function summaryNotesVisibleStorageKey(docId: unknown): string | null {
   const value = normalizeDocId(docId);
   return value ? `iftree.summaryNotesVisible:${value}` : null;
 }
 
-export function readPersistedSummaryNotesVisible(docId) {
+export function readPersistedSummaryNotesVisible(docId: unknown): boolean {
   if (typeof window === 'undefined') return true;
   const key = summaryNotesVisibleStorageKey(docId);
   if (!key) return true;
@@ -520,7 +667,7 @@ export function readPersistedSummaryNotesVisible(docId) {
   }
 }
 
-export function persistSummaryNotesVisible(docId, visible) {
+export function persistSummaryNotesVisible(docId: unknown, visible: boolean): void {
   if (typeof window === 'undefined') return;
   const key = summaryNotesVisibleStorageKey(docId);
   if (!key) return;
@@ -531,21 +678,22 @@ export function persistSummaryNotesVisible(docId, visible) {
   }
 }
 
-export function focusCameraOnRect(rect, viewport, camera, options = {}) {
-  if (!rect || !viewport?.width || !viewport?.height) return camera;
-  const currentScale = Number.isFinite(camera?.scale) ? camera.scale : 1;
+export function focusCameraOnRect(rect: Rect | null | undefined, viewport: Viewport | null | undefined, camera: Camera | null | undefined, options: { minScale?: number } = {}): Camera {
+  const baseCamera: Camera = camera || { x: 0, y: 0, scale: 1 };
+  if (!rect || !viewport?.width || !viewport?.height) return baseCamera;
+  const currentScale = Number.isFinite(baseCamera.scale) ? baseCamera.scale : 1;
   const scale = Math.max(currentScale, options.minScale ?? currentScale);
   const tall = Number(rect.height) > viewport.height / scale * 1.5;
   const wide = Number(rect.width) > viewport.width / scale * 1.5;
   return {
-    ...camera,
+    ...baseCamera,
     scale,
     x: wide ? rect.x - 32 / scale : rect.x + rect.width / 2 - viewport.width / (2 * scale),
     y: tall ? rect.y - 48 / scale : rect.y + rect.height / 2 - viewport.height / (2 * scale)
   };
 }
 
-export function initialMindMapCamera(nodes, bounds, viewport, selectedNodeId) {
+export function initialMindMapCamera(nodes: MindMapNode[], bounds: Rect | null | undefined, viewport: Viewport | null | undefined, selectedNodeId: unknown): Camera {
   if (!bounds || !viewport?.width || !viewport?.height) return { x: 0, y: 0, scale: 1 };
   const fit = fitCameraToBounds(bounds, viewport);
   if (fit.scale >= 0.24) return fit;
@@ -556,7 +704,7 @@ export function initialMindMapCamera(nodes, bounds, viewport, selectedNodeId) {
     ? nodes.filter((node) => node?.kind === 'axiom' || node?.kind === 'axiom-group')
     : [];
   if (axiomNodes.length > 0) {
-    const axiomFit = fitCameraToBounds(boundsFromNodes([target, ...axiomNodes], 48), viewport, { maxScale: 1 });
+    const axiomFit = fitCameraToBounds(boundsFromNodes([target, ...axiomNodes] as never, 48), viewport, { maxScale: 1 });
     if (axiomFit.scale >= 0.24) return axiomFit;
   }
   const scale = Math.min(1, Math.max(0.24, viewport.width * 0.72 / Math.max(1, Number(target.width) || 1)));
@@ -569,7 +717,7 @@ export function initialMindMapCamera(nodes, bounds, viewport, selectedNodeId) {
   };
 }
 
-export function expandedMindMapRenderRect(camera, viewport) {
+export function expandedMindMapRenderRect(camera: Partial<Camera> | null | undefined, viewport: Viewport | null | undefined): Rect & { scale: number } {
   const scale = Math.max(0.000001, Number(camera?.scale) || 1);
   const width = Math.max(1, Number(viewport?.width) || 1) / scale;
   const height = Math.max(1, Number(viewport?.height) || 1) / scale;
@@ -581,4 +729,3 @@ export function expandedMindMapRenderRect(camera, viewport) {
     scale
   };
 }
-

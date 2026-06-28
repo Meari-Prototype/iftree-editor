@@ -1,4 +1,3 @@
-﻿// @ts-nocheck
 import { ArrowUp, Bot, Brain, Check, ChevronDown, ChevronRight, Trash2, X
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -8,13 +7,75 @@ import { RichMarkdown } from './RichMarkdown';
 import {
   AGENT_REASONING_OPTIONS, agentBranchDocLabel, agentBranchEntries, agentBranchOwnerLabel, agentContextUsageView, agentModeLabel, agentReasoningLabel, agentReasoningShortLabel,
   agentSessionTime, agentSessionTitle, agentToolArgsSummary, agentToolNameText, agentToolStatusText, buildAgentModelOptions, compactAgentModelLabel,
-  defaultAgentModelKey, formatAgentElapsed
+  defaultAgentModelKey, formatAgentElapsed,
+  type AgentBranch, type AgentMessageLike, type AgentModelOption,
+  type AgentSegment, type AgentSession, type AgentSettingsLike,
+  type AgentToolEvent, type AgentUsage
 } from '../lib/agent-utils.js';
 
+// AgentPanel 是 Agent 子面板：消费 agent-utils 已 export 的真类型（messages/diffs/sessions/usage 等），
+// 内部 3 个子组件 + groupSegments + 主组件 props 都按真类型收紧；docs 字段沿用 agentBranchDocLabel 的最小形参形态。
 
+type AgentDocOption = { id?: unknown; title?: string };
+type AgentToolByIdMap = Map<string, AgentToolEvent>;
+type AgentMode = 'qa' | 'edit' | 'full';
+type AgentMenuView = 'main' | 'models';
+type ReasoningEffort = string;
+
+// 渲染前把连续的 tool 段聚合成组：text/reasoning 段原样保留，连续 tool 段合成一个 tool-group。
+interface AgentToolGroupSegment {
+  kind: 'tool-group';
+  tools: string[];
+}
+type AgentGroupedSegment =
+  | Extract<AgentSegment, { kind: 'text' }>
+  | Extract<AgentSegment, { kind: 'reasoning' }>
+  | AgentToolGroupSegment;
+
+interface AgentToolRowProps {
+  tool: AgentToolEvent;
+}
+
+interface AgentToolGroupProps {
+  toolIds: string[];
+  toolById: AgentToolByIdMap;
+}
+
+interface AgentReasoningProps {
+  text: string;
+  live?: boolean;
+}
+
+export interface AgentRunRequest {
+  mode: AgentMode;
+  prompt: string;
+  modelOption: AgentModelOption | null;
+  reasoningEffort: ReasoningEffort;
+}
+
+export interface AgentPanelProps {
+  agentSettings?: AgentSettingsLike | null;
+  messages?: AgentMessageLike[];
+  diffs?: AgentBranch[];
+  docs?: AgentDocOption[];
+  sessions?: AgentSession[];
+  activeSessionId?: number | string | null;
+  busy?: boolean;
+  contextUsage?: AgentUsage | null;
+  onRun?: (payload: AgentRunRequest) => void;
+  onCancel?: () => void;
+  onApply?: (branchId: unknown) => void;
+  onReject?: (branchId: unknown) => void;
+  onApplyAll?: () => void;
+  onRejectAll?: () => void;
+  onLoadSession?: (sessionId: unknown) => void;
+  onDeleteSession?: (sessionId: unknown) => void;
+  onNewSession?: () => void;
+  onTraceDiff?: (branch: AgentBranch) => void;
+}
 
 // 单个工具调用卡片：segments 交错渲染与旧会话两段式回退共用一处。默认折叠、可展开看参数 / 返回 / 错误。
-function AgentToolRow({ tool }) {
+function AgentToolRow({ tool }: AgentToolRowProps) {
   const hasDisplayPreview = Object.prototype.hasOwnProperty.call(tool, 'displayPreview');
   const resultText = hasDisplayPreview ? tool.displayPreview : tool.resultPreview;
   const status = tool.status === 'done' || tool.status === 'error' ? tool.status : 'running';
@@ -52,8 +113,10 @@ function AgentToolRow({ tool }) {
 }
 
 // 连续工具聚合成组（CC 式"已使用 N 个工具"）：单个直接一行,多个折叠成组、展开看各工具（组 → 工具 → 详情三层）。
-function AgentToolGroup({ toolIds, toolById }) {
-  const tools = toolIds.map((id) => toolById.get(id)).filter(Boolean);
+function AgentToolGroup({ toolIds, toolById }: AgentToolGroupProps) {
+  const tools = toolIds
+    .map((id) => toolById.get(id))
+    .filter((tool): tool is AgentToolEvent => Boolean(tool));
   if (tools.length === 0) return null;
   if (tools.length === 1) return <AgentToolRow tool={tools[0]} />;
   const running = tools.some((tool) => tool.status !== 'done' && tool.status !== 'error');
@@ -72,7 +135,7 @@ function AgentToolGroup({ toolIds, toolById }) {
 }
 
 // 思考链：默认折叠成一行,展开看全文；流式途中默认展开看实时思考。
-function AgentReasoning({ text, live }) {
+function AgentReasoning({ text, live }: AgentReasoningProps) {
   return (
     <details className="agent-reasoning" open={live || undefined}>
       <summary>
@@ -86,8 +149,8 @@ function AgentReasoning({ text, live }) {
 }
 
 // 渲染前把连续的 tool 段聚合成组,text / reasoning 段原样保留时间线顺序。
-function groupSegments(segments) {
-  const groups = [];
+function groupSegments(segments: AgentSegment[]): AgentGroupedSegment[] {
+  const groups: AgentGroupedSegment[] = [];
   for (const segment of segments) {
     if (segment.kind === 'tool') {
       const last = groups[groups.length - 1];
@@ -102,13 +165,13 @@ function groupSegments(segments) {
 
 export function AgentPanel({
   agentSettings,
-  messages,
-  diffs,
+  messages = [],
+  diffs = [],
   docs = [],
   sessions = [],
   activeSessionId = null,
-  busy,
-  contextUsage,
+  busy = false,
+  contextUsage = null,
   onRun,
   onCancel,
   onApply,
@@ -119,24 +182,24 @@ export function AgentPanel({
   onDeleteSession,
   onNewSession,
   onTraceDiff
-}) {
-  const [mode, setMode] = useState('qa');
-  const [input, setInput] = useState('');
-  const [expanded, setExpanded] = useState(false);
-  const [modelKey, setModelKey] = useState('');
-  const [reasoningEffort, setReasoningEffort] = useState('auto');
-  const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
-  const [modeMenuOpen, setModeMenuOpen] = useState(false);
-  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
-  const [agentMenuView, setAgentMenuView] = useState('main');
-  const chatScrollRef = useRef(null);
-  const stickToChatBottomRef = useRef(true);
-  const sessionMenuRef = useRef(null);
-  const modeMenuRef = useRef(null);
-  const agentMenuRef = useRef(null);
+}: AgentPanelProps) {
+  const [mode, setMode] = useState<AgentMode>('qa');
+  const [input, setInput] = useState<string>('');
+  const [expanded, setExpanded] = useState<boolean>(false);
+  const [modelKey, setModelKey] = useState<string>('');
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('auto');
+  const [sessionMenuOpen, setSessionMenuOpen] = useState<boolean>(false);
+  const [modeMenuOpen, setModeMenuOpen] = useState<boolean>(false);
+  const [agentMenuOpen, setAgentMenuOpen] = useState<boolean>(false);
+  const [agentMenuView, setAgentMenuView] = useState<AgentMenuView>('main');
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const stickToChatBottomRef = useRef<boolean>(true);
+  const sessionMenuRef = useRef<HTMLDivElement | null>(null);
+  const modeMenuRef = useRef<HTMLDivElement | null>(null);
+  const agentMenuRef = useRef<HTMLDivElement | null>(null);
   const pendingCount = diffs.length;
   const activeSession = sessions.find((session) => Number(session.id) === Number(activeSessionId)) || null;
-  const modelOptions = useMemo(() => buildAgentModelOptions(agentSettings), [agentSettings]);
+  const modelOptions = useMemo(() => buildAgentModelOptions(agentSettings ?? {}), [agentSettings]);
   const selectedModel = modelOptions.find((option) => option.key === modelKey) || modelOptions[0] || null;
   const supportedReasoningEfforts = useMemo(() => new Set(selectedModel?.reasoningEfforts || []), [selectedModel]);
   const contextView = agentContextUsageView(contextUsage);
@@ -155,7 +218,7 @@ export function AgentPanel({
   }, [pendingCount]);
 
   useEffect(() => {
-    const nextKey = defaultAgentModelKey(agentSettings, modelOptions);
+    const nextKey = defaultAgentModelKey(agentSettings ?? {}, modelOptions);
     setModelKey((current) => (modelOptions.some((option) => option.key === current) ? current : nextKey));
   }, [agentSettings, modelOptions]);
 
@@ -167,8 +230,8 @@ export function AgentPanel({
 
   useEffect(() => {
     if (!agentMenuOpen) return undefined;
-    const closeMenu = (event) => {
-      if (!agentMenuRef.current?.contains(event.target)) setAgentMenuOpen(false);
+    const closeMenu = (event: PointerEvent) => {
+      if (!agentMenuRef.current?.contains(event.target as Node | null)) setAgentMenuOpen(false);
     };
     document.addEventListener('pointerdown', closeMenu);
     return () => document.removeEventListener('pointerdown', closeMenu);
@@ -176,8 +239,8 @@ export function AgentPanel({
 
   useEffect(() => {
     if (!sessionMenuOpen) return undefined;
-    const closeMenu = (event) => {
-      if (!sessionMenuRef.current?.contains(event.target)) setSessionMenuOpen(false);
+    const closeMenu = (event: PointerEvent) => {
+      if (!sessionMenuRef.current?.contains(event.target as Node | null)) setSessionMenuOpen(false);
     };
     document.addEventListener('pointerdown', closeMenu);
     return () => document.removeEventListener('pointerdown', closeMenu);
@@ -185,8 +248,8 @@ export function AgentPanel({
 
   useEffect(() => {
     if (!modeMenuOpen) return undefined;
-    const closeMenu = (event) => {
-      if (!modeMenuRef.current?.contains(event.target)) setModeMenuOpen(false);
+    const closeMenu = (event: PointerEvent) => {
+      if (!modeMenuRef.current?.contains(event.target as Node | null)) setModeMenuOpen(false);
     };
     document.addEventListener('pointerdown', closeMenu);
     return () => document.removeEventListener('pointerdown', closeMenu);
@@ -215,7 +278,7 @@ export function AgentPanel({
           {diffs.map((branch) => {
             const entries = agentBranchEntries(branch);
             return (
-              <div key={branch.id} className="agent-diff-card">
+              <div key={String(branch.id ?? '')} className="agent-diff-card">
                 <header>
                   <div className="agent-diff-title">
                     <strong>{agentBranchDocLabel(branch, docs)}</strong>
@@ -336,7 +399,9 @@ export function AgentPanel({
                     </div>
                   );
                 }
-                const toolById = new Map((message.toolEvents || []).map((toolEvent) => [toolEvent.id, toolEvent]));
+                const toolById: AgentToolByIdMap = new Map(
+                  (message.toolEvents || []).map((toolEvent): [string, AgentToolEvent] => [String(toolEvent.id ?? ''), toolEvent])
+                );
                 const segments = Array.isArray(message.segments) ? message.segments : [];
                 const lastSegmentIndex = segments.length - 1;
                 const streamingTail = message.streaming && segments[lastSegmentIndex]?.kind === 'tool';
@@ -388,7 +453,7 @@ export function AgentPanel({
                           )}
                         </>
                       )}
-                      {role === 'assistant' && message.diffCount > 0 && (
+                      {role === 'assistant' && (message.diffCount ?? 0) > 0 && (
                         <span className="agent-message-note">{message.diffCount} 个待审变更</span>
                       )}
                     </div>

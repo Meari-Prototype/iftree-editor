@@ -1,14 +1,25 @@
-// @ts-nocheck
 import { useEffect, useState } from 'react';
 import { Database, FileText, KeyRound, Plus, Trash2
 } from 'lucide-react';
 import { LLM_PROVIDER_PRESETS, newLlmApi, newLlmProvider,
-  normalizeLlmSettingsForEditor, providerMatchesPreset
+  normalizeLlmSettingsForEditor, providerMatchesPreset,
+  type LlmApi, type LlmProvider, type LlmProviderRaw
 } from '../../lib/summary-utils.js';
 
 const ANTHROPIC_MAX_OUTPUT_MESSAGE = 'Anthropic compatible 需要填写最大输出 token。';
 
-function needsAnthropicMaxOutput(api: any = {}) {
+type LlmSettingsShape = ReturnType<typeof normalizeLlmSettingsForEditor>;
+
+interface LlmSummarySettingsPanelProps {
+  settings?: unknown;
+  onChange?: (next: LlmSettingsShape) => void;
+  title?: string;
+  description?: string;
+  currentLabel?: string;
+  showHeader?: boolean;
+}
+
+function needsAnthropicMaxOutput(api: Partial<LlmApi> = {}) {
   return String(api.protocol || 'openai-compatible') === 'anthropic-compatible'
     && Number(api.maxOutputTokens) <= 0;
 }
@@ -20,8 +31,8 @@ export function LlmSummarySettingsPanel({
   description = '非密钥配置写入项目根目录 JSON；API Key 保留在 .env。',
   currentLabel = '当前 API',
   showHeader = true
-}) {
-  const config = normalizeLlmSettingsForEditor(settings || {});
+}: LlmSummarySettingsPanelProps) {
+  const config = normalizeLlmSettingsForEditor((settings || {}) as Parameters<typeof normalizeLlmSettingsForEditor>[0]);
   const providers = Array.isArray(config.providers) ? config.providers : [];
   const activeProvider = providers.find((provider) => provider.id === config.activeProviderId) || providers[0] || null;
   const apis = Array.isArray(activeProvider?.apis) ? activeProvider.apis : [];
@@ -36,8 +47,8 @@ export function LlmSummarySettingsPanel({
   useEffect(() => {
     setApiValidationMessage('');
   }, [activeApi?.id]);
-  const save = (next) => onChange?.(next);
-  const saveProviders = (nextProviders, extra = {}) => save({ ...config, providers: nextProviders, ...extra });
+  const save = (next: LlmSettingsShape) => onChange?.(next);
+  const saveProviders = (nextProviders: LlmProvider[], extra: Partial<LlmSettingsShape> = {}) => save({ ...config, providers: nextProviders, ...extra });
   const providerOptions = [
     ...providers.map((provider) => ({ kind: 'provider', value: provider.id, label: provider.name || '未命名供应商' })),
     ...LLM_PROVIDER_PRESETS
@@ -65,11 +76,11 @@ export function LlmSummarySettingsPanel({
     });
   };
 
-  const selectProvider = (providerId) => {
+  const selectProvider = (providerId: string) => {
     if (providerId.startsWith('preset:')) {
       const preset = LLM_PROVIDER_PRESETS.find((item) => item.id === providerId.slice('preset:'.length));
       if (!preset) return;
-      const provider = newLlmProvider(preset, providers);
+      const provider = newLlmProvider(preset as LlmProviderRaw, providers);
       saveProviders([...providers, provider], {
         activeProviderId: provider.id,
         activeApiId: provider.apis?.[0]?.id || ''
@@ -84,7 +95,7 @@ export function LlmSummarySettingsPanel({
     });
   };
 
-  const updateProvider = (patch) => {
+  const updateProvider = (patch: Partial<LlmProvider>) => {
     if (!activeProvider) return;
     saveProviders(providers.map((provider) => (
       provider.id === activeProvider.id ? { ...provider, ...patch } : provider
@@ -111,7 +122,7 @@ export function LlmSummarySettingsPanel({
     )), { activeApiId: nextApis[0]?.id || '' });
   };
 
-  const updateApi = (patch) => {
+  const updateApi = (patch: Partial<LlmApi>) => {
     if (!activeProvider || !activeApi) return;
     const nextApi = { ...activeApi, ...patch };
     if (needsAnthropicMaxOutput(nextApi)) {
@@ -226,7 +237,7 @@ export function LlmSummarySettingsPanel({
               </label>
               <label className="llm-field">
                 <span>上下文窗口 token</span>
-                <input type="number" min="0" value={Number(activeApi.contextLimit) > 0 ? activeApi.contextLimit : ''} onChange={(event) => updateApi({ contextLimit: event.target.value })} />
+                <input type="number" min="0" value={Number(activeApi.contextLimit) > 0 ? activeApi.contextLimit : ''} onChange={(event) => updateApi({ contextLimit: Number(event.target.value) })} />
               </label>
               <label className="llm-field">
                 <span>最大输出 token</span>
@@ -234,11 +245,11 @@ export function LlmSummarySettingsPanel({
                   type="number"
                   min="0"
                   value={Number(activeApi.maxOutputTokens) > 0 ? activeApi.maxOutputTokens : ''}
-                  onChange={(event) => updateApi({ maxOutputTokens: event.target.value })}
+                  onChange={(event) => updateApi({ maxOutputTokens: Number(event.target.value) })}
                   onBlur={(event) => {
                     setApiValidationMessage(needsAnthropicMaxOutput({
                       ...activeApi,
-                      maxOutputTokens: event.target.value
+                      maxOutputTokens: Number(event.target.value)
                     }) ? ANTHROPIC_MAX_OUTPUT_MESSAGE : '');
                   }}
                 />
@@ -246,7 +257,7 @@ export function LlmSummarySettingsPanel({
               </label>
               <label className="llm-field">
                 <span>支持推理强度</span>
-                <input value={activeReasoningEfforts} onChange={(event) => updateApi({ reasoningEfforts: event.target.value })} placeholder="low,medium,high,xhigh" />
+                <input value={activeReasoningEfforts} onChange={(event) => updateApi({ reasoningEfforts: event.target.value.split(',').map((part) => part.trim()).filter(Boolean) })} placeholder="low,medium,high,xhigh" />
               </label>
               <div className="llm-switch-row llm-field-wide">
                 <label>

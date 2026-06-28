@@ -1,10 +1,15 @@
-// @ts-nocheck
 import { ChevronDown, FileText, ListTree, LocateFixed, Minus, Square, Upload, X
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { closeWindow, minimizeWindow, toggleMaximizeWindow } from '../data/window-service.js';
 
-const IMPORT_MODE_OPTIONS = [
+interface ImportModeOption {
+  mode: string;
+  label: string;
+  title?: string;
+}
+
+const IMPORT_MODE_OPTIONS: ImportModeOption[] = [
   { mode: 'simple', label: '简单导入' },
   { mode: 'complete', label: '完整导入' },
   { mode: 'smart', label: '智能导入', title: '调用内置 agent 按 skill 解析结构并入库（过程在 AgentPanel 可见）' },
@@ -12,20 +17,31 @@ const IMPORT_MODE_OPTIONS = [
   { mode: 'vector', label: '向量式导入', title: '按字数定长切块导入（块 512 字、相邻块重叠 10%），适合需要切块向量化的数据' }
 ];
 
-export function ViewPromptCard({ selectedLibraryEntry, onImport }) {
+export interface LibraryEntryLike {
+  name?: string;
+  type?: string;
+  [extra: string]: unknown;
+}
+
+interface ViewPromptCardProps {
+  selectedLibraryEntry: LibraryEntryLike | null | undefined;
+  onImport?: (mode: string) => void;
+}
+
+export function ViewPromptCard({ selectedLibraryEntry, onImport }: ViewPromptCardProps) {
   const [importMenuOpen, setImportMenuOpen] = useState(false);
-  const importMenuRef = useRef(null);
+  const importMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!importMenuOpen) return undefined;
-    const closeImportMenu = (event) => {
-      if (!importMenuRef.current?.contains(event.target)) setImportMenuOpen(false);
+    const closeImportMenu = (event: PointerEvent): void => {
+      if (!importMenuRef.current?.contains(event.target as Node)) setImportMenuOpen(false);
     };
     window.addEventListener('pointerdown', closeImportMenu);
     return () => window.removeEventListener('pointerdown', closeImportMenu);
   }, [importMenuOpen]);
 
-  const runImport = (mode) => {
+  const runImport = (mode: string): void => {
     setImportMenuOpen(false);
     onImport?.(mode);
   };
@@ -73,7 +89,13 @@ export function ViewPromptCard({ selectedLibraryEntry, onImport }) {
   );
 }
 
-export function ViewAlignedEmptyState({ activeTab, selectedLibraryEntry, onImport }) {
+interface ViewAlignedEmptyStateProps {
+  activeTab?: string;
+  selectedLibraryEntry: LibraryEntryLike | null | undefined;
+  onImport?: (mode: string) => void;
+}
+
+export function ViewAlignedEmptyState({ activeTab, selectedLibraryEntry, onImport }: ViewAlignedEmptyStateProps) {
   const prompt = <ViewPromptCard selectedLibraryEntry={selectedLibraryEntry} onImport={onImport} />;
   if (activeTab === 'ide') {
     return (
@@ -147,9 +169,24 @@ export function WindowTitlebar({ onClose, title = '条件树编辑器' }: { onCl
   );
 }
 
+export interface ChoiceDialogAction {
+  value: string;
+  label: string;
+  autoFocus?: boolean;
+}
+
+interface ChoiceDialogProps {
+  open: boolean;
+  title?: ReactNode;
+  message?: ReactNode;
+  actions?: ChoiceDialogAction[];
+  backdropValue?: string;
+  onChoose?: (value: string | undefined) => void;
+}
+
 // 统一的命令式确认弹窗。actions 自上而下渲染为按钮，每个 { value, label, autoFocus? }
 // 点击时回调 onChoose(value)；点击遮罩回调 onChoose(backdropValue)。
-export function ChoiceDialog({ open, title, message, actions = [], backdropValue, onChoose }) {
+export function ChoiceDialog({ open, title, message, actions = [], backdropValue, onChoose }: ChoiceDialogProps) {
   if (!open) return null;
   return (
     <div className="dialog-overlay" onClick={() => onChoose?.(backdropValue)}>
@@ -173,7 +210,7 @@ export function ChoiceDialog({ open, title, message, actions = [], backdropValue
   );
 }
 
-export function DepthCollapseOneIcon({ size = 16 }) {
+export function DepthCollapseOneIcon({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" aria-hidden="true">
       <path d="M5 3v10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeDasharray="1.2 2.2" fill="none" />
@@ -183,7 +220,7 @@ export function DepthCollapseOneIcon({ size = 16 }) {
   );
 }
 
-export function DepthExpandOneIcon({ size = 16 }) {
+export function DepthExpandOneIcon({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" aria-hidden="true">
       <path d="M5 3v10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeDasharray="1.2 2.2" fill="none" />
@@ -193,7 +230,14 @@ export function DepthExpandOneIcon({ size = 16 }) {
   );
 }
 
-export function IconButton({ children, title, onClick, disabled = false }) {
+interface IconButtonProps {
+  children?: ReactNode;
+  title?: string;
+  onClick?: () => void;
+  disabled?: boolean;
+}
+
+export function IconButton({ children, title, onClick, disabled = false }: IconButtonProps) {
   return (
     <button
       className="icon-button"
@@ -210,7 +254,15 @@ export function IconButton({ children, title, onClick, disabled = false }) {
   );
 }
 
-export function LocateNodeButton({ title = '定位节点', label = '定位节点', className = '', disabled = false, onClick }) {
+interface LocateNodeButtonProps {
+  title?: string;
+  label?: string;
+  className?: string;
+  disabled?: boolean;
+  onClick?: () => void;
+}
+
+export function LocateNodeButton({ title = '定位节点', label = '定位节点', className = '', disabled = false, onClick }: LocateNodeButtonProps) {
   return (
     <button
       type="button"

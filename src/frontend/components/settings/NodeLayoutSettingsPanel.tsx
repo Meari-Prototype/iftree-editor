@@ -1,9 +1,22 @@
-// @ts-nocheck
 import { Gauge, Lock,
   RotateCcw, SlidersHorizontal, Unlock
 } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { DEFAULT_NODE_LAYOUT } from '../../../core/mindmap.js';
+import type { NodeLayout } from '../../../core/mindmap.js';
 
+type NodeLayoutSettings = NodeLayout;
+
+interface NodeLayoutSettingsPanelProps {
+  title?: string;
+  description?: string;
+  settings?: NodeLayoutSettings | null;
+  disabled?: boolean;
+  onChange?: (patch: Partial<NodeLayoutSettings>) => void;
+  onNumberChange?: (field: string, value: string) => void;
+  treeEditMode?: boolean;
+  onToggleTreeEditMode?: () => void;
+}
 
 export function NodeLayoutSettingsPanel({
   title = '节点调整',
@@ -14,8 +27,8 @@ export function NodeLayoutSettingsPanel({
   onNumberChange,
   treeEditMode,
   onToggleTreeEditMode
-}) {
-  const values = settings || DEFAULT_NODE_LAYOUT;
+}: NodeLayoutSettingsPanelProps) {
+  const values: NodeLayoutSettings = settings || DEFAULT_NODE_LAYOUT;
   const modeLabel = values.mode === 'goldenRatio' ? '等比' : '等宽';
   const saveDefaults = () => onChange?.({ ...DEFAULT_NODE_LAYOUT });
 
@@ -144,7 +157,25 @@ export function NodeLayoutSettingsPanel({
   );
 }
 
-export function NodeLayoutNumberRow({ icon = null, label, detail = '', value, min, max, disabled, onChange }) {
+export function NodeLayoutNumberRow({
+  icon = null,
+  label,
+  detail = '',
+  value,
+  min,
+  max,
+  disabled,
+  onChange
+}: {
+  icon?: ReactNode;
+  label: string;
+  detail?: string;
+  value: unknown;
+  min: number;
+  max: number;
+  disabled?: boolean;
+  onChange?: (value: string) => void;
+}) {
   return (
     <div className="settings-row">
       <div className="settings-row-icon">{icon || <Gauge size={17} />}</div>
@@ -157,7 +188,7 @@ export function NodeLayoutNumberRow({ icon = null, label, detail = '', value, mi
           type="number"
           min={min}
           max={max}
-          value={Number.isFinite(Number(value)) ? value : ''}
+          value={Number.isFinite(Number(value)) ? String(value) : ''}
           disabled={disabled}
           onChange={(event) => onChange?.(event.target.value)}
         />

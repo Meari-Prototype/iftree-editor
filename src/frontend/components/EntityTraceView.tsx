@@ -1,22 +1,31 @@
-// @ts-nocheck
 import { ChevronLeft, ChevronRight, Link2, LocateFixed, Search, Tags } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from 'react';
+
+import type { SearchGroup } from '../features/entity/entity-actions.js';
+import type { EntityNodeSearchRow, EntityNodePage, EntityTraceDetail, EntityTraceRow } from '../hooks/useEntityTrace.js';
 
 const ENTITY_TRACE_LEFT_MIN = 260;
 const ENTITY_TRACE_RIGHT_MIN = 360;
 const ENTITY_TRACE_RESIZER_WIDTH = 1;
 
-function clampEntityTraceWidth(value, min, max, fallback) {
+interface RangeTextArgs {
+  total?: unknown;
+  offset?: unknown;
+  limit?: unknown;
+  returned?: unknown;
+}
+
+function clampEntityTraceWidth(value: unknown, min: number, max: number, fallback: number): number {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return Math.min(max, Math.max(min, numeric));
 }
 
-function countText(value) {
+function countText(value: unknown): string {
   return `x${Number(value) || 0}`;
 }
 
-function rangeText({ total = 0, offset = 0, limit = 100, returned = 0 } = {}) {
+function rangeText({ total = 0, offset = 0, limit = 100, returned = 0 }: RangeTextArgs = {}): string {
   const safeTotal = Math.max(0, Number(total) || 0);
   const safeOffset = Math.max(0, Number(offset) || 0);
   const safeLimit = Math.max(1, Number(limit) || 100);
@@ -27,11 +36,21 @@ function rangeText({ total = 0, offset = 0, limit = 100, returned = 0 } = {}) {
   return `${start}-${end} / ${safeTotal} · 每页 ${safeLimit}`;
 }
 
-function docText(entity: any = {}) {
-  return entity.docTitle ? `doc ${entity.docId} · ${entity.docTitle}` : `doc ${entity.docId ?? '-'}`;
+function docText(entity: EntityTraceRow | null | undefined = {}): string {
+  if (!entity) return 'doc -';
+  const docId = entity.docId == null ? '-' : String(entity.docId);
+  return entity.docTitle ? `doc ${docId} · ${entity.docTitle}` : `doc ${docId}`;
 }
 
-function EntityRow({ entity, active = false, relation = '', onSelect, onDragStart }) {
+interface EntityRowProps {
+  entity: EntityTraceRow | null | undefined;
+  active?: boolean;
+  relation?: string;
+  onSelect?: (entity: EntityTraceRow) => void;
+  onDragStart?: (event: ReactDragEvent<HTMLButtonElement>, entity: EntityTraceRow) => void;
+}
+
+function EntityRow({ entity, active = false, relation = '', onSelect, onDragStart }: EntityRowProps) {
   if (!entity) return null;
   return (
     <button
@@ -51,10 +70,17 @@ function EntityRow({ entity, active = false, relation = '', onSelect, onDragStar
   );
 }
 
-function EntityDetail({ detail, selectedEntity, onUseEntityKeyword, onDragStart }) {
-  const entity = detail?.entity || selectedEntity || null;
-  const synonyms = Array.isArray(detail?.synonyms) ? detail.synonyms : [];
-  const related = Array.isArray(detail?.related) ? detail.related : [];
+interface EntityDetailProps {
+  detail: EntityTraceDetail | null | undefined;
+  selectedEntity: EntityTraceRow | null | undefined;
+  onUseEntityKeyword?: (entity: EntityTraceRow) => void;
+  onDragStart?: (event: ReactDragEvent<HTMLButtonElement>, entity: EntityTraceRow) => void;
+}
+
+function EntityDetail({ detail, selectedEntity, onUseEntityKeyword, onDragStart }: EntityDetailProps) {
+  const entity = (detail?.entity as EntityTraceRow | null | undefined) || selectedEntity || null;
+  const synonyms: EntityTraceRow[] = Array.isArray(detail?.synonyms) ? (detail.synonyms as EntityTraceRow[]) : [];
+  const related: EntityTraceRow[] = Array.isArray(detail?.related) ? (detail.related as EntityTraceRow[]) : [];
   if (!entity) {
     return (
       <div className="entity-detail-empty">
@@ -107,7 +133,16 @@ function EntityDetail({ detail, selectedEntity, onUseEntityKeyword, onDragStart 
   );
 }
 
-function NodeResultRow({ result, onSelectNode }) {
+// 跟 AppBody.selectNodeAndOpenTree 复用的更宽 callback 签名；
+// EntityTraceView 实际传 EntityNodeSearchRow（满足该宽形态）。
+type SelectNodeHandler = (nodeId: unknown, result?: { address?: unknown; [k: string]: unknown }) => void | Promise<void>;
+
+interface NodeResultRowProps {
+  result: EntityNodeSearchRow;
+  onSelectNode?: SelectNodeHandler;
+}
+
+function NodeResultRow({ result, onSelectNode }: NodeResultRowProps) {
   return (
     <button
       type="button"
@@ -122,30 +157,66 @@ function NodeResultRow({ result, onSelectNode }) {
   );
 }
 
-function NodeResults({ rows, groups, onSelectNode }) {
-  const grouped = Array.isArray(groups) ? groups : [];
-  const flatRows = Array.isArray(rows) ? rows : [];
+interface NodeResultsProps {
+  rows: EntityNodeSearchRow[] | null | undefined;
+  groups: SearchGroup[] | null | undefined;
+  onSelectNode?: SelectNodeHandler;
+}
+
+function NodeResults({ rows, groups, onSelectNode }: NodeResultsProps) {
+  const grouped: SearchGroup[] = Array.isArray(groups) ? groups : [];
+  const flatRows: EntityNodeSearchRow[] = Array.isArray(rows) ? rows : [];
   if (grouped.length > 0) {
-    return grouped.map((group) => (
-      <section className="entity-node-group" key={group.term}>
-        <div className="entity-node-group-title">
-          <span>{group.term}</span>
-          <strong>{rangeText({
-            total: group.total,
-            offset: group.offset,
-            limit: group.limit,
-            returned: group.rows?.length || 0
-          })}</strong>
-        </div>
-        {(group.rows || []).map((row) => (
-          <NodeResultRow key={`${group.term}-${row.node_id}`} result={row} onSelectNode={onSelectNode} />
-        ))}
-      </section>
-    ));
+    return grouped.map((group) => {
+      const groupRows: EntityNodeSearchRow[] = Array.isArray(group.rows)
+        ? (group.rows as EntityNodeSearchRow[])
+        : [];
+      const groupTerm = String(group.term ?? '');
+      return (
+        <section className="entity-node-group" key={groupTerm}>
+          <div className="entity-node-group-title">
+            <span>{groupTerm}</span>
+            <strong>{rangeText({
+              total: group.total,
+              offset: group.offset,
+              limit: group.limit,
+              returned: groupRows.length
+            })}</strong>
+          </div>
+          {groupRows.map((row) => (
+            <NodeResultRow key={`${groupTerm}-${String(row.node_id ?? '')}`} result={row} onSelectNode={onSelectNode} />
+          ))}
+        </section>
+      );
+    });
   }
   return flatRows.map((row) => (
-    <NodeResultRow key={row.node_id} result={row} onSelectNode={onSelectNode} />
+    <NodeResultRow key={String(row.node_id ?? '')} result={row} onSelectNode={onSelectNode} />
   ));
+}
+
+export interface EntityTraceViewProps {
+  entityQuery: string;
+  setEntityQuery: (value: string) => void;
+  entityRows: EntityTraceRow[] | null | undefined;
+  entityDetail: EntityTraceDetail | null | undefined;
+  selectedEntity: EntityTraceRow | null | undefined;
+  onSearchEntities?: () => void | Promise<void>;
+  onSelectEntity?: (entity: EntityTraceRow) => void | Promise<void>;
+  onUseEntityKeyword?: (entity: EntityTraceRow) => void | Promise<void>;
+  onEntityDragStart?: (event: ReactDragEvent<HTMLButtonElement>, entity: EntityTraceRow) => void;
+  nodeQuery: string;
+  setNodeQuery: (value: string) => void;
+  nodeMatchMode: 'and' | 'or';
+  setNodeMatchMode: (mode: 'and' | 'or') => void;
+  nodeRows: EntityNodeSearchRow[] | null | undefined;
+  nodeGroups: SearchGroup[] | null | undefined;
+  nodePage: EntityNodePage | null | undefined;
+  onSearchNodes?: () => void | Promise<void>;
+  onPageNodes?: (direction: 'prev' | 'next') => void;
+  onDropEntityTerm?: (event: ReactDragEvent<HTMLDivElement>) => void;
+  onSelectNode?: SelectNodeHandler;
+  disabled?: boolean;
 }
 
 export function EntityTraceView({
@@ -170,10 +241,10 @@ export function EntityTraceView({
   onDropEntityTerm,
   onSelectNode,
   disabled = false
-}) {
-  const surfaceRef = useRef(null);
-  const leftPanelRef = useRef(null);
-  const [leftWidth, setLeftWidth] = useState(null);
+}: EntityTraceViewProps) {
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const leftPanelRef = useRef<HTMLElement | null>(null);
+  const [leftWidth, setLeftWidth] = useState<number | null>(null);
   const hasEntityRows = Array.isArray(entityRows) && entityRows.length > 0;
   const hasNodeRows = (Array.isArray(nodeRows) && nodeRows.length > 0)
     || (Array.isArray(nodeGroups) && nodeGroups.length > 0);
@@ -185,7 +256,7 @@ export function EntityTraceView({
     document.body.classList.remove('entity-trace-resizing');
   }, []);
 
-  function startTraceResize(event) {
+  function startTraceResize(event: ReactPointerEvent<HTMLButtonElement>): void {
     event.preventDefault();
     event.stopPropagation();
     const surface = surfaceRef.current;
@@ -206,7 +277,7 @@ export function EntityTraceView({
     const startX = event.clientX;
     let latestWidth = clampEntityTraceWidth(startWidth, minWidth, maxWidth, startWidth);
     let frame = 0;
-    const apply = () => {
+    const apply = (): void => {
       frame = 0;
       surface.style.setProperty('--entity-trace-left-width', `${latestWidth}px`);
     };
@@ -214,7 +285,7 @@ export function EntityTraceView({
     document.body.classList.add('entity-trace-resizing');
     apply();
 
-    const move = (moveEvent) => {
+    const move = (moveEvent: PointerEvent): void => {
       moveEvent.preventDefault();
       latestWidth = clampEntityTraceWidth(
         startWidth + moveEvent.clientX - startX,
@@ -224,7 +295,7 @@ export function EntityTraceView({
       );
       if (!frame) frame = requestAnimationFrame(apply);
     };
-    const up = () => {
+    const up = (): void => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       window.removeEventListener('pointercancel', up);
@@ -248,7 +319,7 @@ export function EntityTraceView({
     <div
       className="entity-trace-surface"
       ref={surfaceRef}
-      style={leftWidth ? { '--entity-trace-left-width': `${leftWidth}px` } : undefined}
+      style={leftWidth ? ({ '--entity-trace-left-width': `${leftWidth}px` } as CSSProperties) : undefined}
     >
       <section className="entity-trace-panel entity-trace-left" ref={leftPanelRef}>
         <header className="entity-panel-header">
@@ -283,11 +354,11 @@ export function EntityTraceView({
             <strong>{entityRows?.length || 0}</strong>
           </div>
           <div className="entity-list">
-            {hasEntityRows ? entityRows.map((entity) => (
+            {hasEntityRows && entityRows ? entityRows.map((entity) => (
               <EntityRow
-                key={entity.id}
+                key={String(entity.id ?? '')}
                 entity={entity}
-                active={String(selectedEntity?.id || '') === String(entity.id)}
+                active={String(selectedEntity?.id ?? '') === String(entity.id ?? '')}
                 onSelect={onSelectEntity}
                 onDragStart={onEntityDragStart}
               />

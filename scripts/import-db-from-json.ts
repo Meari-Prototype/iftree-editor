@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 // 库级导入：把导出的 json 灌进一个全新空库（按最新 schema 建表+索引+触发器，逐表搬+字段对齐+id 复用/重生）。
 // 跑法：electron scripts/import-db-from-json.mjs <dump.json> [目标库路径] --apply
 //   不带 --apply 只做 dry-run 报告；目标库默认 database/store.sqlite。
@@ -20,6 +19,20 @@ const positional = args.filter((arg) => !arg.startsWith('--'));
 const jsonPath = positional[0];
 const targetPath = positional[1] || join(ROOT, 'database', 'store.sqlite');
 
+interface DumpTable {
+  rows?: unknown[];
+}
+
+interface JsonDump {
+  schema_version?: unknown;
+  tables?: Record<string, DumpTable>;
+}
+
+interface ImportResult {
+  counts: Record<string, number>;
+  violations: unknown[];
+}
+
 function main() {
   if (!jsonPath) {
     console.error('用法: electron scripts/import-db-from-json.mjs <dump.json> [目标库路径] --apply');
@@ -31,7 +44,7 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  const dump = JSON.parse(readFileSync(jsonPath, 'utf8'));
+  const dump = JSON.parse(readFileSync(jsonPath, 'utf8')) as JsonDump;
   const tables = dump.tables || {};
   const tableCount = Object.keys(tables).length;
   const rowCount = Object.values(tables).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
@@ -52,7 +65,7 @@ function main() {
   db.pragma('synchronous = OFF');
   db.exec(TABLES_SQL);
   db.pragma(`user_version = ${SCHEMA_VERSION}`);
-  const result = importDatabase(db, dump);
+  const result = importDatabase(db, dump as Parameters<typeof importDatabase>[1]) as ImportResult;
   db.close();
 
   const imported = Object.values(result.counts).reduce((sum, n) => sum + n, 0);
