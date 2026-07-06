@@ -138,6 +138,10 @@ const DATABASE_ROOT = join(PROJECT_ROOT, 'database');
 const IS_MAIN_APP_PROCESS = process.env.IFTREE_MAIN_APP === '1';
 const FORCE_HARDWARE_ACCELERATION = IS_MAIN_APP_PROCESS && process.env.IFTREE_FORCE_HARDWARE_ACCELERATION !== '0';
 const STARTUP_TIMEOUT_MS = 60_000;
+// 需求 1414 运行期心跳判死：阈值须大于渲染进程后台 intensive throttling 的 ~60s 定时器间隔（最小化窗口
+// 心跳可能退化到每分钟一跳），连续 N 次 poll 均超时才判死（吸收系统睡眠唤醒瞬间的陈旧心跳，避免误杀）。
+const HEARTBEAT_STALE_MS = 120_000;
+const HEARTBEAT_STALE_TICKS = 5;
 const ELECTRON_PROFILE_ROOT = join(PROJECT_ROOT, '.iftree-cache', IS_MAIN_APP_PROCESS ? 'electron-main-profile' : 'electron-launcher-profile');
 const DIST_INDEX_PATH = resolve(PROJECT_ROOT, 'dist', 'index.html');
 const EXTERNAL_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
@@ -163,6 +167,7 @@ let entityMaintenanceWindow: BrowserWindow | null = null;
 let launchedMainProcess: ChildProcess | null = null;
 let launcherPollTimer: NodeJS.Timeout | null = null;
 let launcherLastFailure: RowObject | null = null;
+let heartbeatStaleTicks = 0;
 let mainStartupSucceeded = false;
 let headlessAgentClient: HeadlessAgentClient | null = null;
 let llmWorkspaceState: unknown = null;
@@ -1329,7 +1334,7 @@ function launcherHtml() {
     document.getElementById('refresh').addEventListener('click', load);
     load().catch((error) => {
       statusEl.textContent = '';
-      showFailure({ message: (error as { message?: string }).message || String(error) });
+      showFailure({ message: (error && error.message) || String(error) });
     });
   </script>
 </body>
@@ -1414,10 +1419,28 @@ function pollLauncherStartup() {
   if (!launchedMainProcess || launchedMainProcess.exitCode !== null || launchedMainProcess.signalCode) return;
   const status = readStartupStatus();
   if (status.success === true) {
+    // 需求 1414：运行期心跳停止（主线程卡死 / 渲染停跳）→ watchdog 销毁主服务进程并回到启动器。
+    const heartbeatAt = Number(status.heartbeatAt || 0);
+    if (heartbeatAt && Date.now() - heartbeatAt > HEARTBEAT_STALE_MS) {
+      heartbeatStaleTicks += 1;
+      if (heartbeatStaleTicks < HEARTBEAT_STALE_TICKS) return;
+      heartbeatStaleTicks = 0;
+      const failure = {
+        message: `主服务心跳已停止超过 ${Math.round(HEARTBEAT_STALE_MS / 1000)} 秒，已自动销毁主服务并回到启动器。`,
+        stage: status.stage || 'heartbeat-stopped'
+      };
+      // failure 落盘：进程被杀后 exit 回调读的是状态文件，不落盘会被「主服务已退出 code=…」覆盖。
+      writeStartupStatus({ success: false, failed: true, failure });
+      killLaunchedMainProcess();
+      showLauncherFailure(failure);
+      return;
+    }
+    heartbeatStaleTicks = 0;
     launcherLastFailure = null;
     if (launcherWindow && !launcherWindow.isDestroyed()) launcherWindow.hide();
     return;
   }
+  heartbeatStaleTicks = 0;
   if (status.failed === true) {
     killLaunchedMainProcess();
     showLauncherFailure(status.failure || { message: '启动失败，请切换渲染模式、删除异常文档数据后重试。' });
@@ -1428,12 +1451,14 @@ function pollLauncherStartup() {
   const progress = status.progress
     ? `${status.progress.step ?? 0} / ${status.progress.total ?? 0}`
     : '';
-  killLaunchedMainProcess();
-  showLauncherFailure({
+  const failure = {
     message: '启动超过 60 秒未完成，已自动回到启动器。',
     stage: status.stage || 'unknown',
     progress
-  });
+  };
+  writeStartupStatus({ failed: true, failure });
+  killLaunchedMainProcess();
+  showLauncherFailure(failure);
 }
 
 function startLauncherPoll() {
@@ -1457,6 +1482,7 @@ function startMainAppFromLauncher(payload: RowObject = {}) {
   });
   const statusPath = startupStatusPath();
   launcherLastFailure = null;
+  heartbeatStaleTicks = 0;
   writeStartupStatus({
     startedAt: Date.now(),
     heartbeatAt: Date.now(),
