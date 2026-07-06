@@ -64,6 +64,109 @@ function sortKey(node: MerkleNode): number {
   return Number(node.sort_order ?? node.sortOrder) || 0;
 }
 
+export interface IncrementalHashRow extends MerkleNode {
+  content_hash?: string | null;
+  subtree_hash?: string | null;
+}
+
+export interface IncrementalHashResult {
+  recomputed: Map<string, SubtreeHashEntry>;
+  fullRecomputeNeeded: boolean;
+}
+
+// 增量重算：只重算「hash 缺失的脏行 ∪ 其祖先链」，其余子树直接用存量。
+// 正确性依据一句话：脏节点的祖先全在重算集 ⇒ 凡不在重算集的节点，其整棵子树内无脏 ⇒
+// 它的存量 subtree_hash 仍有效、无需下钻。
+// 入参：rows = 全表结构行（id/parent_id/sort_order + 存量两 hash，不必带正文）；
+//       contentById = 脏行的 5 个内容字段（只有这部分需要拉正文）。
+// 出参 fullRecomputeNeeded=true 表示存量不完整（需要的存量 hash 缺失 / 出现游离行），
+// 增量前提破损，调用方应退回全量重算——宁可慢不可错。
+export function computeSubtreeHashesIncremental(
+  rows: IncrementalHashRow[] = [],
+  contentById: Map<string, MerkleNode> = new Map()
+): IncrementalHashResult {
+  const byId = new Map<string, IncrementalHashRow>();
+  const childrenByParent = new Map<string, IncrementalHashRow[]>();
+  for (const row of rows) {
+    byId.set(String(row.id), row);
+    const key = parentKey(row);
+    if (!childrenByParent.has(key)) childrenByParent.set(key, []);
+    childrenByParent.get(key)!.push(row);
+  }
+  for (const list of childrenByParent.values()) list.sort((a, b) => sortKey(a) - sortKey(b));
+
+  const recomputeSet = new Set<string>();
+  const dirtyIds: string[] = [];
+  for (const row of rows) {
+    if (row.content_hash && row.subtree_hash) continue;
+    dirtyIds.push(String(row.id));
+    let cursor: IncrementalHashRow | undefined = row;
+    while (cursor) {
+      const key = String(cursor.id);
+      if (recomputeSet.has(key)) break; // 祖先链上段已并入
+      recomputeSet.add(key);
+      const parentId: number | string | null | undefined = cursor.parent_id ?? cursor.parentId;
+      cursor = parentId === null || parentId === undefined ? undefined : byId.get(String(parentId));
+    }
+  }
+
+  const recomputed = new Map<string, SubtreeHashEntry>();
+  let fullRecomputeNeeded = false;
+  if (recomputeSet.size === 0) return { recomputed, fullRecomputeNeeded };
+
+  const ownHashOf = (row: IncrementalHashRow): string => {
+    if (row.content_hash) return row.content_hash; // 纯祖先（内容没变、只是子树变了）用存量
+    const content = contentById.get(String(row.id));
+    if (!content) {
+      fullRecomputeNeeded = true;
+      return '';
+    }
+    return contentHash(content);
+  };
+
+  // 显式栈后序（不递归，深链不爆栈）：只展开重算集内的节点，集外子直接取存量 subtree_hash。
+  interface Frame { row: IncrementalHashRow; index: number; childHashes: string[] }
+  for (const root of childrenByParent.get('__root__') || []) {
+    if (!recomputeSet.has(String(root.id))) continue;
+    const stack: Frame[] = [{ row: root, index: 0, childHashes: [] }];
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      const children = childrenByParent.get(String(frame.row.id)) || [];
+      if (frame.index < children.length) {
+        const child = children[frame.index]!;
+        frame.index += 1;
+        if (recomputeSet.has(String(child.id))) {
+          stack.push({ row: child, index: 0, childHashes: [] });
+        } else if (child.subtree_hash) {
+          frame.childHashes.push(child.subtree_hash);
+        } else {
+          fullRecomputeNeeded = true;
+          frame.childHashes.push('');
+        }
+        continue;
+      }
+      const own = ownHashOf(frame.row);
+      const entry: SubtreeHashEntry = { contentHash: own, subtreeHash: subtreeHashFrom(own, frame.childHashes) };
+      recomputed.set(String(frame.row.id), entry);
+      stack.pop();
+      const parent = stack[stack.length - 1];
+      if (parent) parent.childHashes.push(entry.subtreeHash);
+    }
+  }
+
+  // 覆盖性自检：脏行未被遍历到（游离行 / parent 悬挂）意味着增量结果不完整——交回全量兜底，
+  // 免得回写后该行 hash 仍空、每次 ensure 重复走增量却永不收敛。
+  if (!fullRecomputeNeeded) {
+    for (const id of dirtyIds) {
+      if (!recomputed.has(id)) {
+        fullRecomputeNeeded = true;
+        break;
+      }
+    }
+  }
+  return { recomputed, fullRecomputeNeeded };
+}
+
 // 对一棵（或一组根的）节点数组做后序遍历，返回 Map<id, {contentHash, subtreeHash}>。
 // 输入接受 base 行（snake_case）与投影行；只依赖 id / parent_id / sort_order + 5 个内容字段。
 export function computeSubtreeHashes(nodes: MerkleNode[] = []): Map<string, SubtreeHashEntry> {

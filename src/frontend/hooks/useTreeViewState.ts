@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 
 import {
   clampDepthLimit,
@@ -9,7 +9,7 @@ import {
   type DocLike
 } from '../lib/doc-utils.js';
 
-const EMPTY_SET = new Set<unknown>();
+const EMPTY_SET = new Set<string>();
 
 type IdSet = Set<unknown>;
 type SetOrUpdater<T> = T | ((previous: T) => T);
@@ -18,15 +18,17 @@ type SetOrUpdater<T> = T | ((previous: T) => T);
 // 调用 docDepthStats/fullDepthForDoc/promoteTreeViewDepthIfLayerExpanded 时直接兼容、无需 cast。
 type TreeViewDocument = DocLike;
 
-// 字段类型 union 兼容 useDocumentState 真返回（SessionView 用 Set<string>）—— Set 是 invariant，
-// 必须显式 union 才能让 Set<string> 也赋给本接口；内部 setter 取 Set 时单点 cast 成 IdSet（Set<unknown>）。
+// view 字段对齐 SessionView 真型 Set<string>（γ 阶段 5：不再 union Set<unknown>）；
+// 输出侧（collapsed/expanded/collapsedOutlineNodeIds）随之是 Set<string>，消费方免 cast。
+// setter 形参保持宽（IdSet=Set<unknown>）——输入宽、输出严是函数子类型的正确方向。
 interface TreeViewDocumentState {
   currentDoc?: TreeViewDocument | null;
   view?: {
     depthLimit?: number;
-    collapsed?: Set<string> | Set<unknown>;
-    expanded?: Set<string> | Set<unknown>;
-    outlineCollapsed?: Set<string> | Set<unknown>;
+    collapsed?: Set<string>;
+    expanded?: Set<string>;
+    outlineCollapsed?: Set<string>;
+    c2dExpanded?: Set<string>;
   } | null;
   setViewSnapshot?: (patch: Record<string, unknown>, options?: Record<string, unknown>) => void;
   patchDocMeta?: (patch: Record<string, unknown>) => void;
@@ -53,9 +55,9 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
   const collapsed = view?.collapsed ?? EMPTY_SET;
   const expanded = view?.expanded ?? EMPTY_SET;
   const collapsedOutlineNodeIds = view?.outlineCollapsed ?? EMPTY_SET;
+  const c2dExpanded = view?.c2dExpanded ?? EMPTY_SET;
   const axiomsCollapsed = Boolean(currentDoc?.doc?.axioms_collapsed);
 
-  const outlineCollapseDocRef = useRef<unknown>(null);
   const [c2dDepthControlSeq, setC2dDepthControlSeq] = useState(0);
   const [c2dDepthControlAction, setC2dDepthControlAction] = useState('setDepth');
 
@@ -92,6 +94,12 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
     const resolved = typeof next === 'function' ? next((view?.outlineCollapsed ?? EMPTY_SET) as IdSet) : next;
     documentState?.setViewSnapshot?.({ outlineCollapsedNodeIds: idArray(resolved) });
   }, [documentState, view]);
+
+  // C2D 展开列（address 键）受控写点：真相在 session view，不随后端持久化（组件 localStorage
+  // hotspot 播种）。C2DMapView 上抛整集，无函数式更新需求。
+  const setC2dExpanded = useCallback((next: Set<string>) => {
+    documentState?.setViewSnapshot?.({ c2dExpandedAddresses: [...next] });
+  }, [documentState]);
 
   const setAxiomsCollapsed = useCallback((value: unknown) => {
     const doc = documentState?.currentDoc?.doc;
@@ -163,12 +171,13 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
     collapsed,
     expanded,
     collapsedOutlineNodeIds,
+    c2dExpanded,
     setDepthLimit,
     setAxiomsCollapsed,
     setCollapsed,
     setExpanded,
     setCollapsedOutlineNodeIds,
-    outlineCollapseDocRef,
+    setC2dExpanded,
     actualMaxDepth,
     depthOptions,
     treeDepthStats,
@@ -183,8 +192,8 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
     setPersisted,
     setPersistedAfterExpansion
   }), [
-    depthLimit, axiomsCollapsed, collapsed, expanded, collapsedOutlineNodeIds,
-    setDepthLimit, setAxiomsCollapsed, setCollapsed, setExpanded, setCollapsedOutlineNodeIds,
+    depthLimit, axiomsCollapsed, collapsed, expanded, collapsedOutlineNodeIds, c2dExpanded,
+    setDepthLimit, setAxiomsCollapsed, setCollapsed, setExpanded, setCollapsedOutlineNodeIds, setC2dExpanded,
     actualMaxDepth, depthOptions, treeDepthStats,
     c2dDepthControlSeq, c2dDepthControlAction,
     setVisibleDepth, collapseVisibleDepthOne, syncC2dVisibleDepth,

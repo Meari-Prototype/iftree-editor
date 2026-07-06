@@ -152,10 +152,16 @@ export function nodeHistory(store: IftreeStore, docId: unknown, address: unknown
   return entries;
 }
 
-// 对象库 GC（独立运维动词，不在写热路径）：回收没被任何 commit 引用的 blob/tree/source 对象。
-// reset/revert 后不自动跑——留「可后悔」窗口；需要时手动触发。
+// 对象库 GC（独立运维动词，不在写热路径）：回收没被任何 commit（或活 undo token）引用的
+// blob/tree/source 对象。reset/revert 后不自动跑——留「可后悔」窗口；需要时手动触发。
 export function gcHistoryObjects(store: IftreeStore) {
-  return store.withTransaction(() => gcObjects(store.db!));
+  return store.withTransaction(() => {
+    const result = gcObjects(store.db!, store.editorSnapshots.liveRoots());
+    // 列缓存的前提是「hash 在列上 ⇒ 对象在库里」；sweep 之后无法廉价证明哪些缓存仍指向存活
+    // 对象，一律作废（gc 低频，下次写快照全量重建缓存），换悬挂引用绝迹。
+    store.db!.prepare('UPDATE nodes SET tree_object_hash = NULL WHERE tree_object_hash IS NOT NULL').run();
+    return result;
+  });
 }
 
 export function saveHistorySnapshot(store: IftreeStore, { docId, summary = '保存版本', owner = 'human' }: SaveHistorySnapshotPayload) {

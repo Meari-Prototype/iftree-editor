@@ -97,11 +97,18 @@ export function readSource(db: DbLike, hash: unknown) {
   return row ? row.data : '';
 }
 
+// gc 的额外可达根：不在 commits 表却仍被引用的对象根——目前是编辑器 undo token（进程内易失，
+// 引用对象库里的树/原文而不建 commit 行）。不纳入的话 gc 会把活 token 指向的对象 sweep 掉。
+export interface ExtraObjectRoots {
+  treeHashes?: Array<string | null | undefined>;
+  sourceHashes?: Array<string | null | undefined>;
+}
+
 // 从所有 commit 出发收集可达对象 hash（mark 阶段）。每个 commit 的 root_tree_hash 递归下钻
 // tree→blob 与子 tree、外加 source_hash。从「所有 commit」而非仅 head 祖先链出发：被 reset/revert
 // 跳过的 commit 仍在 commits 表、其对象仍可达 → 保住「可后悔」窗口（reflog 语义），只有 commit 行
 // 真被删（删文档/删 commit）后其独占对象才变孤儿可收。共享子树因 Set 去重只遍历一次。
-export function collectReachableHashes(db: DbLike) {
+export function collectReachableHashes(db: DbLike, extraRoots: ExtraObjectRoots = {}) {
   const reachable = new Set<string>();
   const treeStmt = db.prepare('SELECT data FROM objects WHERE hash = ? AND kind = ?');
   const visitTree = (treeHash: string) => {
@@ -118,13 +125,19 @@ export function collectReachableHashes(db: DbLike) {
     if (commit.root_tree_hash) visitTree(commit.root_tree_hash);
     if (commit.source_hash) reachable.add(commit.source_hash);
   }
+  for (const treeHash of extraRoots.treeHashes || []) {
+    if (treeHash) visitTree(treeHash);
+  }
+  for (const sourceHash of extraRoots.sourceHashes || []) {
+    if (sourceHash) reachable.add(sourceHash);
+  }
   return reachable;
 }
 
-// 对象库 GC（mark-sweep，lazy/手动）：删掉不被任何 commit 引用的 blob/tree/source。
-// 调用方负责放进事务。返回 { scanned, reachable, deleted }。
-export function gcObjects(db: DbLike) {
-  const reachable = collectReachableHashes(db);
+// 对象库 GC（mark-sweep，lazy/手动）：删掉不被任何 commit（或 extraRoots，如活 undo token）
+// 引用的 blob/tree/source。调用方负责放进事务。返回 { scanned, reachable, deleted }。
+export function gcObjects(db: DbLike, extraRoots: ExtraObjectRoots = {}) {
+  const reachable = collectReachableHashes(db, extraRoots);
   const del = db.prepare('DELETE FROM objects WHERE hash = ?');
   const all = db.prepare('SELECT hash FROM objects').all<Pick<ObjectRow, 'hash'>>();
   let deleted = 0;
@@ -151,8 +164,14 @@ function treeObjectHash(blobHash: string, nodeId: unknown, childTreeHashes: stri
 // 父必先有子：叶子 writeBlob → 父 writeTree(自己 blob + 各子 tree_hash) → 一路到根。
 // 同一节点（id+内容）跨 commit 天然跳过（指纹已在），编辑场景只写变化路径。
 export function writeTree(db: DbLike, nodes: NodeObjectRow[] = []) {
+  // 入口断言：node id 必须唯一。重复 id 写进对象库会在 materialize/restore/三方调和时被 Map
+  // 静默塌缩成丢节点（实测 revert 丢 63 节点的根因形态），宁可当场拒绝产出坏快照。
+  const seenIds = new Set<string>();
   const byParent = new Map<string, NodeObjectRow[]>();
   for (const node of nodes) {
+    const idKey = String(node.id ?? '');
+    if (seenIds.has(idKey)) throw new Error(`writeTree 拒绝写入：快照含重复节点 id ${idKey}`);
+    seenIds.add(idKey);
     const key = node.parent_id == null ? '__root__' : String(node.parent_id);
     if (!byParent.has(key)) byParent.set(key, []);
     byParent.get(key)!.push(node);
@@ -176,6 +195,81 @@ export function writeTree(db: DbLike, nodes: NodeObjectRow[] = []) {
   // 文档快照恰好一个根节点（assertRestorableSnapshotPayload 已保证）。
   const root = roots[0];
   return { root_node_id: String(root!.id), root_tree_hash: writeNode(root!) };
+}
+
+// 增量写树输入：结构行（不必带正文）+ tree_object_hash 列缓存。
+export interface IncrementalTreeRow extends MerkleNode {
+  tree_object_hash?: string | null;
+}
+
+export interface IncrementalTreeResult {
+  root_node_id: string;
+  root_tree_hash: string;
+  // 本次真正（重新）算了 hash 的节点 → tree hash，调用方回写 tree_object_hash 列。
+  recomputed: Map<string, string>;
+}
+
+// writeTree 的增量版：tree_object_hash 列缓存有效（非 NULL 且不在「缓存缺失行∪其祖先」集内）的
+// 子树整棵剪掉——不取正文、不算 hash、不写对象。正确性同 merkle 增量：缓存缺失行的祖先全在重算集，
+// 故集外节点的整棵子树缓存均有效。前提「列上有 hash ⇒ 对象在库里」由两条纪律维持：列只在写完对象
+// 后回写（本函数返回 recomputed 由调用方回写）；gc 之后全列作废（见 gcHistoryObjects）。
+// 只可用于「行直读自 nodes 表」的调用点——投影/快照行的缓存值对应 base 不对应投影后，禁止走这里。
+// getContent(id) 惰性取重算集节点的 5 个内容字段（重算集通常远小于全树，逐条点查比全表拉正文便宜）。
+export function writeTreeIncremental(
+  db: DbLike,
+  rows: IncrementalTreeRow[] = [],
+  getContent: (id: string) => MerkleNode | null | undefined
+): IncrementalTreeResult | null {
+  const seenIds = new Set<string>();
+  const byId = new Map<string, IncrementalTreeRow>();
+  const byParent = new Map<string, IncrementalTreeRow[]>();
+  for (const node of rows) {
+    const idKey = String(node.id ?? '');
+    if (seenIds.has(idKey)) throw new Error(`writeTreeIncremental 拒绝写入：快照含重复节点 id ${idKey}`);
+    seenIds.add(idKey);
+    byId.set(idKey, node);
+    const key = node.parent_id == null ? '__root__' : String(node.parent_id);
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key)!.push(node);
+  }
+  for (const list of byParent.values()) {
+    list.sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0));
+  }
+
+  // 重算集 = 缓存缺失行 ∪ 祖先闭包。
+  const staleSet = new Set<string>();
+  for (const node of rows) {
+    if (node.tree_object_hash) continue;
+    let cursor: IncrementalTreeRow | undefined = node;
+    while (cursor) {
+      const key = String(cursor.id);
+      if (staleSet.has(key)) break;
+      staleSet.add(key);
+      const parentId: number | string | null | undefined = cursor.parent_id ?? cursor.parentId;
+      cursor = parentId === null || parentId === undefined ? undefined : byId.get(String(parentId));
+    }
+  }
+
+  const insertTree = db.prepare('INSERT OR IGNORE INTO objects (hash, kind, data) VALUES (?, ?, ?)');
+  const recomputed = new Map<string, string>();
+  const writeNode = (node: IncrementalTreeRow): string => {
+    const idKey = String(node.id);
+    if (!staleSet.has(idKey) && node.tree_object_hash) return node.tree_object_hash; // 整棵剪枝
+    const content = getContent(idKey);
+    if (!content) throw new Error(`writeTreeIncremental 取不到节点 ${idKey} 的内容行`);
+    const blobHash = writeBlob(db, content);
+    const kids = byParent.get(idKey) || [];
+    const childEntries = kids.map((kid) => ({ id: String(kid.id), tree_hash: writeNode(kid) }));
+    const treeHash = treeObjectHash(blobHash, node.id, childEntries.map((c) => c.tree_hash));
+    insertTree.run(treeHash, 'tree', JSON.stringify({ blob_hash: blobHash, children: childEntries }));
+    recomputed.set(idKey, treeHash);
+    return treeHash;
+  };
+
+  const roots = byParent.get('__root__') || [];
+  if (roots.length === 0) return null;
+  const root = roots[0]!;
+  return { root_node_id: String(root.id), root_tree_hash: writeNode(root), recomputed };
 }
 
 // 从根 tree hash 展开对象库，还原 nodes 数组（带 id/parent/sort/address/depth + blob 内容）。
@@ -233,5 +327,16 @@ export function materializeTree(db: DbLike, rootTreeHash: unknown, rootNodeId: s
   };
 
   expand(String(rootTreeHash), null, 1, rootNodeId, '1', 1);
+  // 出口断言：treeObjectHash 混入 node id 之前写入的旧对象（内容相同的节点被 INSERT OR IGNORE
+  // 塌缩共享一份 tree）会在这里把同一 id 展开到多个位置。放行会让下游（restore 纯 INSERT、
+  // revert 三方调和的按 id Map）要么撞 UNIQUE 要么静默丢节点——当场报错，指明该 commit 不可恢复。
+  const seenIds = new Set<string>();
+  for (const node of nodes) {
+    const idKey = String(node.id ?? '');
+    if (seenIds.has(idKey)) {
+      throw new Error(`对象库快照含重复节点 id ${idKey}（tree ${rootTreeHash}）：历史对象为旧版塌缩产物，该 commit 不可恢复`);
+    }
+    seenIds.add(idKey);
+  }
   return nodes;
 }

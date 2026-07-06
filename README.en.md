@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.4%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.5%20alpha-orange)
 
-> **Project status: 0.6.4, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.6.5, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -77,7 +77,7 @@ In-depth documentation lives in `docs/` (currently in Chinese):
 - **Streaming writes**: append-only data streams (chat logs, event logs) go straight into an "incremental edit" document without a branch, with keyword and semantic indexes maintained incrementally; bulk import has a dedicated acceleration session.
 - **Event memory volumes**: an external agent can deliver a structured self-report log as a memory volume at the end of a session; volumes seal automatically on a 24-hour rhythm and become distillable; the `memory-distill` skill turns a volume into a diff proposal for long-term core memory, approved into place under the `human` tier.
 - **Shared backend**: one backend process per database — the app, MCP, and CLI share it over a named pipe and can stay online at the same time without conflict.
-- **Multi-format import & export**: import CHM, TXT, Markdown, PDF, DOCX; irregular sources go through smart import (an LLM produces JSON that is validated byte-for-byte before ingestion); Excel / CSV are explicitly relay formats for database export, not ordinary document import; export to Markdown and JSON.
+- **Multi-format import & export**: import CHM, TXT, Markdown, PDF, DOCX, EPUB; irregular sources go through smart import (an LLM produces JSON that is validated byte-for-byte before ingestion); Excel / CSV are explicitly relay formats for database export, not ordinary document import; export to JSON structure (Markdown export is being redesigned and is temporarily disabled).
 - **AI summary notes**: call an OpenAI- or Anthropic-compatible API to generate summary notes for a single node, a subtree, the current level, or the whole document.
 - **Rich node metadata**: node type, trust level, manual tags, axioms, ERRORs, references, and save history.
 
@@ -239,21 +239,25 @@ The app, MCP, and CLI share one backend process per database and can stay online
 ```text
 .
 ├── electron/
-│   ├── main.ts           # Main process: window, IPC, SQLite/LanceDB/file access, LLM dispatch
+│   ├── main.ts           # Main process: window, IPC, spawns the shared node backend and forwards reads/writes (no in-process database access)
 │   └── preload.ts        # Secure bridge exposing the window.iftree API to the renderer
 ├── index.html            # Renderer entry HTML
 ├── src/
 │   ├── renderer/
 │   │   └── main.tsx      # React mount entry
 │   ├── frontend/         # UI layer
-│   │   ├── App.tsx
+│   │   ├── App.tsx       # Assembly root: hook / command wiring and context composition
+│   │   ├── screens/      # Screen-level splits: editor / settings / left sidebar / workspace / dialog host
+│   │   ├── commands/     # Command layer: editor / document / agent / treeView / axiom business verbs
+│   │   ├── stores/       # Lightweight stores and the edit-lifecycle state machine
+│   │   ├── session/      # Document session: windowed loading & eviction, undo stack and snapshot tokens
 │   │   ├── components/   # Views and panels (tree view, relationship graph, rich text, settings, etc.)
 │   │   ├── hooks/        # React hooks: document state, layout, selection, settings, etc.
 │   │   ├── data/         # Repository / service wrappers calling window.iftree
 │   │   ├── features/     # Feature actions: entities, library, settings, etc.
 │   │   ├── lib/          # Frontend utilities
 │   │   └── styles.css
-│   ├── backend/          # Main-process business logic
+│   ├── backend/          # Backend business logic (runs in a separate node backend process)
 │   │   ├── store/        # Storage core / history / edit-branch subsystems (SQLite schema, document/node writes)
 │   │   ├── db/           # schema, ids, normalizers, snapshot history, content-addressed object store
 │   │   ├── memory/       # Memory volumes: multi-tenant isolation, anchor layout, read/write & maintenance

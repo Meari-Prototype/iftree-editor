@@ -27,6 +27,9 @@ export interface SessionView {
   collapsed: Set<string>;
   expanded: Set<string>;
   outlineCollapsed: Set<string>;
+  // C2D 思维导图的展开列集（address 键，组件语义即 address；不随后端持久化，恢复走组件的
+  // localStorage hotspot 机制）。收编进 view 的动机：驱逐的渲染依赖集必须看得见导图可见性。
+  c2dExpanded: Set<string>;
   selectedId: string | null;
   multiSelected: Set<string>;
 }
@@ -38,6 +41,9 @@ export interface Session {
   childPages: Map<string, ChildPageInfo>;
   focusId: string | null;
   loadSeq: number;
+  // 后端权威树深（doc.get 的 treeDepthStats.maxDepth；0=未知）。深度 clamp 的天花板用它而非
+  // 已加载最大深度——扩散加载初期/驱逐后已加载区变浅，不能把用户持久化的 depthLimit 夹低。
+  claimedMaxDepth: number;
   view: SessionView;
 }
 
@@ -68,6 +74,7 @@ export interface ViewSnapshot {
   collapsedNodeIds?: string[];
   expandedNodeIds?: string[];
   outlineCollapsedNodeIds?: string[];
+  c2dExpandedAddresses?: string[];
   multiSelectedNodeIds?: string[];
 }
 
@@ -96,15 +103,24 @@ export function createSession(docId: unknown): Session {
     childPages: new Map<string, ChildPageInfo>(),
     focusId: null,
     loadSeq: 0,
+    claimedMaxDepth: 0,
     view: {
       depthLimit: 1,
       collapsed: new Set<string>(),
       expanded: new Set<string>(),
       outlineCollapsed: new Set<string>(),
+      c2dExpanded: new Set<string>(),
       selectedId: null,
       multiSelected: new Set<string>()
     }
   };
+}
+
+// 设后端权威树深（loadComplete 从 doc.get 的 treeDepthStats 喂入）。
+export function setClaimedMaxDepth(state: Session, value: unknown): Session {
+  const next = Math.max(0, Math.floor(Number(value) || 0));
+  if (next === state.claimedMaxDepth) return state;
+  return bump({ ...state, claimedMaxDepth: next });
 }
 
 function bump(state: Session): Session {
@@ -112,13 +128,22 @@ function bump(state: Session): Session {
 }
 
 // 把一批节点行并入 index（byId / byAddress），不碰 childrenOf 排序——那留给 reorderChildren。
-function upsertNodes(index: TreeIndex, rows: unknown[]): TreeNode[] {
+// outlineCollapsed 传入时维护 Outline 默认折叠不变量：新并入（此前不在镜像）的「深度≥2 且声称
+// 有子」节点默认折叠，与 doc-utils.defaultCollapsedOutlineIds 同口径。必须在 ingest 时增量做——
+// 打开文档时一次性算默认集只覆盖首批投影，后台预取源源并入的深层节点若不折叠，Outline 渲染
+// 与驱逐保护集都会随预取膨胀到全量。原地 add（只增不换引用）：ingest 高频，clone Set 是 O(集合)；
+// 视图动词换引用的约定不变，这里是加载动词维护默认值的唯一豁免。
+function upsertNodes(index: TreeIndex, rows: unknown[], outlineCollapsed?: Set<string>): TreeNode[] {
   const nodes: TreeNode[] = [];
   for (const row of rows) {
     const node = toTreeNode(row as Record<string, unknown> | null);
     if (!node) continue;
     const prev = index.byId.get(node.id);
     if (prev?.address && prev.address !== node.address) index.byAddress.delete(prev.address);
+    if (!prev && outlineCollapsed && node.childCount > 0
+      && (node.address ? node.address.split('-').length : 1) >= 2) {
+      outlineCollapsed.add(node.id);
+    }
     index.byId.set(node.id, node);
     if (node.address) index.byAddress.set(node.address, node);
     nodes.push(node);
@@ -152,9 +177,13 @@ export function ingestRoot(state: Session, rootRow: unknown): Session {
 export function ingestChildren(state: Session, patch: IngestChildrenPatch = {}): Session {
   const parentId = normalizeId(patch.parentId);
   if (parentId == null) return state;
+  // 孤儿闸：parent 行必须已在镜像里（root 经 ingestRoot 先行，合法 ingest 的 parent 必然先到）。
+  // 驱逐与在途 fetch 交错时，祖先已被级联卸载的迟到结果直接丢弃——否则写进从根不可达的
+  // 孤儿行：计入窗口 W、planEvictions 又摸不到（byId 查不到 parent 即跳过），成为驱不掉的泄漏。
+  if (!state.index.byId.has(parentId)) return state;
   const rows = Array.isArray(patch.rows) ? patch.rows : [];
   const index = state.index;
-  upsertNodes(index, rows);
+  upsertNodes(index, rows, state.view.outlineCollapsed);
   const children = reorderChildren(index, parentId);
   index.size = index.byId.size;
 
@@ -308,6 +337,151 @@ export function isFullyLoaded(state: Session): boolean {
   return nextBackgroundFetch(state) === null;
 }
 
+// ─── 投影窗口 W 与驱逐（frontend-refactor.md §5 方案 II，阶段 4） ────────────────
+// 驱逐 = 逆 ingestChildren：卸载某 parent 的整个已加载子树（parent 行自身保留，childCount
+// 「声称」不动）→ 该 parent 回到「声称有子但未拉取」的取数边界态，再次访问经现有扩散加载
+// 重取，零新回源机制。node id 稳定，view 里指向被驱逐节点的 collapsed/expanded/selected
+// 记录原样保留，重载后自动重新生效——驱逐对视图态透明。
+// 只读驱逐（§5.5）：编辑模式不驱逐由调用方（useDocumentState.maybeEvict）把关，
+// 被驱逐节点必然干净、无需回写。
+
+// W 静态保守值起步（§7：先 ~20 万节点，后续按机器内存自适应）。
+export const DEFAULT_EVICT_WINDOW = 200_000;
+
+export function loadedNodeCount(state: Session): number {
+  return state.index.byId.size;
+}
+
+// 卸载某 parent 的已加载子树。未加载或无已加载子返回原引用（不 bump）。
+export function evictChildren(state: Session, parentId: unknown): Session {
+  const id = normalizeId(parentId);
+  if (id == null || !state.loadedParents.has(id)) return state;
+  const index = state.index;
+  const children = [...(index.childrenOf.get(id) || [])];
+  if (children.length === 0) return state;
+  for (const child of children) removeNode(index, child.id); // 级联清子树 + byAddress + childrenOf
+  index.childrenOf.delete(id);
+  index.size = index.byId.size;
+  state.loadedParents.delete(id);
+  state.childPages.delete(id);
+  // 级联删掉的后代里可能有已加载 parent，其 loadedParents/childPages 记录一并清理，
+  // 否则 fetchBoundaryOf 会把「幽灵已加载」当非边界、该子树永远取不回来。
+  for (const pid of [...state.loadedParents]) {
+    if (!index.byId.has(pid)) {
+      state.loadedParents.delete(pid);
+      state.childPages.delete(pid);
+    }
+  }
+  return bump(state);
+}
+
+// 「其子应被渲染」的节点集 = 三个同时挂载的视图（display 切换、不卸载）各自可见性的并集，
+// 与渲染层同源（§5.4：渲染依赖集 ⊆ 投影窗口）：
+//   主树视图：(depthLimit 内默认展开) ⊕ collapsed 盖掉浅层 ⊕ expanded 盖掉深层；
+//   Outline 面板：无 depthLimit，仅 outlineCollapsed（默认折叠深度≥2 有子节点，ingest 增量维护）；
+//   C2D 思维导图：root 列恒显 + c2dExpanded（address 键）各开一列。祖先收起的展开项也保护——
+//   9-2-7 语义要求父级再展开时内部状态自动还原，还原的前提是数据还在。
+function childrenVisibleSet(state: Session): Set<string> {
+  const out = new Set<string>();
+  const root = state.index.root;
+  if (!root) return out;
+  const view = state.view;
+  const stack: TreeNode[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    const depth = node.address ? node.address.split('-').length : 1;
+    const childrenVisible = !view.collapsed.has(node.id) && (depth < view.depthLimit || view.expanded.has(node.id));
+    if (!childrenVisible) continue;
+    out.add(node.id);
+    for (const child of state.index.childrenOf.get(node.id) || []) stack.push(child);
+  }
+  const outlineStack: TreeNode[] = [root];
+  while (outlineStack.length > 0) {
+    const node = outlineStack.pop()!;
+    if (view.outlineCollapsed.has(node.id)) continue;
+    out.add(node.id);
+    for (const child of state.index.childrenOf.get(node.id) || []) outlineStack.push(child);
+  }
+  out.add(root.id);
+  for (const address of view.c2dExpanded) {
+    const node = state.index.byAddress.get(address);
+    if (node) out.add(node.id);
+  }
+  return out;
+}
+
+function addressSegments(address: string | null | undefined): string[] {
+  return String(address || '1').split('-');
+}
+
+function commonPrefixLen(a: string[], b: string[]): number {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i += 1;
+  return i;
+}
+
+// 驱逐候选（只计划不执行）：loadedParents 中「子不可见、不在焦点/选中祖先链、有已加载子」的
+// parent，按离焦点最远（地址公共前缀短）优先、同距离深层优先（先卸叶子层）排序。
+// 不变量 1（§5.4）：可见子树 + 焦点/选中祖先链 = 渲染依赖集，永不出现在候选里。
+export function planEvictions(state: Session, options: { protectIds?: Iterable<unknown> } = {}): string[] {
+  const visible = childrenVisibleSet(state);
+  const protect = new Set<string>();
+  for (const raw of options.protectIds || []) {
+    const id = normalizeId(raw);
+    if (id) protect.add(id);
+  }
+  const protectChain = (startId: string | null) => {
+    let cursor: TreeNode | null | undefined = startId ? state.index.byId.get(startId) : null;
+    while (cursor) {
+      protect.add(cursor.id);
+      cursor = cursor.parentId ? state.index.byId.get(cursor.parentId) : null;
+    }
+  };
+  protectChain(state.focusId);
+  protectChain(state.view.selectedId);
+  for (const id of state.view.multiSelected) protectChain(id);
+
+  const focusNode = state.focusId ? state.index.byId.get(state.focusId) : null;
+  const focusSegments = addressSegments(focusNode?.address || state.index.root?.address);
+  const candidates: Array<{ id: string; distance: number; depth: number }> = [];
+  for (const parentId of state.loadedParents) {
+    if (visible.has(parentId) || protect.has(parentId)) continue;
+    const node = state.index.byId.get(parentId);
+    if (!node) continue;
+    if ((state.index.childrenOf.get(parentId)?.length || 0) === 0) continue;
+    const segments = addressSegments(node.address);
+    candidates.push({
+      id: parentId,
+      distance: commonPrefixLen(segments, focusSegments),
+      depth: segments.length
+    });
+  }
+  candidates.sort((a, b) => a.distance - b.distance || b.depth - a.depth);
+  return candidates.map((candidate) => candidate.id);
+}
+
+// 驱逐至窗口以内。≤ limit 直接返回原引用——文档不超窗口时驱逐路径完全不跑，
+// (II) 在小文档下逐字节等同全量物化 (I)（§5.7 不分档）。
+// maxEvictions 节流单轮工作量（低优先级空闲任务，不做长任务）。
+export function evictToWindow(
+  state: Session,
+  options: { limit?: number; protectIds?: Iterable<unknown>; maxEvictions?: number } = {}
+): Session {
+  const limit = Math.max(1, Math.floor(Number(options.limit) || DEFAULT_EVICT_WINDOW));
+  if (state.index.byId.size <= limit) return state;
+  const maxEvictions = Math.max(1, Math.floor(Number(options.maxEvictions) || 64));
+  const plan = planEvictions(state, { protectIds: options.protectIds });
+  let next = state;
+  let evicted = 0;
+  for (const parentId of plan) {
+    if (next.index.byId.size <= limit || evicted >= maxEvictions) break;
+    const after = evictChildren(next, parentId);
+    if (after !== next) evicted += 1; // 已被前序级联卸掉的候选是空操作，不计数
+    next = after;
+  }
+  return next;
+}
+
 // ─── 视图瞬态：折叠 / 展开 / 深度 / 选中 / 标签 ─────────────────────────────
 // 全部纯函数：输入 state + 参数，输出新 state（view 子对象换引用 + bump）。可见性模型沿用
 // (depthLimit, collapsed, expanded) 三元——depthLimit 内默认展开；collapsed 盖掉浅层默认展开；
@@ -329,6 +503,9 @@ function idSet(value: unknown): Set<string> {
   return out;
 }
 
+// address 键集合（C2D 展开列）：归一化口径与 id 相同（非空字符串），单独具名以示键型不同。
+const addressSet = idSet;
+
 function depthOfId(state: Session, id: string): number {
   const node = state.index.byId.get(id);
   return node?.address ? node.address.split('-').length : 1;
@@ -340,9 +517,11 @@ function hasChildrenById(state: Session, id: string): boolean {
   return node.childCount > 0 || (state.index.childrenOf.get(id)?.length || 0) > 0;
 }
 
-// 已加载区的最大深度（扩散加载下随预取增长；深度调节与 promote 的天花板都用它）。
+// 树深天花板（深度调节与 promote 的 clamp 都用它）：后端权威深度（claimedMaxDepth，loadComplete
+// 喂入）优先；未知时退回遍历已加载区。不能只看已加载——扩散加载初期/折叠子树被驱逐后已加载区
+// 变浅，若据此 clamp 会把用户持久化的 depthLimit 夹低并写回（降级不可逆）。
 export function maxDepthOf(state: Session): number {
-  let max = 1;
+  let max = Math.max(1, state.claimedMaxDepth);
   for (const node of state.index.byId.values()) {
     const depth = node.address ? node.address.split('-').length : 1;
     if (depth > max) max = depth;
@@ -487,6 +666,7 @@ export interface ViewSnapshotOut {
   collapsedNodeIds: string[];
   expandedNodeIds: string[];
   outlineCollapsedNodeIds: string[];
+  c2dExpandedAddresses: string[];
   multiSelectedNodeIds: string[];
 }
 
@@ -500,6 +680,7 @@ export function snapshotView(state: Session): ViewSnapshotOut {
     collapsedNodeIds: [...v.collapsed],
     expandedNodeIds: [...v.expanded],
     outlineCollapsedNodeIds: [...v.outlineCollapsed],
+    c2dExpandedAddresses: [...v.c2dExpanded],
     multiSelectedNodeIds: [...v.multiSelected]
   };
 }
@@ -529,6 +710,7 @@ export function applyViewSnapshot(state: Session, snapshot: ViewSnapshot = {}): 
   if (snapshot.collapsedNodeIds !== undefined) patch.collapsed = idSet(snapshot.collapsedNodeIds);
   if (snapshot.expandedNodeIds !== undefined) patch.expanded = idSet(snapshot.expandedNodeIds);
   if (snapshot.outlineCollapsedNodeIds !== undefined) patch.outlineCollapsed = idSet(snapshot.outlineCollapsedNodeIds);
+  if (snapshot.c2dExpandedAddresses !== undefined) patch.c2dExpanded = addressSet(snapshot.c2dExpandedAddresses);
   if (snapshot.multiSelectedNodeIds !== undefined) patch.multiSelected = idSet(snapshot.multiSelectedNodeIds);
   if (viewPatchUnchanged(state.view, patch)) return state;
   return commitView(state, patch);

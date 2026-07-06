@@ -2,6 +2,35 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.5 — 2026-07-06
+
+本版两条主线：一批后端性能手术（merkle 增量维护、undo 快照对象库化、读写分离、编辑分支拆表、投影缓存），把大文档下的几处 O(N) / O(K²) 热点收敛到增量成本；以及前端架构重构阶段 0–5（命令层 / store 状态机 / render 拆分 / 数据窗口化），`App.tsx` 从 2720 行瘦到 736 行的薄装配根。对外动词契约不变；schema 有新增表 / 列，旧库打开时自动完成一次性迁移（幂等、可中断续跑）。
+
+### 性能（后端手术批次）
+
+- **merkle 脏标记降到节点级**：原 doc 级布尔脏位改一个字就全表重算，改为节点级失效触发器（内容写清本行 hash、挂 / 移 / 删 / 调序清受影响父行 subtree hash）+ `computeSubtreeHashesIncremental`（重算集 = 脏行 ∪ 祖先闭包，集外子树直接用存量），hash 维护从 O(全树) 降到 O(改动 × 深度)。doc 级粗位保留为旧库安全网，升级前的陈旧态自动退全量重算，免迁移。
+- **undo token 换对象库存储**：原每次写前全表 SELECT（含正文）驻进程内 Map，80 个栈位对大文档是 GB 级内存。改为 token 只持 commit 行同形引用，快照本体进内容寻址对象库；`nodes` 新列 `tree_object_hash` 缓存对象树 hash，`writeTreeIncremental` 对缓存有效子树整棵剪枝（不取正文 / 不算 hash / 不写对象）。gc 把活 token 根并入可达集，sweep 后列缓存作废杜绝悬挂引用。易失语义不变（进程内、退出即失效）。行为变化：undo 恢复的节点 `created_at` / `updated_at` 重置为当下（与恢复历史 commit 一致）。
+- **`database.read` 绕全局串行队列**：原共享后端把读 / 写 / `agent.run` 全串一条队列，agent 分钟级占队期间 GUI 浏览与 MCP 检索全部冻结。读请求改走独立只读连接（`query_only=ON`，WAL 快照隔离）绕队直跑，绝不与写连接的事务中间态照面；单请求内多条 SELECT 经 `withReadSnapshot`（BEGIN DEFERRED）钉在同一提交点。写与 `db.shell` 保持入队硬串行不变。
+- **编辑分支草稿 entries 拆表**：原 entries 整包塞 `edit_branches.diff` 单列，每 stage 一步 parse + 重写整包，K 步编辑累计 O(K²) 写放大。新表 `edit_branch_entries` 一行一条，stage / undo / redo 降为 O(1) 单行操作，保存 / 丢弃走 `ON DELETE CASCADE` 连带清；所有 JSON 消费点（投影 / 三方合并 / diff 视图 / cherry-pick）与前端契约零改动。旧库存量 entries 在 init 时一次性搬进子表（幂等，半途中断重启续跑安全）。
+- **编辑模式投影缓存**：编辑分支下 `getDoc` 需全量拉 base + 重放 entries，而前端每次 undo / save / applyDiff 后的刷新都重来一次。加单槽投影缓存，key 带写代数戳（`data_version` + `total_changes`，跨连接与本连接的写都能感知），戳不变即复用上次投影，`getDoc` 从「每次操作 O(N)」降到「每次写后一次」。
+
+### 前端（架构重构阶段 0–5）
+
+- **命令层落位**：新增 `frontend/commands/` 五组命令（editor / document / agent / treeView / axiom），编辑生命周期、写管线、撤销栈、文档打开、agent 请求、树视图操作等业务逻辑自 `AppBody` 下沉；`useWritePipeline` / `useEditorOps` 两个 hook 退役。
+- **编辑生命周期状态机化**：新增 `frontend/stores/`（轻量 store + selector 级订阅，零新依赖），`editor-store` 以判别式联合（idle / entering / leaving / conflict）+ 转移纯函数管理编辑生命周期，非法转移返回原引用；双击进入编辑、连点合并、Ctrl+Z 连发三类竞态由转移守卫结构性消灭。
+- **render 拆分**：新增 `frontend/screens/`（SettingsScreen / EditorScreen / LeftSidebar / WorkspacePane / DialogHost），全部业务 JSX 与渲染计算迁出装配根，命令与状态经双 context 下发；`App.tsx` 2720 → 736 行。
+- **数据窗口化（投影窗口 W + 折叠子树驱逐）**：`document-session` 新增驱逐原语（`evictChildren` / `planEvictions` / `evictToWindow`），后台预取上限收到 W = 20 万节点，超窗后按「子不可见且不在焦点 / 选中祖先链、离焦点最远优先」驱逐折叠子树，重载复用现有扩散加载；小文档（≤W）驱逐路径不跑、行为不变。渲染依赖集取主树 / 大纲 / C2D 三视图可见性并集，驱逐对折叠 / 展开 / 选中记录透明。
+- **类型收紧起手（γ 路线示范）**：`OutlinePanel` props 从「全 optional + unknown 兜底」收紧为真投影递归类型，上游 `useNodeSelection` / `useTreeViewState` 同刀对齐，输出侧 cast 清零；余刀按此模式排队。
+- **review 修复批次**：四路 agent review 阶段 0–5 后的收尾——驱逐可见性并集补全、大纲默认折叠改 ingest 增量维护、C2D 展开态收编 session、在途 fetch 与驱逐交错的孤儿闸、conflict 合并后无锁窗口、`openDoc` 在过渡态一律拒绝、长 agent 请求完成时基统一、redo 栈对账等九刀，配 5 项行为锁定测试。
+
+### 修复
+
+- **堵重复 node id 源头**：旧版 tree 对象 hash 未混 node id 时，内容相同节点会塌缩共享对象，恢复历史版本时撞 UNIQUE 或静默丢节点。补三道 fail-fast 断言——`writeTree` 产出口（快照含重复 id 当场拒绝）、`materializeTree` 物化口（旧塌缩对象报「该 commit 不可恢复」）、restore / editor 快照令牌消费口统一拦截。
+
+### 测试
+
+- 顶层套件 309 pass / 1 skip、`test:verbs` 46 pass、`check:types`（strict）/ `lint` 全绿；新增驱逐、editor-store、快照令牌、entries 拆表、只读绕行、前端 store 等六个测试文件。
+
 ## 0.6.4 — 2026-06-29
 
 承接 0.6.3 的运行时 TypeScript 化：本版把 `backend` / `frontend` / `vector` / `agent` 仍带 `@ts-nocheck` 的模块全部补齐类型标注、摘除跳检标记，并把 `tsconfig.check.json` 的 `strict` 从暂关恢复为开启——全仓（`src` / `electron` / `scripts`，含 `checkJs`）在 strict 下 `check:types` 零错误。本轮主体为纯类型基建 / 代码质量收尾；对外另有一处行为变更——markdown 导出（查询动词 `doc.exportMarkdown` 与 CLI `db export`）临时停用、待重新设计（见下），其余对外功能与动词契约不变。

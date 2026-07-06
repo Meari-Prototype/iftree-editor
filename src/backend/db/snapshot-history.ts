@@ -138,5 +138,15 @@ export function assertRestorableSnapshotPayload(snapshot: SnapshotPayload | null
   if (snapshotNodes.length === 0 || rootCount !== 1) {
     throw new Error('Refusing to restore an incomplete document snapshot');
   }
+  // id 唯一性：重复 id 的快照写回会撞 nodes 主键或被按 id 索引的消费方静默塌缩（丢节点），
+  // 统一在消费口拒绝——restoreSnapshot 与 editor 快照令牌都过这里。
+  const seenIds = new Set<string>();
+  for (const node of snapshotNodes) {
+    const idKey = String(node?.id ?? '');
+    if (seenIds.has(idKey)) {
+      throw new Error(`Refusing to restore a snapshot with duplicate node id ${idKey}`);
+    }
+    seenIds.add(idKey);
+  }
   return snapshotNodes;
 }

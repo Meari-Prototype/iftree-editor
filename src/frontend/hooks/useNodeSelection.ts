@@ -9,18 +9,19 @@ interface SelectionDocument {
   tree?: TreeNodeLike | null;
 }
 
-// view 字段对齐 useDocumentState 真返回（SessionView）：multiSelected union 兼容 Set<string>。
+// view 字段对齐 useDocumentState 真返回（SessionView）：selectedId 是 string | null 真型
+//（γ 阶段 5：不再 union unknown），multiSelected union 兼容 Set<string>。
 interface DocumentSelectionState {
   currentDoc?: SelectionDocument | null;
   view?: {
-    selectedId?: string | null | unknown;
+    selectedId?: string | null;
     multiSelected?: Set<string> | Set<unknown>;
   } | null;
   selectNode?: (nodeId: unknown) => void;
   setMultiSelected?: (nodeIds: Set<unknown>) => void;
 }
 
-function selectedNodeForDoc(doc: SelectionDocument | null | undefined, selectedNodeId: unknown): TreeNodeLike | null {
+function selectedNodeForDoc(doc: SelectionDocument | null | undefined, selectedNodeId: string | null): TreeNodeLike | null {
   if (!doc?.tree) return null;
   return findNode(doc.tree, selectedNodeId) || doc.tree;
 }

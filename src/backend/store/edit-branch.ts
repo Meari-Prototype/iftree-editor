@@ -124,12 +124,72 @@ function createLazyEditBranchBaseSnapshot({ owner, baseDocId, shadowDocId, baseC
 function createEmptyEditBranchDiff({ owner, baseDocId, shadowDocId }: EmptyDiffInput) {
   return {
     kind: 'edit_branch_diff',
-    storage: 'lazy_diff',
+    storage: 'entries_table',
     owner,
     baseDocId,
     shadowDocId,
     entries: []
   };
+}
+
+// ─── entries 子表存取（storage: entries_table）──────────────────────────────
+// 存储真相在 edit_branch_entries（一行一条，schema 有账）；diff 列退役为元壳。
+// 行离开 SQL 的出口统一经 _withBranchEntries 把子表条目装回 diff JSON——内部所有
+// JSON.parse(branch.diff) 消费点、handler 返回、前端 undo 栈的契约全部原样工作。
+// 收益在写侧：stage=INSERT 一行、undo/redo=翻转单行 status，不再整包重写（原先
+// K 步编辑 O(K²) 写放大的根源）。
+
+type BranchEntrySqlRow = { id: number; seq: number; status: string; created_at: string | null; undone_at: string | null; entry: string };
+
+function branchEntrySqlRows(store: EditBranchStore, branchId: unknown): BranchEntrySqlRow[] {
+  return store.db!.prepare(`
+    SELECT id, seq, status, created_at, undone_at, entry
+    FROM edit_branch_entries WHERE branch_id = ? ORDER BY seq
+  `).all<BranchEntrySqlRow>(Number(branchId));
+}
+
+function entryRowToEntry(row: BranchEntrySqlRow): EditBranchEntry {
+  const payload = JSON.parse(row.entry || '{}') as EditBranchEntry;
+  const entry = { ...payload, status: row.status } as EditBranchEntry;
+  if (row.created_at) entry.createdAt = row.created_at;
+  if (row.undone_at) entry.undoneAt = row.undone_at;
+  return entry;
+}
+
+// status/createdAt/undoneAt 提为列（排序/翻转靠它们），负载 JSON 里不留冗余副本。
+function entryToRowFields(entry: EditBranchEntry) {
+  const { status, createdAt, undoneAt, ...payload } = entry as unknown as Record<string, unknown>;
+  return {
+    status: status === 'undone' ? 'undone' : 'active',
+    created_at: createdAt ? String(createdAt) : null,
+    undone_at: undoneAt ? String(undoneAt) : null,
+    payload: JSON.stringify(payload)
+  };
+}
+
+export function _withBranchEntries<T extends EditBranchRow>(store: EditBranchStore, row: T | null): T | null {
+  if (!row) return row;
+  let meta: Record<string, unknown> = {};
+  try { meta = (JSON.parse(row.diff || '{}') as Record<string, unknown>) || {}; } catch { meta = {}; }
+  let entryRows: BranchEntrySqlRow[] = [];
+  try {
+    entryRows = branchEntrySqlRows(store, row.id);
+  } catch {
+    return row; // 子表还不存在（readonly 打开未升级旧库）：按旧形态原样返回
+  }
+  const entries = entryRows.map(entryRowToEntry);
+  // 未迁移旧行兜底（readonly 连接打开旧库、写侧迁移还没跑）：diff 里还躺着 entries
+  // 且子表为空 → 原样返回，消费方按旧形态工作。
+  if (entries.length === 0 && Array.isArray(meta.entries) && meta.entries.length > 0) return row;
+  return {
+    ...row,
+    diff: JSON.stringify({ ...meta, storage: 'entries_table', updatedAt: row.updated_at, entries })
+  };
+}
+
+function _branchRowById(store: EditBranchStore, branchId: unknown): EditBranchRow {
+  const row = store.db!.prepare('SELECT * FROM edit_branches WHERE id = ?').get<EditBranchRow>(Number(branchId));
+  return _withBranchEntries(store, row as EditBranchRow) as EditBranchRow;
 }
 
 /** @param {EditBranchEntry} entry edit-branch diff entry（kind/patch/fields 形态随动作而异） */
@@ -182,23 +242,23 @@ export function activeEditBranchForBaseDoc(store: EditBranchStore, docId: unknow
     if (!store.hasEditBranchesTable()) return null;
     const identity = store.normalizeEditBranchOwner(owner);
     // 按身份前缀匹配：owner=identity 兼容旧的无 ts 值，owner LIKE 'identity#%' 命中带 ts 的新草稿；取最新一条。
-    return store.db!.prepare(`
+    return _withBranchEntries(store, store.db!.prepare(`
       SELECT * FROM edit_branches
       WHERE base_doc_id = ? AND status = 'active'
         AND (owner = ? OR owner LIKE ?)
       ORDER BY id DESC
       LIMIT 1
-    `).get<EditBranchRow>(normalizePositiveId(docId), identity, identity + '#%') || null;
+    `).get<EditBranchRow>(normalizePositiveId(docId), identity, identity + '#%') || null);
   }
 
 export function activeEditBranchForShadowDoc(store: EditBranchStore, docId: unknown) {
     if (!store.hasEditBranchesTable()) return null;
-    return store.db!.prepare(`
+    return _withBranchEntries(store, store.db!.prepare(`
       SELECT * FROM edit_branches
       WHERE shadow_doc_id = ? AND status = 'active'
       ORDER BY id DESC
       LIMIT 1
-    `).get<EditBranchRow>(normalizePositiveId(docId)) || null;
+    `).get<EditBranchRow>(normalizePositiveId(docId)) || null);
   }
 
 export function activeEditBranchForDoc(store: EditBranchStore, docId: unknown, owner: unknown = null) {
@@ -226,7 +286,7 @@ export function listActiveEditBranches(store: EditBranchStore, owner: unknown = 
       LEFT JOIN docs shadow ON shadow.id = eb.shadow_doc_id
       ${where}
       ORDER BY eb.updated_at DESC, eb.id DESC
-    `).all<EditBranchBranchRow>(...params);
+    `).all<EditBranchBranchRow>(...params).map((row) => _withBranchEntries(store, row) as EditBranchBranchRow);
   }
 
 export function docIdForMutationPayload(store: EditBranchStore, payload: EditBranchPayload = {}) {
@@ -314,38 +374,39 @@ export function _appendEditBranchEntry(store: EditBranchStore, branch: EditBranc
     if (!isSupportedEditBranchEntryKind(entry?.kind)) {
       throw new Error(`Unsupported edit branch entry kind: ${entry?.kind || ''}`);
     }
-    const diff = JSON.parse(branch.diff || '{}') as EditBranchDiff;
-    const entries = activeEntries(diff.entries);
-    const updatedAt = new Date().toISOString();
-    entries.push({ ...entry, status: 'active', createdAt: entry.createdAt || updatedAt });
-    const nextDiff = {
-      ...diff,
-      kind: 'edit_branch_diff',
-      storage: 'lazy_diff',
-      owner: branch.owner,
-      baseDocId: branch.base_doc_id,
-      shadowDocId: branch.shadow_doc_id,
-      updatedAt,
-      entries
-    };
+    // append 即销毁 redo 分支（与旧行为一致：原实现按 activeEntries 过滤后重建）。
+    store.db!.prepare("DELETE FROM edit_branch_entries WHERE branch_id = ? AND status = 'undone'").run(branch.id);
+    const fields = entryToRowFields({ ...entry, status: 'active', createdAt: entry.createdAt || new Date().toISOString() } as EditBranchEntry);
     store.db!.prepare(`
-      UPDATE edit_branches
-      SET diff = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(JSON.stringify(nextDiff), branch.id);
-    return store.db!.prepare('SELECT * FROM edit_branches WHERE id = ?').get<EditBranchRow>(branch.id) as EditBranchRow;
+      INSERT INTO edit_branch_entries (branch_id, seq, status, created_at, undone_at, entry)
+      VALUES (?, COALESCE((SELECT MAX(seq) FROM edit_branch_entries WHERE branch_id = ?), 0) + 1, ?, ?, ?, ?)
+    `).run(branch.id, branch.id, fields.status, fields.created_at, fields.undone_at, fields.payload);
+    store.db!.prepare('UPDATE edit_branches SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(branch.id);
+    return _branchRowById(store, branch.id);
   }
 
 export function editBranchHistoryState(store: EditBranchStore, branch: EditBranchRow) {
-    const diff = JSON.parse(branch?.diff || '{}') as EditBranchDiff;
-    const entries = Array.isArray(diff.entries) ? diff.entries : [];
-    const active = activeEntries(entries);
-    const undone = undoneEntries(entries);
+    const counts = store.db!.prepare(`
+      SELECT status, COUNT(*) AS n FROM edit_branch_entries WHERE branch_id = ? GROUP BY status
+    `).all<{ status: string; n: number }>(branch?.id);
+    let active = 0;
+    let undone = 0;
+    for (const row of counts) {
+      if (row.status === 'undone') undone += Number(row.n) || 0;
+      else active += Number(row.n) || 0;
+    }
+    if (active + undone === 0) {
+      // 未迁移旧行兜底：子表空但 diff 列还躺着 entries（readonly 打开旧库）→ 按旧 JSON 计。
+      const diff = JSON.parse(branch?.diff || '{}') as EditBranchDiff;
+      const entries = Array.isArray(diff.entries) ? diff.entries : [];
+      active = activeEntries(entries).length;
+      undone = undoneEntries(entries).length;
+    }
     return {
-      undoDepth: active.length,
-      redoDepth: undone.length,
-      hasUndo: active.length > 0,
-      hasRedo: undone.length > 0
+      undoDepth: active,
+      redoDepth: undone,
+      hasUndo: active > 0,
+      hasRedo: undone > 0
     };
   }
 
@@ -846,61 +907,69 @@ export function applyThreeWayMerge(store: EditBranchStore, { branchId = null, sh
   }
 
 export function _replaceEditBranchDiff(store: EditBranchStore, branch: EditBranchRow, diff: EditBranchDiff): EditBranchRow {
-    const updatedAt = new Date().toISOString();
-    const nextDiff = {
-      ...diff,
+    // 整替（冲突解决折叠 / 显式重排用，低频 O(K)）：清子表重灌，diff 列只写元壳。
+    const { entries: rawEntries, ...metaRest } = (diff || {}) as EditBranchDiff & Record<string, unknown>;
+    const entries = Array.isArray(rawEntries) ? rawEntries : [];
+    const metaShell = {
+      ...metaRest,
       kind: 'edit_branch_diff',
-      storage: 'lazy_diff',
+      storage: 'entries_table',
       owner: branch.owner,
       baseDocId: branch.base_doc_id,
       shadowDocId: branch.shadow_doc_id,
-      updatedAt
+      updatedAt: new Date().toISOString()
     };
+    store.db!.prepare('DELETE FROM edit_branch_entries WHERE branch_id = ?').run(branch.id);
+    const insert = store.db!.prepare(`
+      INSERT INTO edit_branch_entries (branch_id, seq, status, created_at, undone_at, entry)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    entries.forEach((entry, index) => {
+      const fields = entryToRowFields(entry as EditBranchEntry);
+      insert.run(branch.id, index + 1, fields.status, fields.created_at, fields.undone_at, fields.payload);
+    });
     store.db!.prepare(`
       UPDATE edit_branches
       SET diff = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `).run(JSON.stringify(nextDiff), branch.id);
-    return store.db!.prepare('SELECT * FROM edit_branches WHERE id = ?').get<EditBranchRow>(branch.id) as EditBranchRow;
+    `).run(JSON.stringify(metaShell), branch.id);
+    return _branchRowById(store, branch.id);
   }
 
 export function undoEditBranchEntry(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: EditBranchPayload = {}) {
     const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) throw new Error('Edit branch not found');
-    const diff = JSON.parse(branch.diff || '{}') as EditBranchDiff;
-    const entries = Array.isArray(diff.entries) ? [...diff.entries] : [];
-    const index = entries.findLastIndex((entry) => activeEntries([entry]).length === 1);
-    if (index < 0) {
+    // 最后一条 active → undone，单行翻转 O(1)（原实现整包重写 O(K)）。
+    const target = store.db!.prepare(`
+      SELECT id FROM edit_branch_entries
+      WHERE branch_id = ? AND status = 'active'
+      ORDER BY seq DESC LIMIT 1
+    `).get<{ id: number }>(branch.id);
+    if (!target) {
       return { changed: false, branch, ...editBranchHistoryState(store, branch) };
     }
-    const updatedAt = new Date().toISOString();
-    entries[index] = { ...entries[index], status: 'undone', undoneAt: updatedAt };
-    const freshBranch = _replaceEditBranchDiff(store, branch, { ...diff, entries });
+    store.db!.prepare("UPDATE edit_branch_entries SET status = 'undone', undone_at = ? WHERE id = ?")
+      .run(new Date().toISOString(), target.id);
+    store.db!.prepare('UPDATE edit_branches SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(branch.id);
+    const freshBranch = _branchRowById(store, branch.id);
     return { changed: true, branch: freshBranch, ...editBranchHistoryState(store, freshBranch) };
   }
 
 export function redoEditBranchEntry(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: EditBranchPayload = {}) {
     const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) throw new Error('Edit branch not found');
-    const diff = JSON.parse(branch.diff || '{}') as EditBranchDiff;
-    const entries = Array.isArray(diff.entries) ? [...diff.entries] : [];
-    let index = -1;
-    let latest = '';
-    for (let i = 0; i < entries.length; i += 1) {
-      if (activeEntries([entries[i]]).length > 0) continue;
-      const marker = String(entries[i].undoneAt || entries[i].createdAt || i);
-      if (index < 0 || marker >= latest) {
-        index = i;
-        latest = marker;
-      }
-    }
-    if (index < 0) {
+    // 复活「最近被 undo」的条目（undoneAt 最新、同刻取 seq 最大），与原 marker 扫描语义一致。
+    const target = store.db!.prepare(`
+      SELECT id FROM edit_branch_entries
+      WHERE branch_id = ? AND status = 'undone'
+      ORDER BY COALESCE(undone_at, created_at, '') DESC, seq DESC LIMIT 1
+    `).get<{ id: number }>(branch.id);
+    if (!target) {
       return { changed: false, branch, ...editBranchHistoryState(store, branch) };
     }
-    const restored: EditBranchEntry = { ...(entries[index] as EditBranchEntry), status: 'active' };
-    delete restored.undoneAt;
-    entries[index] = restored;
-    const freshBranch = _replaceEditBranchDiff(store, branch, { ...diff, entries });
+    store.db!.prepare("UPDATE edit_branch_entries SET status = 'active', undone_at = NULL WHERE id = ?").run(target.id);
+    store.db!.prepare('UPDATE edit_branches SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(branch.id);
+    const freshBranch = _branchRowById(store, branch.id);
     return { changed: true, branch: freshBranch, ...editBranchHistoryState(store, freshBranch) };
   }
 
@@ -1690,7 +1759,7 @@ export function beginEditBranch(store: EditBranchStore, docId: unknown, owner: u
       });
       try {
         const result = insertBranch.run(normalizedDocId, normalizedDocId, fullOwner, JSON.stringify(baseSnapshot), JSON.stringify(diff));
-        return store.db!.prepare('SELECT * FROM edit_branches WHERE id = ?').get<EditBranchRow>(Number(result.lastInsertRowid)) as EditBranchRow;
+        return _branchRowById(store, Number(result.lastInsertRowid));
       } catch (error) {
         const isUniqueClash = (error as { code?: string } | null | undefined)?.code === 'SQLITE_CONSTRAINT_UNIQUE'
           || /UNIQUE constraint failed/i.test(String((error as { message?: string } | null | undefined)?.message || ''));
@@ -1708,7 +1777,7 @@ export function findEditBranch(store: EditBranchStore, { branchId = null, shadow
     if (branchId) {
       // branchId 是主键、全局唯一，唯一锁定一条草稿；owner 是写入身份/消歧维度、不是定位键。
       // 给了唯一句柄就不再按 owner 过滤——否则不传/传错 owner 会找不到本已锁定的草稿（见 A5-5、15-5-2）。
-      return store.db!.prepare("SELECT * FROM edit_branches WHERE id = ? AND status = 'active'").get<EditBranchRow>(Number(branchId)) || null;
+      return _withBranchEntries(store, store.db!.prepare("SELECT * FROM edit_branches WHERE id = ? AND status = 'active'").get<EditBranchRow>(Number(branchId)) || null);
     }
     if (shadowDocId) return acceptOwner(activeEditBranchForShadowDoc(store, shadowDocId));
     if (baseDocId) return activeEditBranchForBaseDoc(store, baseDocId, normalizedOwner || 'human');
@@ -1736,7 +1805,7 @@ export function rebaseEditBranch(store: EditBranchStore, { branchId = null, shad
       SET base_snapshot = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(JSON.stringify(baseSnapshot), branch.id);
-    const freshBranch = store.db!.prepare('SELECT * FROM edit_branches WHERE id = ?').get<EditBranchRow>(branch.id) as EditBranchRow;
+    const freshBranch = _branchRowById(store, branch.id);
     return {
       changed: true,
       branch: freshBranch,

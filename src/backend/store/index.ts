@@ -7,7 +7,7 @@ import { mergeNodeNotes } from '../../core/node-notes.js';
 import { normalizeNodeType } from '../../core/node-model.js';
 import { buildTree, splitSentences } from '../../core/tree.js';
 import { bodyCharCount } from '../../core/char-count.js';
-import { computeSubtreeHashes, type MerkleNode } from '../../core/merkle.js';
+import { computeSubtreeHashes, computeSubtreeHashesIncremental, type MerkleNode } from '../../core/merkle.js';
 import { compareNodeAddress, editModeMismatchMessage, parseJsonObject, assertNoHumanTagField } from '../shared.js';
 import { memoryVolumeMetaOf } from '../memory/index.js';
 import {
@@ -18,6 +18,7 @@ import {
   type CommitRow,
   type DocFolderRow,
   type DocRow,
+  type EditBranchRow,
   type NodeRow,
   type RefRow,
   type SourceDocBlockRow,
@@ -56,6 +57,7 @@ import {
   materializeTree,
   readSource,
   writeSource,
+  writeTreeIncremental,
   // 别名避开 stream-push 路径里那个同名的局部 writeTree（按地址插树，语义不同）。
   writeTree as writeCommitTree
 } from '../db/object-store.js';
@@ -181,6 +183,8 @@ type NodeHashRow = Pick<
   | 'content_hash'
   | 'subtree_hash'
 > & MerkleNode;
+type NodeHashStructureRow = Pick<NodeRow, 'id' | 'parent_id' | 'sort_order' | 'content_hash' | 'subtree_hash'> & MerkleNode;
+type NodeHashContentRow = Pick<NodeRow, 'id' | 'text' | 'node_title' | 'node_note' | 'node_type' | 'trust_level'> & MerkleNode;
 type NodeAddressRow = Pick<NodeRow, 'id' | 'parent_id' | 'sort_order'>;
 type StreamNodeInput = RowObject & { children?: StreamNodeInput[] };
 // 从子模块函数签名去掉第一个 store 参数，剩下的就是门面壳要透传的参数。
@@ -212,6 +216,15 @@ export class IftreeStore {
   maintenance: ReturnType<typeof createMaintenanceScheduler>;
   _streamPushCache: Map<string, { at: number; result: RowObject }> | null;
   _bulkTouchedDocIds: Set<string> | null;
+  // 编辑分支投影缓存（单槽，getDoc #3b）：写代数戳不变时复用上次投影，键与失效见 getDoc 注释。
+  _branchProjectionCache: {
+    docId: string;
+    branchId: number;
+    stamp: string;
+    nodes: NodeWithChildCountRow[];
+    axioms: AxiomRow[];
+    refs: RefRow[];
+  } | null;
 
   // 内部访问 db 一律走 conn：构造前 / close 后命中即立即抛，比满地 this.db!.x 真消除 NPE 隐患。
   // 守卫已在意者（如 _runStoreMaintenance line 241 / close 等）继续用 this.db 直接判 null。
@@ -228,6 +241,7 @@ export class IftreeStore {
     this.editorSnapshots = new EditorSnapshotTokens(this);
     this._streamPushCache = null;
     this._bulkTouchedDocIds = null;
+    this._branchProjectionCache = null;
     // 后台维护调度器（主库位置，4-6）：只派发信号。主库在此注册自己的维护 handler（只碰 SQLite，绝不
     // 内联向量/lance 逻辑）；向量模块的 handler 由 host 接线时注册（自给自足）。host 启动时 start()。
     this.maintenance = createMaintenanceScheduler();
@@ -281,9 +295,55 @@ export class IftreeStore {
     }
     // WAL 标准搭配：NORMAL 在断电时最多丢最近 checkpoint 后的提交，不损坏库。
     this.conn.pragma('synchronous = NORMAL');
+    // 旧库补列须在 exec(TABLES_SQL) 之前：hash 失效触发器（DROP+CREATE）引用 tree_object_hash，
+    // 缺列时建触发器会失败；全新库表还不存在，ensureColumn 内部 catch 吞掉后由建表语句带上该列。
+    // 加列即全 NULL = 首次全量写树，之后增量（对象树 hash 缓存，快照/undo token 剪枝依据）。
+    this.ensureColumn('nodes', 'tree_object_hash', 'TEXT');
     this.conn.exec(TABLES_SQL);
+    this._migrateEditBranchEntriesToTable();
     this.applySchemaVersion();
     this.ensureVirtualDocs();
+  }
+
+  // 一次性搬迁：把还整包躺在 edit_branches.diff 里的 entries 搬进子表（storage: entries_table），
+  // diff 列改写为元壳。分支表行数 = 活跃草稿数（个位数量级），全表扫零成本；幂等——已有子表行的
+  // 分支跳过（半途中断重启续跑安全）。
+  _migrateEditBranchEntriesToTable() {
+    if (!this.hasTable('edit_branches') || !this.hasTable('edit_branch_entries')) return;
+    const rows = this.conn.prepare(`
+      SELECT id, diff FROM edit_branches
+      WHERE diff LIKE '%"entries":%' AND diff NOT LIKE '%"entries":[]%'
+    `).all<Pick<EditBranchRow, 'id' | 'diff'>>();
+    if (rows.length === 0) return;
+    const hasEntries = this.conn.prepare('SELECT 1 FROM edit_branch_entries WHERE branch_id = ? LIMIT 1');
+    const insert = this.conn.prepare(`
+      INSERT INTO edit_branch_entries (branch_id, seq, status, created_at, undone_at, entry)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const rewriteDiff = this.conn.prepare('UPDATE edit_branches SET diff = ? WHERE id = ?');
+    this.withTransaction(() => {
+      for (const row of rows) {
+        if (hasEntries.get(row.id)) continue;
+        let diff: Record<string, unknown>;
+        try { diff = (JSON.parse(row.diff || '{}') as Record<string, unknown>) || {}; } catch { continue; }
+        const entries = Array.isArray(diff.entries) ? diff.entries : [];
+        if (entries.length === 0) continue;
+        entries.forEach((rawEntry, index) => {
+          const entry = (rawEntry || {}) as Record<string, unknown>;
+          const { status, createdAt, undoneAt, ...payload } = entry;
+          insert.run(
+            row.id,
+            index + 1,
+            status === 'undone' ? 'undone' : 'active',
+            createdAt ? String(createdAt) : null,
+            undoneAt ? String(undoneAt) : null,
+            JSON.stringify(payload)
+          );
+        });
+        const { entries: _dropped, ...metaRest } = diff;
+        rewriteDiff.run(JSON.stringify({ ...metaRest, storage: 'entries_table' }), row.id);
+      }
+    });
   }
 
   // schema 版本闸：建表后只读 user_version 决定要不要迁移，跑过（版本已到位）启动期零全表扫。
@@ -322,16 +382,47 @@ export class IftreeStore {
   // doc 未脏 → 直接读列；脏（编辑过 / 新导入 / 旧库迁移）→ 整树重算并回写、清脏标记（即「必要时整树重算」）。
   // 返回 Map<id,{contentHash,subtreeHash}> 供 diff 当 base 侧用，免去每个 session 重算整个 base。
   ensureNodeHashes(docId: unknown) {
+    // 结构行不拉正文：脏行（hash 为 NULL，节点级失效触发器置的）才补拉 5 个内容字段。
+    const structureRows = this.conn.prepare(
+      'SELECT id, parent_id, sort_order, content_hash, subtree_hash FROM nodes WHERE doc_id = ?'
+    ).all<NodeHashStructureRow>(docId);
+    if (structureRows.length === 0) return new Map();
+    const dirtyCount = structureRows.reduce((n, row) => (row.content_hash && row.subtree_hash ? n : n + 1), 0);
+    const doc = this.conn.prepare('SELECT nodes_hash_dirty FROM docs WHERE id = ?').get<Pick<DocRow, 'nodes_hash_dirty'>>(docId);
+    const docDirty = !doc || Number(doc.nodes_hash_dirty) !== 0;
+    if (dirtyCount === 0) {
+      // 位=1 但无 NULL 行 = 旧触发器时代的陈旧态（升级前最后一次写只置了粗位）：退全量，
+      // 重算清位后即归新常态。位=0 且无 NULL 行 = clean，直接读列。
+      if (docDirty) return this._recomputeAllNodeHashes(docId);
+      return new Map(structureRows.map((row) => [String(row.id), { contentHash: row.content_hash, subtreeHash: row.subtree_hash }]));
+    }
+    // 脏行过半：重算集≈全树，增量没有优势，少一趟双查直接全量。
+    if (dirtyCount * 2 >= structureRows.length) return this._recomputeAllNodeHashes(docId);
+    const contentRows = this.conn.prepare(
+      'SELECT id, text, node_title, node_note, node_type, trust_level FROM nodes WHERE doc_id = ? AND (content_hash IS NULL OR subtree_hash IS NULL)'
+    ).all<NodeHashContentRow>(docId);
+    const contentById = new Map<string, MerkleNode>(contentRows.map((row) => [String(row.id), row]));
+    const { recomputed, fullRecomputeNeeded } = computeSubtreeHashesIncremental(structureRows, contentById);
+    if (fullRecomputeNeeded) return this._recomputeAllNodeHashes(docId);
+    if (!this.readonly) {
+      const update = this.conn.prepare('UPDATE nodes SET content_hash = ?, subtree_hash = ? WHERE id = ?');
+      this.withTransaction(() => {
+        for (const [id, hash] of recomputed) update.run(hash.contentHash, hash.subtreeHash, id);
+        this.conn.prepare('UPDATE docs SET nodes_hash_dirty = 0 WHERE id = ?').run(docId);
+      });
+    }
+    // 返回全表：存量行打底、重算结果覆盖。
+    const out = new Map(structureRows.map((row) => [String(row.id), { contentHash: row.content_hash, subtreeHash: row.subtree_hash }]));
+    for (const [id, hash] of recomputed) out.set(id, hash);
+    return out;
+  }
+
+  // 全量重算兜底（原实现主体）：新导入 / 旧库陈旧 / 脏行过半 / 增量前提破损时走这里。
+  _recomputeAllNodeHashes(docId: unknown) {
     const rows = this.conn.prepare(
       'SELECT id, parent_id, sort_order, text, node_title, node_note, node_type, trust_level, content_hash, subtree_hash FROM nodes WHERE doc_id = ?'
     ).all<NodeHashRow>(docId);
     if (rows.length === 0) return new Map();
-    const doc = this.conn.prepare('SELECT nodes_hash_dirty FROM docs WHERE id = ?').get<Pick<DocRow, 'nodes_hash_dirty'>>(docId);
-    const clean = doc && Number(doc.nodes_hash_dirty) === 0
-      && rows.every((row) => row.content_hash && row.subtree_hash);
-    if (clean) {
-      return new Map(rows.map((row) => [String(row.id), { contentHash: row.content_hash, subtreeHash: row.subtree_hash }]));
-    }
     const hashes = computeSubtreeHashes(rows);
     if (!this.readonly) {
       const update = this.conn.prepare('UPDATE nodes SET content_hash = ?, subtree_hash = ? WHERE id = ?');
@@ -1267,51 +1358,76 @@ export class IftreeStore {
     // depth slicing kicks back in after projection.
     // 主文档视图只投影人类自己的编辑分支（owner=human）；外部/内置 agent 的分支
     // （owner=llm:<会话>）是 A5-5 待审/并行分支，经 diff 视图单独看，不混入主视图（沿用 15-4 待审语义）。
-    const activeBranch = this.activeEditBranchForBaseDoc(docId, 'human') as { diff?: string | null } | null;
+    const activeBranch = this.activeEditBranchForBaseDoc(docId, 'human') as { id: number; diff?: string | null } | null;
+    let branchEntries: unknown[] = [];
+    if (activeBranch) {
+      try {
+        const diff = JSON.parse(activeBranch.diff || '{}');
+        branchEntries = Array.isArray(diff.entries) ? diff.entries : [];
+      } catch { branchEntries = []; }
+    }
+    const useProjection = Boolean(activeBranch) && branchEntries.length > 0;
     const sliceDepthForQuery = activeBranch ? null : treeDepthLimit;
 
-    let nodes = sliceDepthForQuery
-      ? this.conn.prepare(`
-        WITH visible_nodes AS (
-          SELECT *
+    // 投影缓存（#3b）：编辑模式下 getDoc 必须全量拉 base + 重放 entries（O(N+K)），而前端每次
+    // undo/save/applyDiff 后的刷新都会再来一次。写代数戳 = data_version（其它连接的提交，只读
+    // 连接经 #2 绕行读时靠它感知写连接）+ total_changes（本连接的写）；戳没变 ⇒ base 与 entries
+    // 都没动 ⇒ 直接复用上次投影，跳过全量 SELECT 与 replay。命中条件即「两次读之间零写」——
+    // 别的 doc 的写也会失效本缓存（保守但绝不给错值）；每次写后恰好 miss 一次，符合预期。
+    let nodes: NodeWithChildCountRow[];
+    let axioms: AxiomRow[];
+    let refs: RefRow[];
+    const changeStamp = useProjection ? this._dataChangeStamp() : '';
+    const projectionCache = this._branchProjectionCache;
+    if (
+      useProjection && projectionCache
+      && projectionCache.docId === String(docId)
+      && projectionCache.branchId === activeBranch!.id
+      && projectionCache.stamp === changeStamp
+    ) {
+      nodes = projectionCache.nodes;
+      axioms = projectionCache.axioms;
+      refs = projectionCache.refs;
+    } else {
+      nodes = sliceDepthForQuery
+        ? this.conn.prepare(`
+          WITH visible_nodes AS (
+            SELECT *
+            FROM nodes
+            WHERE doc_id = ? AND depth <= ?
+          ),
+          child_counts(parent_id, child_count) AS (
+            SELECT child.parent_id, COUNT(*)
+            FROM nodes child
+            JOIN visible_nodes ON child.parent_id = visible_nodes.id
+            WHERE child.doc_id = ?
+            GROUP BY child.parent_id
+          )
+          SELECT visible_nodes.*,
+            visible_nodes.depth AS tree_depth,
+            COALESCE(child_counts.child_count, 0) AS child_count
+          FROM visible_nodes
+          LEFT JOIN child_counts ON child_counts.parent_id = visible_nodes.id
+          ORDER BY visible_nodes.parent_id IS NOT NULL, visible_nodes.parent_id, visible_nodes.sort_order, visible_nodes.id
+        `).all<NodeWithChildCountRow>(docId, sliceDepthForQuery, docId)
+        : this.conn.prepare(`
+          WITH child_counts(parent_id, child_count) AS (
+            SELECT parent_id, COUNT(*)
+            FROM nodes
+            WHERE doc_id = ? AND parent_id IS NOT NULL
+            GROUP BY parent_id
+          )
+          SELECT nodes.*,
+            COALESCE(child_counts.child_count, 0) AS child_count
           FROM nodes
-          WHERE doc_id = ? AND depth <= ?
-        ),
-        child_counts(parent_id, child_count) AS (
-          SELECT child.parent_id, COUNT(*)
-          FROM nodes child
-          JOIN visible_nodes ON child.parent_id = visible_nodes.id
-          WHERE child.doc_id = ?
-          GROUP BY child.parent_id
-        )
-        SELECT visible_nodes.*,
-          visible_nodes.depth AS tree_depth,
-          COALESCE(child_counts.child_count, 0) AS child_count
-        FROM visible_nodes
-        LEFT JOIN child_counts ON child_counts.parent_id = visible_nodes.id
-        ORDER BY visible_nodes.parent_id IS NOT NULL, visible_nodes.parent_id, visible_nodes.sort_order, visible_nodes.id
-      `).all<NodeWithChildCountRow>(docId, sliceDepthForQuery, docId)
-      : this.conn.prepare(`
-        WITH child_counts(parent_id, child_count) AS (
-          SELECT parent_id, COUNT(*)
-          FROM nodes
-          WHERE doc_id = ? AND parent_id IS NOT NULL
-          GROUP BY parent_id
-        )
-        SELECT nodes.*,
-          COALESCE(child_counts.child_count, 0) AS child_count
-        FROM nodes
-        LEFT JOIN child_counts ON child_counts.parent_id = nodes.id
-        WHERE nodes.doc_id = ?
-        ORDER BY nodes.parent_id IS NOT NULL, nodes.parent_id, nodes.sort_order, nodes.id
-      `).all<NodeWithChildCountRow>(docId, docId);
-    let axioms = this.listAxioms(docId) as unknown as AxiomRow[];
-    let refs = this._fetchBaseRefsForDoc(docId) as RefRow[];
+          LEFT JOIN child_counts ON child_counts.parent_id = nodes.id
+          WHERE nodes.doc_id = ?
+          ORDER BY nodes.parent_id IS NOT NULL, nodes.parent_id, nodes.sort_order, nodes.id
+        `).all<NodeWithChildCountRow>(docId, docId);
+      axioms = this.listAxioms(docId) as unknown as AxiomRow[];
+      refs = this._fetchBaseRefsForDoc(docId) as RefRow[];
 
-    if (activeBranch) {
-      const diff = JSON.parse(activeBranch.diff || '{}');
-      const entries = Array.isArray(diff.entries) ? diff.entries : [];
-      if (entries.length > 0) {
+      if (useProjection) {
         // ProjectionNode = NodeRow & { child_count; pending_insert? }——结构上 NodeWithChildCountRow
         // 可直传，projection 返回的 nodes/axioms/refs 也直接接住，无需 cast。
         const projected = projectEditBranchDoc({
@@ -1319,22 +1435,36 @@ export class IftreeStore {
           nodes,
           axioms,
           refs
-        }, entries);
+        }, branchEntries);
         nodes = projected.nodes;
         axioms = projected.axioms;
         refs = projected.refs;
-        if (treeDepthLimit) {
-          nodes = nodes.filter((node) => (Number(node.depth) || 0) <= treeDepthLimit);
-        }
-        // Recompute child_count after possible truncation
-        const childCountByParent = new Map();
-        for (const node of nodes) {
-          const key = node.parent_id === null || node.parent_id === undefined ? 'root' : node.parent_id;
-          childCountByParent.set(key, (childCountByParent.get(key) || 0) + 1);
-        }
-        for (const node of nodes) {
-          node.child_count = childCountByParent.get(node.id) || 0;
-        }
+        this._branchProjectionCache = {
+          docId: String(docId),
+          branchId: activeBranch!.id,
+          stamp: changeStamp,
+          nodes,
+          axioms,
+          refs
+        };
+      } else {
+        // 无活跃分支/空 entries：分支已保存或丢弃，缓存随之作废（单槽，防驻留）。
+        this._branchProjectionCache = null;
+      }
+    }
+
+    if (useProjection) {
+      if (treeDepthLimit) {
+        nodes = nodes.filter((node) => (Number(node.depth) || 0) <= treeDepthLimit);
+      }
+      // Recompute child_count after possible truncation
+      const childCountByParent = new Map();
+      for (const node of nodes) {
+        const key = node.parent_id === null || node.parent_id === undefined ? 'root' : node.parent_id;
+        childCountByParent.set(key, (childCountByParent.get(key) || 0) + 1);
+      }
+      for (const node of nodes) {
+        node.child_count = childCountByParent.get(node.id) || 0;
       }
     }
 
@@ -2706,7 +2836,7 @@ export class IftreeStore {
   }
 
   // 未启用（待重新设计）：经 doc.exportMarkdown 入口已停用——渲染有「地址当标题 / 混入 node_note」等
-  // 功能错误，导出应写文件而非返回命令行，幂等与 import/export 对称设计未定（详见 NOW.md）。实现暂留作重做
+  // 功能错误，导出应写文件而非返回命令行，幂等与 import/export 对称设计未定。实现暂留作重做
   // 参考，当前无入口可达；重做时连同 core.renderDocMarkdown 一并设计。
   exportDocMarkdown(docId: unknown) {
     const normalizedDocId = requireStableId(docId, 'export docId');
@@ -3058,6 +3188,60 @@ export class IftreeStore {
     return assertRestorableSnapshotPayload(snapshot);
   }
 
+  // 把当前 live 文档写成对象库快照，返回 commit 行同形的引用（不建 commits/doc_heads 行）——
+  // 编辑器 undo token 的存储底座：token 只持这份引用，恢复经 commitSnapshotFromRow 展开。
+  // 与 createSnapshot（全量 JS 对象）的差别：正文只为「tree_object_hash 缓存缺失行∪祖先」取
+  //（触发器按写失效、增量维护），未变子树整棵剪枝，成本 O(改动×深度) 而非 O(全树)。
+  writeDocSnapshotObjects(docId: unknown) {
+    return this.withTransaction(() => {
+      const rows = this.conn.prepare(
+        'SELECT id, parent_id, sort_order, tree_object_hash FROM nodes WHERE doc_id = ?'
+      ).all<Pick<NodeRow, 'id' | 'parent_id' | 'sort_order' | 'tree_object_hash'> & MerkleNode>(docId);
+      const rootCount = rows.reduce((n, row) => (row.parent_id === null ? n + 1 : n), 0);
+      if (rows.length === 0 || rootCount !== 1) {
+        // 与 assertRestorableSnapshotPayload 同语义：拍不出「将来可恢复」的快照就当场拒绝。
+        throw new Error('Refusing to restore an incomplete document snapshot');
+      }
+      const contentStmt = this.conn.prepare(
+        'SELECT id, text, node_title, node_note, node_type, trust_level FROM nodes WHERE id = ? AND doc_id = ?'
+      );
+      const tree = writeTreeIncremental(this.conn, rows, (id) => contentStmt.get<NodeHashContentRow>(id, docId));
+      if (!tree) throw new Error('Refusing to restore an incomplete document snapshot');
+      if (!this.readonly && tree.recomputed.size > 0) {
+        const update = this.conn.prepare('UPDATE nodes SET tree_object_hash = ? WHERE id = ?');
+        for (const [id, hash] of tree.recomputed) update.run(hash, id);
+      }
+      const doc = this.conn.prepare('SELECT id, meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?')
+        .get<Pick<DocRow, 'id' | 'meta' | 'axioms_collapsed' | 'tree_view_state'>>(docId) || null;
+      const sourceDocument = this.conn.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get<SourceDocumentRow>(docId) || null;
+      const refs = this.conn.prepare(`
+        SELECT * FROM refs
+        WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+           OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+        ORDER BY id
+      `).all<RefRow>(docId, docId);
+      const meta = buildCommitMeta({
+        doc,
+        axioms: this.listAxioms(docId) as unknown[],
+        refs,
+        sourceDocument
+      });
+      // commit 行同形（id 等填空值）：不进 commits 表，但可原样喂 commitSnapshotFromRow 展开。
+      return {
+        id: '',
+        doc_id: String(docId),
+        parent_commit_id: null,
+        committed_at: '',
+        summary: null,
+        author: null,
+        root_node_id: tree.root_node_id,
+        root_tree_hash: tree.root_tree_hash,
+        source_hash: writeSource(this.conn, sourceDocument?.raw_markdown),
+        meta: JSON.stringify(meta)
+      };
+    });
+  }
+
   // 编辑器易失令牌实现见 ./editor-snapshot-tokens.mjs；此处保留 store 门面方法转调（实例持进程内表）。
   createEditorSnapshotToken(docId: unknown) {
     return this.editorSnapshots.create(docId);
@@ -3219,6 +3403,35 @@ export class IftreeStore {
     }
     // 父不在本批的节点（完整快照不该有）/ 成环节点永不入队 → 计数不符即报，与原「unresolved parents」同语义。
     if (head !== nodes.length) throw new Error('Snapshot contains unresolved node parents');
+  }
+
+  // 写代数戳：data_version（其它连接的提交——只读连接感知写连接靠它，且在只读快照事务内冻结）
+  // + total_changes（本连接累计写行数）。任何来源的写都会改变戳值，作缓存失效信号绝不给旧值。
+  _dataChangeStamp(): string {
+    const dataVersion = Number(this.conn.pragma('data_version', { simple: true })) || 0;
+    const totalChanges = Number(this.conn.prepare('SELECT total_changes() AS c').get<{ c: number }>()?.c) || 0;
+    return `${dataVersion}:${totalChanges}`;
+  }
+
+  // 只读快照事务（BEGIN DEFERRED）：WAL 下把一个请求内的多条 SELECT 钉在同一提交点。
+  // 供只读连接（database.read 绕队列）用；与 withTransaction 的差别是不取写锁（IMMEDIATE
+  // 在 readonly 连接直接报 SQLITE_READONLY，且会与写连接互相阻塞——正是绕行要避开的）。
+  // fn 返回 Promise 的读动词（semantic 等）事务在 promise 未决时即 COMMIT——只读事务提前
+  // 结束无害，只是那类动词退回逐查询快照，不享受请求级一致性。
+  withReadSnapshot<T>(fn: () => T): T {
+    if (this.inTransaction) return fn();
+    this.inTransaction = true;
+    this.conn.exec('BEGIN');
+    try {
+      const result = fn();
+      this.conn.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this.conn.exec('ROLLBACK');
+      throw error;
+    } finally {
+      this.inTransaction = false;
+    }
   }
 
   withTransaction<T>(fn: () => T): T {

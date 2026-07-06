@@ -25,18 +25,22 @@ import { documentRepository } from '../data/document-repository.js';
 import { treeViewRepository } from '../data/repositories.js';
 import { useAppUIContext } from './useAppUI.js';
 import {
+  DEFAULT_EVICT_WINDOW,
   applyViewSnapshot as viewApplySnapshot,
   applyViewState as viewApplyState,
   createSession,
+  evictToWindow,
   expandOneLevel as viewExpandOneLevel,
   ingestChildren,
   ingestRoot,
+  loadedNodeCount,
   nextBackgroundFetch,
   planHotFetches,
   projectToLegacyDoc,
   reconcileChildren as viewReconcileChildren,
   reconcileNode,
   selectNode as viewSelectNode,
+  setClaimedMaxDepth,
   setDepthLimit as viewSetDepthLimit,
   setFocus,
   setMultiSelected as viewSetMultiSelected,
@@ -160,15 +164,19 @@ export function useDocumentState() {
   }
 
   // 取一个 parent 的一窗子节点并入 session（前台热区 / 后台预取 / 手动展开共用）。
+  // 代际校验：await 期间换了文档（loadComplete 重建 session 时 bgRef.token 递增），迟到结果
+  // 直接丢弃——否则旧文档的行会 ingest 进新文档的 session，byAddress 跨文档冲突。
   async function fetchChildrenInto(fetch: FetchRequest | { parentId?: unknown; offset?: number; limit?: number }): Promise<void> {
     const docId = sessionRef.current?.docId;
     if (!docId || !fetch?.parentId || !sessionRef.current) return;
+    const generation = bgRef.current.token;
     const result = await documentRepository.getNodeChildren({
       docId,
       parentId: fetch.parentId,
       offset: fetch.offset || 0,
       limit: fetch.limit || NODE_CHILDREN_PAGE_SIZE
     }) as { rows?: unknown[]; total?: number; offset?: number; hasMore?: boolean } | null | undefined;
+    if (bgRef.current.token !== generation || !sessionRef.current) return;
     sessionRef.current = ingestChildren(sessionRef.current, {
       parentId: fetch.parentId,
       rows: result?.rows || [],
@@ -206,14 +214,30 @@ export function useDocumentState() {
       if (fetches.length === 0) break;
       for (const fetch of fetches) await fetchChildrenInto(fetch);
     }
+    maybeEvict();
   }
 
-  // 后台预取至全量：idle 逐个取边界、永驻常驻；token 变了立即停（换文档/卸载作废旧循环）。
+  // 投影窗口 W（方案 II，frontend-refactor.md §5）：热区拉入使投影超窗后，空闲卸载
+  // 离焦点最远的折叠子树（session.evictToWindow 保证渲染依赖集永不驱逐）。
+  // 编辑模式不驱逐（§5.5：编辑天然局部 + 分支隔离，驱逐只处理干净的只读节点）。
+  function maybeEvict(): void {
+    const session = sessionRef.current;
+    if (!session) return;
+    if (docMetaRef.current?.editBranch) return;
+    if (loadedNodeCount(session) <= DEFAULT_EVICT_WINDOW) return;
+    const next = evictToWindow(session, { limit: DEFAULT_EVICT_WINDOW });
+    if (next !== session) sessionRef.current = next;
+  }
+
+  // 后台预取至 min(全量, W)：idle 逐个取边界；token 变了立即停（换文档/卸载作废旧循环）。
+  // 达到窗口上界即停——超出部分只由热区显式拉入（用户意图），由 maybeEvict 空闲收回，
+  // 避免「预取→超窗→驱逐→再预取」的振荡把整个文档流过内存。
   function startBackgroundPrefetch(): void {
     const token = ++bgRef.current.token;
     const step = async (): Promise<void> => {
       if (bgRef.current.token !== token) return;
       if (!sessionRef.current) return;
+      if (loadedNodeCount(sessionRef.current) >= DEFAULT_EVICT_WINDOW) return; // 预取至 W 停
       const fetch = nextBackgroundFetch(sessionRef.current);
       if (!fetch) return; // 全量加载完，循环自然结束
       try {
@@ -264,19 +288,22 @@ export function useDocumentState() {
       const normalizedDocId = normalizeDocId(initial?.doc?.id || docId);
       if (!normalizedDocId) return initial ?? null;
 
-      bgRef.current.token += 1; // 作废上一个文档的后台预取
+      bgRef.current.token += 1; // 作废上一个文档的后台预取与在途 fetch（fetchChildrenInto 代际校验同源）
       docMetaRef.current = metaFromDocResult(initial);
       // 死分支清理：DocRow 没有 root_id 字段（之前的 `initial.doc.root_id` 永远 undefined、走不到兜底）。
       const rootRow = initial?.tree || null;
       if (!rootRow) return initial ?? null;
       sessionRef.current = ingestRoot(createSession(normalizedDocId), rootRow);
+      // 权威树深先落（depthLimit clamp 的天花板），随后恢复视图态必须先于填热区：
+      // fillHotRegion 尾部的驱逐要按用户真实视图算渲染依赖集，不能拿默认 view（depthLimit=1、
+      // 无 expanded）把本应展开的子树当驱逐候选。
+      sessionRef.current = setClaimedMaxDepth(sessionRef.current, initial?.treeDepthStats?.maxDepth);
+      sessionRef.current = viewApplyState(sessionRef.current, parseTreeViewState(initial?.doc?.tree_view_state));
 
       const rootId = sessionRef.current.index.root?.id;
       // 无条件取根的直接子（不依赖 doc.get 是否带 child_count），再以根为焦点扩散填热区。
       await fetchChildrenInto({ parentId: rootId, offset: 0 });
       await fillHotRegion(rootId);
-      // 从后端 doc.tree_view_state 恢复折叠/深度（选中由各打开/新建编排显式设，不在此默认选根）。
-      sessionRef.current = viewApplyState(sessionRef.current, parseTreeViewState(initial?.doc?.tree_view_state));
       const projected = project();
       startBackgroundPrefetch();
       return projected;

@@ -91,3 +91,57 @@ test('同父子节点重排会改变父的 subtreeHash（顺序进入子哈希�
   assert.equal(swapped.get('b').subtreeHash, ordered.get('b').subtreeHash);
   assert.notEqual(swapped.get('root').subtreeHash, ordered.get('root').subtreeHash);
 });
+
+// ─── computeSubtreeHashesIncremental：增量与全量对拍 ───────────────────────────
+
+test('增量重算与全量逐节点一致（随机树、随机脏点）', async () => {
+  const { computeSubtreeHashesIncremental } = await import('../dist/src/core/merkle.js');
+  // 固定种子的伪随机，保证可复现。
+  let seed = 42;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+
+  const nodes = [{ id: 'n0', parent_id: null, sort_order: 1, text: 'root', node_title: '', node_note: '', node_type: 'TEXT', trust_level: null }];
+  for (let i = 1; i < 200; i += 1) {
+    const parent = nodes[Math.floor(rand() * i)];
+    nodes.push({
+      id: `n${i}`, parent_id: parent.id, sort_order: i, text: `t${i}`,
+      node_title: i % 3 ? '' : `题${i}`, node_note: '', node_type: 'TEXT', trust_level: null
+    });
+  }
+  const full = computeSubtreeHashes(nodes);
+
+  // 随机挑 10 个脏点：改内容 + 抹掉 hash；其余行带存量 hash。
+  const dirtyIds = new Set();
+  while (dirtyIds.size < 10) dirtyIds.add(`n${Math.floor(rand() * 200)}`);
+  const mutated = nodes.map((n) => (dirtyIds.has(n.id) ? { ...n, text: `${n.text}-改` } : n));
+  const structureRows = mutated.map((n) => ({
+    id: n.id, parent_id: n.parent_id, sort_order: n.sort_order,
+    content_hash: dirtyIds.has(n.id) ? null : full.get(n.id).contentHash,
+    subtree_hash: dirtyIds.has(n.id) ? null : full.get(n.id).subtreeHash
+  }));
+  const contentById = new Map(mutated.filter((n) => dirtyIds.has(n.id)).map((n) => [n.id, n]));
+
+  const { recomputed, fullRecomputeNeeded } = computeSubtreeHashesIncremental(structureRows, contentById);
+  assert.equal(fullRecomputeNeeded, false);
+  const freshFull = computeSubtreeHashes(mutated);
+  // 重算集内逐一相等；集外存量本就等于 freshFull（未受脏点影响）——合成全表对拍。
+  for (const node of mutated) {
+    const expected = freshFull.get(node.id);
+    const actual = recomputed.get(node.id)
+      || { contentHash: structureRows.find((r) => r.id === node.id).content_hash, subtreeHash: structureRows.find((r) => r.id === node.id).subtree_hash };
+    assert.equal(actual.contentHash, expected.contentHash, `content ${node.id}`);
+    assert.equal(actual.subtreeHash, expected.subtreeHash, `subtree ${node.id}`);
+  }
+  // 剪枝确凿：重算集应远小于全树（10 个脏点 × 祖先链）。
+  assert.ok(recomputed.size < 200, `重算集 ${recomputed.size} 应小于全树`);
+});
+
+test('增量前提破损时报 fullRecomputeNeeded 而不是给错值', async () => {
+  const { computeSubtreeHashesIncremental } = await import('../dist/src/core/merkle.js');
+  const rows = [
+    { id: 'r', parent_id: null, sort_order: 1, content_hash: 'x', subtree_hash: null }, // 脏（subtree 缺）
+    { id: 'k', parent_id: 'r', sort_order: 1, content_hash: null, subtree_hash: null }  // 子也脏但没给内容行
+  ];
+  const { fullRecomputeNeeded } = computeSubtreeHashesIncremental(rows, new Map());
+  assert.equal(fullRecomputeNeeded, true, '缺脏行内容 → 必须要求全量兜底');
+});

@@ -98,7 +98,7 @@ const ACTIONS = Object.freeze([
   'editBranch.diffView',
   'editBranch.threeWayMerge',
   'doc.get',
-  // 'doc.exportMarkdown' 已停用（未启用，待重新设计）——不再对外通告；分派入口保留并抛清晰停用错误。详见 NOW.md。
+  // 'doc.exportMarkdown' 已停用（未启用，待重新设计）——不再对外通告；分派入口保留并抛清晰停用错误。
   'doc.getInfo',
   'doc.hasTreeDepth',
   'node.get',
@@ -2011,9 +2011,9 @@ function queryDoc(store: IftreeStore, payload: Payload = {}): DocGetResult | nul
 
 function queryDocExportMarkdown(_store: IftreeStore, _payload: Payload = {}) {
   // 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，渲染有地址当标题/混入
-  // node_note 等功能错误，幂等与 import/export 对称设计未定。详见 NOW.md。store.exportDocMarkdown /
+  // node_note 等功能错误，幂等与 import/export 对称设计未定。store.exportDocMarkdown /
   // core.renderDocMarkdown 实现暂留作重做参考，此入口先停。
-  throw new Error('doc.exportMarkdown 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，且渲染有地址当标题/混入 node_note 等功能错误，幂等与 import/export 对称设计未定。详见 NOW.md。');
+  throw new Error('doc.exportMarkdown 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，且渲染有地址当标题/混入 node_note 等功能错误，幂等与 import/export 对称设计未定。');
 }
 
 function queryPendingEditBranches(store: IftreeStore, payload: Payload = {}) {

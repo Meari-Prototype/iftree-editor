@@ -1133,7 +1133,7 @@ export function registerWriteTools(server: McpServer, client: BackendClient, tie
     });
 
     // 'export' 动词已停用（未启用，待重新设计）：原实现把 markdown 渲染结果返回到命令行而非导出为文件，
-    // 且渲染有「地址当标题 / 混入 node_note」等功能错误；幂等与 import/export 对称设计尚未确定。详见 NOW.md。
+    // 且渲染有「地址当标题 / 混入 node_note」等功能错误；幂等与 import/export 对称设计尚未确定。
     // 重新设计前不注册此工具，避免 agent 调用到功能错误的导出。store.exportDocMarkdown / core.renderDocMarkdown
     // 实现暂留作重做参考，但已无入口可达。
 

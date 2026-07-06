@@ -222,3 +222,86 @@ test('nodeHistory tracks a node across commits via the object store', async () =
     assert.ok(history.some((e) => e.summary === 'v2'), '应包含改正文的 v2 提交');
   });
 });
+
+// ─── 重复 node id 防线（堵旧塌缩 bug 源头）────────────────────────────────
+// 旧版 treeObjectHash 未混 node id 时，内容相同的节点被塌缩共享一份 tree 对象，
+// materializeTree 会把同一 id 展开到多个位置 → restore 撞 UNIQUE / revert 三方调和静默丢节点。
+// 防线三道：writeTree 产出口拒绝、materializeTree 物化口拒绝、assertRestorableSnapshotPayload 消费口拒绝。
+
+test('writeTree rejects snapshots with duplicate node ids', async () => {
+  const { writeTree } = await import('../dist/src/backend/db/object-store.js');
+  await withStore(async (store) => {
+    const nodes = [
+      { id: 'r1', parent_id: null, sort_order: 1, text: '根', node_type: 'TEXT', node_title: '', node_note: '', trust_level: null },
+      { id: 'a1', parent_id: 'r1', sort_order: 1, text: '甲', node_type: 'TEXT', node_title: '', node_note: '', trust_level: null },
+      { id: 'a1', parent_id: 'r1', sort_order: 2, text: '乙', node_type: 'TEXT', node_title: '', node_note: '', trust_level: null }
+    ];
+    assert.throws(
+      () => writeTree(store.db, nodes),
+      /重复节点 id a1/,
+      '重复 id 快照应被产出口当场拒绝'
+    );
+  });
+});
+
+test('materializeTree rejects legacy collapsed tree objects that expand duplicate ids', async () => {
+  const { materializeTree } = await import('../dist/src/backend/db/object-store.js');
+  await withStore(async (store) => {
+    // 手工构造旧塌缩形态：根 tree 的两个 children entry 复用同一 id + tree_hash。
+    const insert = store.db.prepare('INSERT INTO objects (hash, kind, data) VALUES (?, ?, ?)');
+    insert.run('blob-root', 'blob', JSON.stringify({ text: '根', node_type: 'TEXT', node_title: '', node_note: '', trust_level: '' }));
+    insert.run('blob-kid', 'blob', JSON.stringify({ text: '重复段落', node_type: 'TEXT', node_title: '', node_note: '', trust_level: '' }));
+    insert.run('tree-kid', 'tree', JSON.stringify({ blob_hash: 'blob-kid', children: [] }));
+    insert.run('tree-root', 'tree', JSON.stringify({
+      blob_hash: 'blob-root',
+      children: [
+        { id: 'kid-1', tree_hash: 'tree-kid' },
+        { id: 'kid-1', tree_hash: 'tree-kid' }
+      ]
+    }));
+    assert.throws(
+      () => materializeTree(store.db, 'tree-root', 'root-1'),
+      /重复节点 id kid-1/,
+      '旧塌缩对象物化时应报错而不是静默吐重复节点'
+    );
+  });
+});
+
+test('restoreCommit fails loudly (not silently) on a commit whose objects expand duplicate ids', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'BadHistory', rootText: '根' });
+    const insert = store.db.prepare('INSERT INTO objects (hash, kind, data) VALUES (?, ?, ?)');
+    insert.run('blob-r', 'blob', JSON.stringify({ text: '根', node_type: 'TEXT', node_title: '', node_note: '', trust_level: '' }));
+    insert.run('blob-k', 'blob', JSON.stringify({ text: '段', node_type: 'TEXT', node_title: '', node_note: '', trust_level: '' }));
+    insert.run('tree-k', 'tree', JSON.stringify({ blob_hash: 'blob-k', children: [] }));
+    insert.run('tree-r', 'tree', JSON.stringify({
+      blob_hash: 'blob-r',
+      children: [{ id: 'dup-1', tree_hash: 'tree-k' }, { id: 'dup-1', tree_hash: 'tree-k' }]
+    }));
+    store.db.prepare(`
+      INSERT INTO commits (id, doc_id, parent_commit_id, summary, root_node_id, root_tree_hash, meta)
+      VALUES ('bad-commit', ?, NULL, '坏历史', 'root-x', 'tree-r', '{}')
+    `).run(doc.id);
+    const before = store.db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ?').get(doc.id).c;
+    assert.throws(() => store.restoreCommit('bad-commit'), /重复节点 id dup-1/);
+    const after = store.db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE doc_id = ?').get(doc.id).c;
+    assert.equal(after, before, '恢复失败必须不动现有节点（事务回滚）');
+  });
+});
+
+test('restoreSnapshot rejects snapshots with duplicate node ids at the consumption gate', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'DupGate', rootText: '根' });
+    const dupSnapshot = {
+      doc: null,
+      nodes: [
+        { id: 'n-root', parent_id: null, sort_order: 1, text: '根', node_type: 'TEXT' },
+        { id: 'n-a', parent_id: 'n-root', sort_order: 1, text: '甲', node_type: 'TEXT' },
+        { id: 'n-a', parent_id: 'n-root', sort_order: 2, text: '乙', node_type: 'TEXT' }
+      ],
+      axioms: [],
+      refs: []
+    };
+    assert.throws(() => store.restoreSnapshot(doc.id, dupSnapshot), /duplicate node id n-a/);
+  });
+});

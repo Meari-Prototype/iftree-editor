@@ -158,6 +158,7 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
   }
   type DatabaseService = ReturnType<typeof createDatabaseService>;
   let database: DatabaseService | null = null;
+  let readDatabase: DatabaseService | null = null;
   let agentStore: AgentStore | null = null;
   type AgentRuntime = ReturnType<typeof createAgentRuntime>;
   let agentRuntime: AgentRuntime | null = null;
@@ -480,6 +481,22 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
     return database;
   }
 
+  // 只读 service（第二个连接，query_only=ON）：database.read 绕全局串行队列直跑的落点。
+  // WAL 下读写连接分离 = 读永远只见已提交快照，绝不与写连接的事务中间态照面（同连接绕队列
+  // 读会在写 handler 的 await 间隙读到未提交数据，这正是必须分连接的原因）；query_only 让
+  // 任何混进读路径的写 SQL 当场报错而不是绕过队列偷写。
+  function getReadDatabase(): DatabaseService {
+    if (!readDatabase) {
+      readDatabase = createDatabaseService({
+        dbPath: dbPath(),
+        libraryRoot,
+        readContext: databaseReadContext,
+        initOptions: { readonly: true }
+      } as Parameters<typeof createDatabaseService>[0]);
+    }
+    return readDatabase;
+  }
+
   // 已导入库文档生命周期（导入 / 删除 / 库文件移动后源路径重写）已下沉到 import-service 的
   // createLibraryDocumentService（解耦第 1c 步）：host 只注入 store / 写信封 / 派生索引维护 / 刷新 /
   // library 通知 / 路径解析，落库仍直接走 store 整篇建库能力。解构出同名句柄，下方注入与注册表沿用。
@@ -597,7 +614,24 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
       agentTool: (payload: Record<string, unknown> = {}) => (getAgentRuntime() as unknown as { runTool: (p: Record<string, unknown>) => unknown }).runTool(payload)
     } as never),
     'database.run': (request) => getDatabase().run((request.databaseCommand || request.commandPayload || request.payload || {}) as never, (request.fallbackOperation || 'read') as 'read' | 'write'),
-    'database.read': (request) => getDatabase().run({ operation: 'read', payload: request.payload || {} } as never, 'read'),
+    // 读走只读连接 + 单请求只读快照事务（同步读动词的多条 SELECT 钉在同一提交点；async
+    // 读动词退回逐查询快照）。库文件还没建成时（首启未写，readonly 打开 fileMustExist 抛）
+    // 退回写 service——那一瞬也没有并发写事务可撞；写 store 一旦建库，下次读即回到只读连接。
+    'database.read': (request) => {
+      let svc: DatabaseService | null = null;
+      try {
+        svc = getReadDatabase();
+        svc.getStore();
+      } catch {
+        readDatabase?.close();
+        readDatabase = null;
+        // 退化裸读不开快照事务：写连接上与队列写共用一条连接，绕行读在这儿开事务会与
+        // 队列写事务交错（inTransaction 直通互相吞并）。裸读每条查询自成快照，够用。
+        return getDatabase().read(request.payload || {});
+      }
+      const store = svc.getStore() as unknown as { withReadSnapshot<T>(fn: () => T): T };
+      return store.withReadSnapshot(() => svc.read(request.payload || {}));
+    },
     'database.write': (request) => getDatabase().run({ operation: 'write', payload: request.payload || {} } as never, 'write'),
     // source 只读（路 B：前端去 native，PDF 原件/高亮也走后端 RPC，内部调既有 store 方法）。
     'source.readPdfData': (request) => {
@@ -677,6 +711,7 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
   }
 
   function close(): void {
+    if (readDatabase) readDatabase.close();
     if (database) database.close();
     database = null;
     if (agentStore) agentStore.close();

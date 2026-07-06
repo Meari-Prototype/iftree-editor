@@ -1,23 +1,19 @@
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useEffect, useRef } from 'react';
-import type { ReactNode } from 'react';
 
+import type { TreeNode } from '../../core/node-model.js';
 import { depthOf, hasKnownChildren } from '../lib/doc-utils.js';
 
-interface OutlineTreeNode {
-  id?: unknown;
-  address?: unknown;
-  text?: ReactNode;
-  children?: OutlineTreeNode[];
-  [extra: string]: unknown;
-}
+// 真投影类型（γ 路线，阶段 5 起手刀）：projectToLegacyDoc 的 tree 就是 TreeNode 递归嵌套，
+// 不再用「字段全 optional + [extra] 兜底」的宽松层。
+type OutlineTreeNode = TreeNode & { children?: OutlineTreeNode[] };
 
 interface OutlineNodeProps {
   node: OutlineTreeNode;
-  selectedNodeId?: unknown;
-  collapsedOutlineNodeIds: Set<unknown>;
-  onToggle: (id: unknown) => void;
-  onSelect: (id: unknown) => void;
+  selectedNodeId: string | null;
+  collapsedOutlineNodeIds: Set<string>;
+  onToggle: (id: string) => void;
+  onSelect: (id: string) => void;
 }
 
 // 父节点驻留靠原生 position: sticky：每个节点一个 wrapper（行 + 子树），
@@ -36,9 +32,9 @@ function OutlineNode({
   onToggle,
   onSelect
 }: OutlineNodeProps) {
-  const hasChildren = hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]);
+  const hasChildren = hasKnownChildren(node);
   const collapsedOutline = collapsedOutlineNodeIds.has(node.id);
-  const depth = depthOf(String(node.address ?? ''));
+  const depth = depthOf(node.address);
   const sticky = hasChildren && !collapsedOutline && depth <= OUTLINE_STICKY_MAX_DEPTH;
   return (
     <div className="outline-node">
@@ -67,12 +63,12 @@ function OutlineNode({
             <span className="outline-toggle-spacer" />
           )}
         </span>
-        <code>{String(node.address ?? '')}</code>
-        <span>{(node.text as ReactNode) || '空节点'}</span>
+        <code>{node.address}</code>
+        <span>{node.text || '空节点'}</span>
       </button>
-      {!collapsedOutline && (node.children || []).map((child: OutlineTreeNode) => (
+      {!collapsedOutline && (node.children || []).map((child) => (
         <OutlineNode
-          key={String(child.id ?? '')}
+          key={child.id}
           node={child}
           selectedNodeId={selectedNodeId}
           collapsedOutlineNodeIds={collapsedOutlineNodeIds}
@@ -91,11 +87,11 @@ export function OutlinePanel({
   onToggle,
   onSelect
 }: {
-  tree?: OutlineTreeNode | null;
-  selectedNodeId?: unknown;
-  collapsedOutlineNodeIds?: Set<unknown>;
-  onToggle?: (id: unknown) => void;
-  onSelect?: (id: unknown) => void;
+  tree: OutlineTreeNode | null;
+  selectedNodeId: string | null;
+  collapsedOutlineNodeIds: Set<string>;
+  onToggle: (id: string) => void;
+  onSelect: (id: string) => void;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
   // 滚轮一格滚一行，且始终停在行格上：行格对齐后驻留底边永远贴着下一行
@@ -120,11 +116,11 @@ export function OutlinePanel({
     <section className="panel outline-panel">
       <header className="panel-header">目录</header>
       <div className="outline-list" ref={listRef}>
-        {tree && onToggle && onSelect && (
+        {tree && (
           <OutlineNode
             node={tree}
             selectedNodeId={selectedNodeId}
-            collapsedOutlineNodeIds={collapsedOutlineNodeIds ?? new Set()}
+            collapsedOutlineNodeIds={collapsedOutlineNodeIds}
             onToggle={onToggle}
             onSelect={onSelect}
           />

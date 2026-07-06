@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.4%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.5%20alpha-orange)
 
-> **项目状态：0.6.4，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
+> **项目状态：0.6.5，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
 >
 > - **前端**：仍有较多已知 bug 未修复。
 > - **后端写入路径**：缺少长期使用的实测——项目开发时间尚短，客观上还没有积累足够的长时运行数据。
@@ -75,7 +75,7 @@ IF-Tree Editor 是一个本地优先的文档数据管理工具，面向规模�
 - **流式写入**：聊天记录、日志类数据流按「增量编辑」模式直接追加节点（不走分支），关键词与语义索引随写增量维护；海量导入有 bulk 加速会话。
 - **事件记忆卷**：外部 agent 会话收尾把自述日志投递成记忆卷，按 24 小时节律自动封卷、进入可提炼；提炼经 `memory-distill` skill 产出长期核心记忆的 diff 提议，由 `human` 档人审落地。
 - **共享后端**：一库一后端进程，应用、MCP、命令行通过命名管道共用，同时在线互不冲突。
-- **多格式导入导出**：导入 CHM、TXT、Markdown、PDF、DOCX；结构不规则的源文走智能导入（LLM 产 JSON 经逐字节校验入库）；Excel / CSV 明确作为数据库导出的中继格式，不作为普通文档导入；导出 Markdown 与 JSON。
+- **多格式导入导出**：导入 CHM、TXT、Markdown、PDF、DOCX、EPUB；结构不规则的源文走智能导入（LLM 产 JSON 经逐字节校验入库）；Excel / CSV 明确作为数据库导出的中继格式，不作为普通文档导入；导出 JSON 结构（Markdown 导出重新设计中、临时停用）。
 - **AI 摘要备注**：调用 OpenAI / Anthropic 兼容接口，为单个节点、子树、当前层级或全文生成摘要备注。
 - **丰富的节点元数据**：节点类型、信任级别、人工标签、事实前提、ERROR、引用关系与保存历史。
 
@@ -237,21 +237,25 @@ MCP server 把文档库开放给 Claude Code、Codex 等外部 agent 框架，st
 ```text
 .
 ├── electron/
-│   ├── main.ts           # 主进程：窗口、IPC、SQLite/LanceDB/文件访问、LLM 调度
+│   ├── main.ts           # 主进程：窗口、IPC、拉起共享 node 后端并转发读写（不再 in-process 访问数据库）
 │   └── preload.ts        # 安全桥接，向渲染进程暴露 window.iftree API
 ├── index.html            # 渲染进程入口 HTML
 ├── src/
 │   ├── renderer/
 │   │   └── main.tsx      # React 挂载入口
 │   ├── frontend/         # 界面层
-│   │   ├── App.tsx
+│   │   ├── App.tsx       # 装配根：hook / 命令装配与 context 组装
+│   │   ├── screens/      # 整屏拆分：编辑器 / 设置 / 左侧栏 / 工作区 / 弹窗宿主
+│   │   ├── commands/     # 命令层：editor / document / agent / treeView / axiom 业务动词
+│   │   ├── stores/       # 轻量 store 与编辑生命周期状态机
+│   │   ├── session/      # 文档会话：窗口化加载与驱逐、撤销栈与快照令牌
 │   │   ├── components/   # 视图与面板（树视图、关系图谱、富文本、设置等）
 │   │   ├── hooks/        # 文档状态、布局、选择、设置等 React hooks
 │   │   ├── data/         # 调用 window.iftree 的仓储 / 服务封装
 │   │   ├── features/     # 实体、库、设置等功能动作
 │   │   ├── lib/          # 前端工具函数
 │   │   └── styles.css
-│   ├── backend/          # 主进程业务逻辑
+│   ├── backend/          # 后端业务逻辑（跑在独立 node 后端进程）
 │   │   ├── store/        # 存储底座 / 历史 / 编辑分支子系统（SQLite schema 与文档/节点写操作）
 │   │   ├── db/           # schema、id、归一化、快照历史、内容寻址对象库
 │   │   ├── memory/       # 记忆卷：多租户隔离、锚布局、读写与维护

@@ -121,7 +121,8 @@ async function main() {
       writeJson({ id: null, type: 'error', error: errorPayload(error) });
       return;
     }
-    if (request.type === 'agent.cancel' || request.type === 'summary.cancelNode' || request.type === 'summary.generateNode') {
+    // database.read 绕队列（与共享模式 IMMEDIATE_TYPES 同口径）：host 侧走独立只读连接。
+    if (request.type === 'agent.cancel' || request.type === 'summary.cancelNode' || request.type === 'summary.generateNode' || request.type === 'database.read') {
       processRequest(request);
       return;
     }

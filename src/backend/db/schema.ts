@@ -74,6 +74,7 @@ export interface NodeRow {
   trust_level: TrustLevel | null;
   content_hash: string | null;
   subtree_hash: string | null;
+  tree_object_hash: string | null;
   title_chars: number;
   text_chars: number;
   note_chars: number;
@@ -187,6 +188,16 @@ export interface EditBranchRow {
   diff: string;
 }
 
+export interface EditBranchEntryRow {
+  id: number;
+  branch_id: number;
+  seq: number;
+  status: 'active' | 'undone';
+  created_at: string | null;
+  undone_at: string | null;
+  entry: string;
+}
+
 export interface EntityRow {
   id: string;
   doc_id: string;
@@ -263,6 +274,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   trust_level TEXT CHECK(trust_level IN ('受控', '不受控') OR trust_level IS NULL),
   content_hash TEXT,
   subtree_hash TEXT,
+  tree_object_hash TEXT,
   title_chars INTEGER NOT NULL DEFAULT 0,
   text_chars INTEGER NOT NULL DEFAULT 0,
   note_chars INTEGER NOT NULL DEFAULT 0,
@@ -416,6 +428,23 @@ WHERE status = 'active';
 
 CREATE INDEX IF NOT EXISTS idx_edit_branches_shadow_status ON edit_branches(shadow_doc_id, status);
 
+-- 草稿操作条目子表（一行一条）：entries 的存储真相。原先整包塞 edit_branches.diff 单列，
+-- 每 stage 一步都 parse+重写整包——K 步编辑累计 O(K²) 写放大（agent 批量绑定上千节点即退化）。
+-- 拆行后 stage=INSERT 一行、undo/redo=翻转单行 status，均 O(1)。diff 列退役为元壳（kind/owner
+-- 等头信息），行离开 SQL 时由拼合出口把子表条目装回 diff JSON——对内对外（前端 undo 栈）契约不变。
+-- status/created_at/undone_at 提为列（要按它们排序/翻转），entry 存该条操作负载 JSON。
+CREATE TABLE IF NOT EXISTS edit_branch_entries (
+  id INTEGER PRIMARY KEY,
+  branch_id INTEGER NOT NULL REFERENCES edit_branches(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'undone')),
+  created_at TEXT,
+  undone_at TEXT,
+  entry TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_edit_branch_entries_branch_seq ON edit_branch_entries(branch_id, seq);
+
 CREATE TABLE IF NOT EXISTS entities (
   id TEXT PRIMARY KEY,
   doc_id TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
@@ -471,6 +500,38 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_delete
 AFTER DELETE ON nodes BEGIN
   UPDATE docs SET nodes_hash_dirty = 1 WHERE id = OLD.doc_id AND nodes_hash_dirty = 0;
+END;
+-- 节点级 hash 失效触发器（增量 merkle + 增量对象树）：与上面的 doc 级粗位并存——粗位答「该
+-- doc 可能有陈旧 hash」（兼容旧库：位=1 但无 NULL 行 ⇒ 旧触发器时代的陈旧态，ensureNodeHashes
+-- 退全量），行级 NULL 答「具体哪些节点要重算」。三列一起失效：content_hash/subtree_hash 给
+-- merkle diff/merge，tree_object_hash 给对象库增量写树（快照/undo token 剪枝）。内容写清本行；
+-- 结构写（挂/移/删/调序）清受影响父行的子树两列（子树 hash 位置无关，移动只变父不变己）。
+-- 置 NULL 的 UPDATE 只动 hash 列，不在任何触发器监听列内，不递归；IS NOT NULL 守卫让链式导入
+-- （父行刚插、hash 本就 NULL）近乎零开销。DROP+CREATE 而非 IF NOT EXISTS：触发器定义演进时
+-- 旧库启动即拿到最新定义（IF NOT EXISTS 不更新已存在的触发器）。
+DROP TRIGGER IF EXISTS trg_nodes_hash_null_update;
+CREATE TRIGGER trg_nodes_hash_null_update
+AFTER UPDATE OF text, node_title, node_note, node_type, trust_level ON nodes BEGIN
+  UPDATE nodes SET content_hash = NULL, subtree_hash = NULL, tree_object_hash = NULL
+  WHERE id = NEW.id AND (content_hash IS NOT NULL OR subtree_hash IS NOT NULL OR tree_object_hash IS NOT NULL);
+END;
+DROP TRIGGER IF EXISTS trg_nodes_hash_null_move;
+CREATE TRIGGER trg_nodes_hash_null_move
+AFTER UPDATE OF parent_id, sort_order ON nodes BEGIN
+  UPDATE nodes SET subtree_hash = NULL, tree_object_hash = NULL
+  WHERE id IN (OLD.parent_id, NEW.parent_id) AND (subtree_hash IS NOT NULL OR tree_object_hash IS NOT NULL);
+END;
+DROP TRIGGER IF EXISTS trg_nodes_hash_null_insert;
+CREATE TRIGGER trg_nodes_hash_null_insert
+AFTER INSERT ON nodes BEGIN
+  UPDATE nodes SET subtree_hash = NULL, tree_object_hash = NULL
+  WHERE id = NEW.parent_id AND (subtree_hash IS NOT NULL OR tree_object_hash IS NOT NULL);
+END;
+DROP TRIGGER IF EXISTS trg_nodes_hash_null_delete;
+CREATE TRIGGER trg_nodes_hash_null_delete
+AFTER DELETE ON nodes BEGIN
+  UPDATE nodes SET subtree_hash = NULL, tree_object_hash = NULL
+  WHERE id = OLD.parent_id AND (subtree_hash IS NOT NULL OR tree_object_hash IS NOT NULL);
 END;
 -- 字数缓存触发器：写 text/title/note 即按主键单行同步 *_chars，只更 *_chars 不触发上面的失效、不自我递归。
 CREATE TRIGGER IF NOT EXISTS trg_nodes_text_chars_insert

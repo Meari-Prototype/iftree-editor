@@ -445,6 +445,10 @@ const C2DNodeCard = memo(function C2DNodeCard({
 interface C2DMapViewProps {
   docId?: string | number | null;
   rootNode: unknown;
+  // 展开列集（address 键）受控化：真相在 session view（c2dExpanded），驱逐的渲染依赖集才看得见
+  // 导图正在显示的列。组件内仍以 address 为键运转（hotspot/深度纯函数都吃 address）。
+  expanded: Set<string>;
+  onExpandedChange: (next: Set<string>) => void;
   selectedNodeId?: string | null;
   setSelectedNodeId?: (id: string) => void;
   setMultiSelectedIds?: (ids: Set<unknown>) => void;
@@ -470,6 +474,8 @@ interface C2DMapViewProps {
 export function C2DMapView({
   docId = null,
   rootNode,
+  expanded,
+  onExpandedChange,
   selectedNodeId,
   setSelectedNodeId,
   setMultiSelectedIds = () => {},
@@ -492,7 +498,6 @@ export function C2DMapView({
   onAddAxiomRef = null,
 }: C2DMapViewProps) {
   // ── 状态 ────────────────────────────────────
-  const [expanded, setExpanded]       = useState<Set<string>>(() => new Set());
   const [colWidths, setColWidths]     = useState<number[]>([]);
   const [ctxMenu, setCtxMenu]         = useState<CtxMenuState | null>(null);
   const [inlineEdit, setInlineEdit]   = useState<InlineEditState | null>(null);
@@ -943,8 +948,9 @@ export function C2DMapView({
         try { localStorage.setItem(`c2d:last:${docId}`, hotspot || addr); } catch {}
       }
     }
-    setExpanded(next);
-  }, [docId, expanded, index, maxVisibleDepth]);
+    expandedRef.current = next;
+    onExpandedChange(next);
+  }, [docId, expanded, index, maxVisibleDepth, onExpandedChange]);
 
   // ── 卡片回调 api：对象身份稳定，实现每次渲染刷新 ──
   const cardApiImpl = useRef<Omit<CardApi, 'inlineInputRef' | 'registerCard' | 'registerExpandBtn'> | null>(null);
@@ -1050,14 +1056,21 @@ export function C2DMapView({
         }
       } catch {}
     }
-    pendingLocate.current = hotspot;
-    setExpanded(restored);
-    expandedRef.current = restored;
+    // 受控后 session view 是真相：集合已有内容（同文档 remount，如设置屏往返）不播种，
+    // 保留用户即时展开态；空集（新开文档）才用 localStorage hotspot 祖先链播种。
+    // 读本轮闭包 props（expanded），不读 expandedRef——docId 变化的这一轮 ref 还是旧文档的集合。
+    if (expanded.size === 0 && restored.size > 0) {
+      pendingLocate.current = hotspot;
+      expandedRef.current = restored;
+      onExpandedChange(restored);
+    } else {
+      pendingLocate.current = expanded.size === 0 ? hotspot : null;
+    }
     setColWidths([]);
     readyFired.current = false;
     prevColCount.current = 0;
     previousShowAxiomColumn.current = null;
-  }, [docId]);
+  }, [docId]); // deps 刻意只有 docId：仅换文档/重挂载时播种一次，expanded 经本轮闭包读取
 
   useEffect(() => {
     if (!depthControlSeq) return;
@@ -1121,8 +1134,8 @@ export function C2DMapView({
       pendingLocate.current = null;
     }
     expandedRef.current = resolved.nextExpanded;
-    setExpanded(resolved.nextExpanded);
-  }, [depthControlSeq, depthControlAction, root, visibleDepthLimit, maxVisibleDepth, columns.length]);
+    onExpandedChange(resolved.nextExpanded);
+  }, [depthControlSeq, depthControlAction, root, visibleDepthLimit, maxVisibleDepth, columns.length, onExpandedChange]);
 
   useEffect(() => {
     const defaultW = Math.max(180, Math.floor((surfaceWidth.current || 800) * 0.3));
@@ -1164,11 +1177,12 @@ export function C2DMapView({
       ancestors.push(parts.slice(0, i).join('-'));
     }
     if (ancestors.length) {
-      setExpanded(prev => {
-        const next = new Set(prev);
-        for (const a of ancestors) next.add(a);
-        return next;
-      });
+      // 原函数式 setExpanded(prev=>…) 为的是拿最新值（本 effect deps 刻意不含 expanded）；
+      // 受控后经 expandedRef 取最新，乐观写回再上抛。
+      const next = new Set(expandedRef.current);
+      for (const a of ancestors) next.add(a);
+      expandedRef.current = next;
+      onExpandedChange(next);
     }
     pendingLocate.current = addr;
   }, [locateRequest?.seq]);

@@ -669,6 +669,7 @@ function applyNodeInsert(state: ProjectionState, entry: EntryByKind<'node.insert
     // NodeRow 必填的派生字段（DB 触发器在落库时算）；草稿 push 时填默认占位。
     content_hash: null,
     subtree_hash: null,
+    tree_object_hash: null,
     title_chars: 0,
     text_chars: 0,
     note_chars: 0,
@@ -760,6 +761,7 @@ function applyNodeSplitParagraphMode(state: ProjectionState, entry: EntryByKind<
         trust_level: null,
         content_hash: null,
         subtree_hash: null,
+        tree_object_hash: null,
         title_chars: 0,
         text_chars: 0,
         note_chars: 0,
@@ -804,6 +806,7 @@ function applyNodeSplitSentenceMode(state: ProjectionState, entry: EntryByKind<'
       trust_level: null,
       content_hash: null,
       subtree_hash: null,
+      tree_object_hash: null,
       title_chars: 0,
       text_chars: 0,
       note_chars: 0,

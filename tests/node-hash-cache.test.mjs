@@ -104,3 +104,84 @@ test('insert 与 delete 也经触发器标脏', async () => {
     assert.notEqual(dirtyFlag(store, doc.id), 0, 'delete 应标脏');
   });
 });
+
+// ─── 节点级增量重算（触发器置 NULL + ensureNodeHashes 增量路径）────────────────
+
+const hashRow = (store, id) =>
+  store.db.prepare('SELECT content_hash, subtree_hash FROM nodes WHERE id = ?').get(id);
+
+const assertMatchesFullRecompute = (store, docId, ensured) => {
+  const fresh = computeSubtreeHashes(nodeRows(store, docId));
+  assert.equal(ensured.size, fresh.size, '返回 Map 覆盖全表');
+  for (const [id, h] of fresh) {
+    assert.equal(ensured.get(id).contentHash, h.contentHash, `content ${id}`);
+    assert.equal(ensured.get(id).subtreeHash, h.subtreeHash, `subtree ${id}`);
+  }
+  const persisted = store.db.prepare('SELECT id, content_hash, subtree_hash FROM nodes WHERE doc_id = ?').all(docId);
+  for (const row of persisted) {
+    assert.equal(row.content_hash, fresh.get(String(row.id)).contentHash, `列回写 content ${row.id}`);
+    assert.equal(row.subtree_hash, fresh.get(String(row.id)).subtreeHash, `列回写 subtree ${row.id}`);
+  }
+};
+
+test('内容改动只失效本行；增量 ensure 与全量重算逐节点一致', async () => {
+  await withStore(async (store) => {
+    const { doc, a, b } = buildDoc(store);
+    store.ensureNodeHashes(doc.id);
+
+    store.updateNode(a.id, { text: 'a-改' });
+    const dirty = store.db.prepare(
+      'SELECT id FROM nodes WHERE doc_id = ? AND (content_hash IS NULL OR subtree_hash IS NULL)'
+    ).all(doc.id).map((r) => String(r.id));
+    assert.deepEqual(dirty, [String(a.id)], '触发器只清被改行，不动兄弟与祖先');
+    assert.ok(hashRow(store, b.id).subtree_hash, 'b 行存量保留');
+
+    assertMatchesFullRecompute(store, doc.id, store.ensureNodeHashes(doc.id));
+    assert.equal(dirtyFlag(store, doc.id), 0);
+  });
+});
+
+test('移动/插入/删除失效受影响父行；增量 ensure 与全量一致', async () => {
+  await withStore(async (store) => {
+    const { doc, a, b } = buildDoc(store);
+    const a1 = store.db.prepare('SELECT id FROM nodes WHERE parent_id = ?').get(a.id);
+    store.ensureNodeHashes(doc.id);
+
+    // 移动 a1 → b 下：新旧父 subtree 失效，a1 自身 content_hash 保留（位置无关）。
+    store.moveNodeToParent({ nodeId: a1.id, newParentId: b.id });
+    assert.equal(hashRow(store, a.id).subtree_hash, null, '旧父 subtree 失效');
+    assert.equal(hashRow(store, b.id).subtree_hash, null, '新父 subtree 失效');
+    assert.ok(hashRow(store, a1.id).content_hash, '被移节点 content 保留');
+    assertMatchesFullRecompute(store, doc.id, store.ensureNodeHashes(doc.id));
+
+    // 插入：父行 subtree 失效，新行天然 NULL。
+    const c = store.insertNode({ docId: doc.id, parentId: b.id, text: 'c' });
+    assert.equal(hashRow(store, b.id).subtree_hash, null, '插入使父 subtree 失效');
+    assert.equal(hashRow(store, c.id).content_hash, null, '新行 hash 为空');
+    assertMatchesFullRecompute(store, doc.id, store.ensureNodeHashes(doc.id));
+
+    // 删除子树：父行 subtree 失效。
+    store.deleteNodeSubtree(b.id);
+    assert.equal(hashRow(store, doc.rootNodeId).subtree_hash, null, '删除使父 subtree 失效');
+    assertMatchesFullRecompute(store, doc.id, store.ensureNodeHashes(doc.id));
+  });
+});
+
+test('旧库陈旧态安全网：位=1 但行 hash 非 NULL → 退全量、纠正陈旧值', async () => {
+  await withStore(async (store) => {
+    const { doc, a } = buildDoc(store);
+    store.ensureNodeHashes(doc.id);
+    const stale = hashRow(store, a.id);
+
+    // 模拟旧触发器时代：内容变了但行 hash 被塞回旧值、只有粗位=1
+    //（改 hash 列不在任何触发器监听列内，正好用来构造陈旧态）。
+    store.updateNode(a.id, { text: 'a-新内容' });
+    store.db.prepare('UPDATE nodes SET content_hash = ?, subtree_hash = ? WHERE id = ?')
+      .run(stale.content_hash, stale.subtree_hash, a.id);
+    store.db.prepare('UPDATE docs SET nodes_hash_dirty = 1 WHERE id = ?').run(doc.id);
+
+    const ensured = store.ensureNodeHashes(doc.id);
+    assert.notEqual(ensured.get(String(a.id)).contentHash, stale.content_hash, '陈旧值被全量纠正');
+    assertMatchesFullRecompute(store, doc.id, ensured);
+  });
+});

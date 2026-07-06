@@ -10,7 +10,10 @@ import { createInterface } from 'node:readline';
 import type { Interface } from 'node:readline';
 import { unlinkSync } from 'node:fs';
 
-const IMMEDIATE_TYPES = new Set(['ping', 'agent.cancel', 'summary.cancelNode', 'summary.generateNode']);
+// database.read 绕队列直跑：host 侧走独立只读连接（WAL 快照隔离），不会与队列里的写事务
+// 照面——agent.run / 大写入占队时读不再被饿死（GUI 浏览、MCP 检索保持即时响应）。
+// 写与 db.shell（内含写动词）保持入队硬串行不变。
+const IMMEDIATE_TYPES = new Set(['ping', 'agent.cancel', 'summary.cancelNode', 'summary.generateNode', 'database.read']);
 
 type JsonEnvelope = Record<string, unknown> & {
   id?: unknown;

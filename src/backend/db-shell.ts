@@ -2173,8 +2173,8 @@ export async function runDbShellArgv(
 
   if (command === 'export') {
     // 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，渲染有地址当标题/混入
-    // node_note 等问题，幂等与 import/export 对称设计未定。详见 NOW.md。
-    throw new Error('db export 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，且渲染有地址当标题/混入 node_note 等功能错误，幂等与 import/export 对称设计未定。详见 NOW.md。');
+    // node_note 等问题，幂等与 import/export 对称设计未定。
+    throw new Error('db export 已停用（未启用，待重新设计）：原实现把 markdown 返回命令行而非导出为文件，且渲染有地址当标题/混入 node_note 等功能错误，幂等与 import/export 对称设计未定。');
   }
 
   if (command === 'restore') {
