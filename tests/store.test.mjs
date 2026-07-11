@@ -8,6 +8,11 @@ import test from 'node:test';
 
 import { buildMarkdownStructureRecords, buildSourceDocument } from '../dist/src/core/source-markdown.js';
 import { IftreeStore } from '../dist/src/backend/store/index.js';
+import {
+  createDocFromSentenceRecords,
+  createDocFromSentences,
+  createDocFromStructuredRecords
+} from '../dist/src/backend/import/store-write.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-store-'));
@@ -152,7 +157,7 @@ test('updateNode can clear nullable node labels back to unmarked', async () => {
 
 test('creates imported sentence documents with an import chapter', async () => {
   await withStore(async (store) => {
-    const doc = store.createDocFromSentences({
+    const doc = createDocFromSentences(store, {
       title: '合成样本',
       sourcePath: 'fixtures/sample-sentences.xlsx',
       sentences: ['第一句。', '第二句。']
@@ -175,7 +180,7 @@ test('stores markdown hierarchy metadata and maps sentence spans by explicit ind
       rawMarkdown: '# Chapter\n\nFirst sentence. Second sentence!'
     });
     const records = buildMarkdownStructureRecords(source);
-    const doc = store.createDocFromStructuredRecords({
+    const doc = createDocFromStructuredRecords(store, {
       title: 'Markdown',
       sourcePath: 'sample.md',
       records
@@ -221,7 +226,7 @@ test('stores markdown hierarchy metadata and maps sentence spans by explicit ind
 
 test('stores source markdown spans and resolves current node addresses', async () => {
   await withStore(async (store) => {
-    const doc = store.createDocFromSentenceRecords({
+    const doc = createDocFromSentenceRecords(store, {
       title: 'Source',
       sourcePath: 'sample.md',
       records: [
@@ -257,7 +262,7 @@ test('stores source markdown spans and resolves current node addresses', async (
 
 test('moves source markdown span mapping when nodes are merged', async () => {
   await withStore(async (store) => {
-    const doc = store.createDocFromSentenceRecords({
+    const doc = createDocFromSentenceRecords(store, {
       title: 'Source',
       sourcePath: 'sample.md',
       records: [

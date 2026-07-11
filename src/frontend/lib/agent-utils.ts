@@ -58,6 +58,7 @@ export interface AgentUsage {
 
 export interface AgentMessageLike {
   id?: string;
+  requestId?: string;
   sessionId?: number;
   role?: string;
   mode?: string;
@@ -75,7 +76,7 @@ export interface AgentMessageLike {
 }
 
 export interface AgentSession {
-  id?: number;
+  id: number;
   prompt?: string;
   mode?: string;
   created_at?: string;
@@ -432,8 +433,8 @@ const AGENT_ENTRY_LABELS: Record<string, string> = {
 };
 
 export interface AgentBranch {
-  id?: unknown;
-  base_doc_id?: unknown;
+  id: number;
+  base_doc_id: string;
   base_title?: string;
   owner?: string;
   diff?: string | { entries?: AgentBranchEntry[] };

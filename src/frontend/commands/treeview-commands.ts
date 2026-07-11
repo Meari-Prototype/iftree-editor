@@ -235,7 +235,7 @@ export function createTreeViewCommands(getDeps: () => TreeViewCommandDeps) {
     return true;
   }
 
-  async function selectNodeAndOpenTree(nodeId: unknown, result: { address?: unknown; [extra: string]: unknown } = {}) {
+  async function selectNodeAndOpenTree(nodeId: unknown, result: { address?: unknown } = {}) {
     const deps = getDeps();
     if (!nodeId) return;
     const address = String(result?.address || '').trim();

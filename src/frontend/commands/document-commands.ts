@@ -1,16 +1,16 @@
 // documentCommands：文档生命周期编排（frontend-refactor.md §4.4 阶段 2）。
 // open / refresh / create / delete / import / openLibraryNavigation 自 AppBody 原样搬入。
-// 依赖方向：document → editor（离场确认、分支识别、栈清理）为单向命令间调用；
-// importFiles(smart) → agent.runAgentRequest 经 deps 注入（agent 组阶段 2b 落位后仍为注入，
-// 避免 document/agent 双向 import）。deps 经 getDeps() 惰性读取（同 editor-commands 约定）。
+// 依赖方向：document → editor（离场确认、分支识别、栈清理）为单向命令间调用。
+// 跨 document/agent 的导入编排由 import-commands 协调，document 本身不再反向依赖 agent。
+// deps 经 getDeps() 惰性读取（同 editor-commands 约定）。
 
 import {
-  isSupportedLibraryImport,
   normalizeDocId,
   persistActiveDocId,
   sameDocId
 } from '../lib/doc-utils.js';
-import { documentRepository, importService } from '../data/repositories.js';
+import { documentRepository } from '../data/repositories.js';
+import type { VectorContentSearchItem } from '../data/operation-services.js';
 import type { EditorCommands } from './editor-commands.js';
 
 // 打开/导入返回的文档投影最小读面（IPC 边界宽形态）。
@@ -60,16 +60,13 @@ export interface DocumentCommandDeps {
     setMultiSelectedNodeIds(ids: Set<string>): void;
     // 清空折叠/展开集合（deleteDoc 清场 / 切库文件视图用）。
     resetCollapseSets(): void;
-    setSearchResults(results: unknown[]): void;
+    setSearchResults(results: VectorContentSearchItem[]): void;
     bumpLocateRequest(nodeId: unknown): void;
     resetLocateRequest(): void;
     setSelectedLibraryEntry(entry: unknown): void;
     getSelectedLibraryEntry(): LibraryEntryLike | null;
     // 首帧渲染解锁探针（useStartup E2E 薄层），返回是否已挂钩。
     armRenderUnlock(docId: unknown, reason?: string): boolean;
-  };
-  agent: {
-    runAgentRequest(request: { mode: string; prompt: unknown }): Promise<unknown>;
   };
 }
 
@@ -281,68 +278,6 @@ export function createDocumentCommands(getDeps: () => DocumentCommandDeps) {
     }
   }
 
-  async function importFiles(mode = 'simple') {
-    const deps = getDeps();
-    const { ui, view, docState, editor } = deps;
-    const rawMode = String(mode || 'simple').trim();
-    const importMode = ['simple', 'complete', 'direct', 'smart', 'vector'].includes(rawMode) ? rawMode : 'simple';
-    const selectedLibraryEntry = view.getSelectedLibraryEntry();
-    if (importMode === 'smart') {
-      if (selectedLibraryEntry?.type !== 'file') {
-        ui.setNotice('智能导入请先在库里选中要导入的文件');
-        return;
-      }
-      try {
-        // 智能导入不在前端/后端落库：后端构造任务 prompt，前端以 full 档发起一次 agent 会话，
-        // agent 自主跑 smart-import skill（观察源文 → 写脚本 → 校验 → 入库），过程在 AgentPanel 可见。
-        const task = await importService.smartImportTask({ relativePath: selectedLibraryEntry.relativePath }) as { mode?: string; prompt?: string } | null;
-        await deps.agent.runAgentRequest({ mode: task?.mode || 'full', prompt: task?.prompt || '' });
-        // agent 跑 db import-json 直接入库、不一定进 runAgent 的 changedDocIds，显式刷新库与文档列表。
-        await docState.refreshLibrary();
-        await docState.refreshList();
-      } catch (error) {
-        ui.setNotice(errorMessage(error) || '智能导入发起失败');
-      }
-      return;
-    }
-    if (selectedLibraryEntry?.type === 'file' && !isSupportedLibraryImport(selectedLibraryEntry as unknown as Parameters<typeof isSupportedLibraryImport>[0])) {
-      ui.setNotice(`不支持导入格式：${selectedLibraryEntry.extension || '未知格式'}`);
-      return;
-    }
-    const canLeave = await editor.confirmLeaveEditMode();
-    if (!canLeave) return;
-    ui.setBusy(true);
-    ui.setOperationLock({ label: '正在处理导入……', step: 0, total: 0 });
-    try {
-      const payload = { mode: importMode };
-      const importedRaw = selectedLibraryEntry?.type === 'file' && importService.canImportLibraryDocument()
-        ? await importService.importLibraryDocument({ relativePath: selectedLibraryEntry.relativePath, ...payload })
-        : await importService.chooseImportFile(payload);
-      const imported = (Array.isArray(importedRaw) ? importedRaw : []) as Array<{ doc?: { id?: unknown }; [extra: string]: unknown }>;
-      if (imported.length) {
-        const last = imported[imported.length - 1];
-        ui.setOperationLock({ label: '正在打开文档……', step: 0, total: 0 });
-        const opened = await docState.loadComplete(last.doc?.id, '正在打开文档……');
-        view.setSelectedLibraryEntry(null);
-        persistActiveDocId(opened?.doc?.id || last?.doc?.id);
-        ui.setBusy(false);
-        ui.setProgress(null);
-        ui.setOperationLock(null);
-        ui.setNotice(`已导入 ${imported.length} 份文档`);
-        refreshDocs(null).catch(() => {});
-      } else {
-        ui.setBusy(false);
-        ui.setProgress(null);
-        ui.setOperationLock(null);
-      }
-    } catch (error) {
-      ui.setNotice(errorMessage(error));
-      ui.setBusy(false);
-      ui.setProgress(null);
-      ui.setOperationLock(null);
-    }
-  }
-
   return {
     currentVisualDocId,
     refreshDocs,
@@ -351,8 +286,7 @@ export function createDocumentCommands(getDeps: () => DocumentCommandDeps) {
     createDoc,
     deleteDoc,
     clearActiveDocumentForLibraryFile,
-    showLibraryFileOnly,
-    importFiles
+    showLibraryFileOnly
   };
 }
 

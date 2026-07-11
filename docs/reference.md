@@ -6,7 +6,7 @@
 
 ## MCP server
 
-- 启动：`npm run mcp`（等价于 `node dist/scripts/mcp-server.js`），stdio 传输。
+- 启动：`npm run mcp`（等价于 `node dist/src/mcp/mcp-server.js`；旧路径 `dist/scripts/mcp-server.js` 是兼容垫片、继续可用），stdio 传输。
 - 权限档由启动时的环境变量 `IFTREE_MCP_TIER` 决定，运行中不可切换：
 
 | 取值 | 档位 | 可见工具 |
@@ -57,12 +57,12 @@
 | `restore` | 按 history id、saved_at 时间戳或 summary tag 精确回滚文档历史 |
 | `rebase` | 把当前分支的 lazy base 刷新到主干 HEAD（不是完整冲突裁决器） |
 | `cherry-pick` | 从同一文档的保存历史或编辑分支摘取 edit entries 写入目标分支 |
+| `export` | 导出已导入文档为 Markdown 文本（返回文本，不写文件）——**当前版本临时停用**，正在重新设计 |
 | `vectors` | 为已导入文档补建语义向量（重算力，归 full） |
 | `set_mode` | 切换文档编辑模式：readonly / incremental（流式写入）/ full（分支与合并），增量与草稿编辑互斥 |
 | `push` | 流式写入：把消息节点追加进增量编辑文档（恒落不受控，不接受 `trust_level`，标受控走 human `certify`）；`embed=true` 同步建向量、缺省后补 |
 | `bulk` | 海量导入加速会话：begin 异步写 → 多次 push → end；全库降 durability + 独占锁 |
 | `memory_distill` | 标记记忆卷已提炼（提炼=人审地界；原 memory_admin 的 mark_distilled；seal 已自动化、不再设动词） |
-| `relink` | 把已导入 doc 重绑到新的源文件路径（锚改名 / 迁移后用），只更新路径元数据、不动正文；回执自检并报 targetExists |
 | `revert` | 反向提交：撤销某次已落 commit 的改动、生成反向变更并保留其后历史（区别于 `restore` 的 reset 回滚）；三方调和，撞冲突 blocked 交人裁 |
 | `web_search` | 联网检索（只读）：对齐通用 web_search，带 URL 校验与内网拦截，给 query 返回搜索结果 |
 | `gc_objects` | 对象库垃圾回收（mark-sweep）：回收不被任何 commit 引用的历史对象（blob/tree/source）；reset/revert 跳过的 commit 仍保其对象（可后悔窗口）。不在写热路径、手动跑 |
@@ -75,7 +75,7 @@
 - **检索与读取**：`find`、`keyword`、`index`、`tree`、`read`、`inspect`、`article`、`log`、`diff`、`sql`、`web_search`（full/human 联网只读）、`memory list`（`query` 是 `db find --semantic` 的兼容别名）
 - **写入**：`edit`、`push`、`import-json`、`set-mode`、`bulk`、`import`、`vectors`、`memory deliver`
 - **草稿**：`draft`、`commit`、`merge`、`switch`、`undo`、`discard`、`rebase`、`cherry-pick`
-- **管理**：`restore`、`delete`、`vectors`、`set-mode`、`push`、`bulk`、`relink`（`export` 已临时停用、待重新设计，Markdown 导出重做后恢复）
+- **管理**：`export`、`restore`、`delete`、`vectors`、`set-mode`、`push`、`bulk`
 
 `db help` 输出当前版本的权威用法。语义与上面的 MCP 工具一一对应。
 

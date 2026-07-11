@@ -11,7 +11,7 @@ import { debugPerfBegin, debugPerfEnd } from '../lib/debug-log.js';
 // （历史 API 保留），但内部 SourceMarkdownBlockImpl 在 'table' 分支调用 SourceTableBlock、其它分支
 // 调 SourceTextRange，维持原 export 不动。
 
-interface SourceSpanLike {
+export interface SourceSpanLike {
   id?: string | number;
   sentence_index?: number;
   start_offset?: number;
@@ -19,7 +19,7 @@ interface SourceSpanLike {
   absolute_start_offset?: number;
   absolute_end_offset?: number;
   node_id?: string | number | null;
-  node_address?: string;
+  node_address?: string | null;
 }
 
 interface SourceNodeLike {

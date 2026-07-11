@@ -1,4 +1,4 @@
-import './_assert-electron.mjs';
+﻿import './_assert-electron.mjs';
 
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -43,7 +43,7 @@ test('capture→改（内容+结构）→restore 回到快照时刻；restore �
     store.addAxiom({ docId: doc.id, content: '公理一' });
     const before = contentState(store, doc.id);
 
-    const token = store.createEditorSnapshotToken(doc.id);
+    const token = store.editorSnapshots.create(doc.id);
     assert.match(token.id, /^editor-/);
 
     store.updateNode(a.id, { text: 'a-改' });
@@ -53,12 +53,12 @@ test('capture→改（内容+结构）→restore 回到快照时刻；restore �
     const after = contentState(store, doc.id);
     assert.notDeepEqual(after, before, '健全性：确实改了');
 
-    const redoToken = store.restoreEditorSnapshotToken({ docId: doc.id, tokenId: token.id });
+    const redoToken = store.editorSnapshots.restore({ docId: doc.id, tokenId: token.id });
     assert.deepEqual(contentState(store, doc.id), before, 'undo 回到快照时刻（内容+结构）');
     assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM axioms WHERE doc_id = ?').get(doc.id).n, 1, '公理跟随快照');
 
     // 反向 token = redo：恢复到 restore 前的状态。
-    store.restoreEditorSnapshotToken({ docId: doc.id, tokenId: redoToken.id });
+    store.editorSnapshots.restore({ docId: doc.id, tokenId: redoToken.id });
     assert.deepEqual(contentState(store, doc.id), after, 'redo 回到改动后状态');
   });
 });
@@ -66,7 +66,7 @@ test('capture→改（内容+结构）→restore 回到快照时刻；restore �
 test('token 不驻全量快照：entry 只持对象库引用，无 nodes 数组', async () => {
   await withStore(async (store) => {
     const { doc } = buildDoc(store);
-    const token = store.createEditorSnapshotToken(doc.id);
+    const token = store.editorSnapshots.create(doc.id);
     const entry = store.editorSnapshots.tokens?.get?.(token.id)
       ?? [...(store.editorSnapshots['tokens'] || new Map()).values()][0];
     assert.ok(entry.row.root_tree_hash, 'entry 持 root_tree_hash 引用');
@@ -84,11 +84,11 @@ test('增量剪枝确凿：连续 capture 之间只改一个节点，第二次�
       store.insertNode({ docId: doc.id, parentId: parent, text: `side-${i}` });
       parent = store.insertNode({ docId: doc.id, parentId: parent, text: `chain-${i}` }).id;
     }
-    store.createEditorSnapshotToken(doc.id);
+    store.editorSnapshots.create(doc.id);
     const baseline = objectCount(store);
 
     store.updateNode(parent, { text: 'chain-19-改' });
-    store.createEditorSnapshotToken(doc.id);
+    store.editorSnapshots.create(doc.id);
     const grown = objectCount(store) - baseline;
     // 改动路径 = 1 个新 blob + 21 个新 tree（叶到根）；旁支若未剪枝会再写 ~40 个对象。
     assert.ok(grown > 0 && grown <= 25, `第二次 capture 只写改动路径的对象（实测新增 ${grown}）`);
@@ -99,7 +99,7 @@ test('gc 不删活 token 的对象；gc 后列缓存作废但 token 仍可恢复
   await withStore(async (store) => {
     const { doc, a } = buildDoc(store);
     const before = contentState(store, doc.id);
-    const token = store.createEditorSnapshotToken(doc.id);
+    const token = store.editorSnapshots.create(doc.id);
 
     // 大改 + 落一个 commit（token 的对象不被该 commit 引用 → 只靠 liveRoots 保活）。
     store.updateNode(a.id, { text: 'a-新' });
@@ -111,7 +111,7 @@ test('gc 不删活 token 的对象；gc 后列缓存作废但 token 仍可恢复
     ).get(doc.id).n;
     assert.equal(cached, 0, 'gc 后 tree_object_hash 列全部作废');
 
-    store.restoreEditorSnapshotToken({ docId: doc.id, tokenId: token.id });
+    store.editorSnapshots.restore({ docId: doc.id, tokenId: token.id });
     assert.deepEqual(contentState(store, doc.id), before, 'gc 之后活 token 仍可恢复');
   });
 });
@@ -121,14 +121,14 @@ test('discard 后 token 独占对象成孤儿、可被 gc 回收', async () => {
     const { doc, a } = buildDoc(store);
     store.saveHistorySnapshot({ docId: doc.id, summary: 'v1', owner: 'human' });
     store.updateNode(a.id, { text: 'a-临时' });
-    const token = store.createEditorSnapshotToken(doc.id); // 引用 v1 后的临时态，不被任何 commit 引用
+    const token = store.editorSnapshots.create(doc.id); // 引用 v1 后的临时态，不被任何 commit 引用
     store.updateNode(a.id, { text: 'a-终' });
     store.saveHistorySnapshot({ docId: doc.id, summary: 'v2', owner: 'human' });
 
     const keptAlive = store.gcHistoryObjects();
     assert.equal(keptAlive.deleted, 0, '活 token 引用的临时态对象不被回收');
 
-    store.discardEditorSnapshotTokens([token.id]);
+    store.editorSnapshots.discard([token.id]);
     const swept = store.gcHistoryObjects();
     assert.ok(swept.deleted > 0, 'discard 后临时态独占对象被回收');
   });
@@ -139,7 +139,7 @@ test('空文档拒绝 capture（与旧行为一致）', async () => {
     const doc = store.createDoc({ title: 'E', rootText: '根' });
     store.db.prepare('DELETE FROM nodes WHERE doc_id = ?').run(doc.id);
     assert.throws(
-      () => store.createEditorSnapshotToken(doc.id),
+      () => store.editorSnapshots.create(doc.id),
       /incomplete document snapshot/
     );
   });

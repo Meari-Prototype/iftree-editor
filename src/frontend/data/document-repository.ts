@@ -1,5 +1,6 @@
 import { callIftree } from './iftree-api.js';
 import { canReadDatabase, readDatabase, writeDatabase } from './database-client.js';
+import type { LibraryEntry } from '../../backend/library/library-fs.js';
 
 type RepositoryPayload = Record<string, unknown>;
 
@@ -15,14 +16,14 @@ async function readRows(action: string, payload?: RepositoryPayload | null): Pro
 
 async function write(action: string, payload: RepositoryPayload | null | undefined, key?: string) {
   const result = await writeDatabase({ action, ...(payload || {}) });
-  return key ? ((result as Record<string, unknown> | null | undefined)?.[key] || result) : result;
+  return key ? (result[key] || result) : result;
 }
 
 export const documentRepository = {
   canRead: canReadDatabase,
 
-  listDocs() { return read('doc.list'); },
-  listDocFolders() { return read('docFolder.list'); },
+  listDocs() { return readDatabase({ action: 'doc.list' }); },
+  listDocFolders() { return readDatabase({ action: 'docFolder.list' }); },
   listContentDocs(payload: RepositoryPayload) { return read('content.listDocs', payload); },
   getLibraryNavigation(payload?: Record<string, unknown>) { return read('library.getNavigation', payload); },
   getContentIndex(payload: RepositoryPayload) { return read('content.getIndex', payload); },
@@ -34,14 +35,15 @@ export const documentRepository = {
   getDocInfo(payload: RepositoryPayload) { return read('doc.getInfo', payload); },
   getNode(payload: RepositoryPayload) { return read('node.get', payload); },
   hasDocTreeDepth(payload: RepositoryPayload) { return read('doc.hasTreeDepth', payload); },
-  getNodeChildren(payload: RepositoryPayload) { return read('node.listChildren', payload); },
+  getNodeChildren(payload: RepositoryPayload) { return readDatabase({ action: 'node.listChildren', ...payload }); },
   getDocNodesPage(payload: RepositoryPayload) { return read('node.listPage', payload); },
   getSubtreeTextWindow(payload: RepositoryPayload) { return read('subtree.getTextWindow', payload); },
-  getSourceWindow(payload: RepositoryPayload) { return read('source.getWindow', payload); },
+  getSourceWindow(payload: RepositoryPayload) { return readDatabase({ action: 'source.getWindow', ...payload }); },
   getPendingEditBranches(payload?: Record<string, unknown>) { return read('editBranch.listPending', payload); },
 
   getDoc(request: RepositoryPayload | string | null) {
-    return read('doc.get', typeof request === 'object' ? request : { docId: request });
+    const payload = typeof request === 'object' && request !== null ? request : { docId: request };
+    return readDatabase({ action: 'doc.get', ...payload });
   },
 
   getDocStructureRows(payload: RepositoryPayload) { return readRows('node.listStructureRows', { ...payload, limit: 0 }); },
@@ -66,9 +68,9 @@ export const documentRepository = {
 
   async updateDocAxiomsCollapsed(payload: RepositoryPayload) {
     const result = await write('doc.updateAxiomsCollapsed', payload, 'doc');
-    return (result as { doc?: unknown } | null | undefined)?.doc ? result : { doc: result };
+    return result && typeof result === 'object' && 'doc' in result && result.doc ? result : { doc: result };
   },
 
-  readLibraryTree() { return callIftree('readLibraryTree'); },
+  readLibraryTree() { return callIftree<LibraryEntry | null>('readLibraryTree'); },
   moveLibraryEntry(payload: RepositoryPayload) { return callIftree('moveLibraryEntry', payload); }
 };

@@ -23,7 +23,8 @@ export {
   illegalEventVolumeMessage
 } from './anchor-layout.js';
 
-// 供别的模块单向只读 memory 标记用（不经动作分发）：store 删除保护 / 信任断言读 memoryVolumeMetaOf；
+// 卷性判定 memoryVolumeMetaOf 本体住 shared.ts；删除保护与流式信任策略由 memory 域实现，
+// 经上层装配注入 store 的通用端口。此处 re-export 供 memory 消费者沿用。
 // 检索侧另走 SQL 直读 meta 判 doc 类型（event/memory/knowledge），不依赖这里。
 export {
   memoryVolumeMetaOf,

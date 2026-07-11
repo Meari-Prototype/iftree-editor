@@ -19,62 +19,36 @@ import { startResizeRailGesture } from '../lib/mindmap-utils.js';
 import { formatDate } from '../lib/ui-utils.js';
 import { AgentPanel, type AgentPanelProps } from './AgentPanel.jsx';
 import { IconButton, LocateNodeButton } from './common.jsx';
+import type { ProjectedDoc } from '../hooks/useDocumentState.js';
+import type { TreeNode } from '../../core/node-model.js';
+import type { DocGetRefRow } from '../../backend/query-api.js';
+import type { AxiomRow } from '../../backend/db/schema.js';
+import type { HistoryEntry } from '../../backend/store/history.js';
+import type {
+  assetRepository,
+  axiomRepository,
+  historyRepository,
+  nodeRepository,
+  refRepository
+} from '../data/repositories.js';
 
 // Inspector 是右边栏：上半 AgentPanel（18 个 agent* props 直接转发，类型对齐 AgentPanelProps）、
 // 下半 NodeInfo 面板（读 currentDoc 的 refs/axioms/tree/history 投影 + 编辑 selectedNode + 调 inspectorActions）。
 // 本地接口字段全 optional——currentDoc / selectedNode 来自 store 投影，上游字段宽度未收紧前不假设必填。
 
-export interface InspectorRefRow {
-  id?: unknown;
-  source_type?: string;
-  source_id?: unknown;
-  target_type?: string;
-  target_id?: unknown;
-  [extra: string]: unknown;
+export type InspectorRefRow = DocGetRefRow;
+export type InspectorAxiomRow = AxiomRow;
+export type InspectorHistoryRow = HistoryEntry;
+export type InspectorDocLike = ProjectedDoc;
+export type InspectorSelectedNode = TreeNode;
+
+export interface InspectorActionsMap {
+  updateNode?: typeof nodeRepository.updateNode;
+  createImageAsset?: typeof assetRepository.createImageAsset;
+  updateAxiom?: typeof axiomRepository.updateAxiom;
+  deleteRef?: typeof refRepository.deleteRef;
+  restoreHistory?: typeof historyRepository.restoreDocumentSnapshot;
 }
-
-export interface InspectorAxiomRow {
-  id?: unknown;
-  label?: string;
-  content?: string;
-  status?: string;
-  [extra: string]: unknown;
-}
-
-export interface InspectorHistoryRow {
-  id?: unknown;
-  saved_at?: unknown;
-  summary?: string;
-  [extra: string]: unknown;
-}
-
-export interface InspectorDocLike {
-  doc?: { id?: unknown; [extra: string]: unknown } | null;
-  refs?: InspectorRefRow[];
-  axioms?: InspectorAxiomRow[];
-  tree?: { text?: string; [extra: string]: unknown } | null;
-  history?: InspectorHistoryRow[];
-  [extra: string]: unknown;
-}
-
-export interface InspectorSelectedNode {
-  id?: unknown;
-  address?: string;
-  nodeType?: string;
-  trustLevel?: string | null;
-  note?: string | null;
-  [extra: string]: unknown;
-}
-
-export type InspectorActionName =
-  | 'updateNode'
-  | 'createImageAsset'
-  | 'updateAxiom'
-  | 'deleteRef'
-  | 'restoreHistory';
-
-export type InspectorActionHandler = (payload?: unknown) => Promise<unknown> | unknown;
-export type InspectorActionsMap = Partial<Record<InspectorActionName, InspectorActionHandler>>;
 
 export interface JumpAddressResult {
   ok: boolean;
@@ -85,9 +59,8 @@ export interface InspectorProps {
   currentDoc?: InspectorDocLike | null;
   selectedNode?: InspectorSelectedNode | null;
   runWrite?: (fn: () => Promise<unknown> | unknown) => Promise<unknown> | unknown;
-  selectNode?: (nodeId: unknown) => void;
+  selectNode?: (nodeId: string) => void;
   canEdit?: boolean;
-  viewMode?: 'tree' | 'ide' | 'rich';
   collapsed?: boolean;
   sidebarWidth?: number | null;
   onLocateNode?: () => void;
@@ -111,7 +84,7 @@ export interface InspectorProps {
   onDeleteAgentSession?: AgentPanelProps['onDeleteSession'];
   onNewAgentSession?: AgentPanelProps['onNewSession'];
   onTraceAgentDiff?: AgentPanelProps['onTraceDiff'];
-  onAddAxiomRef?: (nodeId: unknown) => void;
+  onAddAxiomRef?: (nodeId: string) => void;
   inspectorActions?: InspectorActionsMap;
 }
 
@@ -121,7 +94,6 @@ export function Inspector({
   runWrite,
   selectNode,
   canEdit,
-  viewMode = 'tree',
   collapsed,
   sidebarWidth,
   onLocateNode,
@@ -258,28 +230,30 @@ export function Inspector({
     );
   }
 
-  function runInspectorAction(action: InspectorActionName, payload?: unknown): Promise<unknown> | unknown {
-    const handler = inspectorActions?.[action];
+  function runInspectorAction<Payload>(handler: ((payload: Payload) => Promise<unknown> | unknown) | undefined, payload: Payload): Promise<unknown> | unknown {
     if (!handler) return null;
     return runWrite ? runWrite(() => handler(payload)) : handler(payload);
   }
 
-  // 这两个 function declaration 会被 hoist 出 if(!currentDoc || !selectedNode) 守卫之外，
-  // TS narrow 不传播到函数体——内部访问改 ?. 兜底（运行时不会真为 null，守卫之前不会被调）。
+  const inspectedDoc = currentDoc;
+  const inspectedNode = selectedNode;
+
   async function updateSelected(patch: Record<string, unknown>) {
     if (!canEdit) return;
-    await runInspectorAction('updateNode', {
-      docId: currentDoc?.doc?.id,
-      nodeId: selectedNode?.id,
+    await runInspectorAction(inspectorActions.updateNode, {
+      docId: inspectedDoc.doc?.id,
+      nodeId: inspectedNode.id,
       patch
     });
   }
 
   async function createImageAsset() {
     if (!canEdit) return;
-    await runInspectorAction('createImageAsset', {
-      docId: currentDoc?.doc?.id,
-      nodeId: selectedNode?.id
+    const docId = inspectedDoc.doc?.id;
+    if (!docId) return;
+    await runInspectorAction(inspectorActions.createImageAsset, {
+      docId,
+      nodeId: inspectedNode.id
     });
   }
 
@@ -437,7 +411,7 @@ export function Inspector({
               <select
                 value={axiom.status}
                 disabled={!canEdit}
-                onChange={(event) => runInspectorAction('updateAxiom', {
+                onChange={(event) => runInspectorAction(inspectorActions.updateAxiom, {
                   docId: currentDoc.doc?.id,
                   axiomId: axiom.id,
                   patch: { status: event.target.value }
@@ -450,7 +424,7 @@ export function Inspector({
                 <IconButton
                   title="移除事实前提引用"
                   disabled={!canEdit}
-                  onClick={() => runInspectorAction('deleteRef', {
+                  onClick={() => runInspectorAction(inspectorActions.deleteRef, {
                     docId: currentDoc.doc?.id,
                     refId: selectedFactRefByAxiomId.get(String(axiom.id))?.id
                   })}
@@ -476,7 +450,7 @@ export function Inspector({
               <IconButton
                 title="回滚到此版本"
                 disabled={!canEdit}
-                onClick={() => runInspectorAction('restoreHistory', {
+                onClick={() => runInspectorAction(inspectorActions.restoreHistory, {
                   docId: currentDoc.doc?.id,
                   commitId: entry.id
                 })}

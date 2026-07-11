@@ -19,7 +19,6 @@ import {
   nodeRepository,
   refRepository
 } from '../data/repositories.js';
-import { useAppUIContext } from '../hooks/useAppUI.js';
 import { useAppState } from '../app-context.js';
 import { useCommands } from '../commands/commands-context.js';
 import { LeftSidebar } from './LeftSidebar.jsx';
@@ -27,7 +26,6 @@ import { WorkspacePane } from './WorkspacePane.jsx';
 import { DialogHost } from './DialogHost.jsx';
 
 export function EditorScreen() {
-  const { activeTab } = useAppUIContext();
   const { docState, selection, layout, agentChat, misc } = useAppState();
   const { editor, treeView: treeViewCommands, axiom, agent } = useCommands();
   const { currentDoc, docs } = docState;
@@ -77,12 +75,11 @@ export function EditorScreen() {
         <WorkspacePane />
 
         <Inspector
-          currentDoc={currentDoc as Parameters<typeof Inspector>[0]['currentDoc']}
-          selectedNode={selection.selectedNode as Parameters<typeof Inspector>[0]['selectedNode']}
-          runWrite={editor.dispatchWrite as Parameters<typeof Inspector>[0]['runWrite']}
+          currentDoc={currentDoc}
+          selectedNode={selection.selectedNode}
+          runWrite={editor.dispatchWrite}
           selectNode={treeViewCommands.selectNodeAndOpenTree}
           canEdit={misc.treeEditMode}
-          viewMode={activeTab as Parameters<typeof Inspector>[0]['viewMode']}
           collapsed={rightCollapsed}
           sidebarWidth={rightWidth}
           onLocateNode={treeViewCommands.locateSelectedNode}
@@ -106,7 +103,7 @@ export function EditorScreen() {
           onNewAgentSession={agentChat.newSession}
           onTraceAgentDiff={agent.traceAgentDiff}
           onAddAxiomRef={axiom.requestAxiomRef}
-          inspectorActions={inspectorActions as Parameters<typeof Inspector>[0]['inspectorActions']}
+          inspectorActions={inspectorActions}
         />
 
         <DialogHost />

@@ -14,10 +14,11 @@ import test from 'node:test';
 // 文档列表连「暂无导入文档。」占位都不渲染、启动/刷新按钮 listener 绑不上、失败信息永不显示。
 // 唯一能拦住的位置就是对构建产物里的内嵌 script 做一次真实 JS 语法解析。
 
-const distMainPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'electron', 'main.js');
+// launcherHtml 已随 §6-8 拆至 electron/launcher.ts（757867d），产物指向同步。
+const distLauncherPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'electron', 'launcher.js');
 
-test('dist/electron/main.js 内嵌 <script> 均为合法纯 JS（launcher 页面脚本不含 TS 语法）', () => {
-  const source = readFileSync(distMainPath, 'utf8');
+test('dist/electron/launcher.js 内嵌 <script> 均为合法纯 JS（launcher 页面脚本不含 TS 语法）', () => {
+  const source = readFileSync(distLauncherPath, 'utf8');
   const scripts = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)];
   assert.ok(scripts.length >= 1, '产物中应至少有 launcher 页面一块内嵌 <script>');
   for (const [index, match] of scripts.entries()) {

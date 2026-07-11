@@ -1,0 +1,1141 @@
+#!/usr/bin/env node
+// MCP entry (projectneed `18`): official MCP SDK thin shell over the headless
+// backend. Exposes the retrieval channel (db.shell / database.read) and the
+// A2A channel (agent.run -> built-in agent). The shell itself touches no native
+// module; it delegates to the headless host. The host ALWAYS runs on a real node
+// runtime (node ABI): resolveNodeExecutable (in backend-client) pins it regardless
+// of whether this shell was launched by node or electron — so better-sqlite3 only
+// ever needs its node-ABI build, and the host can't inherit an Electron ABI. Launch
+// either way (host is node ABI in both):
+//   node dist/src/mcp/mcp-server.js                            (npm run mcp:node)
+//   ELECTRON_RUN_AS_NODE=1 electron dist/src/mcp/mcp-server.js (npm run mcp)
+// 旧入口 dist/scripts/mcp-server.js 留兼容垫片（re-export 本模块），既有 MCP 接入配置不受迁移影响。
+import { spawnSync } from 'node:child_process';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+
+import { createBackendClient } from '../backend/llm/backend-client.js';
+import { backendDescriptorPath, resolveBackendDbPath, removeBackendDescriptorIfOwn } from '../backend/llm/backend-discovery.js';
+import { NODE_TYPES, NODE_TYPE_LABELS } from '../core/node-model.js';
+
+// 本模块产物住 dist/src/mcp/，项目根在三级之上（垫片入口不影响本模块自身位置）。
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+// doc/node/commit(历史)/ref 标识统一为 UUID v7 字符串；整数 id 已退役（save_history 退役后不再有整数历史 id）。
+const docIdSchema = z.string().min(1);
+const ownerSchema = z.string().min(1);
+
+// MCP SDK 的 ToolCallback<InputArgs> 应该会从 inputSchema 推 callback args 类型，但 strict 下实测推断常退化为
+// any——本文件每个 callback 显式 annotate args 形参，按「原子 Arg 接口 + 工具专属字段 inline 组合」组装：
+// 原子接口（DocId / Address / Uuid / At / Limit / Json / Owner / BranchTarget / DraftSummary）收公共字段，
+// 工具专属字段在交叉类型里 inline 列出。所有字段除显式必填外一律 optional——MCP 调用方传什么由 inputSchema 卡。
+
+type DocId = string;
+type ToolTextResult = { content: Array<{ type: 'text'; text: string }> };
+type BackendClient = ReturnType<typeof createBackendClient>;
+
+interface DocIdArg { docId: DocId }
+interface DocIdOptionalArg { docId?: DocId }
+interface AddressArg { address?: string; nodeId?: DocId }
+interface UuidArg { uuid?: boolean }
+interface AtArg { at?: DocId | string; atAddress?: boolean }
+interface LimitArg { limit?: number }
+interface JsonArg { json?: boolean }
+interface OwnerArg { owner?: string }
+interface BranchTargetArg {
+  branchId?: number;
+  shadowDocId?: DocId;
+  baseDocId?: DocId;
+}
+interface DraftSummaryArg {
+  summary?: string;
+  tag?: string;
+}
+
+const nodeTypeContractText = `节点类型统一写 node_type/nodeType，不再使用 human_tag。内部码：${NODE_TYPES.join(', ')}；中文标签：${Object.values(NODE_TYPE_LABELS).join(' / ')}。`;
+
+// Permission tier picked at launch by the deployment (projectneed `18-3`).
+// 四档：read 只读 / edit 隔离编辑（owner=llm 待审）/ full 完全（仍 llm 身份，多几把运维动词、
+// 不直写主库、不审批、不标受控）/ human 人类档（owner=human，主库内容的唯一权威：直写、
+// 审批 merge llm 待审、标受控）。yolo 是 human 的俗称别名。
+const RAW_TIER = (process.env.IFTREE_MCP_TIER || 'read').toLowerCase();
+const TIER = RAW_TIER === 'yolo' ? 'human' : RAW_TIER;
+const IS_WRITE_TIER = TIER === 'edit' || TIER === 'full' || TIER === 'human';
+// 写入者身份由启动档位决定（projectneed 18-3）：human 档 role=human、其余 role=llm；运行中不升档——
+// 非 human 档不接受调用方自报 human 身份（honor 级，无安全边界，只是让档位名副其实）。
+// owner 编码 role:user（身份前缀，后端新建草稿时补 #ts 唯一化）：role 由档位定，user 读 IFTREE_OWNER
+// 配置注入（不同 agent 各配各的，如 claude-code / codex），缺省 default。人类不走 MCP、经 db shell 传身份。
+const OWNER_ROLE = TIER === 'human' ? 'human' : 'llm';
+const OWNER_USER = (process.env.IFTREE_OWNER || 'default').trim() || 'default';
+const DEFAULT_WRITE_OWNER = `${OWNER_ROLE}:${OWNER_USER}`;
+
+// switch 选中的当前草稿（进程内全局，见 15-5-2-1）：read 档的 diff 与 write 档动词共享同一选择，
+// 切一次草稿后 diff/commit/merge/discard/undo/redo 未显式传目标时都用它。registerWriteTools 只调一次，
+// 提到模块作用域不改变行为，只是让 read 档的 diff 也够得着这份选择。
+const selectedBranch: {
+  branchId: number | null;
+  baseDocId: DocId | null;
+  owner: string | null;
+} = { branchId: null, baseDocId: null, owner: null };
+
+// owner 作为「写入身份」时的归一（edit 的 editBranchOwner、draft new 的新草稿 owner）；
+// 作为「分支选择器」用的 owner（list/diff/drop/merge/switch 指向已存在分支）不走这里。
+function resolveWriteOwner(owner: unknown): { owner: string; error?: undefined } | { error: string; owner?: undefined } {
+  const raw = owner == null ? '' : String(owner).trim();
+  // 按 role 段判断（owner 可能是 role:user 身份前缀，或旧式裸 human）：非 human 档不接受 human 身份注入。
+  if (TIER !== 'human' && raw && raw.split(':', 1)[0].toLowerCase() === 'human') {
+    return { error: '当前档位不能以 human 身份写入；human 身份只在 human 档（IFTREE_MCP_TIER=human）下可用。' };
+  }
+  return { owner: raw || DEFAULT_WRITE_OWNER };
+}
+
+function textResult(text: unknown): ToolTextResult {
+  return { content: [{ type: 'text', text: String(text ?? '') }] };
+}
+
+// 文本回执单一调用点（A2-1 / §6-6）：MCP 各动词一律转发对应 db-shell 动词，人读文本与
+// 结构化 --json 都在 backend 渲染（write-result-text/diff-text/merge-text）；本文件只做
+// 入口业务——inputSchema、owner 档位闸门、目标解析成显式 argv。
+async function dbShell(client: BackendClient, argv: string[], currentDocId?: DocId | null): Promise<string> {
+  const res = await client.dbShell(argv, { currentDocId }) as { text?: unknown } | null;
+  return res?.text != null ? String(res.text) : '';
+}
+
+function registerRetrievalTools(server: McpServer, client: BackendClient) {
+  server.registerTool('library_index', {
+    description: '按 library 文件夹包含层级列出已导入文档的 ASCII tree；默认文件节点显示文件名、字数和语义状态，不显示 UUID；uuid=true 时附 #docId。未导入文件不列出；(xxx字) 是该文档节点 1 的整棵子树正文合计，不是节点 1 自有正文。默认不显示摘要，includeSummary=true 时才附加摘要内容。',
+    inputSchema: {
+      folder: z.string().optional().describe('可选 library 相对文件夹路径；省略时从 library 根列出。'),
+      includeSummary: z.boolean().optional().describe('默认 false；true 时附加摘要内容。字数仍表示整棵子树正文合计，不是节点自有正文。'),
+      includeHidden: z.boolean().optional().describe('默认 false：忽略 . 开头隐藏文件夹（如事件卷锚所在的 .memory）。true 时一并列出。'),
+      uuid: z.boolean().optional().describe('true 时显示 #docId；默认 false，只显示文件名作为文档标签。')
+    }
+  }, async ({ folder, includeSummary, includeHidden, uuid }: { folder?: string; includeSummary?: boolean; includeHidden?: boolean } & UuidArg = {}) => {
+    const argv = ['index'];
+    if (folder) argv.push('--folder', String(folder));
+    if (includeSummary) argv.push('--summary');
+    if (includeHidden) argv.push('--include-hidden');
+    if (uuid) argv.push('--uuid');
+    return textResult((await dbShell(client, argv)) || '(库里暂无已导入文档)');
+  });
+
+  server.registerTool('tree', {
+    description: '查看文档结构（缩进 ASCII 树：地址 类型 标题 (子树字数)）。可选 address 只看某子树，depth 限层。地址形如 1、1-3、1-3-2，是相对地址。注意字数是整棵子树合计，不是该节点自有正文。',
+    inputSchema: {
+      docId: docIdSchema.describe('已导入文档的 doc id。'),
+      address: z.string().optional().describe('可选节点地址；省略时从节点 1 展开。输出中的字数是该地址节点的子树合计。'),
+      nodeId: docIdSchema.optional().describe('可选节点稳定 UUID：兼容定位入口，给了即从该节点子树展开（优先于 address）。'),
+      depth: z.number().int().positive().optional().describe('可选展开层数；输出中的 (xxx) 仍是各节点整棵子树合计，不是节点自有正文。'),
+      at: z.union([docIdSchema, z.string()]).optional().describe('可选历史 ref（commit id/committed_at/summary tag）：看该版本的结构快照。给 address 时默认按节点身份穿透（当前 address→node_id，节点换过地址也认得）。'),
+      atAddress: z.boolean().optional().describe('与 at 配合：true 时按历史地址定位（git <commit>:<path> 语义，查已删节点/某版本某位置）；默认按当前节点身份穿透。'),
+      uuid: z.boolean().optional().describe('true 时保留稳定 id；默认 false。')
+    }
+  }, async ({ docId, address, depth, at, atAddress, uuid, nodeId }: DocIdArg & AddressArg & AtArg & UuidArg & { depth?: number }) => {
+    const argv = ['tree', String(docId)];
+    if (address) argv.push(address);
+    if (nodeId) argv.push('--node-id', String(nodeId));
+    if (depth) argv.push('--depth', String(depth));
+    if (at !== undefined) argv.push('--at', String(at));
+    if (atAddress) argv.push('--at-address');
+    if (uuid) argv.push('--uuid');
+    return textResult((await dbShell(client, argv)) || '(空)');
+  });
+
+  server.registerTool('read', {
+    description: '读取文档某地址的正文，只回正文、不带节点头。scope 选范围：subtree(默认，整棵子树正文拼接)/node(只本节点)/siblings(同父前中后三条)。必须定位到具体节点：address 传到小节（如 1-1、1-3-2）或给 nodeId——本系统的文档是检索定位用的、不是从头通读，直读根地址 1（=整篇）是反常用法，正常连读开头都该传 1-1。子树正文有 1 万字门禁（超了分层早停、只返回前几层并提示），要完整读大段得显式加大 limit 二次突破。全篇结构用 tree、定长原文窗口用 article、元信息/出处/引用用 inspect；历史版本传 at。命中过碎时读父地址或相邻地址补上下文。',
+    inputSchema: {
+      docId: docIdSchema,
+      address: z.string().optional().describe('节点地址(如 1-3-2)：主定位方式；与 nodeId 二选一，二者皆给时以 nodeId 为准。'),
+      nodeId: docIdSchema.optional().describe('节点稳定 UUID：兼容定位入口，可传 inspect / log·diff / 引用括号 拿到的 node_id 直接读，免去先换算地址；address 仍是主路径（find 命中只给地址、不输出 node_id，要 node_id 用 inspect 单节点取）。'),
+      scope: z.enum(['node', 'subtree', 'siblings']).optional().describe('读取范围：subtree 整棵子树正文拼接(默认)/node 只本节点/siblings 同父前中后三条。'),
+      at: z.union([docIdSchema, z.string()]).optional().describe('可选历史 ref：commit id（UUID）、committed_at 或 summary tag；只读历史快照。默认按节点身份穿透（当前 address→node_id，节点换过地址也认得；不在该版本则报错，而非静默命中同址别的节点）。'),
+      atAddress: z.boolean().optional().describe('与 at 配合：true 时按历史地址定位（git <commit>:<path> 语义，查已删节点/某版本某位置）；默认按当前节点身份穿透。'),
+      limit: z.number().int().positive().optional().describe('子树正文字数门禁；默认 1 万字（分层早停、超了只返回前几层）。要完整读大子树就显式加大它——这是突破门禁的二次确认。'),
+      uuid: z.boolean().optional().describe('true 时头部显示 doc:UUID；默认显示文档标签。')
+    }
+  }, async ({ docId, address, scope, at, atAddress, limit, uuid, nodeId }: DocIdArg & AddressArg & AtArg & LimitArg & UuidArg & { scope?: 'node' | 'subtree' | 'siblings' }) => {
+    if (!address && !nodeId) {
+      return textResult('read 要先定位到具体节点：传 address（正常到小节，如 1-1、1-3-2）或 nodeId。本系统的文档是检索定位用的、不是从头通读——直读根地址 1 等于拉整篇，是反常用法（连读开头都该传 1-1）；先用 tree 看结构，挑要读的小节再 read。');
+    }
+    const argv = ['read', String(docId)];
+    if (address) argv.push(String(address));
+    if (scope) argv.push('--range', String(scope));
+    if (nodeId) argv.push('--node-id', String(nodeId));
+    if (at !== undefined) argv.push('--at', String(at));
+    if (atAddress) argv.push('--at-address');
+    if (limit) argv.push('--limit', String(limit));
+    if (uuid) argv.push('--uuid');
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('inspect', {
+    description: '节点/文档档案：身份段(doc/地址/类型/信任/标题) + 选取的附加段。sections 逗号分隔选 meta(updated/created/sort/hash)、source(原文出处+spans，原 blame)、links(引用进出)、axioms(文档事实前提，地址为根时)、note(备注)；默认 meta,note。读正文用 read、原文窗口用 article。',
+    inputSchema: {
+      docId: docIdSchema,
+      address: z.string().optional().describe('节点地址(如 1-3-2)：主定位方式；与 nodeId 二选一，二者皆给时以 nodeId 为准。'),
+      nodeId: docIdSchema.optional().describe('节点稳定 UUID：兼容定位入口，可直接传 inspect / log·diff / 引用 拿到的 node_id；address 仍是主路径（find 不输出 node_id）。'),
+      sections: z.string().optional().describe('逗号分隔选段：meta,source,links,axioms,note；默认 meta,note。'),
+      limit: z.number().int().positive().optional(),
+      uuid: z.boolean().optional().describe('true 时身份行显示 doc:UUID；默认显示文档标签。')
+    }
+  }, async ({ docId, address, sections, limit, uuid, nodeId }: DocIdArg & AddressArg & LimitArg & UuidArg & { sections?: string }) => {
+    if (!address && !nodeId) return textResult('inspect 需要 address 或 nodeId 之一。');
+    const argv = ['inspect', String(docId)];
+    if (address) argv.push(String(address));
+    if (sections) argv.push('--sections', String(sections));
+    if (nodeId) argv.push('--node-id', String(nodeId));
+    if (limit) argv.push('--limit', String(limit));
+    if (uuid) argv.push('--uuid');
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('find', {
+    description: '统一检索动词。默认用 terms 做多词 AND 字面检索；semantic=true 时用 query 做语义检索并在命中行追加 score；entity=true 时检索实体库（无 terms 列全部实体，有 terms 返同义/相关列表，加 expand=true 时用同义组扩展后做字面检索返节点）。命中行输出 文档标签/address/type/title；uuid=true 时文档标签换成 doc:UUID。命中只用于挑候选，回答前用 read 取回正文证据。',
+    inputSchema: {
+      terms: z.array(z.string()).min(1).optional().describe('字面检索词；semantic=false 时必填（entity=true 时可省略以列全部实体），多词按 AND 精确匹配。'),
+      query: z.string().optional().describe('semantic=true 时的自然语言查询。'),
+      semantic: z.boolean().optional().describe('true 时走语义检索；需目标文档已建立向量索引。'),
+      entity: z.boolean().optional().describe('true 时走实体检索：无 terms 列当前文档全部实体；有 terms 返同义/相关实体列表；配合 expand=true 时用同义组扩展后做字面检索返节点。实体按文档存储，仍需配合 docId/allDocs/folder 圈定范围。'),
+      expand: z.boolean().optional().describe('仅在 entity=true 时有效：用同义组扩展 terms 后做字面检索，返回节点列表而非实体列表。多词保持 AND 框架，每个词的同义组内 OR。'),
+      docId: docIdSchema.optional().describe('限定单篇文档；与 allDocs 二选一。'),
+      allDocs: z.boolean().optional().describe('true 时跨所有已导入文档检索；与 docId 二选一。'),
+      scopeAddress: z.string().optional().describe('可选局部节点地址；需要同时给 docId。'),
+      limit: z.number().int().positive().optional().describe('可选返回数量上限。'),
+      matchMode: z.enum(['doc', 'node', 'or']).optional().describe('字面检索匹配模式：doc=文档级AND(默认,高命中,词可分散在同文档不同节点)、node=节点级AND(精确同节点共现)、or=任一词命中。'),
+      workspace: z.string().optional().describe('按工作区过滤(逗号分隔多值)，如 D--WorkSpace-IFTreeEditor。'),
+      agent: z.string().optional().describe('按记忆卷 agent 过滤(逗号分隔)，如 claude-code、iftree-builtin。'),
+      kind: z.string().optional().describe('按文档类型过滤(逗号分隔)：event=事件卷、memory=核心记忆、knowledge=知识文档。'),
+      trust: z.string().optional().describe('按信任层过滤(逗号分隔)：受控 / 不受控。'),
+      since: z.string().optional().describe('只返回 updated_at ≥ 此时间(ISO 8601)的节点。'),
+      until: z.string().optional().describe('只返回 updated_at ≤ 此时间(ISO 8601)的节点。'),
+      at: z.union([docIdSchema, z.string()]).optional().describe('可选历史 ref（commit id/committed_at/summary tag）：在该版本快照上做字面检索（仅单篇、不支持 semantic/entity/跨文档）。'),
+      folder: z.string().optional().describe('按 library 文件夹子树限定跨文档检索范围（= 检索该文件夹这篇大型虚拟文档），如 generated 或 testtext/无限规则test；folder 本身即跨文档，无需再给 allDocs。有哪些文件夹用 library_index（导航虚拟文档）查。'),
+      excludeFolder: z.string().optional().describe('从跨文档检索中排除这些 library 文件夹子树（逗号分隔多个）；可单独用（= 整库减去这些子树）。文件夹路径同样用 library_index 查。'),
+      labels: z.boolean().optional().describe('true 时命中按文档标层级(事件卷/核心记忆/知识)、按节点标信任(受控/不受控/null=导入未标注，按不受控对待)，便于分层分信任挑候选；默认 false 不输出这些以保持精简。'),
+      uuid: z.boolean().optional().describe('true 时命中行显示 doc:UUID；默认 false，显示文档标签。'),
+      includeHidden: z.boolean().optional().describe('默认 false：跨文档检索排除 . 开头隐藏路径文件夹（如事件卷锚所在的 .memory）；true 时把隐藏路径一并纳入。'),
+      minScore: z.number().optional().describe('过滤阈值（高级搜索）：语义检索按相似度下限，默认 0.51（过滤 sim < 0.51 的弱相关）；字面检索按命中次数下限（hit < 阈值则过滤），默认不限。')
+    }
+  }, async ({ terms, query, semantic, entity, expand, docId, allDocs, scopeAddress, limit, matchMode, workspace, agent, kind, trust, since, until, at, folder, excludeFolder, labels, uuid, includeHidden, minScore }: DocIdOptionalArg & AtArg & LimitArg & UuidArg & {
+    terms?: string[]; query?: string; semantic?: boolean; entity?: boolean; expand?: boolean;
+    allDocs?: boolean; scopeAddress?: string; matchMode?: 'doc' | 'node' | 'or';
+    workspace?: string; agent?: string; kind?: string; trust?: string;
+    since?: string; until?: string; folder?: string; excludeFolder?: string;
+    labels?: boolean; includeHidden?: boolean; minScore?: number;
+  } = {}) => {
+    const folderScope = Boolean(folder) || Boolean(excludeFolder);
+    if (docId && allDocs) return textResult('docId 和 allDocs 只能二选一。');
+    if (docId && folderScope) return textResult('docId 与 folder/excludeFolder 不能同用（folder 已是跨文档范围）。');
+    if (!docId && !allDocs && !folderScope) {
+      return textResult(entity
+        ? '请给 docId 限定单篇，或用 allDocs / folder 跨文档检索。实体按文档存储，同样要先圈定范围。'
+        : '请给 docId 限定单篇，或用 allDocs / folder 跨文档检索。');
+    }
+    if (scopeAddress && !docId) return textResult('scopeAddress 需要同时给 docId。');
+    if (semantic && entity) return textResult('semantic 和 entity 不能同时为 true。');
+    if (expand && !entity) return textResult('expand 需要配合 entity=true 使用。');
+    if (semantic && folderScope) return textResult('folder/excludeFolder 暂只支持字面检索，不支持 semantic（与 workspace/kind 一致，语义范围过滤待接入）。');
+
+    const argv = ['find'];
+    if (semantic) argv.push('--semantic');
+    if (entity) argv.push('--entity');
+    if (expand) argv.push('--expand');
+    if (allDocs || folderScope) argv.push('--all-docs');
+    if (folder) argv.push('--folder', String(folder));
+    if (excludeFolder) argv.push('--exclude-folder', String(excludeFolder));
+    if (scopeAddress) argv.push('--scope', String(docId), scopeAddress);
+    if (limit) argv.push('--limit', String(limit));
+    if (minScore !== undefined) argv.push('--min-score', String(minScore));
+    if (at !== undefined) argv.push('--at', String(at));
+    if (matchMode) argv.push('--match-mode', String(matchMode));
+    if (workspace) argv.push('--workspace', String(workspace));
+    if (agent) argv.push('--agent', String(agent));
+    if (kind) argv.push('--kind', String(kind));
+    if (trust) argv.push('--trust', String(trust));
+    if (since) argv.push('--since', String(since));
+    if (until) argv.push('--until', String(until));
+    if (labels) argv.push('--labels');
+    if (uuid) argv.push('--uuid');
+    if (includeHidden) argv.push('--include-hidden');
+    if (semantic) {
+      const text = String(query || '').trim();
+      if (!text) return textResult('semantic=true 时请给 query。');
+      argv.push(text);
+    } else {
+      const safeTerms = Array.isArray(terms) ? terms.map((term) => String(term).trim()).filter(Boolean) : [];
+      if (safeTerms.length === 0 && !entity) return textResult('请给 terms（entity=true 时可省略以列全部实体）。');
+      argv.push(...safeTerms);
+    }
+    try {
+      return textResult((await dbShell(client, argv, allDocs || folderScope || scopeAddress ? undefined : docId)) || '(无命中)');
+    } catch (error) {
+      return textResult(`find 当前不能执行：${(error as { message?: string } | null | undefined)?.message || error}\n降级：用 find 的 terms 字面检索 + tree 结构定位。`);
+    }
+  });
+
+  server.registerTool('log', {
+    description: '列出文档或某节点/子树的提交历史。不给 address 即整篇文档的 commit 史；给 address（如 1-3-2）则按 git log <path> 语义，只列该地址的整棵子树（node=true 时只看本节点）被改动过的 commit，按稳定 id 追（节点换过地址也连得上）。每行含 commit id（可喂给 diff/read --at/restore）、时间、@author、摘要。',
+    inputSchema: {
+      docId: docIdSchema.describe('已导入文档的 doc id。'),
+      address: z.string().optional().describe('可选节点地址（如 1-3-2）；给了即节点级 log，默认看整棵子树。'),
+      nodeId: docIdSchema.optional().describe('可选节点稳定 UUID：兼容定位入口，给了即节点级 log（优先于 address）。'),
+      node: z.boolean().optional().describe('true 时只看该地址节点自身、不含子树（需配合 address）。'),
+      limit: z.number().int().positive().optional()
+    }
+  }, async ({ docId, address, node, limit, nodeId }: DocIdArg & AddressArg & LimitArg & { node?: boolean }) => {
+    const argv = ['log', String(docId)];
+    if (address) argv.push(String(address));
+    if (nodeId) argv.push('--node-id', String(nodeId));
+    if (node) argv.push('--node');
+    if (limit) argv.push('--limit', String(limit));
+    return textResult((await dbShell(client, argv)) || '(无历史)');
+  });
+
+  server.registerTool('diff', {
+    description: '对比草稿与正文，或两版保存历史。不给 historyId 时对比「草稿↔正文」：给 branchId/baseDocId/shadowDocId 指定草稿，否则用 switch 选中的草稿（原 changes / changes --detail 已并入此态）。给 docId + toHistoryId（可选 fromHistoryId）则对比两版历史。两个正交参数：detail 切粒度（summary 节点+计数 / full 逐行 old→new，默认 full），json 切格式（true 出结构化 entries）。计数为正文↔草稿最终态的按节点净效果（等价来回的中间动作会被压平、一次 split 计为净增节点数），与 edit 返回的逐动作累加计数口径不同、数值可能不等。',
+    inputSchema: {
+      docId: docIdSchema.optional(),
+      fromHistoryId: docIdSchema.optional(),
+      toHistoryId: docIdSchema.optional(),
+      historyId: docIdSchema.optional(),
+      branchId: z.number().int().positive().optional(),
+      shadowDocId: docIdSchema.optional(),
+      baseDocId: docIdSchema.optional(),
+      owner: ownerSchema.optional(),
+      detail: z.enum(['summary', 'full']).optional().describe('文本粒度：summary（节点列表+改增删移计数、不出正文）/ full（逐行 old→new）；默认 full。'),
+      json: z.boolean().optional().describe('true 时返回结构化 entries（含 fields old/new、createdAt 等）；与 detail 正交——json 管格式、detail 管文本粒度。'),
+      from: z.string().optional().describe('refA↔refB 比对左端：head（正文，默认 from）/ <commitId>（历史）/ draft 或 draft:<branchId>（草稿）。给 from 或 to 即走通用 ref 比对。'),
+      to: z.string().optional().describe('比对右端：取值同 from。只给 from 时对端默认 head 正文；from/to 都不传则整体走草稿↔正文。'),
+      entity: z.boolean().optional().describe('true 时把草稿的实体改动（entity.create/update/delete/bindNode/link 等）按动作流也列进 diff；默认 false 不列——一次实体绑定常涉及上千节点，混进正文 diff 会刷屏。仅对草稿↔正文 diff 生效（历史/ref 比对不含实体）。')
+    }
+  }, async ({ docId, fromHistoryId, toHistoryId, historyId, branchId, shadowDocId, baseDocId, owner, json, detail, from, to, entity }: DocIdOptionalArg & BranchTargetArg & OwnerArg & JsonArg & {
+    fromHistoryId?: DocId; toHistoryId?: DocId; historyId?: DocId;
+    detail?: 'summary' | 'full'; from?: string; to?: string; entity?: boolean;
+  } = {}) => {
+    const argv = ['diff'];
+    const targetHistoryId = toHistoryId ?? historyId;
+    if (from !== undefined || to !== undefined) {
+      // refA↔refB（15-5-2）：draft ref 的目标解析在 db-shell 侧做，这里把显式目标 + switch 选择铺成 flags 供其兜底。
+      if (docId !== undefined) argv.push(String(docId));
+      if (from !== undefined) argv.push('--from', String(from));
+      if (to !== undefined) argv.push('--to', String(to));
+      const draftTarget = { branchId: branchId ?? selectedBranch.branchId ?? undefined, baseDocId: baseDocId ?? selectedBranch.baseDocId ?? undefined };
+      if (draftTarget.branchId !== undefined) argv.push('--branch', String(draftTarget.branchId));
+      if (draftTarget.baseDocId !== undefined) argv.push('--base', String(draftTarget.baseDocId));
+      argv.push('--owner', String(owner ?? selectedBranch.owner ?? DEFAULT_WRITE_OWNER));
+    } else if (docId && targetHistoryId) {
+      // 历史两版优先：给了 docId + historyId 即比历史，不抢草稿态。
+      argv.push(String(docId));
+      if (fromHistoryId) argv.push(String(fromHistoryId));
+      argv.push(String(targetHistoryId));
+    } else {
+      // 草稿↔正文：显式目标或 switch 选中的草稿（草稿按 branchId 唯一定位，owner 仅 baseDocId 场景消歧、缺省兜档位默认）。
+      const tgtBranchId = branchId ?? selectedBranch.branchId ?? undefined;
+      const tgtBaseDocId = baseDocId ?? selectedBranch.baseDocId ?? undefined;
+      if (tgtBranchId === undefined && shadowDocId === undefined && tgtBaseDocId === undefined) {
+        return textResult('diff 需要 docId + toHistoryId/historyId（两版历史），或 branchId/baseDocId/shadowDocId（草稿↔正文），或先 switch 到一个草稿。');
+      }
+      if (tgtBranchId !== undefined) argv.push('--branch', String(tgtBranchId));
+      if (shadowDocId !== undefined) argv.push('--shadow', String(shadowDocId));
+      if (tgtBaseDocId !== undefined) argv.push('--base', String(tgtBaseDocId));
+      argv.push('--owner', String(owner ?? selectedBranch.owner ?? DEFAULT_WRITE_OWNER));
+      if (entity) argv.push('--entity');
+    }
+    if (detail) argv.push('--detail', String(detail));
+    if (json) argv.push('--json');
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('sql', {
+    description: '只读 SQL 调试查询。只允许 SELECT/WITH，后端用 SQLite readonly 校验；用于核对数据库事实，不写入。'
+      + ' 核心表(主键/常用列)：'
+      + 'docs(id 主键=文档UUID, title, meta JSON含semantic状态, folder_id, edit_mode, updated_at)；'
+      + 'nodes(id 主键=节点UUID, doc_id 外键, parent_id, address, node_type, text 正文, node_title, node_note, trust_level=受控|不受控, content_hash, subtree_hash, updated_at)；'
+      + 'source_documents(doc_id 主键且=外键, source_type, original_path, raw_markdown；注意无 id 列)；'
+      + 'doc_folders(id 主键 INTEGER, parent_id, name)；'
+      + 'axioms(id 主键, doc_id, label, content, status)；'
+      + 'refs(id 主键, source_type/source_id, target_type/target_id, ref_kind)；'
+      + 'commits(id 主键=commitUUID, doc_id, parent_commit_id, committed_at, summary, snapshot JSON)；doc_heads(doc_id 主键, head_commit_id 指向当前)；'
+      + 'edit_branches(id 主键 INTEGER, base_doc_id, shadow_doc_id, owner, status)；'
+      + 'entities(id 主键, doc_id, literal, normalized_literal) / entity_links / entity_node_bindings。'
+      + ' 速记：文档=docs.id、节点正文=nodes.text；docs/nodes/commits 主键叫 id，source_documents 主键叫 doc_id。',
+    inputSchema: {
+      sql: z.string().describe('SELECT 或 WITH 开头的只读 SQL。'),
+      params: z.union([z.array(z.any()), z.record(z.string(), z.any())]).optional().describe('可选 SQL 参数；数组对应 ? 参数，对象对应 @name 参数。'),
+      limit: z.number().int().positive().optional().describe('可选返回行数上限；后端会限制最大值。'),
+      json: z.boolean().optional().describe('true 时返回原始 JSON（行数组）；默认按行渲染紧凑文本。')
+    }
+  }, async ({ sql, params, limit, json }: LimitArg & JsonArg & { sql: string; params?: unknown[] | Record<string, unknown> }) => {
+    const argv = ['sql', String(sql)];
+    if (params !== undefined) argv.push('--params', JSON.stringify(params));
+    if (limit !== undefined) argv.push('--limit', String(limit));
+    if (json) argv.push('--json');
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('article', {
+    description: '读取导入文档的原文窗口。以锚点（startOffset 或 nodeId，都不给则文档开头）为基准取总长 limit 的窗口（默认 5000、上限 50000）。往前/往后自动分配：往前=min(⌊limit/5⌋,1000)、其余归往后（limit≤5000 时前后 1:4，更大时往前封顶 1000）；撞原文开头把往前余量并入往后、撞结尾则往前不补。触及原文首/尾时文本带 [原文开始]/[原文结束] 标记以区分自然到底与截断。可附 source spans。',
+    inputSchema: {
+      docId: docIdSchema.describe('已导入文档的 doc id。'),
+      nodeId: docIdSchema.optional().describe('可选锚点节点 id；从该节点对应的原文位置取窗口。'),
+      startOffset: z.number().int().nonnegative().optional().describe('可选原文锚点偏移；以它为中心取总长 limit 的窗口。不提供时用 nodeId 或文档开头。'),
+      limit: z.number().int().positive().optional().describe('可选总窗口字符数；默认 5000，上限 50000（超过即报错，不静默截断）。'),
+      before: z.number().int().nonnegative().optional().describe('可选往前字符数；不传按 min(⌊limit/5⌋,1000) 自动分配、传了覆盖；上限 50000（超过即报错）。'),
+      spansLimit: z.number().int().positive().optional().describe('可选 source span 返回数量上限；默认 30。截断时文本模式标「窗口共 N」、json 模式给 spansTotal。'),
+      includeSpans: z.boolean().optional().describe('true 时附 source spans（文本模式为紧凑行，json 模式为结构化数组）；默认只返回窗口和文本。'),
+      json: z.boolean().optional().describe('true 时返回原始结构化 JSON（window 对象 + 完整 sourceSpans）；默认返回文本（窗口头一行 + 原文 + 可选紧凑 spans 行）。')
+    }
+  }, async ({ docId, nodeId, startOffset, limit, before, spansLimit, includeSpans, json }: DocIdArg & LimitArg & JsonArg & {
+    nodeId?: DocId; startOffset?: number; before?: number; spansLimit?: number; includeSpans?: boolean;
+  }) => {
+    const argv = ['article', String(docId)];
+    if (nodeId !== undefined) argv.push('--node-id', String(nodeId));
+    if (startOffset !== undefined) argv.push('--start', String(startOffset));
+    if (before !== undefined) argv.push('--before', String(before));
+    if (limit !== undefined) argv.push('--limit', String(limit));
+    if (spansLimit !== undefined) argv.push('--spans-limit', String(spansLimit));
+    if (includeSpans) argv.push('--spans');
+    if (json) argv.push('--json');
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('memory_volumes', {
+    description: '列出完整记忆的 session 卷及状态（projectneed 15-10）。状态由时间戳推导：active（活跃）→ sealed（末次活动+24h 视为收尾，冷却中）→ distillable（再+24h 可提炼）→ distilled（已提炼）。返回每卷的 agent 身份、session id、起止时间、末次活动时间等时间元数据；采信任何卷内容前先看时间（15-12-6）。卷正文用 tree/read 按 docId 下钻（查过往）。',
+    inputSchema: {
+      state: z.enum(['active', 'sealed', 'distillable', 'distilled']).optional().describe('可选状态过滤。'),
+      agent: z.string().optional().describe('可选 agent 身份过滤。'),
+      sessionId: z.string().optional().describe('可选 session id 过滤。'),
+      limit: z.number().int().positive().optional().describe('可选返回数量上限；默认最新 5 卷（按建卷时间倒序，最新在前）。要看更早的卷请显式调大 limit。'),
+      json: z.boolean().optional().describe('true 时返回原始 JSON（卷数组）；默认每卷一行渲染。')
+    }
+  }, async ({ state, agent, sessionId, limit, json }: LimitArg & JsonArg & {
+    state?: 'active' | 'sealed' | 'distillable' | 'distilled'; agent?: string; sessionId?: string;
+  } = {}) => {
+    const argv = ['memory', 'list'];
+    if (state !== undefined) argv.push('--state', String(state));
+    if (agent !== undefined) argv.push('--agent', String(agent));
+    if (sessionId !== undefined) argv.push('--session-id', String(sessionId));
+    if (limit !== undefined) argv.push('--limit', String(limit));
+    if (json) argv.push('--json');
+    return textResult(await dbShell(client, argv));
+  });
+}
+
+export function registerAgentTools(server: McpServer, client: BackendClient, tier = TIER) {
+  // A2A 委托内置 agent 的入口按档位化（projectneed 18-1）：ask_agent 恒 qa（read 档·只读问答），
+  // edit_agent（edit 档）/admin_agent（full 档）委托更高能力；委托权限不超过调用方自身档位，
+  // 按档位注册不同动词、不在单一动词内按档位切 mode。
+  const isWriteTier = tier === 'edit' || tier === 'full' || tier === 'human';
+  const isFullTier = tier === 'full' || tier === 'human';
+  const registerAgentDelegate = (name: string, mode: string, description: string) => {
+    server.registerTool(name, {
+      description,
+      inputSchema: { prompt: z.string(), docId: docIdSchema.optional(), sessionId: z.number().int().positive().optional() }
+    }, async ({ prompt, docId, sessionId }: DocIdOptionalArg & { prompt: string; sessionId?: number }, extra: any) => {
+      const payload: Record<string, unknown> = { mode, prompt };
+      if (docId) payload.docId = docId;
+      if (sessionId) payload.sessionId = sessionId;
+      // 委托内置 agent 是长任务（检索+多轮推理），单次回包前默认无声 → 调用方 MCP 客户端会 -32001 超时。
+      // 跑期间周期发 progress 通知保活（仅在调用方请求带 progressToken + resetTimeoutOnProgress 时生效）。
+      const progressToken = extra?._meta?.progressToken;
+      let keepAlive: NodeJS.Timeout | null = null;
+      if (progressToken != null && typeof extra?.sendNotification === 'function') {
+        let ticks = 0;
+        keepAlive = setInterval(() => {
+          extra.sendNotification({
+            method: 'notifications/progress',
+            params: { progressToken, progress: (ticks += 1), message: `${name} 运行中…` }
+          }).catch(() => { /* 通知失败不影响主流程 */ });
+        }, 20000);
+        if (typeof keepAlive?.unref === 'function') keepAlive.unref();
+      }
+      try {
+        const result = await client.runAgent(payload) as { answer?: string; error?: string; sessionId?: number } | null;
+        const answer = result?.answer || result?.error || '(无回答)';
+        const sid = result?.sessionId != null ? `\n\n[sessionId: ${result.sessionId}]` : '';
+        return textResult(`${answer}${sid}`);
+      } finally {
+        if (keepAlive) clearInterval(keepAlive);
+      }
+    });
+  };
+  registerAgentDelegate('ask_agent', 'qa',
+    '直接问本产品的内置文档智能体（A2A，read 档·只读问答，恒 qa 不随档提权）。它会按检索纪律自己查文档、读正文、附证据节点再回答。docId 指定当前文档；sessionId 用于多轮续接（把上轮返回的 sessionId 传回来）。');
+  if (isWriteTier) registerAgentDelegate('edit_agent', 'edit',
+    'edit/full/human 档可见：委托内置 agent 以 edit 能力代劳——它可提议编辑，提议落 owner=llm:<会话> 待审草稿，再用 draft list/merge/discard 审批。多轮/证据纪律同 ask_agent。');
+  if (isFullTier) registerAgentDelegate('admin_agent', 'full',
+    'full/human 档可见：委托内置 agent 以 full 能力运维——在 edit 提议之外还可做历史改写、流式、索引补建等运维。多轮/证据纪律同 ask_agent。');
+}
+
+// 探活：process.kill(pid, 0) 不发信号、只探进程是否存在。ESRCH=不存在；EPERM=存在但无权限（仍算活）。
+function isBackendProcessAlive(pid: number | null | undefined): boolean {
+  if (!pid || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as { code?: string } | null)?.code === 'EPERM';
+  }
+}
+
+// 强杀后端并确认退出：优雅 shutdown 兜不住时（host 崩在加载 native 不响应 shutdown、或被别的客户端长
+// 操作阻塞在队列）必须真把它杀掉。Windows 的 process.kill 只 TerminateProcess 单进程、不杀子进程也不等
+// 退出；这里用 taskkill /T /F 杀整棵进程树，posix 用 SIGKILL，再轮询确认 pid 真消失（最多 ~3s）——不是
+// 发个信号就算数。SQLite(WAL)/LanceDB(版本化提交) 崩溃安全，强杀不致损坏。
+async function forceKillBackend(pid: number): Promise<boolean> {
+  if (!isBackendProcessAlive(pid)) return true;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      process.kill(pid, 'SIGKILL');
+    }
+  } catch { /* 可能正好自己退出了 */ }
+  for (let i = 0; i < 30; i += 1) {
+    if (!isBackendProcessAlive(pid)) return true;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  return !isBackendProcessAlive(pid);
+}
+
+function registerLifecycleTools(server: McpServer, client: BackendClient) {
+  server.registerTool('restart_backend', {
+    description: 'full 档运维：强制重启共享后端。先优雅关停、再按 pid 强杀整棵进程树并确认退出——确保被其他客户端（opencode/codex 等）续住、或崩在加载 native 不响应 shutdown 的旧后端也被真正杀掉。下次工具调用会拉起 node runtime 的最新实例（host 恒 node ABI，与本 shell 自己跑 node 还是 electron 无关）。会中断其余客户端正在进行的后端操作（它们下次调用自会重连/重拉）。工具 schema 未变，无需重连 MCP。'
+  }, async () => {
+    // pid 取自当前连接的 ready 帧；本进程还没连过后端时回退描述文件——别的客户端/GUI 续住的游离
+    // 后端 pid 一直记在那里，否则首调会因 client.pid 为 null 误判「未启动」而漏杀。
+    // transport.sharedBackendPid 在 backend-client 处声明为 unknown（IPC 边界），收口为 number | null。
+    const pid: number | null = (client.sharedBackendPid as number | null) ?? null;
+    try {
+      await client.shutdown();
+    } catch { /* 后端可能已在退出 */ }
+    client.close();
+    let outcome: string;
+    if (!pid) {
+      outcome = '当前未启动';
+    } else if (pid === process.pid) {
+      outcome = `pid=${pid}（即本进程，跳过）`;
+    } else {
+      const dead = await forceKillBackend(pid);
+      outcome = `pid=${pid}（${dead ? '已终止' : '强杀后仍未退出，请手动检查'}）`;
+    }
+    // 清自己认得的陈尸连接描述：避免下次发现复用死 pid/pipe；pid 不匹配（已被新后端重写）则不动。
+    try {
+      removeBackendDescriptorIfOwn(backendDescriptorPath(resolveBackendDbPath(PROJECT_ROOT)), pid);
+    } catch { /* 描述不存在或已被新后端重写 */ }
+    return textResult(`已关闭后端（${outcome}）。下一次 MCP 工具调用会拉起最新实例（node runtime）；工具 schema 未变，无需重连 MCP。`);
+  });
+}
+
+// 写动词内部用的草稿目标态：来自 callback args + selectedBranch 兜底 + 写身份 owner 默认。
+interface ResolvedBranchTarget {
+  branchId?: number;
+  shadowDocId?: DocId;
+  baseDocId?: DocId;
+  owner: string;
+}
+
+// Progressive tier (projectneed `18-3`): read = read tools only; edit adds
+// import/delete plus review of proposed changes; full adds accepting + saving.
+export function registerWriteTools(server: McpServer, client: BackendClient, tier: string) {
+  const setSelectedBranch = ({ branchId = null, baseDocId = null, owner = null }: {
+    branchId?: number | null; baseDocId?: DocId | null; owner?: string | null;
+  } = {}) => {
+    selectedBranch.branchId = branchId ?? null;
+    selectedBranch.baseDocId = baseDocId ?? null;
+    selectedBranch.owner = owner ?? null;
+    return { ...selectedBranch };
+  };
+  const branchTarget = ({ branchId, shadowDocId, baseDocId, owner }: BranchTargetArg & OwnerArg = {}): ResolvedBranchTarget => ({
+    branchId: branchId ?? selectedBranch.branchId ?? undefined,
+    shadowDocId,
+    baseDocId: baseDocId ?? selectedBranch.baseDocId ?? undefined,
+    owner: owner ?? selectedBranch.owner ?? DEFAULT_WRITE_OWNER
+  });
+  const hasBranchTarget = (target: ResolvedBranchTarget) => (
+    target.branchId !== undefined || target.shadowDocId !== undefined || target.baseDocId !== undefined
+  );
+  // 草稿目标 → db-shell flags（discard/rebase/cherry-pick 先例的通用化）：目标在 MCP 侧解析成
+  // 显式 argv、不消费 backend shellState——共享后端多客户端互不干扰。
+  const branchArgv = (target: ResolvedBranchTarget): string[] => {
+    const argv: string[] = [];
+    if (target.branchId !== undefined) argv.push('--branch', String(target.branchId));
+    if (target.shadowDocId !== undefined) argv.push('--shadow', String(target.shadowDocId));
+    if (target.baseDocId !== undefined) argv.push('--base', String(target.baseDocId));
+    if (target.owner) argv.push('--owner', String(target.owner));
+    return argv;
+  };
+  const importLibraryDocument = async ({ relativePath, mode, embed, vectors }: {
+    relativePath: string; mode?: string; embed?: boolean; vectors?: boolean;
+  }) => {
+    // vectors 是 push 的内联向量口径、不是 import 的开关——传错直接回报错，别静默不建。
+    if (vectors !== undefined) return textResult('import 不接受 vectors 参数；导入时同步建向量用 embed:true（vectors 是 push 的内联向量口径）。');
+    const argv = ['import', String(relativePath)];
+    if (mode) argv.push('--mode', String(mode));
+    if (embed === true) argv.push('--embed');
+    return textResult(await dbShell(client, argv));
+  };
+
+  const ensureVectors = async ({ docId }: DocIdArg) => textResult(await dbShell(client, ['vectors', String(docId)]));
+
+  const saveBranch = async (input: BranchTargetArg & OwnerArg & DraftSummaryArg = {}) => {
+    const target = branchTarget(input);
+    if (!hasBranchTarget(target)) return textResult('commit/merge 需要 branchId/baseDocId/shadowDocId。');
+    const argv = ['commit', ...branchArgv(target)];
+    const summary = input.summary || input.tag;
+    if (summary) argv.push('--summary', String(summary));
+    return textResult(await dbShell(client, argv));
+  };
+
+  const stepEditBranchEntry = async (action: string, input: BranchTargetArg & OwnerArg = {}) => {
+    const target = branchTarget(input);
+    if (!hasBranchTarget(target)) {
+      return textResult(`${action} 需要 branchId/baseDocId/shadowDocId，或先 switch 到一个分支。`);
+    }
+    return textResult(await dbShell(client, [action, ...branchArgv(target)]));
+  };
+
+  server.registerTool('edit', {
+    description: `edit/full/human 档可见：把一条编辑动作写入当前草稿；owner 默认取档位（edit/full 档为 llm、human 档为 human），不直接改主库。action 使用现有 node/axiom/ref/entity 写动作。${nodeTypeContractText}`,
+    inputSchema: {
+      action: z.enum([
+        'node.update',
+        'node.insert',
+        'node.delete',
+        'node.move',
+        'node.promote',
+        'node.split',
+        'node.mergeInto',
+        'node.mergePrevious',
+        'node.reparent',
+        'node.moveAfter',
+        'node.moveBefore',
+        'axiom.add',
+        'axiom.update',
+        'axiom.delete',
+        'axiom.move',
+        'ref.addNodeToNode',
+        'ref.addAxiomToNode',
+        'ref.delete',
+        'entity.create',
+        'entity.update',
+        'entity.delete',
+        'entity.link',
+        'entity.unlink',
+        'entity.bindNode',
+        'entity.ignoreNode',
+        'entity.clearNodeBinding'
+      ]),
+      nodeId: docIdSchema.optional().describe('目标节点 id：node.update/delete/move/reparent/moveAfter/moveBefore/promote/split 的目标；node.mergeInto 的源节点（合并进 targetNodeId）。'),
+      text: z.string().optional().describe('正文：node.update 改正文 / node.insert 新节点正文。'),
+      nodeType: z.string().optional().describe(`节点类型：node.update/insert。${nodeTypeContractText}`),
+      nodeTitle: z.string().optional().describe('节点标题：node.update/insert。'),
+      nodeNote: z.string().optional().describe('节点备注：node.update/insert。'),
+      parentId: docIdSchema.optional().describe('父节点 id：node.reparent 新父；node.insert 仅在插为首个子节点/空父下时需要（给了 afterNodeId 则父从锚点自动推断、不必再给）。'),
+      afterNodeId: docIdSchema.optional().describe('锚点节点 id：node.insert 插其后（父从锚点自动推断，无需 parentId）/ node.moveAfter 移到其后。'),
+      targetNodeId: docIdSchema.optional().describe('目标节点 id：node.moveAfter 移到其后 / node.moveBefore 移到其前 / node.mergeInto 合并进的目标节点（afterNodeId 会兜底映射到它）。'),
+      direction: z.enum(['up', 'down']).optional().describe('node.move 方向（up/down 与相邻兄弟换位）。move 逐动作记进草稿，但 diff/commit/merge 按最终态净效果对账（git 式：不保存草稿内的连续中间动作）——若该节点被同草稿内后续的增删/重排又挪回原位，这次 move 在净效果里会被中和、不单独显示，这是正确的净效果而非动作丢失（要看逐动作累加用 edit 回执的改/增/删/移计数）。'),
+      splitAsciiPunctuation: z.boolean().optional().describe('node.split 切句落点：把目标节点正文按句末标点切分，首句留在原节点、其余各句作为原节点的【子节点】下沉进它的子树（不是生成与原节点平级的兄弟——切第七章只在第七章内部分层，不会溢成第八章那样的同级邻居）。本参数控制是否额外按 ASCII .!? 切句，默认 false（中文文档只按中文句末标点 。！？ 切）。'),
+      payload: z.record(z.string(), z.any()).optional().describe(`兜底参数：仅 axiom/ref/entity 等低频动作、或上面未覆盖的字段才需要；高频 node 操作用上面的具名字段、不必手写 payload（不裸 json，见 15-5-2）。低频动作字段（统一推荐驼峰；docId 一律走顶层 baseDocId）：axiom.add{content,status?,nodeTitle?,nodeNote?} / axiom.update{axiomId,content?,status?} / axiom.delete{axiomId} / axiom.move{axiomId,direction}；ref.addNodeToNode{sourceNodeId,targetNodeId,refKind,note?} / ref.addAxiomToNode{nodeId,axiomId,note?} / ref.delete{refId}；entity.create{literal} / entity.update{entityId,literal} / entity.delete{entityId} / entity.link|unlink{sourceEntityId,targetEntityId,kind:synonym|related} / entity.bindNode|ignoreNode|clearNodeBinding{entityId,nodeId}。${nodeTypeContractText}`),
+      owner: ownerSchema.optional().describe('写入者身份；缺省取档位默认（非 human 档不接受 owner=human，18-3 运行中不升档）。'),
+      baseDocId: docIdSchema.optional().describe('目标文档 id：node/axiom/ref/entity 各动作均认（顶层给即可，进编辑分支后作 docId 真相）。动作参数能推出 docId（带 nodeId/entityId/axiomId/refId 反查）时可省。'),
+      branchId: z.number().int().positive().optional().describe('目标草稿 branchId：多草稿并存时精确指定写哪个分支；省略则用 switch 选中的草稿，再退回 (baseDocId, owner) 定位。')
+    }
+  }, async ({ action, nodeId, text, nodeType, nodeTitle, nodeNote, parentId, afterNodeId, targetNodeId, direction, splitAsciiPunctuation, payload = {}, owner, baseDocId, branchId }: BranchTargetArg & OwnerArg & {
+    action: string;
+    nodeId?: DocId; text?: string; nodeType?: string; nodeTitle?: string; nodeNote?: string;
+    parentId?: DocId; afterNodeId?: DocId; targetNodeId?: DocId;
+    direction?: 'up' | 'down'; splitAsciiPunctuation?: boolean;
+    payload?: Record<string, unknown>;
+  }) => {
+    const resolved = resolveWriteOwner(owner);
+    if (resolved.error) return textResult(resolved.error);
+    // 具名字段合入 payload：高频 node 操作无需手写 payload（不裸 json，见 15-5-2）；payload 仅兜底 axiom/ref/entity 等低频动作。
+    const named = { nodeId, text, nodeType, nodeTitle, nodeNote, parentId, afterNodeId, targetNodeId, direction, splitAsciiPunctuation };
+    const writePayload: Record<string, unknown> = { ...payload };
+    for (const [key, value] of Object.entries(named)) {
+      if (value !== undefined) writePayload[key] = value;
+    }
+    if (action === 'node.reparent'
+      && writePayload.parentId !== undefined
+      && writePayload.newParentId === undefined
+      && writePayload.new_parent_id === undefined) {
+      writePayload.newParentId = writePayload.parentId;
+    }
+    if ((action === 'node.moveAfter' || action === 'node.moveBefore' || action === 'node.mergeInto')
+      && writePayload.afterNodeId !== undefined
+      && writePayload.targetNodeId === undefined
+      && writePayload.target_node_id === undefined) {
+      writePayload.targetNodeId = writePayload.afterNodeId;
+    }
+    // 转发 db-shell edit：action/editBranch* 由 db-shell 从 argv 铺，payload 只带动作参数。
+    // 草稿定位优先级：显式 branchId > switch 选中的 branchId；baseDocId 同理回退 switch 选中，多草稿并存时精确路由（不再只靠 (baseDocId, owner)）。
+    const argv = ['edit', action, JSON.stringify(writePayload), '--owner', String(resolved.owner)];
+    const targetBranchId = branchId ?? selectedBranch.branchId ?? undefined;
+    if (targetBranchId !== undefined) argv.push('--branch', String(targetBranchId));
+    const targetBaseDocId = baseDocId ?? selectedBranch.baseDocId ?? undefined;
+    if (targetBaseDocId !== undefined) argv.push('--base', String(targetBaseDocId));
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('draft', {
+    description: 'edit/full/human 档可见：草稿管理。new 起草（挂某文档，owner 取档位身份）——默认复用当前身份下最新草稿，fresh:true 才另起一份新草稿；list 列当前草稿及署名（可按 docId 过滤）。对比走 diff、弃稿走 discard、落正文走 commit/merge。',
+    inputSchema: {
+      action: z.enum(['new', 'list']),
+      docId: docIdSchema.optional(),
+      owner: ownerSchema.optional(),
+      fresh: z.boolean().optional().describe('draft new：true 时强制另起一份新草稿，不复用当前身份下已有的最新草稿。')
+    }
+  }, async ({ action, docId, owner, fresh }: DocIdOptionalArg & OwnerArg & { action?: 'new' | 'list'; fresh?: boolean } = {}) => {
+    if (action === 'list') {
+      const argv = ['draft', 'list'];
+      if (docId) argv.push(String(docId));
+      if (owner) argv.push('--owner', String(owner));
+      // current 标注用本进程的 switch 选择显式传入（不消费 backend shellState）。
+      if (selectedBranch.branchId != null) argv.push('--current', String(selectedBranch.branchId));
+      return textResult(await dbShell(client, argv));
+    }
+    if (action === 'new') {
+      if (!docId) return textResult('draft new 需要 docId。');
+      const resolved = resolveWriteOwner(owner);
+      if (resolved.error) return textResult(resolved.error);
+      const argv = ['draft', 'new', String(docId), '--owner', String(resolved.owner)];
+      if (fresh === true) argv.push('--fresh');
+      return textResult(await dbShell(client, argv));
+    }
+    return textResult(`未知 draft action: ${action}`);
+  });
+
+  server.registerTool('commit', {
+    description: 'edit/full/human 档可见：定稿——把当前草稿生效 diff 写入正文历史并销稿。不带裁决：快进直落；非快进逐条前置验证账目，结构性失配返回 blocked（正文已被修改，只能 discard 弃稿），字段级冲突返回 conflicts 待裁清单、不落——要带裁决落库改走 merge（strategy/resolutions）。',
+    inputSchema: {
+      branchId: z.number().int().positive().optional(),
+      shadowDocId: docIdSchema.optional(),
+      baseDocId: docIdSchema.optional(),
+      owner: ownerSchema.optional(),
+      summary: z.string().optional(),
+      tag: z.string().optional().describe('当前后端没有独立 tag 表；传入时作为 summary 使用。')
+    }
+  }, saveBranch);
+
+  server.registerTool('merge', {
+    description: 'edit/full/human 档可见：按 A5-10 把草稿调和落正文。默认只预览三方分类（fastForward、hasConflicts、逐节点 resolution 与扁平 conflicts，按稳定 node id 调和、不按地址）。yes=true 执行：快进直接写回；非快进逐条前置验证（乐观并发，O(改动数) 点查），结构性失配（正文删了被改/被挂载的节点、并发移动、拆分/并入的内容漂移）返回 blocked；字段级冲突按裁决折叠——strategy=ours/theirs 整批取正文侧/草稿侧，或 resolutions 逐条裁决 [{id,field,pick:ours|theirs|fill,value?}]；不给裁决撞冲突则返回 conflicts 待裁清单、不落。冲突与受阻时正文与草稿均不动。',
+    inputSchema: {
+      branchId: z.number().int().positive().optional(),
+      shadowDocId: docIdSchema.optional(),
+      baseDocId: docIdSchema.optional(),
+      owner: ownerSchema.optional(),
+      summary: z.string().optional(),
+      strategy: z.enum(['ours', 'theirs']).optional().describe('整批裁决：撞字段冲突一律取正文侧(ours)/草稿侧(theirs)，对应 git -X。'),
+      resolutions: z.array(z.object({
+        id: docIdSchema,
+        field: z.string(),
+        pick: z.enum(['ours', 'theirs', 'fill']),
+        value: z.string().optional()
+      })).optional().describe('逐条裁决；pick=fill 时须给 value。与 strategy 同给以 resolutions 为准。'),
+      yes: z.boolean().optional(),
+      json: z.boolean().optional().describe('true 时返回结构化三方摘要：省略 unchanged 节点，只列有净变化的节点与冲突；默认文本同样折叠未改。')
+    }
+  }, async ({ yes, summary, strategy, resolutions, json, ...rest }: BranchTargetArg & OwnerArg & JsonArg & {
+    summary?: string; strategy?: 'ours' | 'theirs';
+    resolutions?: Array<{ id: DocId; field: string; pick: 'ours' | 'theirs' | 'fill'; value?: string }>;
+    yes?: boolean;
+  } = {}) => {
+    const target = branchTarget(rest);
+    if (!hasBranchTarget(target)) return textResult('merge 需要 branchId/baseDocId/shadowDocId，或先 switch 到一个草稿。');
+    const argv = ['merge', ...branchArgv(target)];
+    if (yes) {
+      argv.push('--yes');
+      if (summary) argv.push('--summary', String(summary));
+      if (Array.isArray(resolutions) && resolutions.length > 0) argv.push('--resolutions', JSON.stringify(resolutions));
+      else if (strategy) argv.push('--strategy', String(strategy));
+    }
+    if (json) argv.push('--json');
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('switch', {
+    description: 'edit/full/human 档可见：切换当前草稿选择（进程内）。后续 edit/diff/commit/discard/undo/redo/merge/rebase/cherry-pick 未显式传目标时使用该选择。',
+    inputSchema: { branchId: z.number().int().positive().optional(), baseDocId: docIdSchema.optional(), owner: ownerSchema.optional() }
+  }, async ({ branchId, baseDocId, owner }: BranchTargetArg & OwnerArg = {}) => {
+    if (branchId === undefined && baseDocId === undefined) {
+      // 无参查看：把进程内选择交给 db-shell switch 解析渲染（分支状态行 + base 落后提示），
+      // 与有参切换同一出口；顺带把 backend shellState 同步到当前选择（无害）。
+      if (selectedBranch.branchId == null && !selectedBranch.baseDocId) return textResult('(未选择草稿)');
+      const argv = ['switch'];
+      if (selectedBranch.branchId != null) argv.push('--branch', String(selectedBranch.branchId));
+      if (selectedBranch.baseDocId) argv.push('--base', String(selectedBranch.baseDocId));
+      argv.push('--owner', String(selectedBranch.owner ?? DEFAULT_WRITE_OWNER));
+      return textResult(await dbShell(client, argv));
+    }
+    // 下沉：委托 db-shell switch（分支状态行 + base 落后提示在 backend 渲染，restart_backend 热更可达）。
+    // owner 缺省兜档位默认，让 --base 定位解析到本档草稿；MCP 进程内 selectedBranch 仍双写——
+    // edit/diff/commit/merge 等直连动词的目标兜底读它，待写动词全部下沉后再收敛成单份。
+    const argv = ['switch'];
+    if (branchId !== undefined) argv.push('--branch', String(branchId));
+    if (baseDocId !== undefined) argv.push('--base', String(baseDocId));
+    argv.push('--owner', String(owner ?? DEFAULT_WRITE_OWNER));
+    const text = await dbShell(client, argv);
+    setSelectedBranch({ branchId, baseDocId, owner });
+    return textResult(text);
+  });
+
+  server.registerTool('import', {
+    description: 'edit/full/human 档可见：导入 library 内真实文件。导入强保真：源文件/EPUB 自身重复的章节会原样保留，不在导入层去重。mode 默认 simple：simple=按标题/段落切树，但结构不达标（无标题/层级过浅/只有单一顶层标题）且文档≤1000字时自动退化为整篇单节点（回执会提示退化原因）、超1000字则报错让你改 direct；complete=按句子细切；direct=整篇不切、单节点；smart/vector 暂未接入。embed=true 导入后同步建向量（吃性能），默认不建、留待后补。',
+    inputSchema: {
+      relativePath: z.string().describe('library 内相对路径，不要使用绝对路径。'),
+      mode: z.enum(['simple', 'complete', 'direct', 'smart', 'vector']).optional(),
+      embed: z.boolean().optional().describe('导入后是否同步建立向量（吃性能）。默认 false=后补；true=当场 embed。与 mode 切分方式正交。')
+    }
+  }, importLibraryDocument);
+
+  server.registerTool('delete', {
+    description: 'edit/full/human 档可见：删除已导入文档的 doc 数据，不删除 library 真实文件（`18-3-1`：与 import 成对）。`forget` 一词留给记忆系统的"遗忘记忆"。',
+    inputSchema: { docId: docIdSchema }
+  }, async ({ docId }: DocIdArg) => {
+    return textResult(await dbShell(client, ['delete', String(docId)]));
+  });
+
+  server.registerTool('memory_deliver', {
+    description: 'edit/full/human 档可见：事件卷投递（projectneed 18-8-4）——把这个 session 的宿主记录导入成事件卷。你不复述、不整理：系统读 hostAnchor 指向的真实 session 文件、纯规则解析成卷（确定可重复），所以你只需给 agent + sessionId + hostAnchor。一 session 一卷：同 agent+sessionId 重投 = 旧卷全删 + 完整重导（session 只追加 + 解析确定，重导 ≡ 追加）。无真实源文件就拒投、不建空卷。节点一律 trust_level=不受控（15-10-3）。卷落库后按 24h 节律自动封卷/进入可提炼（15-11-5）。',
+    inputSchema: {
+      agent: z.string().describe('agent 身份标识，如 claude-code、codex。'),
+      sessionId: z.string().describe('宿主侧 session id。'),
+      hostAnchor: z.string().describe('宿主 session 文件锚（路径#sessionid）：必填，指向你这个 session 的真实 transcript 文件；系统读它解析成卷，文件不存在/解析不出对话即拒（15-10-4）。'),
+      title: z.string().optional().describe('卷标题；省略时按 agent+日期+session 生成。'),
+      startedAt: z.string().optional().describe('会话起始时间 ISO 8601。'),
+      endedAt: z.string().optional().describe('会话结束时间 ISO 8601。'),
+      idempotencyKey: z.string().optional().describe('请求级防抖键：只抵消同一次请求的网络重试（省去无谓的重复重导），非内容去重；同 session 重投本就由 session 身份去重，不靠此键。')
+    }
+  }, async ({ agent, sessionId, hostAnchor, title, startedAt, endedAt, idempotencyKey }: {
+    agent: string; sessionId: string; hostAnchor: string;
+    title?: string; startedAt?: string; endedAt?: string; idempotencyKey?: string;
+  }) => {
+    const payload: Record<string, unknown> = { agent, sessionId };
+    if (hostAnchor !== undefined) payload.hostAnchor = hostAnchor;
+    if (title !== undefined) payload.title = title;
+    if (startedAt !== undefined) payload.startedAt = startedAt;
+    if (endedAt !== undefined) payload.endedAt = endedAt;
+    if (idempotencyKey !== undefined) payload.idempotencyKey = idempotencyKey;
+    return textResult(await dbShell(client, ['memory', 'deliver', JSON.stringify(payload)]));
+  });
+
+  server.registerTool('discard', {
+    description: 'edit/full/human 档可见：弃稿——丢弃一份草稿（给 branchId/baseDocId/shadowDocId，或先 switch 到一个草稿）。默认只预览，yes=true 时执行；正文不变。原 branch drop 已并入此动词。',
+    inputSchema: {
+      branchId: z.number().int().positive().optional(),
+      shadowDocId: docIdSchema.optional(),
+      baseDocId: docIdSchema.optional(),
+      owner: ownerSchema.optional(),
+      yes: z.boolean().optional()
+    }
+  }, async ({ yes, ...rest }: BranchTargetArg & OwnerArg & { yes?: boolean } = {}) => {
+    const target = branchTarget(rest);
+    if (!hasBranchTarget(target)) return textResult('discard 需要 branchId/baseDocId/shadowDocId，或先 switch 到一个分支。');
+    // 下沉：委托 db-shell discard（预览与执行回执均在 backend 渲染）。
+    const argv = ['discard', ...branchArgv(target)];
+    if (yes) argv.push('--yes');
+    return textResult(await dbShell(client, argv));
+  });
+
+  server.registerTool('undo', {
+    description: 'edit/full/human 档可见：撤销当前 edit branch 内最后一条生效临时 diff entry，只改变 entry 的 active/undone 状态，不写入主文档历史。',
+    inputSchema: {
+      branchId: z.number().int().positive().optional(),
+      shadowDocId: docIdSchema.optional(),
+      baseDocId: docIdSchema.optional(),
+      owner: ownerSchema.optional()
+    }
+  }, (input: BranchTargetArg & OwnerArg = {}) => stepEditBranchEntry('undo', input));
+
+  server.registerTool('redo', {
+    description: 'edit/full/human 档可见：恢复当前 edit branch 内最近一条已撤销临时 diff entry，只改变 entry 的 active/undone 状态，不写入主文档历史。',
+    inputSchema: {
+      branchId: z.number().int().positive().optional(),
+      shadowDocId: docIdSchema.optional(),
+      baseDocId: docIdSchema.optional(),
+      owner: ownerSchema.optional()
+    }
+  }, (input: BranchTargetArg & OwnerArg = {}) => stepEditBranchEntry('redo', input));
+
+  // A2A 待审收敛（projectneed 18-1 / 乙）：内置 agent 提议进 owner=llm:<会话> 影子分支，外部 agent 用统一
+  // draft list（看，filter owner=llm:*）/ merge（整批采纳）/ discard（整批弃）审批，不再设 list_diffs/apply_diff/reject_diff 专属动词。
+  // full/human 档动词（restore/export/rebase/cherry-pick、vectors/push/set_mode/bulk、memory_distill）；
+  // import/delete 在 edit（18-3-1 成对）、seal 已自动化无动词（memory_volumes 列卷时顺手封到期卷）。
+  if (tier === 'full' || tier === 'human') {
+    server.registerTool('web_search', {
+      description: 'full/human 档可见：联网检索（projectneed 15-5-3），用法对齐通用 web_search、保留 URL 校验+内网拦截；只读联网。给 query 返回搜索结果。',
+      inputSchema: {
+        query: z.string().describe('检索词。'),
+        limit: z.number().int().positive().optional().describe('返回结果数上限。')
+      }
+    }, async ({ query, limit }: LimitArg & { query: string }) => {
+      const argv = ['web', 'search', String(query)];
+      if (limit) argv.push('--limit', String(limit));
+      return textResult(await dbShell(client, argv));
+    });
+
+    server.registerTool('restore', {
+      description: 'full/human 档可见：按 commit id（UUID）、committed_at 精确时间戳或 summary tag 精确回滚文档历史。',
+      inputSchema: {
+        ref: z.union([docIdSchema, z.string()]).optional().describe('commit id（UUID）、committed_at 或 summary tag。'),
+        historyId: docIdSchema.optional().describe('commit id（UUID）；兼容旧入口名。'),
+        savedAt: z.string().optional().describe('精确匹配 commits.committed_at。'),
+        at: z.string().optional().describe('savedAt 的别名。'),
+        tag: z.string().optional().describe('精确匹配 commits.summary。'),
+        docId: docIdSchema.optional().describe('ref/tag/savedAt 命中多条时用于限定文档。')
+      }
+    }, async ({ ref, historyId, savedAt, at, tag, docId }: DocIdOptionalArg & {
+      ref?: DocId | string; historyId?: DocId; savedAt?: string; at?: string; tag?: string;
+    } = {}) => {
+      const argv = ['restore'];
+      if (historyId !== undefined) argv.push('--history', String(historyId));
+      else if (savedAt || at) argv.push('--at', String(savedAt || at));
+      else if (tag) argv.push('--tag', String(tag));
+      else if (ref !== undefined) argv.push(String(ref));
+      else return textResult('restore 需要 ref/historyId/savedAt/at/tag。');
+      if (docId !== undefined) argv.push(String(docId));
+      return textResult(await dbShell(client, argv));
+    });
+
+    server.registerTool('revert', {
+      description: 'full/human 档可见：反向提交——撤销某次已落改动、生成反向变更、保留其后历史（不丢历史，区别于 restore 的 reset 式回滚）。三方调和：只撤目标 commit 改过而其后未再动的部分、并复活其删过的节点；撞冲突（两侧改同处 / 结构性删改）一律 blocked 交人裁、不自动解。',
+      inputSchema: {
+        commitId: z.union([docIdSchema, z.string()]).describe('要撤销的 commit id（UUID）。'),
+        docId: docIdSchema.optional().describe('可选，限定文档。'),
+        json: z.boolean().optional().describe('true 时返回原始 JSON（含完整 doc 刷新）；默认渲染要点摘要。')
+      }
+    }, async ({ commitId, docId, json }: DocIdOptionalArg & JsonArg & { commitId: DocId | string }) => {
+      const argv = ['revert', String(commitId)];
+      if (docId !== undefined) argv.push(String(docId));
+      argv.push('--owner', DEFAULT_WRITE_OWNER);
+      if (json) argv.push('--json');
+      return textResult(await dbShell(client, argv));
+    });
+
+    server.registerTool('vectors', {
+      description: 'full/human 档可见：为已导入文档补建语义向量（重算力，归 full）。只接收 docId。',
+      inputSchema: { docId: docIdSchema }
+    }, ensureVectors);
+
+    server.registerTool('push', {
+      description: 'full/human 档可见：流式写入（projectneed 4-16）。把一批消息节点直接追加进「增量编辑」文档，不走 edit branch。docId 必填——指向已导入的增量编辑文档（要新增文档请用 import，push 不新建文档，否则新建的文档无源文件锚、library_index 不可见）；parentId(uuid 挂载点) 追加，省略 parentId 挂根下。写入信任恒为不受控（18-3：trust 字段下线、不接受 trust_level，标受控走 human 档 certify）；node_type 缺省 TEXT；更细结构放 children 数组递归（缩进即深度）。系统不做内容查重，去重责任在调用方——务必先 read 当前结构确认增量、再 push，不先读就盲推导致的重复由调用方负责。idempotencyKey 只抵消同一次请求的网络重试/重复投递（请求级幂等），不是内容去重。挂载点 uuid 可在增量编辑模式下用只读动词（tree/read）查到。',
+      inputSchema: {
+        docId: docIdSchema.describe('目标增量编辑文档（必填）。要新增文档请用 import。'),
+        title: z.string().optional().describe('文档标题（仅内部记忆卷使用，外部调用无效）。'),
+        parentId: docIdSchema.optional().describe('挂载点节点 uuid；省略时挂在文档根节点下。'),
+        nodes: z.array(z.any()).describe('节点数组；每个 { node_type?, text?, node_title?, node_note?, address?, children? }。写入信任恒为不受控（18-3：不接受 trust_level）。海量追加时给 address（调用方按读到的结构算好，系统校验纯追加并直写、不重排）；省略 address 则系统自动续号（小流友好）。children 递归表达子树。'),
+        idempotencyKey: z.string().optional().describe('请求级幂等键：仅抵消同一次请求的网络重试/重复投递；不做内容去重，跨调用携带同键仍会照写新节点，去重责任在调用方（先 read 后 push）。'),
+        embed: z.boolean().optional().describe('是否对这批刚写入的节点即时生成向量（推一点算一点，与 import 同名）。算力富裕、写入量小可开；海量导入建议不开以保写入吞吐，导完再离线补。声明开启但向量配置不可用会直接报错。'),
+        json: z.boolean().optional().describe('true 时返回原始 JSON（含完整 created 树）；默认按缩进地址渲染。')
+      }
+    }, async ({ docId, title, parentId, nodes, idempotencyKey, embed, vectors, json }: DocIdOptionalArg & JsonArg & {
+      title?: string; parentId?: DocId; nodes?: unknown[];
+      idempotencyKey?: string; embed?: boolean; vectors?: boolean;
+    } = {}) => {
+      // vectors 是旧名、已退役；传了直接回报错别静默不建（统一用 embed）。
+      if (vectors !== undefined) return textResult('push 用 embed 表示同步建向量，不再接受 vectors 参数。');
+      const payload: Record<string, unknown> = { nodes: nodes || [] };
+      if (docId !== undefined) payload.docId = docId;
+      if (title !== undefined) payload.title = title;
+      if (parentId !== undefined) payload.parentId = parentId;
+      if (idempotencyKey !== undefined) payload.idempotencyKey = idempotencyKey;
+      if (embed !== undefined) payload.embed = embed;
+      const argv = ['push', JSON.stringify(payload)];
+      if (json) argv.push('--json');
+      return textResult(await dbShell(client, argv));
+    });
+
+    server.registerTool('set_mode', {
+      description: 'full/human 档可见：切换文档编辑模式（projectneed 4-16-8）。readonly 只读 / incremental 增量编辑（流式写入）/ full 完整编辑（2way/3way 分支与合并）。增量编辑与完整编辑互斥：流式写入期间不能分支编辑；要修订流式文档先切回 full，改完可再切回 incremental。',
+      inputSchema: {
+        docId: docIdSchema,
+        mode: z.enum(['readonly', 'incremental', 'full'])
+      }
+    }, async ({ docId, mode }: DocIdOptionalArg & { mode?: 'readonly' | 'incremental' | 'full' } = {}) => {
+      return textResult(await dbShell(client, ['set-mode', String(docId), String(mode)]));
+    });
+
+    server.registerTool('bulk', {
+      description: 'full/human 档可见：海量流式导入加速会话（projectneed 4-16）。begin 设异步写（synchronous=OFF，journal 保持 WAL 不降级）；end 恢复安全设置并 checkpoint 截断 -wal。索引不再 drop/重建（SQL/FTS 全程增量维护，唯一延迟的重活是离线补 bge-m3 向量）。导大批语料时 begin → 多次 push → end；崩溃丢最近批由地址校验 + 幂等重推兜底。共享后端上 begin 需独占（使用前提）：有其他客户端（如 opencode/codex）在线会被拒——先确保单客户端、或 restart_backend 清场后再用；会话期间其他客户端的写请求被拒（读不受影响），开启方断线自动恢复安全设置。仅在专门导入阶段用，日常库勿开。',
+      inputSchema: {
+        action: z.enum(['begin', 'end'])
+      }
+    }, async ({ action }: { action?: 'begin' | 'end' } = {}) => {
+      return textResult(await dbShell(client, ['bulk', String(action)]));
+    });
+
+    server.registerTool('memory_distill', {
+      description: 'full/human 档可见：标记记忆卷已提炼（15-11-5；提炼落地受控事实只经人审，故归 full）。冷却期内默认拒绝，force 仅限用户明确指示"记一下"时用；活跃卷上 force 是截至当下的快照标记、不封卷。封卷已自动化（memory_volumes 列卷时按 24h 顺手封），不再设 seal 动词。',
+      inputSchema: {
+        docId: docIdSchema.describe('要标记的卷 docId。'),
+        force: z.boolean().optional().describe('跳过冷却期（用户明确指示时）。')
+      }
+    }, async ({ docId, force }: DocIdOptionalArg & { force?: boolean } = {}) => {
+      const argv = ['memory', 'distill', String(docId)];
+      if (force === true) argv.push('--force');
+      return textResult(await dbShell(client, argv));
+    });
+
+    server.registerTool('relink', {
+      description: 'full/human 档可见：把已导入 doc 重绑到新的源文件路径（锚改名/迁移后用，15-10-4），更新 meta.sourcePath 与 source_documents.original_path，不动正文、不改 source_type。不强制校验目标存在（记忆/会话卷由对应 agent 自己维护、我们不替外部程序管文件状态），但回执会自检并报 targetExists。',
+      inputSchema: {
+        docId: docIdSchema,
+        sourcePath: z.string().describe('新源文件路径（与 import 记录一致，建议库内绝对路径）。')
+      }
+    }, async ({ docId, sourcePath }: DocIdArg & { sourcePath: string }) => {
+      return textResult(await dbShell(client, ['relink', String(docId), String(sourcePath)]));
+    });
+
+    // 'export' 动词已停用（未启用，待重新设计）：原实现把 markdown 渲染结果返回到命令行而非导出为文件，
+    // 且渲染有「地址当标题 / 混入 node_note」等功能错误；幂等与 import/export 对称设计尚未确定。
+    // 重新设计前不注册此工具，避免 agent 调用到功能错误的导出。store.exportDocMarkdown / core.renderDocMarkdown
+    // 实现暂留作重做参考，但已无入口可达。
+
+    server.registerTool('rebase', {
+      description: 'full/human 档可见：把当前 edit branch 的 lazy base 刷新到当前主干 HEAD，并返回分支状态。当前不是完整冲突裁决器。',
+      inputSchema: {
+        branchId: z.number().int().positive().optional(),
+        baseDocId: docIdSchema.optional(),
+        owner: ownerSchema.optional()
+      }
+    }, async ({ branchId, baseDocId, owner }: BranchTargetArg & OwnerArg = {}) => {
+      const target = branchTarget({ branchId, baseDocId, owner });
+      if (target.branchId === undefined && target.baseDocId === undefined) {
+        return textResult('rebase 需要 branchId/baseDocId，或先 switch 到一个分支。');
+      }
+      // 下沉：委托 db-shell rebase（base 旧→新回执在 backend 渲染）；目标解析成显式 argv，同 discard。
+      return textResult(await dbShell(client, ['rebase', ...branchArgv(target)]));
+    });
+
+    server.registerTool('cherry-pick', {
+      description: 'full/human 档可见：从同一文档的保存历史或 edit branch 中摘取 edit entries，写入目标 edit branch。目标分支须已存在：传 targetBranchId，或先 switch 到目标分支；targetBaseDocId/owner 只用于定位已有分支、不会自动新建（先用 draft new 建好目标分支再 cherry-pick）。',
+      inputSchema: {
+        historyId: docIdSchema.optional(),
+        sourceHistoryId: docIdSchema.optional(),
+        sourceBranchId: z.number().int().positive().optional(),
+        targetBranchId: z.number().int().positive().optional(),
+        targetBaseDocId: docIdSchema.optional(),
+        owner: ownerSchema.optional(),
+        entryId: z.string().optional(),
+        entryIndex: z.number().int().nonnegative().optional()
+      }
+    }, async ({ historyId, sourceHistoryId, sourceBranchId, targetBranchId, targetBaseDocId, owner, entryId, entryIndex }: OwnerArg & {
+      historyId?: DocId; sourceHistoryId?: DocId; sourceBranchId?: number;
+      targetBranchId?: number; targetBaseDocId?: DocId;
+      entryId?: string; entryIndex?: number;
+    } = {}) => {
+      const target = branchTarget({ branchId: targetBranchId, baseDocId: targetBaseDocId, owner });
+      // 下沉：委托 db-shell cherry-pick（picked 清单回执在 backend 渲染）；目标解析成显式 argv，同 discard。
+      const argv = ['cherry-pick'];
+      const sourceHistory = sourceHistoryId ?? historyId;
+      if (sourceHistory !== undefined) argv.push('--history', String(sourceHistory));
+      if (sourceBranchId !== undefined) argv.push('--source-branch', String(sourceBranchId));
+      if (target.branchId !== undefined) argv.push('--target-branch', String(target.branchId));
+      if (target.baseDocId !== undefined) argv.push('--target-base', String(target.baseDocId));
+      if (target.owner) argv.push('--owner', String(target.owner));
+      if (entryId !== undefined) argv.push('--entry-id', String(entryId));
+      if (entryIndex !== undefined) argv.push('--entry-index', String(entryIndex));
+      return textResult(await dbShell(client, argv));
+    });
+
+  }
+
+  if (tier === 'full' || tier === 'human') {
+    // full 档运维：对象库 GC（mark-sweep，lazy/手动）——回收不被任何 commit 引用的历史对象。
+    server.registerTool('gc_objects', {
+      description: 'full 档运维：对象库垃圾回收（mark-sweep）。回收不被任何 commit 引用的历史对象（blob/tree/source）——即删文档/删 commit 后变孤儿的内容寻址对象。reset/revert 跳过的 commit 仍在表中、其对象不会被收（保住可后悔窗口）。不在写热路径，需要时手动跑。'
+    }, async () => {
+      return textResult(await dbShell(client, ['gc']));
+    });
+  }
+
+  if (tier === 'human') {
+    // human 档专属背书动词（projectneed 18-3）：标受控的唯一合法入口，owner 恒 human、进历史可追溯。
+    server.registerTool('certify', {
+      description: 'human 档专属：节点级背书——把节点或整棵子树标受控（受控内容的唯一合法来源，18-3）；owner 恒 human、作为一次 human 提交进历史，改 trust 即改内容指纹（A5-2）。scope=subtree 默认标整子树、node 只本节点；trust=不受控 用于撤销背书（收回许可）。定位给 nodeId 或 address 之一。',
+      inputSchema: {
+        docId: docIdSchema,
+        nodeId: docIdSchema.optional().describe('目标节点 id；与 address 二选一。'),
+        address: z.string().optional().describe('目标节点地址（如 1-3-2）；与 nodeId 二选一。'),
+        scope: z.enum(['subtree', 'node']).optional().describe('subtree 默认标整子树 / node 只本节点。'),
+        trust: z.enum(['受控', '不受控']).optional().describe('默认受控；不受控用于撤销背书。')
+      }
+    }, async ({ docId, nodeId, address, scope, trust }: DocIdArg & AddressArg & {
+      scope?: 'subtree' | 'node'; trust?: '受控' | '不受控';
+    }) => {
+      const argv = ['certify', String(docId)];
+      if (address !== undefined) argv.push(String(address));
+      if (nodeId !== undefined) argv.push('--node-id', String(nodeId));
+      if (scope === 'node') argv.push('--node');
+      if (trust !== undefined) argv.push('--trust', String(trust));
+      return textResult(await dbShell(client, argv));
+    });
+  }
+}
+
+async function main() {
+  // 后端共用（projectneed 18-6-1）：写档（edit/full）实例经连接描述文件发现并复用共享后端，
+  // 连不上自行拉起（detached），单机离线回退私有 stdio；只读实例照旧各起私有后端（并发读安全）。
+  const hostScriptPath = join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js');
+  // 统一 backend-client SDK：写档（edit/full）走共享管道复用同一后端、只读档走私有 stdio（并发读安全）；
+  // 各动词只调 SDK 的语义方法、内部不再散写 request('database.read'...)。owner 解析 / payload 构造仍是
+  // mcp-server 的入口业务、留在动词侧不进 SDK。
+  const client = createBackendClient({
+    projectRoot: PROJECT_ROOT,
+    hostScriptPath,
+    mode: IS_WRITE_TIER ? 'shared' : 'private',
+    onStderr: (text: unknown) => { process.stderr.write(String(text ?? '')); },
+    onStatus: (text: unknown) => { process.stderr.write(String(text ?? '')); }
+  });
+
+  // schema 自述（projectneed 15-12-5 / 18-8-1）：外部 agent 接入第一读物。
+  // 数百 token 的约定说明，不是内容清单——不预载"库里有什么"。
+  const SERVER_INSTRUCTIONS = [
+    'IF-Tree 条件树知识库 + agent 记忆库。本说明是接入约定，不是内容清单——知道库里有什么是检索的产物，不是检索的前提，请直接检索。',
+    '',
+    '三层时态（结构同构、语义异质）：完整记忆（session 事件卷）答"确曾发生"——一个 session 一卷，只追加、封卷不可变、永不删除；长期核心记忆答"现在如此"——经提炼与人工审批产生的当前事实层，回指事件出处；知识文档答"未来可用"——导入的资料。树地址统一：1 是根，1-3-2 是 1-3 的第 2 个子节点，前缀即父子。',
+    '',
+    '检索动词：library_index（库目录）、tree（结构）、read（正文）、find（多词 AND 关键词 / semantic 语义）、article（原文窗口）、memory_volumes（列记忆卷及状态）、log/diff（历史）、sql（只读核对）、ask_agent（问内置智能体）。查询纪律：命中预览只用于选候选，下结论前必须 read 回正文证据；搜索为空先拆词重试、再下钻结构，不要直接断言没有。开工先看最近发生过什么（memory_volumes），再做手头任务。',
+    '',
+    '信任语义：节点分受控（经人工审批）/不受控（机器产物未经人审）；导入知识文档默认无人工标注（trust 为空 NULL），实践中按不受控对待；事件卷一律不受控——这是层级的时态属性，不是质量评分。命中未解决的 ERROR 节点必须停下向用户报告，不得绕过续跑。',
+    '',
+    '时间纪律：召回结果附带时间元数据，采信前先看时间；同主题证据冲突新者胜，不得以"内容看起来更合理"推翻时间新旧；找不到更新的证据时，旧证据就是最佳可用证据，知旧而用。',
+    '',
+    '记忆写入边界（18-8-3）：外部 agent 唯一合法的记忆侧写入是事件卷投递（memory_deliver，edit/full 档）——会话收尾把结构化自述日志投递成卷，用户说"记一下"时当场投快照卷；契约与骨架见 .iftree-llm-workspace/skills/memory-deliver/SKILL.md。不得把自己的结论直写成记忆。',
+    '',
+    `当前接入档位（IFTREE_MCP_TIER）=${TIER}：read 只读检索 / edit 增量写(owner=llm) / full 分支编辑·合并(owner=llm) / human 直写主库·审批·标受控(owner=human)。写动词是否注册由此档位决定；非 human 档不能以 human 身份写入。`,
+    '',
+    '更详尽的记忆库使用（召回动线、find 范围过滤、写入边界与提炼、存储定位、操作踩坑）见 docs/memory.md。'
+  ].join('\n');
+
+  const server = new McpServer({ name: 'iftree-library', version: '0.3.0' }, { instructions: SERVER_INSTRUCTIONS });
+  registerRetrievalTools(server, client);
+  registerAgentTools(server, client, TIER);
+  registerLifecycleTools(server, client);
+  if (IS_WRITE_TIER) registerWriteTools(server, client, TIER);
+
+  const shutdown = async () => {
+    // 共享后端（mode==='pipe'）是多客户端复用的，不能因单个 MCP 退出而全局关停——只断开本连接。
+    // 私有兜底后端（private）/只读档自起的 headless（无 mode）由本进程独占，正常 shutdown 免泄漏子进程。
+    // restart_backend 仍走 client.shutdown()（有意全局重启共享后端），不受此处影响。
+    try {
+      if (client.mode !== 'pipe') await client.shutdown();
+    } catch { /* already closing */ }
+    client.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  await server.connect(new StdioServerTransport());
+}
+
+// 仅在被直接运行（electron scripts/mcp-server.mjs）时自启 server；被测试 import 时不启动。
+if ((process.argv[1] || '').endsWith('mcp-server.js')) main().catch((error) => {
+  process.stderr.write(`${(error as { stack?: string } | null | undefined)?.stack || (error as { message?: string } | null | undefined)?.message || error}\n`);
+  process.exit(1);
+});

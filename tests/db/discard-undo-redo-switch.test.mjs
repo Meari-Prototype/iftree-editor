@@ -28,7 +28,7 @@ test('db undo/redo：undo 撤销 entry、redo 恢复，undoDepth/redoDepth 互�
     assert.ok(detail.rows.some((row) => row.status === 'modified'));
 
     // undo：撤销最后一条 entry
-    const undoResult = parseJsonStdout(await runBashDb(dbPath, ['undo', '--base', docId, '--owner', owner]));
+    const undoResult = parseJsonStdout(await runBashDb(dbPath, ['undo', '--base', docId, '--owner', owner, '--json']));
     assert.equal(undoResult.ok, true);
     assert.equal(undoResult.action, 'editBranch.undo');
     assert.equal(undoResult.changed, true);
@@ -42,7 +42,7 @@ test('db undo/redo：undo 撤销 entry、redo 恢复，undoDepth/redoDepth 互�
     assert.equal(afterUndo.stats.activeEntryCount, 0, 'undo 后 activeEntryCount 应为 0');
 
     // redo：恢复撤销的 entry
-    const redoResult = parseJsonStdout(await runBashDb(dbPath, ['redo', '--base', docId, '--owner', owner]));
+    const redoResult = parseJsonStdout(await runBashDb(dbPath, ['redo', '--base', docId, '--owner', owner, '--json']));
     assert.equal(redoResult.ok, true);
     assert.equal(redoResult.action, 'editBranch.redo');
     assert.equal(redoResult.changed, true);
@@ -51,7 +51,7 @@ test('db undo/redo：undo 撤销 entry、redo 恢复，undoDepth/redoDepth 互�
     assert.match(stdoutOf(await runBashDb(dbPath, ['draft', 'list', docId, '--owner', owner])), /改:1\s+增:0\s+删:0/);
 
     // 收尾 discard 清草稿（discard 行为本身在 draft.test.mjs 有专门 test）
-    const discarded = parseJsonStdout(await runBashDb(dbPath, ['discard', '--base', docId, '--owner', owner, '--yes']));
+    const discarded = parseJsonStdout(await runBashDb(dbPath, ['discard', '--base', docId, '--owner', owner, '--yes', '--json']));
     assert.equal(discarded.ok, true);
     assert.equal(discarded.changed, true);
     assert.equal(stdoutOf(await runBashDb(dbPath, ['draft', 'list', docId, '--owner', owner])), '(无草稿)');

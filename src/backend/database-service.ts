@@ -1,6 +1,7 @@
 import { IftreeStore } from './store/index.js';
+import { createConfiguredIftreeStore } from './store-domain-adapter.js';
 import { runDatabaseCommand } from './database-command.js';
-import { createLibraryService } from './library-service.js';
+import { createLibraryService } from './library/library-service.js';
 import { runDatabaseRead, databaseReadActions } from './query-api.js';
 import { runDatabaseWrite, databaseWriteActions } from './mutation-api.js';
 
@@ -32,23 +33,6 @@ interface DatabaseServiceOptions {
   seed?: (store: IftreeStore) => void;
   writeService?: DatabaseServiceLike | (() => DatabaseServiceLike) | null;
 }
-
-const runDatabaseReadTyped = runDatabaseRead as unknown as (
-  store: unknown,
-  payload: PayloadValue,
-  context: ContextValue
-) => unknown;
-const runDatabaseWriteTyped = runDatabaseWrite as unknown as (
-  store: unknown,
-  payload: PayloadValue,
-  context: ContextValue
-) => unknown;
-const runDatabaseCommandTyped = runDatabaseCommand as unknown as (
-  service: unknown,
-  command: PayloadValue,
-  fallbackOperation: string,
-  contextOverride: unknown
-) => unknown;
 
 function resolveContext(value: unknown): ContextValue {
   if (typeof value === 'function') return ((value as () => ContextValue | null | undefined)() || {});
@@ -94,7 +78,7 @@ export function createDatabaseService(options: string | DatabaseServiceOptions =
       // 必须把半成品丢弃、保持 store 未赋值再 rethrow；否则带 db=null 的实例会被钉进 store 缓存，
       // 之后每次读都命中 query-api 的 `!store?.db` → 持续报 'read query store is not available'，
       // 整个 host 进程不可自愈（projectneed 18-6）。复位后下次工具调用会重建 store、重试开库。
-      const candidate = new IftreeStore(dbPath);
+      const candidate = createConfiguredIftreeStore(dbPath);
       try {
         candidate.init(config.initOptions || {});
       } catch (error) {
@@ -116,9 +100,9 @@ export function createDatabaseService(options: string | DatabaseServiceOptions =
     read(payload: PayloadValue = {}, contextOverride: unknown = null) {
       const action = payload?.action || payload?.type;
       if (action === 'query.actions' || action === 'library.getTree') {
-        return runDatabaseReadTyped(null, payload, readContext(contextOverride));
+        return runDatabaseRead(null, payload, readContext(contextOverride));
       }
-      return runDatabaseReadTyped(getStore(), payload, readContext(contextOverride));
+      return runDatabaseRead(getStore(), payload, readContext(contextOverride));
     },
     write(payload: PayloadValue = {}, contextOverride: unknown = null) {
       const writeService = resolveService(config.writeService);
@@ -126,12 +110,12 @@ export function createDatabaseService(options: string | DatabaseServiceOptions =
         return writeService.write(payload, contextOverride);
       }
       if ((payload?.action || payload?.type) === 'mutation.actions') {
-        return runDatabaseWriteTyped(null, payload, mergeContext(config.writeContext || config.ctx, contextOverride));
+        return runDatabaseWrite(null, payload, mergeContext(config.writeContext || config.ctx, contextOverride));
       }
-      return runDatabaseWriteTyped(getStore(), payload, mergeContext(config.writeContext || config.ctx, contextOverride));
+      return runDatabaseWrite(getStore(), payload, mergeContext(config.writeContext || config.ctx, contextOverride));
     },
     run(command: PayloadValue = {}, fallbackOperation = 'read', contextOverride: unknown = null) {
-      return runDatabaseCommandTyped(service, command, fallbackOperation, contextOverride);
+      return runDatabaseCommand(service, command, fallbackOperation, contextOverride);
     },
     updateSourceBinding(payload: PayloadValue = {}) {
       const writeService = resolveService(config.writeService);

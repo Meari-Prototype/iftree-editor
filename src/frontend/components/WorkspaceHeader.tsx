@@ -17,7 +17,8 @@ import { type MouseEvent, type ReactNode, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import { DepthCollapseOneIcon, DepthExpandOneIcon, IconButton } from './common.jsx';
-import { SummaryConfirmDialog, type SummaryConfirmRequest, type SummaryStrategy } from './SummaryConfirmDialog.jsx';
+import { SummaryConfirmDialog, type SummaryConfirmRequest } from './SummaryConfirmDialog.jsx';
+import type { SummaryStrategy } from '../lib/summary-utils.js';
 import { useFloatingMenu } from '../hooks/useFloatingMenu.js';
 
 const VIEW_MENU_WIDTH = 190;
@@ -69,11 +70,11 @@ interface WorkspaceHeaderViewState {
   viewShowAxioms: boolean;
 }
 
-export interface WorkspaceHeaderProps {
+export interface WorkspaceHeaderProps<SummaryRequest extends SummaryConfirmRequest = SummaryConfirmRequest> {
   title?: string;
   subtitle?: string;
   activeTab: WorkspaceTab;
-  setActiveTab: (tab: string) => void;
+  setActiveTab: (tab: WorkspaceTab) => void;
   undoEdit?: () => void;
   redoEdit?: () => void;
   undoDisabled?: boolean;
@@ -90,15 +91,15 @@ export interface WorkspaceHeaderProps {
   actualMaxDepth: number;
   summaryNotesVisible?: boolean;
   onToggleSummaryNotes?: () => void;
-  onGenerateSummary?: (mode: string) => Promise<SummaryConfirmRequest | null | undefined>;
-  onRunSummaryGeneration?: (request: SummaryConfirmRequest, strategy: SummaryStrategy) => void;
+  onGenerateSummary?: (mode: string) => Promise<SummaryRequest | null | undefined>;
+  onRunSummaryGeneration?: (request: SummaryRequest, strategy: SummaryStrategy) => void;
   diffBranches?: DiffBranchOption[];
   onOpenDiff?: (branch: DiffBranchOption) => void;
   onOpenEntityMaintenance?: () => void;
   children?: ReactNode | ((viewState: WorkspaceHeaderViewState) => ReactNode);
 }
 
-export function WorkspaceHeader({
+export function WorkspaceHeader<SummaryRequest extends SummaryConfirmRequest>({
   title,
   subtitle,
   activeTab,
@@ -125,8 +126,8 @@ export function WorkspaceHeader({
   onOpenDiff,
   onOpenEntityMaintenance,
   children
-}: WorkspaceHeaderProps) {
-  const [summaryConfirm, setSummaryConfirm] = useState<SummaryConfirmRequest | null>(null);
+}: WorkspaceHeaderProps<SummaryRequest>) {
+  const [summaryConfirm, setSummaryConfirm] = useState<SummaryRequest | null>(null);
   const [viewShowLeftInfo, setViewShowLeftInfo] = useState<boolean>(true);
   const [viewShowTitles, setViewShowTitles] = useState<boolean>(true);
   const [viewShowAxioms, setViewShowAxioms] = useState<boolean>(true);
@@ -331,7 +332,9 @@ export function WorkspaceHeader({
               </button>
               {renderDiffMenu()}
             </div>
-            <Tabs.Root value={activeTab} onValueChange={setActiveTab}>
+      <Tabs.Root value={activeTab} onValueChange={(value) => {
+        if (value === 'tree' || value === 'ide' || value === 'rich' || value === 'entity' || value === 'search') setActiveTab(value);
+      }}>
               <Tabs.List className="tab-switcher" aria-label="视图">
                 <Tabs.Trigger value="tree" title="树视图" aria-label="树视图" className={activeTab === 'tree' ? 'active' : ''}>树</Tabs.Trigger>
                 <Tabs.Trigger value="ide" title="IDE视图" aria-label="IDE视图" className={activeTab === 'ide' ? 'active' : ''}>码</Tabs.Trigger>

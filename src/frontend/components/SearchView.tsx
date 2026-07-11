@@ -1,12 +1,8 @@
 ﻿
 
-interface SearchResult {
-  node_id: string | number;
-  address?: string | null;
-  text?: string;
-  score?: unknown;
-  [key: string]: unknown;
-}
+import type { VectorContentSearchItem } from '../data/operation-services.js';
+
+type SearchResult = VectorContentSearchItem;
 
 interface SearchResultGroup {
   term: string;

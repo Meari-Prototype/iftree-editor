@@ -20,17 +20,17 @@ export const axiomRepository = {
   },
 
   async updateAxiom(payload: AxiomMutationPayload) {
-    const result = await writeDatabase({ action: 'axiom.update', ...(payload || {}) }) as { doc?: unknown } | null | undefined;
+    const result = await writeDatabase({ action: 'axiom.update', ...(payload || {}) });
     return result?.doc || result;
   },
 
   async deleteAxiom(payload: AxiomMutationPayload) {
-    const result = await writeDatabase({ action: 'axiom.delete', ...(payload || {}) }) as { doc?: unknown } | null | undefined;
+    const result = await writeDatabase({ action: 'axiom.delete', ...(payload || {}) });
     return result?.doc || result;
   },
 
   async moveAxiom(payload: AxiomMutationPayload) {
-    const result = await writeDatabase({ action: 'axiom.move', ...(payload || {}) }) as { doc?: unknown } | null | undefined;
+    const result = await writeDatabase({ action: 'axiom.move', ...(payload || {}) });
     return result?.doc || result;
   }
 };

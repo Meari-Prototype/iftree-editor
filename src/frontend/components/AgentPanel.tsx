@@ -3,6 +3,7 @@ import { ArrowUp, Bot, Brain, Check, ChevronDown, ChevronRight, Trash2, X
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { RichMarkdown } from './RichMarkdown';
+import type { DocListItem } from '../../backend/query-api.js';
 
 import {
   AGENT_REASONING_OPTIONS, agentBranchDocLabel, agentBranchEntries, agentBranchOwnerLabel, agentContextUsageView, agentModeLabel, agentReasoningLabel, agentReasoningShortLabel,
@@ -16,7 +17,7 @@ import {
 // AgentPanel 是 Agent 子面板：消费 agent-utils 已 export 的真类型（messages/diffs/sessions/usage 等），
 // 内部 3 个子组件 + groupSegments + 主组件 props 都按真类型收紧；docs 字段沿用 agentBranchDocLabel 的最小形参形态。
 
-type AgentDocOption = { id?: unknown; title?: string };
+type AgentDocOption = Pick<DocListItem, 'id' | 'title'>;
 type AgentToolByIdMap = Map<string, AgentToolEvent>;
 type AgentMode = 'qa' | 'edit' | 'full';
 type AgentMenuView = 'main' | 'models';
@@ -64,12 +65,12 @@ export interface AgentPanelProps {
   contextUsage?: AgentUsage | null;
   onRun?: (payload: AgentRunRequest) => void;
   onCancel?: () => void;
-  onApply?: (branchId: unknown) => void;
-  onReject?: (branchId: unknown) => void;
+  onApply?: (branchId: number) => void;
+  onReject?: (branchId: number) => void;
   onApplyAll?: () => void;
   onRejectAll?: () => void;
-  onLoadSession?: (sessionId: unknown) => void;
-  onDeleteSession?: (sessionId: unknown) => void;
+  onLoadSession?: (sessionId: number | string) => void;
+  onDeleteSession?: (sessionId: number | string) => void;
   onNewSession?: () => void;
   onTraceDiff?: (branch: AgentBranch) => void;
 }

@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.5%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.6%20alpha-orange)
 
-> **项目状态：0.6.5，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
+> **项目状态：0.6.6，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
 >
 > - **前端**：仍有较多已知 bug 未修复。
 > - **后端写入路径**：缺少长期使用的实测——项目开发时间尚短，客观上还没有积累足够的长时运行数据。
@@ -237,7 +237,11 @@ MCP server 把文档库开放给 Claude Code、Codex 等外部 agent 框架，st
 ```text
 .
 ├── electron/
-│   ├── main.ts           # 主进程：窗口、IPC、拉起共享 node 后端并转发读写（不再 in-process 访问数据库）
+│   ├── main.ts           # 主进程装配根：窗口、IPC 与 preload 装配，拉起共享 node 后端并转发读写（不再 in-process 访问数据库）
+│   ├── launcher.ts       # 启动器窗口（文档列表 / 渲染模式）+ 主服务拉起 + 启动超时与运行期心跳看门狗
+│   ├── settings-io.ts    # .env / iftree.config.json / settings.json 的读写
+│   ├── e2e-capture.ts    # 端到端窗口截屏与视口分析
+│   ├── ipc-channels.ts   # IPC 通道常量
 │   └── preload.ts        # 安全桥接，向渲染进程暴露 window.iftree API
 ├── index.html            # 渲染进程入口 HTML
 ├── src/
@@ -260,18 +264,27 @@ MCP server 把文档库开放给 Claude Code、Codex 等外部 agent 框架，st
 │   │   ├── db/           # schema、id、归一化、快照历史、内容寻址对象库
 │   │   ├── memory/       # 记忆卷：多租户隔离、锚布局、读写与维护
 │   │   ├── entities/     # 实体读写与投影
+│   │   ├── editor-session/ # 编辑器会话与快照令牌
+│   │   ├── diff/         # ref / view 差异计算
+│   │   ├── derived-index/ # 衍生索引（keyword / semantic-status）与自对账
+│   │   ├── projection/   # 编辑分支投影缓存
+│   │   ├── source/       # 源文档地址映射
+│   │   ├── text/         # 文本预算 / 合并
+│   │   ├── import/       # 导入编排与 JSON 落库
+│   │   ├── library/      # 库文件系统与虚拟文档
 │   │   ├── handlers/     # 读 / 写命令处理器
 │   │   └── llm/          # Agent 运行时、共享后端 SDK（命名管道）、headless agent、LLM 设置
+│   ├── mcp/              # MCP server 入口（`src/mcp/mcp-server.ts`，产物 `dist/src/mcp/mcp-server.js`）
 │   ├── core/             # 纯逻辑（无 Electron 依赖）
-│   │   ├── tree.ts       # 树构建、动态地址、Markdown/JSON 导出
+│   │   ├── tree.ts       # 树构建、动态地址、扁平化 / 遍历
 │   │   ├── mindmap.ts    # 树视图投影、深度控制、布局
 │   │   ├── merkle.ts / merkle-diff.ts / merkle-merge.ts # 树哈希、差异与三方合并
 │   │   ├── source-text.ts / source-pdf.ts / source-docx.ts / source-chm.ts / source-epub.ts # 配合 import-formats/ 解析 txt/md/pdf/docx/chm/epub
 │   │   ├── source-markdown.ts # 原文解析与句子 offset 映射
-│   │   └── ...           # viewport、hitbox、drag-drop、markdown 等
+│   │   └── ...           # viewport、markdown、tree-cursor、tree-ui、flat-tree 等
 │   ├── vector/           # 语义向量：embeddings、vector-store、worker、模型下载
 │   └── agent/            # Agent 配置与会话存储
-├── scripts/              # CLI 工具：MCP 服务、db 命令、native 重编、验证脚本
+├── scripts/              # CLI 工具：db 命令、native 重编、验证脚本、导入/导出/迁移；`scripts/mcp-server.ts` 是旧位置的兼容垫片
 ├── tests/                # node:test 单元测试
 ├── docs/                 # 项目文档：教程 / 操作指南 / 参考 / 概念
 ├── .iftree-llm-workspace/
@@ -306,4 +319,4 @@ npm run test:verbs    # node --test 运行 db 动词契约套件
 - 界面内置 [Noto Sans CJK](src/frontend/assets/fonts/NOTICE.md) 字体（SIL Open Font License）。
 - 语义向量基于 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) 模型。
 - 以及 Electron、React、Vite、LanceDB、Transformers.js 等开源项目。
-- 开发过程中借助 ChatGPT 5.5 xhigh、Claude Opus 4.8 max、Claude Fable 5 与 DeepSeek V4 辅助。
+- 开发过程中借助 ChatGPT 5.6 sol、ChatGPT 5.5、Claude Opus 4.8、Claude Opus 4.7、Claude Sonnet 5、Claude Fable 5、GLM 5.2 与 DeepSeek V4 辅助。

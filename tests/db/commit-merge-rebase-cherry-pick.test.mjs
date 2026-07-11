@@ -21,7 +21,7 @@ test('db rebase 刷新分支 base 到 HEAD，返回 changed/baseCommitId/undoDep
     const branch = await beginBranch(dbPath, docId, owner);
     await editSetText(dbPath, docId, '1-1-3-2-1', alphaChangedText, owner);
 
-    const rebaseResult = parseJsonStdout(await runBashDb(dbPath, ['rebase', '--base', docId, '--owner', owner]));
+    const rebaseResult = parseJsonStdout(await runBashDb(dbPath, ['rebase', '--base', docId, '--owner', owner, '--json']));
     assert.equal(rebaseResult.ok, true);
     assert.equal(rebaseResult.changed, true);
     assert.equal(rebaseResult.action, 'editBranch.rebase');
@@ -47,14 +47,14 @@ test('db commit 快进落库：applied/fastForward/history.commit_id(UUIDv7) + r
     await editSetText(dbPath, docId, '1-1-3-2-1', alphaChangedText, owner);
 
     const commit = await commitBranch(dbPath, docId, owner, 'DBT_COMMIT_TEST');
-    const commitId = String(commit.history.id);
+    // --json 经 slimWriteResult 收口：history 以 commit_id 为权威主键（id 别名折叠掉）。
+    const commitId = String(commit.history.commit_id);
     // commitBranch helper 已断言 ok/history.summary；补钉 commit 链路特有字段：
     assert.equal(commit.applied, true, '快进 commit 应 applied=true');
     assert.equal(commit.changed, true);
     assert.equal(commit.fastForward, true, 'base==HEAD 时应 fastForward=true');
     assert.equal(commit.baseDocId, docId);
     assert.equal(commit.history.doc_id, docId);
-    assert.equal(commit.history.commit_id, commitId, 'commit_id 应与 history.id 同值');
     assert.ok(commit.history.saved_at, 'history 应有 saved_at（committed_at 别名）');
     assert.match(commitId, /^019[a-f0-9-]+$/, 'commit id 应是 UUIDv7');
     // 落库后 read 回查：正文已是改动版
@@ -71,7 +71,7 @@ test('db cherry-pick 摘取 commit entry 入新分支，merge --yes 落库；dry
     await beginBranch(dbPath, docId, sourceOwner);
     await editSetText(dbPath, docId, '1-1-3-2-1', alphaChangedText, sourceOwner);
     const sourceCommit = await commitBranch(dbPath, docId, sourceOwner, 'DBT_PICK_SOURCE');
-    const sourceHistoryId = String(sourceCommit.history.id);
+    const sourceHistoryId = String(sourceCommit.history.commit_id);
 
     // 回退主干：改回 original 并提交，让 cherry-pick 有用武之地
     await beginBranch(dbPath, docId, 'dbt-reset-before-pick');
@@ -86,7 +86,7 @@ test('db cherry-pick 摘取 commit entry 入新分支，merge --yes 落库；dry
     // cherry-pick：从 source commit 摘取 entry[0] 写入新分支
     const picked = parseJsonStdout(await runBashDb(dbPath, [
       'cherry-pick', '--history', sourceHistoryId, '--target-base', docId,
-      '--owner', 'dbt-picked-history', '--entry-index', '0'
+      '--owner', 'dbt-picked-history', '--entry-index', '0', '--json'
     ]));
     assert.equal(picked.ok, true);
     assert.equal(picked.changed, true);
@@ -101,13 +101,13 @@ test('db cherry-pick 摘取 commit entry 入新分支，merge --yes 落库；dry
     assert.ok(picked.picked[0].cherryPickedFrom, 'picked entry 应记录溯源信息');
     assert.equal(picked.picked[0].cherryPickedFrom.id, sourceHistoryId, '溯源应指向 source commit id');
 
-    // merge dry-run：不带 --yes 只预览
+    // merge dry-run：不带 --yes 走真三方预览（与 MCP 同源渲染）
     const mergeDryRun = stdoutOf(await runBashDb(dbPath, ['merge', '--base', docId, '--owner', 'dbt-picked-history']));
-    assert.match(mergeDryRun, new RegExp(`would merge doc:${docId} owner:dbt-picked-history(?:#[\\d:T-]+)?; rerun with --yes to apply`));
+    assert.match(mergeDryRun, /\[merge 预览 (快进|三方)\]/);
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-3-2-1'])), alphaOriginalText, '预览不落库');
 
     // merge --yes：落库
-    const merged = parseJsonStdout(await runBashDb(dbPath, ['merge', '--base', docId, '--owner', 'dbt-picked-history', '--yes']));
+    const merged = parseJsonStdout(await runBashDb(dbPath, ['merge', '--base', docId, '--owner', 'dbt-picked-history', '--yes', '--json']));
     assert.equal(merged.ok, true);
     assert.equal(merged.applied, true);
     assert.equal(merged.changed, true);

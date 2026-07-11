@@ -122,23 +122,24 @@ test('MCP 档位注册：certify 只 human、revert/web_search 在 full、edit_a
   assert.ok(agentFull.tools.has('admin_agent'), 'full 档有 admin_agent');
 });
 
-test('MCP payload 转换：certify→history.certify(owner=human)、revert→history.revert、admin_agent→agent.run(mode=full)', async () => {
+test('MCP payload 转换：certify→db certify（owner 在 db-shell 恒 human）、revert→db revert、admin_agent→agent.run(mode=full)', async () => {
   const client = mockClient();
   const srv = mockServer();
   registerWriteTools(srv, client, 'human');
 
+  // §6-6 收敛后 MCP 写动词一律转发 db-shell argv（文本回执单一调用点）；
+  // certify 的 owner=human 恒定在 db-shell certify 内铺 payload，MCP 只传定位与 trust。
   await srv.tools.get('certify').handler({ docId: 'd1', nodeId: 'n1', trust: '受控' });
   const certifyReq = client.calls.at(-1);
-  assert.equal(certifyReq.method, 'databaseWrite');
-  assert.equal(certifyReq.payload.action, 'history.certify');
-  assert.equal(certifyReq.payload.owner, 'human', 'certify 恒以 human 身份写');
-  assert.equal(certifyReq.payload.nodeId, 'n1');
+  assert.equal(certifyReq.method, 'dbShell');
+  assert.deepEqual(certifyReq.payload, ['certify', 'd1', '--node-id', 'n1', '--trust', '受控']);
 
   await srv.tools.get('revert').handler({ commitId: 'c1' });
   const revertReq = client.calls.at(-1);
-  assert.equal(revertReq.method, 'databaseWrite');
-  assert.equal(revertReq.payload.action, 'history.revert');
-  assert.equal(revertReq.payload.commitId, 'c1');
+  assert.equal(revertReq.method, 'dbShell');
+  assert.equal(revertReq.payload[0], 'revert');
+  assert.equal(revertReq.payload[1], 'c1');
+  assert.ok(revertReq.payload.includes('--owner'), 'revert 显式携带写身份（不吃 db-shell 的 CLI 默认 human）');
 
   const aClient = mockClient();
   const aSrv = mockServer();

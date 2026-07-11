@@ -1,4 +1,3 @@
-import { handleStreamMutation } from '../handlers/write/doc.js';
 import {
   createMemoryVolume,
   findActiveSessionVolume,
@@ -18,6 +17,20 @@ interface MemoryMutationContext {
   // mutation-api 的 MutationContext 带 [extra: string]: unknown 索引签名（refreshDoc 等其他字段
   // 也走这里），需对得上才能直传 ctx。
   [extra: string]: unknown;
+}
+
+// 记忆卷节点写入复用 stream.push 同一条底层链（store.pushStreamNodes：幂等缓存、事务自管），
+// 直调 store 而不经 handlers/write——域模块只向下依赖 store，不反向引用 L4 分派层。
+function pushVolumeNodes(
+  store: IftreeStore,
+  ctx: MemoryMutationContext,
+  { docId, nodes, embed }: { docId: unknown; nodes: MemoryNode[]; embed: boolean }
+): Record<string, unknown> {
+  // embed fail-fast 与 stream.push 动词同口径：声明建向量但模块不可用 → 写 SQL 前抛。
+  if (embed && ctx?.isVectorModuleEnabled?.() !== true) {
+    throw new Error('声明 embed:true，但向量模块不可用；请检查向量配置，或改为不启用向量。');
+  }
+  return store.pushStreamNodes({ docId, title: null, parentId: null, nodes, idempotencyKey: null }) as Record<string, unknown>;
 }
 
 // 建卷与节点写入不在同一事务（push 的事务在 store 内自管），先把最常见的违约拦在建卷前，
@@ -96,14 +109,11 @@ export async function handleMemoryMutation(store: IftreeStore, payload: MemoryPa
       endedAt: payload.endedAt ?? payload.ended_at ?? null
     });
     anchorMemoryVolumeOrRollback(store, ctx, { docId: created.docId, agent, sessionId, hostAnchor });
-    const pushed = await handleStreamMutation(store, {
+    const pushedView = pushVolumeNodes(store, ctx, {
       docId: created.docId,
       nodes,
       embed: payload.embed === true
-    }, ctx, 'stream.push', effects);
-    // handleStreamMutation 是 union（stream.push/bulkBegin/bulkEnd/attachSource 各 variant），
-    // 我们 action='stream.push' 时回来的一定是 push variant，但 TS 看不出来——用 Record 视图取字段。
-    const pushedView = pushed as Record<string, unknown>;
+    });
     const result = {
       ok: true,
       action,
@@ -149,17 +159,17 @@ export async function handleMemoryMutation(store: IftreeStore, payload: MemoryPa
         hostAnchor: payload.hostAnchor ?? payload.host_anchor ?? null
       });
     }
-    const pushed = await handleStreamMutation(store, {
+    const pushed = pushVolumeNodes(store, ctx, {
       docId,
       nodes,
       embed: payload.embed === true
-    }, ctx, 'stream.push', effects);
+    });
     return {
       ok: true,
       action,
       docId,
       createdVolume,
-      createdCount: (pushed as Record<string, unknown>).createdCount,
+      createdCount: pushed.createdCount,
       refresh: { kind: 'doc', docId },
       sideEffects: effects
     };

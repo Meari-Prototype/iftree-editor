@@ -14,7 +14,7 @@ import { debugLog } from './lib/debug-log.js';
 import { debugElementTarget, debugShouldLogKey } from './features/debug/ui-debug-actions.js';
 import { openSettingsAction, saveAgentSettingsAction } from './features/settings/settings-actions.js';
 import { type EditBranchDiffViewModel } from './components/EditBranchDiffDialog.jsx';
-import { useAppUI, useAppUIContext, AppUIContext } from './hooks/useAppUI.js';
+import { useAppUI, useAppUIContext, AppUIContext, type AppTab } from './hooks/useAppUI.js';
 import { useLayout } from './hooks/useLayout.js';
 import { useEntityTrace } from './hooks/useEntityTrace.js';
 import { useNodeSelection } from './hooks/useNodeSelection.js';
@@ -30,9 +30,10 @@ import { createStore } from './stores/create-store.js';
 import { initialEditorState } from './stores/editor-store.js';
 import { createEditorCommands, type EditorCommandDeps, type EditorCurrentDocLike } from './commands/editor-commands.js';
 import { createDocumentCommands, type DocumentCommandDeps, type DocumentOpenedDocLike } from './commands/document-commands.js';
-import { createAgentCommands, type AgentCommandDeps, type RunAgentRequestInput } from './commands/agent-commands.js';
+import { createAgentCommands, type AgentCommandDeps } from './commands/agent-commands.js';
 import { createTreeViewCommands, type TreeViewCommandDeps, type TreeViewDocLike } from './commands/treeview-commands.js';
 import { createAxiomCommands, type AxiomCommandDeps, type AxiomRefDialogPayload } from './commands/axiom-commands.js';
+import { createImportCommands, type ImportCommandDeps } from './commands/import-commands.js';
 import { CommandsContext, type AppCommands } from './commands/commands-context.js';
 import { AppStateContext, type AppState } from './app-context.js';
 import { SettingsScreen } from './screens/SettingsScreen.jsx';
@@ -42,6 +43,7 @@ import {
   settingsRepository,
   vectorService
 } from './data/repositories.js';
+import type { VectorContentSearchItem } from './data/operation-services.js';
 
 type DebugContextLog = Record<string, unknown>;
 type LastUiAction = { event: string; [extra: string]: unknown } | null;
@@ -110,7 +112,7 @@ export function AppBody() {
   } = agentChat;
   // 语义检索 state 留装配根：documentDeps.view.setSearchResults 在 openDoc/清场时清空它。
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<unknown[]>([]);
+  const [searchResults, setSearchResults] = useState<VectorContentSearchItem[]>([]);
   // ─── editor 命令层装配（frontend-refactor.md 阶段 1）───
   // 生命周期状态机 + 两栈住 editorStore；逻辑住 commands/editor-commands.ts。
   // deps 每 render 整体刷新，命令经 getDeps() 惰性读取最新值（原 handler 闭包语义的 γ 桥接；
@@ -145,13 +147,15 @@ export function AppBody() {
     selection: {
       getSelectedNode: () => (selectedNode || null) as ReturnType<TreeViewCommandDeps['selection']['getSelectedNode']>,
       getSelectedNodeId: () => selectedNodeId,
-      setSelectedNodeId: (id) => setSelectedNodeId?.(id),
+      setSelectedNodeId: (id) => setSelectedNodeId?.(normalizeDocId(id)),
       setLocateRequest: (updater) => setLocateRequest(updater as unknown as Parameters<typeof setLocateRequest>[0])
     },
     ui: {
       setNotice,
       getActiveTab: () => activeTab,
-      setActiveTab: (tab) => setActiveTab(tab)
+      setActiveTab: (tab) => {
+        if (tab === 'tree' || tab === 'ide' || tab === 'rich' || tab === 'entity' || tab === 'search') setActiveTab(tab);
+      }
     }
   };
   editorDepsRef.current = {
@@ -297,6 +301,8 @@ export function AppBody() {
   // ─── document 命令层装配（阶段 2a）：文档生命周期编排进 commands/document-commands.ts ───
   const documentDepsRef = useRef<DocumentCommandDeps | null>(null);
   const documentCommands = useMemo(() => createDocumentCommands(() => documentDepsRef.current!), []);
+  const importDepsRef = useRef<ImportCommandDeps | null>(null);
+  const importCommands = useMemo(() => createImportCommands(() => importDepsRef.current!), []);
   const closeAfterEditModeSaveRef = useRef(false);
   const { armRenderUnlock, handleMindMapRenderReady } = useStartup({
     currentDoc,
@@ -334,21 +340,18 @@ export function AppBody() {
     view: {
       getActiveTab: () => activeTab,
       getSelectedNodeId: () => selectedNodeId,
-      setSelectedNodeId: (id) => setSelectedNodeId?.(id),
+      setSelectedNodeId: (id) => setSelectedNodeId?.(normalizeDocId(id)),
       setMultiSelectedNodeIds: (ids) => setMultiSelectedNodeIds?.(ids),
       resetCollapseSets: () => {
         setCollapsed(new Set());
         setExpanded(new Set());
       },
       setSearchResults: (results) => setSearchResults(results),
-      bumpLocateRequest: (nodeId) => setLocateRequest((prev) => ({ seq: (prev?.seq || 0) + 1, nodeId })),
+      bumpLocateRequest: (nodeId) => setLocateRequest((prev) => ({ seq: prev.seq + 1, nodeId: normalizeDocId(nodeId) })),
       resetLocateRequest: () => setLocateRequest({ seq: 0, nodeId: null }),
       setSelectedLibraryEntry: (entry) => setSelectedLibraryEntry(entry as Parameters<typeof setSelectedLibraryEntry>[0]),
       getSelectedLibraryEntry: () => selectedLibraryEntry,
       armRenderUnlock: (docId, reason) => armRenderUnlock(docId, reason)
-    },
-    agent: {
-      runAgentRequest: (request) => agentCommands.runAgentRequest(request as RunAgentRequestInput)
     }
   };
   agentDepsRef.current = {
@@ -379,6 +382,26 @@ export function AppBody() {
       getSelectedNodeId: () => selectedNode?.id ?? null
     },
     loadDocForCurrentView: (docId, sourceDoc) => loadDocForCurrentView(docId, sourceDoc)
+  };
+  importDepsRef.current = {
+    docState: {
+      loadComplete: (docId, label) => loadCompleteDoc(docId, label) as Promise<DocumentOpenedDocLike | null>,
+      refreshList: () => refreshDocList(),
+      refreshLibrary: () => refreshLibraryTree()
+    },
+    document: documentCommands,
+    editor: editorCommands,
+    agent: agentCommands,
+    ui: {
+      setBusy,
+      setNotice,
+      setProgress: (value) => setProgress(value as Parameters<typeof setProgress>[0]),
+      setOperationLock: (value) => setOperationLock(value as Parameters<typeof setOperationLock>[0])
+    },
+    view: {
+      getSelectedLibraryEntry: () => selectedLibraryEntry,
+      setSelectedLibraryEntry: (entry) => setSelectedLibraryEntry(entry as Parameters<typeof setSelectedLibraryEntry>[0])
+    }
   };
   async function loadDocForCurrentView(docId: unknown, sourceDoc: unknown = currentDoc) {
     const depth = Math.max(loadedDepthForDoc(sourceDoc as Parameters<typeof loadedDepthForDoc>[0]), depthLimit, 1);
@@ -411,8 +434,7 @@ export function AppBody() {
     maxDepth: actualMaxDepth
   };
 
-  const changeActiveTab = useCallback((nextTab: unknown) => {
-    const targetTab = String(nextTab || '');
+  const changeActiveTab = useCallback((targetTab: AppTab) => {
     const payload = {
       from: activeTab,
       to: targetTab,
@@ -595,7 +617,8 @@ export function AppBody() {
   }
 
   async function runVectorSearch() {
-    if (!currentDoc || !searchQuery.trim()) return;
+    const docId = normalizeDocId(currentDoc?.doc?.id);
+    if (!docId || !searchQuery.trim()) return;
     if (vectorModuleDisabled) {
       setSearchResults([]);
       setNotice(String(vectorDisabledMessage ?? ''));
@@ -604,11 +627,11 @@ export function AppBody() {
     setBusy(true);
     try {
       const results = await vectorService.searchContentByVector({
-        docId: currentDoc.doc?.id,
+        docId,
         query: searchQuery.trim(),
         limit: 20
       });
-      setSearchResults(results as unknown[]);
+      setSearchResults(results);
     } catch (error) {
       setNotice((error as { message?: string }).message ?? '');
     } finally {
@@ -653,13 +676,14 @@ export function AppBody() {
   // ─── context 组装（阶段 3）：命令与数据分两条 context 下发给 screens/*。
   // appCommands 是 useMemo 单例；appState 每 render 新对象（其字段本就随 render 变化，
   // 与原单组件全量重渲等价），阶段 4/5 store 化后逐域瘦身。───
+  const publicDocumentCommands = useMemo(() => ({ ...documentCommands, ...importCommands }), [documentCommands, importCommands]);
   const appCommands: AppCommands = useMemo(() => ({
     editor: editorCommands,
-    document: documentCommands,
+    document: publicDocumentCommands,
     agent: agentCommands,
     treeView: treeViewCommands,
     axiom: axiomCommands
-  }), [editorCommands, documentCommands, agentCommands, treeViewCommands, axiomCommands]);
+  }), [editorCommands, publicDocumentCommands, agentCommands, treeViewCommands, axiomCommands]);
   const appState: AppState = {
     docState,
     treeView,

@@ -6,9 +6,48 @@
 // 中途提炼（"记一下"，15-11-5）记 distilledAt 但不封卷；封卷前的 distilledAt 只算快照备注，
 // 卷封卷冷却后照常回到 distillable（尾段仍待提炼）。
 
-// type-only import 不产生运行时循环：store/index.ts → memory/index → memory/volumes 是运行时链；
-// 反向只取 IftreeStore 类型签名，编译期解析。
+// type-only import 不产生运行时循环：反向只取 IftreeStore 类型签名，编译期解析。
 import type { IftreeStore } from '../store/index.js';
+// 卷性判定住在公共件（store 的删除保护/信任断言同用，见 shared.ts 注释）；此处 re-export
+// 保持 memory 侧对外接口不变。
+import { memoryVolumeMetaOf } from '../shared.js';
+export { memoryVolumeMetaOf };
+
+interface MemoryPolicyStore {
+  db: {
+    prepare(sql: string): {
+      get<T = unknown>(...params: unknown[]): T | undefined;
+    };
+  };
+}
+
+type MemoryNodeInput = Record<string, unknown> & { children?: MemoryNodeInput[] };
+
+export function assertMemoryVolumeDeleteAllowed(store: MemoryPolicyStore, docId: unknown): void {
+  const doc = store.db.prepare('SELECT id, meta FROM docs WHERE id = ?')
+    .get<{ id: string; meta: string | null }>(docId);
+  if (!doc || !memoryVolumeMetaOf(doc.meta)) return;
+  const anchored = store.db.prepare('SELECT 1 FROM source_documents WHERE doc_id = ? LIMIT 1').get(docId);
+  if (anchored) {
+    throw new Error(`记忆卷不可删除（完整记忆永不删除，projectneed 15-10）：${docId}`);
+  }
+}
+
+export function validateMemoryVolumeStreamPush(store: MemoryPolicyStore, docId: unknown, nodes: unknown): void {
+  const doc = store.db.prepare('SELECT meta FROM docs WHERE id = ?').get<{ meta: string | null }>(docId);
+  if (!memoryVolumeMetaOf(doc?.meta)) return;
+  const assertUncontrolled = (items: MemoryNodeInput[]) => {
+    for (const item of items) {
+      const trust = item?.trust_level ?? item?.trustLevel ?? null;
+      if (trust === '受控') {
+        throw new Error('记忆卷节点一律不受控（projectneed 15-10-3）；收到 trust_level=受控');
+      }
+      const children = Array.isArray(item?.children) ? item.children : [];
+      if (children.length) assertUncontrolled(children);
+    }
+  };
+  assertUncontrolled(Array.isArray(nodes) ? nodes as MemoryNodeInput[] : []);
+}
 
 export const VOLUME_SEAL_IDLE_MS = 24 * 60 * 60 * 1000;
 export const VOLUME_DISTILL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
@@ -26,10 +65,6 @@ function parseMetaJson(meta: unknown) {
   }
 }
 
-export function memoryVolumeMetaOf(docMeta: unknown) {
-  const volume = parseMetaJson(docMeta).memoryVolume;
-  return volume && typeof volume === 'object' ? volume : null;
-}
 
 function parseIsoMs(value: unknown) {
   const ms = Date.parse(String(value || ''));

@@ -7,6 +7,8 @@ import {
   rowById,
   type WriteContext
 } from './shared.js';
+// L4 内部横向复用：历史 ref 解析的唯一实现住读侧 handler，写侧 restore 直接借用（同层，非跨层引用）。
+import { resolveHistoryCommitRow } from '../read/history.js';
 import type { IftreeStore } from '../../store/index.js';
 
 type WritePayload = Record<string, unknown>;
@@ -25,6 +27,11 @@ export async function handleHistoryMutation(store: HistoryStore, payload: WriteP
     return docRefresh(action, docId, { history: plain(history), sideEffects: effects });
   }
   if (action === 'history.restore') {
+    // commitId 精确优先；无 commitId 时走 ref/refKind 模糊解析（自 db-shell restore 下沉，唯一命中才落）。
+    if (payload.commitId == null && payload.commit_id == null) {
+      const commit = resolveHistoryCommitRow(store, payload);
+      payload = { ...payload, commitId: commit.id, docId: payload.docId ?? payload.doc_id ?? commit.doc_id };
+    }
     const commitId = requireId(payload, 'commitId', 'commit_id');
     const commit = rowById(store, 'commits', commitId);
     const docId = payload.docId ?? payload.doc_id ?? commit?.doc_id;
@@ -58,7 +65,8 @@ export async function handleHistoryMutation(store: HistoryStore, payload: WriteP
 export async function handleEditorHistoryMutation(store: HistoryStore, payload: WritePayload, ctx: HistoryContext, action: string, effects: EffectList) {
   if (action === 'editorHistory.capture') {
     const docId = requireDocId(payload);
-    const token = store.createEditorSnapshotToken(docId);
+    // editor-session 域实例挂 store（GC 保活根需要），动作面直调、不经 store 门面（§6-1）。
+    const token = store.editorSnapshots.create(docId);
     return {
       ok: true,
       action,
@@ -72,14 +80,14 @@ export async function handleEditorHistoryMutation(store: HistoryStore, payload: 
     const docId = requireDocId(payload);
     const tokenId = String(payload.tokenId ?? payload.token_id ?? '');
     if (!tokenId) throw new Error('editorHistory.restore requires tokenId');
-    const token = store.restoreEditorSnapshotToken({ docId, tokenId });
+    const token = store.editorSnapshots.restore({ docId, tokenId });
     const doc = maybeRefreshDoc(store, ctx, docId, payload.refreshOptions || {});
     return docRefresh(action, docId, { changed: true, doc, token, sideEffects: effects });
   }
 
   if (action === 'editorHistory.discard') {
     const tokenIds = Array.isArray(payload.tokenIds) ? payload.tokenIds : [payload.tokenId ?? payload.token_id].filter(Boolean);
-    const discarded = store.discardEditorSnapshotTokens(tokenIds);
+    const discarded = store.editorSnapshots.discard(tokenIds);
     return {
       ok: true,
       action,

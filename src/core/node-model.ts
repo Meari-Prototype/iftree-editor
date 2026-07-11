@@ -55,10 +55,11 @@ export interface TreeNode extends BaseIndexNode {
   title: string;
   text: string;
   note: string;
-  trustLevel: unknown;
+  trustLevel: string | null;
   sourcePosition: unknown;
   createdAt: unknown;
   updatedAt: unknown;
+  children?: TreeNode[];
 }
 
 // 最小索引节点 shape：调用方可传 C2DBlock / TreeNode / 任何鸭子类型。
@@ -129,7 +130,9 @@ export function toTreeNode(row: NodeRow | null): TreeNode | null {
     title:          String(row.title ?? row.node_title ?? row.nodeTitle ?? '').trim(),
     text:           String(row.text ?? row.textPreview ?? '').trim(),
     note:           String(row.note ?? row.node_note ?? row.nodeNote ?? '').trim(),
-    trustLevel:     row.trustLevel ?? row.trust_level ?? tags?.trustLevel ?? null,
+    trustLevel:     row.trustLevel == null && row.trust_level == null && tags?.trustLevel == null
+      ? null
+      : String(row.trustLevel ?? row.trust_level ?? tags?.trustLevel),
     sourcePosition: row.sourcePosition ?? row.source_position ?? source?.position ?? null,
     createdAt:      row.createdAt ?? row.created_at ?? null,
     updatedAt:      row.updatedAt ?? row.updated_at ?? null,

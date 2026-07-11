@@ -4,42 +4,33 @@
 // index.mjs 上每个方法保留一行同名转调壳；编辑分支方法之间也经门面句柄互调（store.xxx），
 // 与历史/记忆子系统同构（参数化 store、对外门面壳）。
 
-import { splitSentences } from '../../core/tree.js';
 import { normalizeNodeType } from '../../core/node-model.js';
 import { classifyThreeWayMerge } from '../../core/merkle-merge.js';
 import { computeSubtreeHashes, contentHash, type MerkleNode } from '../../core/merkle.js';
 import { parseJsonObject, hasOwnValue, assertNoHumanTagField, assertNoEditTrustField } from '../shared.js';
-import { applyEntityEntry } from '../entities/write.js';
 import { sameStableId } from '../db/ids.js';
 import { normalizePositiveId, normalizeSourcePosition, patchValue } from '../db/normalizers.js';
-import {
-  activeEditBranchEntries,
-  isSupportedEditBranchEntryKind,
-  isTmpId,
-  nextTmpId,
-  projectEditBranchDoc,
-  resolveConflictEntries,
-  undoneEditBranchEntries,
-  type EditBranchEntry,
-  type NodePatchFields,
-  type NodeUpdateFieldsDelta,
-  type ProjectedDoc,
-  type ProjectionNode
-} from '../edit-branch-projection.js';
-import { buildEditBranchDiffRows, buildAxiomDiffRows, nodeRowWithClientAliases } from '../diff-view.js';
-import type { IftreeStore } from './index.js';
+import type {
+  EditBranchEntry,
+  ProjectedDoc,
+  ProjectionNode
+} from './edit-branch-contract.js';
+import { isBuiltInEditBranchEntry } from './edit-branch-contract.js';
+import type Database from 'better-sqlite3';
+import type { EditBranchProjectionPort, ExternalEntryPort } from './domain-port.js';
+import * as history from './history.js';
+import * as axiomRef from './axiom-ref.js';
+import { applyEditBranchDiffEntries } from './edit-branch-replay.js';
+export { applyEditBranchDiffEntries } from './edit-branch-replay.js';
 import type {
   AxiomRow,
   CommitRow,
   EditBranchRow,
-  EntityRow,
   NodeRow,
-  RefRow,
-  SourceSpanRow
+  RefRow
 } from '../db/schema.js';
 
 type RowObject = Record<string, unknown>;
-type EditBranchStore = IftreeStore;
 type EditBranchPayload = RowObject;
 type BranchLookupPayload = {
   branchId?: unknown;
@@ -70,10 +61,8 @@ type EmptyDiffInput = Pick<BaseSnapshotInput, 'owner' | 'baseDocId' | 'shadowDoc
 type CountRow = { count: number };
 type IdRow = { id: string };
 type DocIdRow = { doc_id: string };
-type TitleRow = { id: string; title: string };
 type HeadRow = { head_commit_id: string | null };
-type HistoryState = { undoDepth: number; redoDepth: number; hasUndo?: boolean; hasRedo?: boolean };
-type BaseDocInputs = { docId: string | null; nodes: ProjectedNode[]; axioms: AxiomRow[]; refs: RefRow[] };
+type BaseDocInputs = { docId: string; nodes: ProjectedNode[]; axioms: AxiomRow[]; refs: RefRow[] };
 type BranchCommitResult = RowObject & {
   changed: boolean;
   baseDocId: string;
@@ -101,12 +90,39 @@ type CherryPickPayload = EditBranchPayload & {
 type NodeSignature = { keyword: string; text: string };
 type CommitHistoryRow = { id: string; doc_id: string; commit_id: string; saved_at: string; summary: string | null };
 
-function activeEntries(entries: unknown): EditBranchEntry[] {
-  return activeEditBranchEntries(entries as never[] | undefined) as unknown as EditBranchEntry[];
+export interface EditBranchStore extends history.HistoryStore {
+  db: Database | null;
+  addAxiom(payload: RowObject): unknown;
+  addAxiomRefToNode(payload: RowObject): unknown;
+  addNodeRefToNode(payload: RowObject): unknown;
+  deleteAxiom(axiomId: unknown): boolean;
+  deleteNodeSubtree(nodeId: unknown): boolean;
+  deleteRef(refId: unknown): boolean;
+  insertNode(payload: RowObject): NodeRow;
+  listAxioms(docId: unknown): AxiomRow[];
+  mergeNodeIntoPreviousSibling(nodeId: unknown): boolean;
+  mergeNodeIntoTarget(payload: RowObject): boolean;
+  moveAxiom(payload: RowObject): boolean;
+  moveNode(nodeId: unknown, direction: unknown): boolean;
+  moveNodeAfterSibling(payload: RowObject): boolean;
+  moveNodeBeforeSibling(payload: RowObject): boolean;
+  moveNodeToParent(payload: RowObject): boolean;
+  promoteNode(nodeId: unknown): boolean;
+  requireEditBranchPort(): EditBranchProjectionPort;
+  requireExternalEntryPort(): ExternalEntryPort;
+  splitNodeIntoChildren(nodeId: unknown): unknown;
+  updateAxiom(axiomId: unknown, patch: RowObject): unknown;
+  updateNode(nodeId: unknown, patch: RowObject): unknown;
+  touchDoc(docId: unknown): void;
+  withTransaction<T>(fn: () => T): T;
 }
 
-function undoneEntries(entries: unknown): EditBranchEntry[] {
-  return undoneEditBranchEntries(entries as never[] | undefined) as unknown as EditBranchEntry[];
+function activeEntries(store: EditBranchStore, entries: unknown): EditBranchEntry[] {
+  return store.requireEditBranchPort().activeEditBranchEntries(entries);
+}
+
+function undoneEntries(store: EditBranchStore, entries: unknown): EditBranchEntry[] {
+  return store.requireEditBranchPort().undoneEditBranchEntries(entries);
 }
 
 function createLazyEditBranchBaseSnapshot({ owner, baseDocId, shadowDocId, baseCommitId = null }: BaseSnapshotInput) {
@@ -194,6 +210,7 @@ function _branchRowById(store: EditBranchStore, branchId: unknown): EditBranchRo
 
 /** @param {EditBranchEntry} entry edit-branch diff entry（kind/patch/fields 形态随动作而异） */
 function editBranchEntryTouchesTrust(entry: EditBranchEntry) {
+  if (!isBuiltInEditBranchEntry(entry)) return false;
   if (entry.kind === 'node.update') {
     if (hasOwnValue(entry.patch, 'trust_level', 'trustLevel', 'trust')) return true;
     return Array.isArray(entry.fields) && entry.fields.some((field) => (
@@ -213,6 +230,14 @@ export function normalizeEditBranchOwner(store: EditBranchStore, owner: unknown 
     const value = String(owner || '').trim();
     return value || 'human';
   }
+
+function hasEditBranchesTable(store: EditBranchStore) {
+  try {
+    return Boolean(store.db!.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edit_branches'").get());
+  } catch {
+    return false;
+  }
+}
 
 // owner 编码（A5-5 多分支 / 18-3 身份）：存储形态 role:user#ts —— role∈{llm,human} 保信任语义、
 // user 是写入身份（MCP 读 IFTREE_OWNER 注入、db shell 经 --owner 传），role:user 合为身份前缀；
@@ -239,8 +264,8 @@ function ownerStamp() {
 }
 
 export function activeEditBranchForBaseDoc(store: EditBranchStore, docId: unknown, owner: unknown = 'human') {
-    if (!store.hasEditBranchesTable()) return null;
-    const identity = store.normalizeEditBranchOwner(owner);
+    if (!hasEditBranchesTable(store)) return null;
+    const identity = normalizeEditBranchOwner(store, owner);
     // 按身份前缀匹配：owner=identity 兼容旧的无 ts 值，owner LIKE 'identity#%' 命中带 ts 的新草稿；取最新一条。
     return _withBranchEntries(store, store.db!.prepare(`
       SELECT * FROM edit_branches
@@ -252,7 +277,7 @@ export function activeEditBranchForBaseDoc(store: EditBranchStore, docId: unknow
   }
 
 export function activeEditBranchForShadowDoc(store: EditBranchStore, docId: unknown) {
-    if (!store.hasEditBranchesTable()) return null;
+    if (!hasEditBranchesTable(store)) return null;
     return _withBranchEntries(store, store.db!.prepare(`
       SELECT * FROM edit_branches
       WHERE shadow_doc_id = ? AND status = 'active'
@@ -262,18 +287,18 @@ export function activeEditBranchForShadowDoc(store: EditBranchStore, docId: unkn
   }
 
 export function activeEditBranchForDoc(store: EditBranchStore, docId: unknown, owner: unknown = null) {
-    const shadow = store.activeEditBranchForShadowDoc(docId) as EditBranchRow | null;
+    const shadow = activeEditBranchForShadowDoc(store, docId) as EditBranchRow | null;
     if (shadow) {
-      if (!owner || ownerIdentity(shadow.owner) === ownerIdentity(store.normalizeEditBranchOwner(owner))) return shadow;
-      return store.activeEditBranchForBaseDoc(shadow.base_doc_id, owner);
+      if (!owner || ownerIdentity(shadow.owner) === ownerIdentity(normalizeEditBranchOwner(store, owner))) return shadow;
+      return activeEditBranchForBaseDoc(store, shadow.base_doc_id, owner);
     }
     if (!owner) return null;
-    return store.activeEditBranchForBaseDoc(docId, owner);
+    return activeEditBranchForBaseDoc(store, docId, owner);
   }
 
 export function listActiveEditBranches(store: EditBranchStore, owner: unknown = null) {
-    if (!store.hasEditBranchesTable()) return [];
-    const normalizedOwner = owner ? store.normalizeEditBranchOwner(owner) : null;
+    if (!hasEditBranchesTable(store)) return [];
+    const normalizedOwner = owner ? normalizeEditBranchOwner(store, owner) : null;
     const where = normalizedOwner ? 'WHERE eb.status = \'active\' AND (eb.owner = ? OR eb.owner LIKE ?)' : 'WHERE eb.status = \'active\'';
     const params: unknown[] = normalizedOwner ? [normalizedOwner, normalizedOwner + '#%'] : [];
     return store.db!.prepare(`
@@ -311,24 +336,8 @@ export function docIdForMutationPayload(store: EditBranchStore, payload: EditBra
       const axiom = store.db!.prepare('SELECT doc_id FROM axioms WHERE id = ?').get<DocIdRow>(axiomId);
       if (axiom) return axiom.doc_id;
     }
-    const entityId = normalizePositiveId(
-      payload.entityId
-        ?? payload.entity_id
-        ?? payload.sourceEntityId
-        ?? payload.source_entity_id
-        ?? payload.targetEntityId
-        ?? payload.target_entity_id
-        ?? payload.entityAId
-        ?? payload.entity_a_id
-        ?? payload.entityBId
-        ?? payload.entity_b_id
-        ?? (Array.isArray(payload.entityIds) ? payload.entityIds[0] : null)
-        ?? (Array.isArray(payload.entity_ids) ? payload.entity_ids[0] : null)
-    );
-    if (entityId !== null) {
-      const entity = store.db!.prepare('SELECT doc_id FROM entities WHERE id = ?').get<DocIdRow>(entityId);
-      if (entity) return entity.doc_id;
-    }
+    const externalDocId = normalizePositiveId(store.requireExternalEntryPort().resolveExternalEntryDocId(store, payload));
+    if (externalDocId) return externalDocId;
     const refId = normalizePositiveId(payload.refId ?? payload.ref_id);
     if (refId !== null) {
       const ref = store.db!.prepare('SELECT * FROM refs WHERE id = ?').get<RefRow>(refId);
@@ -371,7 +380,7 @@ export function nodePatchForEditBranch(store: EditBranchStore, current: NodeRow 
   }
 
 export function _appendEditBranchEntry(store: EditBranchStore, branch: EditBranchRow, entry: EditBranchEntry): EditBranchRow {
-    if (!isSupportedEditBranchEntryKind(entry?.kind)) {
+    if (!store.requireEditBranchPort().isSupportedEditBranchEntryKind(entry?.kind)) {
       throw new Error(`Unsupported edit branch entry kind: ${entry?.kind || ''}`);
     }
     // append 即销毁 redo 分支（与旧行为一致：原实现按 activeEntries 过滤后重建）。
@@ -399,8 +408,8 @@ export function editBranchHistoryState(store: EditBranchStore, branch: EditBranc
       // 未迁移旧行兜底：子表空但 diff 列还躺着 entries（readonly 打开旧库）→ 按旧 JSON 计。
       const diff = JSON.parse(branch?.diff || '{}') as EditBranchDiff;
       const entries = Array.isArray(diff.entries) ? diff.entries : [];
-      active = activeEntries(entries).length;
-      undone = undoneEntries(entries).length;
+      active = activeEntries(store, entries).length;
+      undone = undoneEntries(store, entries).length;
     }
     return {
       undoDepth: active,
@@ -410,132 +419,8 @@ export function editBranchHistoryState(store: EditBranchStore, branch: EditBranc
     };
   }
 
-// 把草稿里的 entity.* 动作映射成实体改动行（带 entity_action，formatDiffText 专门渲染）。
-// 默认 diff 不含实体——一次实体绑定常是上千节点、混进正文 diff 会刷屏；仅 diff entity=true 时追加。
-// label 解析：本草稿新建的 tmp 实体从其 create entry 取 literal，已存在实体反查 entities 表；
-// node_ref 借 addrByNode 折成地址，便于阅读。
-function buildEntityDiffEntries(store: EditBranchStore, activeEntriesInput: EditBranchEntry[], addrByNode: Map<unknown, unknown>) {
-  const labelByRef = new Map<string, unknown>();
-  for (const e of activeEntriesInput) {
-    if (e.kind === 'entity.create' && e.tmp_id != null) {
-      const fields: RowObject = !Array.isArray(e.fields) && e.fields ? e.fields as RowObject : {};
-      labelByRef.set(String(e.tmp_id), fields.literal || '');
-    }
-  }
-  const resolveLabel = (ref: unknown) => {
-    if (ref == null) return '';
-    const key = String(ref);
-    if (labelByRef.has(key)) return labelByRef.get(key);
-    const row = store.db!.prepare('SELECT literal FROM entities WHERE id = ?').get<Pick<EntityRow, 'literal'>>(ref);
-    return row?.literal || key;
-  };
-  const out: RowObject[] = [];
-  for (const e of activeEntriesInput) {
-    if (!e.kind || !String(e.kind).startsWith('entity.')) continue;
-    const status = e.status === 'undone' ? 'undone' : 'active';
-    if (e.kind === 'entity.create') {
-      const fields: RowObject = !Array.isArray(e.fields) && e.fields ? e.fields as RowObject : {};
-      out.push({ entity_action: 'create', entity_ref: e.tmp_id, entity_label: fields.literal || '', status });
-    } else if (e.kind === 'entity.update') {
-      out.push({ entity_action: 'update', entity_ref: e.entity_ref, entity_label: e.literal || resolveLabel(e.entity_ref), status });
-    } else if (e.kind === 'entity.delete') {
-      out.push({ entity_action: 'delete', entity_ref: e.entity_ref, entity_label: resolveLabel(e.entity_ref), status });
-    } else if (e.kind === 'entity.bindNode' || e.kind === 'entity.ignoreNode' || e.kind === 'entity.clearNodeBinding') {
-      out.push({ entity_action: String(e.kind).slice('entity.'.length), entity_ref: e.entity_ref, entity_label: resolveLabel(e.entity_ref), node_ref: e.node_id, node_addr: addrByNode.get(e.node_id) ?? null, status });
-    } else if (e.kind === 'entity.link' || e.kind === 'entity.unlink') {
-      out.push({ entity_action: String(e.kind).slice('entity.'.length), entity_ref: e.source_ref, entity_label: resolveLabel(e.source_ref), target_ref: e.target_ref, target_label: resolveLabel(e.target_ref), link_kind: e.link_kind || null, status });
-    }
-  }
-  return out;
-}
-
-export function getEditBranchDiffView(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human', changedOnly = false, includeEntities = false }: EditBranchPayload = {}) {
-    const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
-    if (!branch) throw new Error('Edit branch not found');
-    const docId = normalizePositiveId(branch.base_doc_id);
-    if (!docId) throw new Error('Edit branch base doc not found');
-    const baseDoc = store.db!.prepare('SELECT id, title FROM docs WHERE id = ?').get<TitleRow>(docId);
-    if (!baseDoc) throw new Error('Edit branch base doc not found');
-    const { nodes: baseNodes, axioms: baseAxioms, refs: baseRefs } = store._baseDocInputsForDoc(docId) as BaseDocInputs;
-    const diff = JSON.parse(branch.diff || '{}') as EditBranchDiff;
-    const baseSnapshot = JSON.parse(branch.base_snapshot || '{}') as RowObject;
-    const head = store.db!.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get<HeadRow>(docId);
-    const entries = Array.isArray(diff.entries) ? diff.entries : [];
-    const active = activeEntries(entries);
-    const projected = projectEditBranchDoc({
-      docId,
-      nodes: baseNodes,
-      axioms: baseAxioms,
-      refs: baseRefs
-    }, active as never[]);
-    const baseHashes = store.ensureNodeHashes(docId);
-    const { rows, stats } = buildEditBranchDiffRows(baseNodes as never[], projected.nodes as never[], baseHashes);
-    // 公理（事实前提）差异行排最前——树视图里它们也画在正文树之外。
-    const axiomDiff = buildAxiomDiffRows(baseAxioms as never[], projected.axioms as never[]);
-    stats.added += axiomDiff.stats.added;
-    stats.deleted += axiomDiff.stats.deleted;
-    stats.modified += axiomDiff.stats.modified;
-    stats.totalRows += axiomDiff.rows.length;
-    stats.visibleRows += axiomDiff.rows.length;
-    const historyState = store.editBranchHistoryState(branch) as HistoryState;
-
-    // 公理改动行排最前（树视图里它们画在正文树之外），再接正文 diff 行。
-    let outRows = [...axiomDiff.rows, ...rows];
-    if (changedOnly) {
-      // 只返改动行（agent/MCP/db 外壳消费路径，projectneed 18-1）：丢掉未改动上下文行与
-      // 折叠占位行（含其 hiddenRows 全文），只留 added/deleted/modified。GUI 对比弹窗不传
-      // changedOnly，仍拿完整折叠/展开结构。
-      outRows = outRows.filter((row) => row.status !== 'unchanged' && row.status !== 'collapsed');
-    }
-
-    // entries：草稿↔正文的 field-diff（与 rows 富视图并存），供 formatDiffText 详略轴渲染、与 diff.refs/history.diff 同形。
-    const diffEntries = store.computeDiff(
-      { nodes: baseNodes as never[], axioms: baseAxioms as never[], refs: baseRefs as never[] },
-      { nodes: projected.nodes as never[], axioms: projected.axioms as never[], refs: projected.refs as never[] }
-    );
-    const addrByNode = new Map<unknown, unknown>();
-    for (const n of projected.nodes) addrByNode.set(n.id, n.address);
-    for (const n of baseNodes) if (!addrByNode.has(n.id)) addrByNode.set(n.id, n.address);
-    for (const e of diffEntries) if (e && e.node_id != null && e.address == null) e.address = addrByNode.get(e.node_id) ?? null;
-
-    // 实体改动默认不进 diff（绑定动辄上千、会淹没正文 diff）；diff entity=true 时按动作流追加实体行。
-    if (includeEntities) {
-      for (const ee of buildEntityDiffEntries(store, active, addrByNode)) diffEntries.push(ee);
-    }
-
-    return {
-      kind: 'editBranch.diffView',
-      entries: diffEntries,
-      branch: { ...branch },
-      baseDoc: { ...baseDoc },
-      mergeBase: {
-        baseCommitId: baseSnapshot.baseCommitId || null,
-        previousBaseCommitId: baseSnapshot.previousBaseCommitId || null,
-        currentHeadCommitId: head?.head_commit_id || null,
-        isFastForward: (baseSnapshot.baseCommitId || null) === (head?.head_commit_id || null)
-      },
-      projectedDoc: {
-        id: branch.shadow_doc_id,
-        baseDocId: branch.base_doc_id,
-        title: baseDoc.title
-      },
-      stats: {
-        ...stats,
-        activeEntryCount: active.length,
-        undoneEntryCount: undoneEntries(entries).length,
-        undoDepth: historyState.undoDepth,
-        redoDepth: historyState.redoDepth,
-        changedOnly
-      },
-      rows: outRows
-    };
-  }
-
-  // 三方合并物化（A5-10）：取 merge-base（分支 fork 点 commit 的 snapshot）/ ours（当前主干 = live nodes）/
-  // theirs（分支 entries 投影到 merge-base），交给 classifyThreeWayMerge 按稳定 id 逐字段三方分类。
-  // fast-forward（分支 base commit == 当前 head）时无需三方调和，照现行直接应用本分支生效 diff 即可。
 export function computeThreeWayMerge(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: EditBranchPayload = {}) {
-    const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
+    const branch = findEditBranch(store, { branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) throw new Error('Edit branch not found');
     const docId = branch.base_doc_id;
     const baseSnapshot = parseJsonObject(branch.base_snapshot) || {};
@@ -553,9 +438,9 @@ export function computeThreeWayMerge(store: EditBranchStore, { branchId = null, 
     // merge-base = 分支 fork 点 commit 的 snapshot；缺 fork commit 时退化为 ours（等价快进）
     let mergeBaseNodes: ProjectedNode[] = oursNodes as ProjectedNode[];
     let mergeBaseAxioms = store.listAxioms(docId) as AxiomRow[];
-    let mergeBaseRefs = store._fetchBaseRefsForDoc(docId) as RefRow[];
+    let mergeBaseRefs = _fetchBaseRefsForDoc(store, docId) as RefRow[];
     if (baseCommitId) {
-      const snap = store.commitSnapshot(baseCommitId);
+      const snap = history.commitSnapshot(store, baseCommitId);
       if (snap && Array.isArray(snap.nodes)) {
             mergeBaseNodes = snap.nodes as ProjectedNode[];
             mergeBaseAxioms = Array.isArray(snap.axioms) ? snap.axioms as AxiomRow[] : [];
@@ -565,13 +450,13 @@ export function computeThreeWayMerge(store: EditBranchStore, { branchId = null, 
 
     // theirs = 本分支：entries 投影到 merge-base（不是投影到 live，避免与主干变更混淆）
     const diff = parseJsonObject(branch.diff) || {};
-    const entries = activeEntries(diff.entries);
-    const theirs = projectEditBranchDoc({
+    const entries = activeEntries(store, diff.entries);
+    const theirs = store.requireEditBranchPort().projectEditBranchDoc({
       docId,
       nodes: mergeBaseNodes,
       axioms: mergeBaseAxioms,
       refs: mergeBaseRefs
-    }, entries as never[]);
+    }, entries);
 
     // classifyThreeWayMerge 期待 MerkleNode（含 [key: string]: unknown 弱接口，便于按字段名动态读）；
     // ProjectionNode 是精确 NodeRow & 草稿增量，运行时满足但 TS 看不出来——这里是子系统边界 cast。
@@ -616,12 +501,12 @@ export function computeThreeWayMerge(store: EditBranchStore, { branchId = null, 
   // v1 不可裁——主干已被修改，只能放弃本次编辑；清理敏感信息等历史重写后属常态）。
 
 export function _trunkNodeRow(store: EditBranchStore, docId: unknown, ref: unknown) {
-    if (ref === null || ref === undefined || isTmpId(ref)) return null;
+    if (ref === null || ref === undefined || store.requireEditBranchPort().isTmpId(ref)) return null;
     return store.db!.prepare('SELECT * FROM nodes WHERE id = ? AND doc_id = ?').get<NodeRow>(ref, docId) || null;
   }
 
 export function _trunkSubtreeHash(store: EditBranchStore, docId: unknown, ref: unknown) {
-    if (!store._trunkNodeRow(docId, ref)) return null;
+    if (!_trunkNodeRow(store, docId, ref)) return null;
     const rows = store.db!.prepare(`
       WITH RECURSIVE subtree(id) AS (
         SELECT id FROM nodes WHERE id = ?
@@ -653,7 +538,7 @@ export function _validateEditBranchEntriesAgainstTrunk(store: EditBranchStore, b
     }
     const refExists = (ref: unknown) => {
       if (ref === null || ref === undefined) return false;
-      if (isTmpId(ref)) return tmpCreated.has(ref);
+      if (store.requireEditBranchPort().isTmpId(ref)) return tmpCreated.has(ref);
       return Boolean(_trunkNodeRow(store, docId, ref));
     };
 
@@ -664,7 +549,7 @@ export function _validateEditBranchEntriesAgainstTrunk(store: EditBranchStore, b
         forkNodes = null;
         const baseCommitId = (parseJsonObject(branch.base_snapshot) || {}).baseCommitId || null;
         if (baseCommitId) {
-          const snap = store.commitSnapshot(baseCommitId);
+          const snap = history.commitSnapshot(store, baseCommitId);
           if (snap && Array.isArray(snap.nodes)) {
             forkNodes = new Map((snap.nodes as ProjectedNode[]).map((node) => [String(node.id), node]));
           }
@@ -689,7 +574,7 @@ export function _validateEditBranchEntriesAgainstTrunk(store: EditBranchStore, b
     const block = (id: unknown, kind: string, reason: string, address = '') => blocked.push({ id: norm(id), kind, reason, address });
     // 拆分/并入的内容前置：节点须仍在主干且正文未漂移（拼接/截句都基于入账时所见内容）。
     const checkContentIntact = (ref: unknown, beforeHash: unknown, address = '') => {
-      if (ref === null || ref === undefined || isTmpId(ref)) return;
+      if (ref === null || ref === undefined || store.requireEditBranchPort().isTmpId(ref)) return;
       const row = _trunkNodeRow(store, docId, ref);
       if (!row) {
         block(ref, 'node-deleted', '主干已删除该节点，分支的拆分/并入无法应用', address);
@@ -706,7 +591,7 @@ export function _validateEditBranchEntriesAgainstTrunk(store: EditBranchStore, b
       switch (entry.kind) {
         case 'node.update': {
           const ref = entry.node_id ?? entry.target_ref;
-          if (isTmpId(ref)) break; // 改自己新建的节点，无主干前置
+          if (store.requireEditBranchPort().isTmpId(ref)) break; // 改自己新建的节点，无主干前置
           const row = _trunkNodeRow(store, docId, ref);
           if (!row) {
             block(ref, 'node-deleted', '主干已删除该节点，分支对它的修改无法应用（复活不支持）', String(entry.address || ''));
@@ -740,7 +625,7 @@ export function _validateEditBranchEntriesAgainstTrunk(store: EditBranchStore, b
         }
         case 'node.delete': {
           const ref = entry.target_ref ?? entry.node_id;
-          if (isTmpId(ref)) break;
+          if (store.requireEditBranchPort().isTmpId(ref)) break;
           if (!_trunkNodeRow(store, docId, ref)) break; // 主干也删了 → 收敛
           const before = entry.before_subtree_hash || forkSubtreeHash(ref) || null;
           if (before && _trunkSubtreeHash(store, docId, ref) !== before) {
@@ -756,7 +641,7 @@ export function _validateEditBranchEntriesAgainstTrunk(store: EditBranchStore, b
         case 'node.moveBefore':
         case 'node.moveAfter': {
           const ref = entry.node_ref ?? entry.target_ref ?? entry.node_id;
-          if (isTmpId(ref)) break;
+          if (store.requireEditBranchPort().isTmpId(ref)) break;
           const row = _trunkNodeRow(store, docId, ref);
           if (!row) {
             // 显式重挂/提升的对象已被主干删除 → 复活不支持；纯排序（moveBefore/After）位置意图失效，跳过即可。
@@ -849,7 +734,7 @@ export function _validateEditBranchEntriesAgainstTrunk(store: EditBranchStore, b
   //   - conflicts（字段级/删改级）→ 无人裁拒绝并返回冲突；带 resolutions 折进账目后提交。
   //   - 干净/收敛 → 直接重放写回。
 export function applyThreeWayMerge(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human', summary = '三方合并', resolutions = null, strategy = null }: EditBranchPayload = {}) {
-    const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
+    const branch = findEditBranch(store, { branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) throw new Error('Edit branch not found');
     const docId = branch.base_doc_id;
     const baseCommitId = (parseJsonObject(branch.base_snapshot) || {}).baseCommitId || null;
@@ -857,7 +742,7 @@ export function applyThreeWayMerge(store: EditBranchStore, { branchId = null, sh
     const headCommitId = head?.head_commit_id || null;
     const fastForward = (baseCommitId || null) === (headCommitId || null);
     const rawPayload = (parseJsonObject(branch.diff) || {}) as EditBranchDiff;
-    const entries = activeEntries(rawPayload.entries);
+    const entries = activeEntries(store, rawPayload.entries);
     const meta = {
       kind: 'editBranch.threeWayMerge.apply',
       baseDocId: docId,
@@ -870,7 +755,7 @@ export function applyThreeWayMerge(store: EditBranchStore, { branchId = null, sh
       return { ...meta, applied: true, ..._commitEditBranchPayload(store, branch, rawPayload, String(summary)) };
     }
 
-    const validation = store._validateEditBranchEntriesAgainstTrunk(branch, entries) as { blocked: RowObject[]; conflicts: RowObject[]; nodes: RowObject[] };
+    const validation = _validateEditBranchEntriesAgainstTrunk(store, branch, entries) as { blocked: RowObject[]; conflicts: RowObject[]; nodes: RowObject[] };
     if (validation.blocked.length > 0) {
       return {
         ...meta,
@@ -893,10 +778,10 @@ export function applyThreeWayMerge(store: EditBranchStore, { branchId = null, sh
       if (picks.length === 0) {
         return { ...meta, applied: false, conflicts: validation.conflicts, nodes: validation.nodes };
       }
-      const { entries: folded, errors } = resolveConflictEntries({
-        entries: rawPayload.entries as never[] | undefined,
-        conflicts: validation.conflicts as never[],
-        resolutions: picks as never[]
+      const { entries: folded, errors } = store.requireEditBranchPort().resolveConflictEntries({
+        entries: rawPayload.entries,
+        conflicts: validation.conflicts,
+        resolutions: picks
       });
       if (errors.length > 0) {
         return { ...meta, applied: false, resolutionErrors: errors, conflicts: validation.conflicts, nodes: validation.nodes };
@@ -937,7 +822,7 @@ export function _replaceEditBranchDiff(store: EditBranchStore, branch: EditBranc
   }
 
 export function undoEditBranchEntry(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: EditBranchPayload = {}) {
-    const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
+    const branch = findEditBranch(store, { branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) throw new Error('Edit branch not found');
     // 最后一条 active → undone，单行翻转 O(1)（原实现整包重写 O(K)）。
     const target = store.db!.prepare(`
@@ -956,7 +841,7 @@ export function undoEditBranchEntry(store: EditBranchStore, { branchId = null, s
   }
 
 export function redoEditBranchEntry(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: EditBranchPayload = {}) {
-    const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
+    const branch = findEditBranch(store, { branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) throw new Error('Edit branch not found');
     // 复活「最近被 undo」的条目（undoneAt 最新、同刻取 seq 最大），与原 marker 扫描语义一致。
     const target = store.db!.prepare(`
@@ -977,29 +862,19 @@ export function redoEditBranchEntry(store: EditBranchStore, { branchId = null, s
   // doc). Shared between getDoc and _projectedDocForBranch so the lazy diff
   // projection always sees the same set of ref rows that the read path does.
 export function _fetchBaseRefsForDoc(store: EditBranchStore, docId: unknown) {
-    return store.db!.prepare(`
-      SELECT refs.* FROM refs
-      LEFT JOIN nodes source_nodes ON refs.source_type = 'node' AND refs.source_id = source_nodes.id
-      LEFT JOIN nodes target_nodes ON refs.target_type = 'node' AND refs.target_id = target_nodes.id
-      LEFT JOIN axioms source_axioms ON refs.source_type = 'axiom' AND refs.source_id = source_axioms.id
-      LEFT JOIN axioms target_axioms ON refs.target_type = 'axiom' AND refs.target_id = target_axioms.id
-      WHERE (refs.source_type = 'node' AND source_nodes.doc_id = ?)
-         OR (refs.target_type = 'node' AND target_nodes.doc_id = ?)
-         OR (refs.source_type = 'axiom' AND source_axioms.doc_id = ?)
-         OR (refs.target_type = 'axiom' AND target_axioms.doc_id = ?)
-      ORDER BY refs.id
-    `).all<RefRow>(docId, docId, docId, docId);
+    return axiomRef.listDocRefs(store, docId);
   }
 
   // 某文档当前正文（base）的投影输入：节点（父→排序→id 稳定序）、公理、引用。diffView / 投影 / liveDocSnapshot
   // 共用这一份取数，省得三处各写一遍、nodes 排序或 base 取法要改时追三处。
-export function _baseDocInputsForDoc(store: EditBranchStore, docId: unknown): BaseDocInputs {
+export function editBranchBaseInputs(store: EditBranchStore, docId: unknown): BaseDocInputs {
     const id = normalizePositiveId(docId);
+    if (!id) throw new Error(`Invalid edit branch document id: ${docId}`);
     const nodes = store.db!.prepare(`
       SELECT * FROM nodes WHERE doc_id = ?
       ORDER BY parent_id IS NOT NULL, parent_id, sort_order, id
     `).all<ProjectedNode>(id);
-    return { docId: id, nodes, axioms: store.listAxioms(id) as AxiomRow[], refs: store._fetchBaseRefsForDoc(id) as RefRow[] };
+    return { docId: id, nodes, axioms: store.listAxioms(id) as AxiomRow[], refs: _fetchBaseRefsForDoc(store, id) as RefRow[] };
   }
 
   // Read the doc with all entries from `branch` already projected on top of the
@@ -1009,719 +884,30 @@ export function _baseDocInputsForDoc(store: EditBranchStore, docId: unknown): Ba
 export function _projectedDocForBranch(store: EditBranchStore, branch: EditBranchRow): ProjectedDocState {
     const diff = JSON.parse(branch.diff || '{}') as EditBranchDiff;
     const entries = Array.isArray(diff.entries) ? diff.entries : [];
-    return projectEditBranchDoc(store._baseDocInputsForDoc(branch.base_doc_id) as never, entries as never[]) as ProjectedDocState;
+    return store.requireEditBranchPort().projectEditBranchDoc(editBranchBaseInputs(store, branch.base_doc_id), entries);
   }
 
   // 把某文档当前正文（HEAD）投影成快照 {nodes(含 address),axioms,refs}，供 diff.refs 与历史/草稿快照同形比对。
   // 空 entries 投影 = 正文本身，但复用投影器算地址，地址口径与草稿/历史快照一致（computeDiff 按稳定 id 配对）。
 export function liveDocSnapshot(store: EditBranchStore, docId: unknown): ProjectedDocState {
-    return projectEditBranchDoc(store._baseDocInputsForDoc(docId) as never, []) as ProjectedDocState;
+    return store.requireEditBranchPort().projectEditBranchDoc(editBranchBaseInputs(store, docId), []);
   }
 
 export function _findProjectedNode(store: EditBranchStore, state: ProjectedDocState, ref: unknown) {
     if (ref === null || ref === undefined) return null;
-    if (isTmpId(ref)) return state.nodes.find((node) => node.id === ref) || null;
+    if (store.requireEditBranchPort().isTmpId(ref)) return state.nodes.find((node) => node.id === ref) || null;
     return state.nodes.find((node) => sameStableId(node.id, ref)) || null;
   }
 
 export function _findProjectedAxiom(store: EditBranchStore, state: ProjectedDocState, ref: unknown) {
     if (ref === null || ref === undefined) return null;
-    if (isTmpId(ref)) return state.axioms.find((axiom) => axiom.id === ref) || null;
+    if (store.requireEditBranchPort().isTmpId(ref)) return state.axioms.find((axiom) => axiom.id === ref) || null;
     return state.axioms.find((axiom) => sameStableId(axiom.id, ref)) || null;
-  }
-
-export function stageEditBranchNodeUpdate(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    assertNoEditTrustField(payload, 'node.update payload');
-    const nodeRef = payload.nodeId ?? payload.node_id;
-    if (nodeRef === null || nodeRef === undefined) throw new Error('node.update requires nodeId');
-    const before = _projectedDocForBranch(store, branch);
-    const currentNode = _findProjectedNode(store, before, nodeRef);
-    if (!currentNode) throw new Error(`Node not found in edit branch: ${nodeRef}`);
-    // 接受顶层字段或 patch 包：不强制调用方手写嵌套 { patch: {...} }（不裸 json，见 15-5-2）。
-    // nodePatchForEditBranch 按白名单取字段，顶层混入的 nodeId/action/owner 等非字段会被忽略。
-    const requestedPatch = nodePatchForEditBranch(store, currentNode, (payload.patch ?? payload) as EditBranchPayload);
-    if (Object.keys(requestedPatch).length === 0) {
-      throw new Error('node.update 需要至少一个可改字段（text / nodeType / nodeTitle / nodeNote / sourcePosition），放在顶层或 patch 内均可');
-    }
-    const patch: NodePatchFields = {};
-    const fields: NodeUpdateFieldsDelta[] = [];
-    for (const [field, value] of Object.entries(requestedPatch)) {
-      const oldValue = (currentNode as unknown as Record<string, unknown>)[field] ?? null;
-      const nextValue = value ?? null;
-      if (oldValue === nextValue) continue;
-      // requestedPatch 经 nodePatchForEditBranch 白名单过滤，键已在 NodePatchFields 字段集内，
-      // 但类型上仍是 string 索引——用 Record 视图写入，避开 keyof NodePatchFields 收紧。
-      (patch as Record<string, unknown>)[field] = value;
-      fields.push({ field, old: oldValue, new: nextValue });
-    }
-    if (fields.length === 0) {
-      // 提供了字段但值与现状相同——合法 no-op，非错误
-      return { branch, changed: false, node: nodeRowWithClientAliases(currentNode as never) };
-    }
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.update',
-      action: 'patch',
-      node_id: currentNode.id,
-      address: currentNode.address || '',
-      patch,
-      fields
-    });
-    const after = _projectedDocForBranch(store, freshBranch);
-    const projectedNode = _findProjectedNode(store, after, currentNode.id) || currentNode;
-    return { branch: freshBranch, changed: true, node: nodeRowWithClientAliases(projectedNode as never) };
-  }
-
-export function stageEditBranchNodeInsert(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    assertNoHumanTagField(payload, 'node.insert payload');
-    assertNoEditTrustField(payload, 'node.insert payload');
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const afterRef = payload.afterNodeId ?? payload.after_node_id ?? null;
-    let parentRef = payload.parentId ?? payload.parent_id ?? null;
-    if (parentRef === null || parentRef === undefined) {
-      // afterNodeId 自足：锚点一确定，父（=锚点的父）与位次（=锚点之后）在地址体系下唯一确定，
-      // 无需再抄一遍 parentId。只有插为首个子节点 / 插进空父（没有前序兄弟可锚）才必须 parentId。
-      if (afterRef === null || afterRef === undefined) {
-        throw new Error('node.insert 需要 parentId（插为首个子节点或空父下），或 afterNodeId（插在某节点之后，父从锚点推断）');
-      }
-      const projected = _projectedDocForBranch(store, branch);
-      const anchor = _findProjectedNode(store, projected, afterRef);
-      if (!anchor) throw new Error(`node.insert afterNodeId 锚点不存在: ${afterRef}`);
-      if (anchor.parent_id === null || anchor.parent_id === undefined) {
-        throw new Error('node.insert 不能插在根节点之后（根唯一）；要在根下插入请给 parentId');
-      }
-      parentRef = anchor.parent_id;
-    }
-    const tmpId = nextTmpId('node');
-    const fields = {
-      text: typeof payload.text === 'string' ? payload.text : '',
-      node_type: normalizeNodeType(String(payload.nodeType ?? payload.node_type ?? 'TEXT')),
-      node_title: payload.nodeTitle ?? payload.node_title ?? '',
-      node_note: payload.nodeNote ?? payload.node_note ?? '',
-      source_position: normalizeSourcePosition(payload.sourcePosition ?? payload.source_position ?? null)
-    };
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.insert',
-      tmp_id: tmpId,
-      parent_ref: parentRef,
-      after_ref: afterRef,
-      fields
-    });
-    const after = _projectedDocForBranch(store, freshBranch);
-    const inserted = _findProjectedNode(store, after, tmpId);
-    return {
-      branch: freshBranch,
-      changed: true,
-      docId,
-      node: inserted ? nodeRowWithClientAliases(inserted as never) : null,
-      insertedNodeId: tmpId
-    };
-  }
-
-export function stageEditBranchNodeDelete(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.nodeId ?? payload.node_id;
-    if (ref === null || ref === undefined) throw new Error('node.delete requires nodeId');
-    const before = _projectedDocForBranch(store, branch);
-    const target = _findProjectedNode(store, before, ref);
-    if (!target) throw new Error(`Node not found in edit branch: ${ref}`);
-    if (target.parent_id === null || target.parent_id === undefined) {
-      throw new Error('Cannot delete document root node');
-    }
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.delete',
-      target_ref: target.id,
-      address: target.address || '',
-      // 乐观并发前置（A5-10）：记下主干当下这棵子树的指纹，保存时一致才允许照删——
-      // 「删除时至少该知道删的是什么」。tmp 目标（分支自建）无主干前置，记 null。
-      before_subtree_hash: _trunkSubtreeHash(store, docId, target.id)
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: target.id };
-  }
-
-export function stageEditBranchNodeMove(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.nodeId ?? payload.node_id;
-    if (ref === null || ref === undefined) throw new Error('node.move requires nodeId');
-    const direction = payload.direction === 'up' ? 'up' : 'down';
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.move',
-      target_ref: ref,
-      direction
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: ref, direction };
-  }
-
-export function stageEditBranchNodePromote(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.nodeId ?? payload.node_id;
-    if (ref === null || ref === undefined) throw new Error('node.promote requires nodeId');
-    const trunkRow = _trunkNodeRow(store, docId, ref);
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.promote',
-      target_ref: ref,
-      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: ref };
-  }
-
-export function stageEditBranchNodeSplit(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.nodeId ?? payload.node_id;
-    if (ref === null || ref === undefined) throw new Error('node.split requires nodeId');
-    const before = _projectedDocForBranch(store, branch);
-    const target = _findProjectedNode(store, before, ref);
-    if (!target) throw new Error(`Node not found in edit branch: ${ref}`);
-
-    // Source-paragraph mode: when target's subtree (in the real base table)
-    // has childless paragraph nodes with source_spans, mirror what
-    // splitNodeIntoChildren -> splitSourceParagraphsIntoSentenceChildren would
-    // do. Only base node ids can carry source_spans; pending-insert tmp nodes
-    // never do.
-    if (!isTmpId(target.id)) {
-      const candidates = store.db!.prepare(`
-        WITH RECURSIVE subtree(id) AS (
-          SELECT id FROM nodes WHERE id = ?
-          UNION ALL
-          SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
-        )
-        SELECT n.*
-        FROM nodes n
-        JOIN subtree s ON n.id = s.id
-        WHERE n.source_position IS NOT NULL
-          AND ABS(n.source_position - CAST(n.source_position AS INTEGER)) > 0.000001
-        ORDER BY n.id
-      `).all<ProjectedNode>(target.id);
-      const baseChildCount = store.db!.prepare('SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?');
-      const spansStmt = store.db!.prepare('SELECT * FROM source_spans WHERE node_id = ? ORDER BY sentence_index, id');
-      const paragraphSplits: RowObject[] = [];
-      for (const candidate of candidates) {
-        // skip if base or projection already gave this paragraph children
-        if ((baseChildCount.get<CountRow>(candidate.id)?.count || 0) > 0) continue;
-        const projectedChildren = before.nodes.filter((n: ProjectedNode) => sameStableId(n.parent_id, candidate.id));
-        if (projectedChildren.length > 0) continue;
-        const spans = spansStmt.all<SourceSpanRow>(candidate.id);
-        if (spans.length === 0) continue;
-        paragraphSplits.push({
-          paragraph_node_id: candidate.id,
-          // 乐观并发前置：拆分基于该段当下的内容，保存时内容漂移则拒绝（candidate 是主干行）。
-          before_content_hash: contentHash(candidate as unknown as MerkleNode),
-          spans: spans.map((span: SourceSpanRow) => ({
-            text: span.text || '',
-            sentence_index: span.sentence_index ?? null,
-            tmp_id: nextTmpId('node')
-          }))
-        });
-      }
-      if (paragraphSplits.length > 0) {
-        const freshBranch = _appendEditBranchEntry(store, branch, {
-          kind: 'node.split',
-          target_ref: target.id,
-          strategy: 'source_paragraphs',
-          paragraph_splits: paragraphSplits
-        });
-        return { branch: freshBranch, changed: true, docId, nodeId: target.id };
-      }
-    }
-
-    const sentences = splitSentences(target.text || '', {
-      splitAsciiPunctuation: payload.splitAsciiPunctuation === true || payload.split_ascii_punctuation === true
-    });
-    if (sentences.length < 2) {
-      return { branch, changed: false, docId, nodeId: target.id };
-    }
-    const newIds = sentences.slice(1).map(() => nextTmpId('node'));
-    const trunkTarget = _trunkNodeRow(store, docId, target.id);
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.split',
-      target_ref: target.id,
-      strategy: 'split_sentences',
-      sentences,
-      new_node_ids: newIds,
-      // 乐观并发前置：拆分基于主干当下的正文，保存时内容漂移则拒绝（tmp 目标无前置）。
-      before_content_hash: trunkTarget ? contentHash(trunkTarget as unknown as MerkleNode) : null
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: target.id };
-  }
-
-export function stageEditBranchNodeMergeInto(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const sourceRef = payload.nodeId ?? payload.node_id;
-    const targetRef = payload.targetNodeId ?? payload.target_node_id;
-    if (sourceRef === null || sourceRef === undefined) throw new Error('node.mergeInto requires nodeId');
-    if (targetRef === null || targetRef === undefined) throw new Error('node.mergeInto requires targetNodeId');
-    const trunkSource = _trunkNodeRow(store, docId, sourceRef);
-    const trunkTarget = _trunkNodeRow(store, docId, targetRef);
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.mergeInto',
-      source_ref: sourceRef,
-      target_ref: targetRef,
-      // 乐观并发前置：拼接结果取决于两侧当下正文，保存时任一侧内容漂移则拒绝。
-      source_before_content_hash: trunkSource ? contentHash(trunkSource as unknown as MerkleNode) : null,
-      target_before_content_hash: trunkTarget ? contentHash(trunkTarget as unknown as MerkleNode) : null
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: sourceRef, sourceNodeId: sourceRef, targetNodeId: targetRef };
-  }
-
-export function stageEditBranchNodeMergePrevious(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const sourceRef = payload.nodeId ?? payload.node_id;
-    if (sourceRef === null || sourceRef === undefined) throw new Error('node.mergePrevious requires nodeId');
-    // "前一兄弟"在 stage 时就着投影态物化成 target_ref：op-log 动词记录意图的对象
-    // 而不是位置谓词，否则 undo/redo 翻动前序 entry 后"前一个"会漂移——投影端
-    // （applyNodeMergeInto）与重放端都按定死的 target_ref 应用，所见即所得。
-    const projected = _projectedDocForBranch(store, branch);
-    const node = _findProjectedNode(store, projected, sourceRef);
-    if (!node) throw new Error(`Node not found in edit branch: ${sourceRef}`);
-    if (node.parent_id === null || node.parent_id === undefined) {
-      return { branch, changed: false, docId, nodeId: sourceRef };
-    }
-    const previous = projected.nodes
-      .filter((other: ProjectedNode) => other.parent_id !== null && other.parent_id !== undefined
-        && String(other.parent_id) === String(node.parent_id)
-        && Number(other.sort_order) < Number(node.sort_order))
-      .sort((left: ProjectedNode, right: ProjectedNode) => Number(right.sort_order) - Number(left.sort_order))[0] || null;
-    if (!previous) {
-      return { branch, changed: false, docId, nodeId: sourceRef };
-    }
-    const trunkSource = _trunkNodeRow(store, docId, sourceRef);
-    const trunkTarget = _trunkNodeRow(store, docId, previous.id);
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.mergePrevious',
-      source_ref: sourceRef,
-      target_ref: previous.id,
-      // 乐观并发前置：与 mergeInto 同律，两侧内容漂移则拒绝（tmp 侧无前置）。
-      source_before_content_hash: trunkSource ? contentHash(trunkSource as unknown as MerkleNode) : null,
-      target_before_content_hash: trunkTarget ? contentHash(trunkTarget as unknown as MerkleNode) : null
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: sourceRef, sourceNodeId: sourceRef, targetNodeId: previous.id };
-  }
-
-export function stageEditBranchNodeReparent(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.nodeId ?? payload.node_id;
-    const newParentRef = payload.newParentId ?? payload.new_parent_id;
-    if (ref === null || ref === undefined) throw new Error('node.reparent requires nodeId');
-    if (newParentRef === null || newParentRef === undefined) throw new Error('node.reparent requires newParentId');
-    const trunkRow = _trunkNodeRow(store, docId, ref);
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.reparent',
-      node_ref: ref,
-      new_parent_ref: newParentRef,
-      // 乐观并发前置：记录移动时主干上的父节点；保存时父已被主干改走 → 两侧移动相撞。
-      // 仅主干行存在时记录（缺省=无前置），避免把「未知」误记成「根(null)」。
-      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: ref, newParentId: newParentRef };
-  }
-
-export function stageEditBranchNodeMoveBefore(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.nodeId ?? payload.node_id;
-    const targetRef = payload.targetNodeId ?? payload.target_node_id;
-    if (ref === null || ref === undefined) throw new Error('node.moveBefore requires nodeId');
-    if (targetRef === null || targetRef === undefined) throw new Error('node.moveBefore requires targetNodeId');
-    const trunkRow = _trunkNodeRow(store, docId, ref);
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.moveBefore',
-      node_ref: ref,
-      target_ref: targetRef,
-      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: ref, targetNodeId: targetRef };
-  }
-
-export function stageEditBranchNodeMoveAfter(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.nodeId ?? payload.node_id;
-    const targetRef = payload.targetNodeId ?? payload.target_node_id;
-    if (ref === null || ref === undefined) throw new Error('node.moveAfter requires nodeId');
-    if (targetRef === null || targetRef === undefined) throw new Error('node.moveAfter requires targetNodeId');
-    const trunkRow = _trunkNodeRow(store, docId, ref);
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'node.moveAfter',
-      node_ref: ref,
-      target_ref: targetRef,
-      ...(trunkRow ? { before_parent_id: trunkRow.parent_id } : {})
-    });
-    return { branch: freshBranch, changed: true, docId, nodeId: ref, targetNodeId: targetRef };
-  }
-
-export function stageEditBranchAxiomAdd(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const tmpId = nextTmpId('axiom');
-    const fields = {
-      content: typeof payload.content === 'string' ? payload.content : '',
-      status: typeof payload.status === 'string' ? payload.status : 'pending',
-      node_title: payload.nodeTitle ?? payload.node_title ?? '',
-      node_note: payload.nodeNote ?? payload.node_note ?? ''
-    };
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'axiom.add',
-      tmp_id: tmpId,
-      fields
-    });
-    const after = _projectedDocForBranch(store, freshBranch);
-    const axiom = _findProjectedAxiom(store, after, tmpId);
-    return { branch: freshBranch, changed: true, docId, axiom: axiom ? { ...axiom } : null, insertedAxiomId: tmpId };
-  }
-
-export function stageEditBranchAxiomUpdate(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.axiomId ?? payload.axiom_id;
-    if (ref === null || ref === undefined) throw new Error('axiom.update requires axiomId');
-    const rawPatch = (payload.patch || payload) as EditBranchPayload;
-    const patch: RowObject = {};
-    if (Object.prototype.hasOwnProperty.call(rawPatch, 'content')) patch.content = rawPatch.content;
-    if (Object.prototype.hasOwnProperty.call(rawPatch, 'status')) patch.status = rawPatch.status;
-    if (Object.prototype.hasOwnProperty.call(rawPatch, 'node_title') || Object.prototype.hasOwnProperty.call(rawPatch, 'nodeTitle')) {
-      patch.node_title = rawPatch.node_title ?? rawPatch.nodeTitle ?? '';
-    }
-    if (Object.prototype.hasOwnProperty.call(rawPatch, 'node_note') || Object.prototype.hasOwnProperty.call(rawPatch, 'nodeNote')) {
-      patch.node_note = rawPatch.node_note ?? rawPatch.nodeNote ?? '';
-    }
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'axiom.update',
-      axiom_ref: ref,
-      patch
-    });
-    const after = _projectedDocForBranch(store, freshBranch);
-    const axiom = _findProjectedAxiom(store, after, ref);
-    return { branch: freshBranch, changed: true, docId, axiom: axiom ? { ...axiom } : null, axiomId: ref };
-  }
-
-export function stageEditBranchAxiomDelete(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.axiomId ?? payload.axiom_id;
-    if (ref === null || ref === undefined) throw new Error('axiom.delete requires axiomId');
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'axiom.delete',
-      axiom_ref: ref
-    });
-    return { branch: freshBranch, changed: true, docId, axiomId: ref };
-  }
-
-export function stageEditBranchAxiomMove(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.axiomId ?? payload.axiom_id;
-    if (ref === null || ref === undefined) throw new Error('axiom.move requires axiomId');
-    const direction = payload.direction === 'up' ? 'up' : 'down';
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'axiom.move',
-      axiom_ref: ref,
-      direction
-    });
-    return { branch: freshBranch, changed: true, docId, axiomId: ref, direction };
-  }
-
-export function stageEditBranchRefAddAxiomToNode(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const nodeRef = payload.nodeId ?? payload.node_id;
-    const axiomRef = payload.axiomId ?? payload.axiom_id;
-    if (nodeRef === null || nodeRef === undefined) throw new Error('ref.addAxiomToNode requires nodeId');
-    if (axiomRef === null || axiomRef === undefined) throw new Error('ref.addAxiomToNode requires axiomId');
-    const tmpId = nextTmpId('ref');
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'ref.addAxiomToNode',
-      tmp_id: tmpId,
-      node_ref: nodeRef,
-      axiom_ref: axiomRef,
-      note: payload.note ?? null
-    });
-    return { branch: freshBranch, changed: true, docId, insertedRefId: tmpId, refId: tmpId, nodeId: nodeRef, axiomId: axiomRef };
-  }
-
-export function stageEditBranchRefAddNodeToNode(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const sourceRef = payload.sourceNodeId ?? payload.source_node_id ?? payload.nodeId ?? payload.node_id;
-    const targetRef = payload.targetNodeId ?? payload.target_node_id;
-    const refKind = String(payload.refKind ?? payload.ref_kind ?? payload.kind ?? '').trim();
-    if (sourceRef === null || sourceRef === undefined) throw new Error('ref.addNodeToNode requires sourceNodeId');
-    if (targetRef === null || targetRef === undefined) throw new Error('ref.addNodeToNode requires targetNodeId');
-    if (!refKind) throw new Error('ref.addNodeToNode requires refKind');
-    const tmpId = nextTmpId('ref');
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'ref.addNodeToNode',
-      tmp_id: tmpId,
-      source_ref: sourceRef,
-      target_ref: targetRef,
-      ref_kind: refKind,
-      note: payload.note ?? null
-    });
-    return { branch: freshBranch, changed: true, docId, insertedRefId: tmpId, refId: tmpId, sourceNodeId: sourceRef, targetNodeId: targetRef };
-  }
-
-export function stageEditBranchRefDelete(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {
-    const docId = normalizePositiveId(branch.base_doc_id);
-    const ref = payload.refId ?? payload.ref_id;
-    if (ref === null || ref === undefined) throw new Error('ref.delete requires refId');
-    const freshBranch = _appendEditBranchEntry(store, branch, {
-      kind: 'ref.delete',
-      ref_ref: ref
-    });
-    return { branch: freshBranch, changed: true, docId, refId: ref };
-  }
-
-export function applyEditBranchDiffEntries(store: EditBranchStore, branch: EditBranchRow, diff: EditBranchDiff = {}) {
-    const entries = activeEntries(diff.entries);
-    const baseDocId = normalizePositiveId(branch.base_doc_id);
-    // tmp_id（key）总是 stage 端 nextTmpId 出的 string；实 id（value）总是 store.addNode/addAxiom/...
-    // 返回的 IdRow.id（string）。Map 类型一开始就标对，下面 set/get 不再绕一道 unknown。
-    const nodeIdByTmp = new Map<string, string>();
-    const axiomIdByTmp = new Map<string, string>();
-    const refIdByTmp = new Map<string, string>();
-    const entityIdByTmp = new Map<string, string>();
-    const resolveNodeId = (ref: unknown) => {
-      if (ref === null || ref === undefined) return null;
-      if (isTmpId(ref)) {
-        const real = nodeIdByTmp.get(ref);
-        if (!real) throw new Error(`apply: unresolved tmp node id ${ref}`);
-        return real;
-      }
-      const id = normalizePositiveId(ref);
-      if (!id) throw new Error(`apply: invalid node id ${ref}`);
-      return id;
-    };
-    const resolveAxiomId = (ref: unknown) => {
-      if (ref === null || ref === undefined) return null;
-      if (isTmpId(ref)) {
-        const real = axiomIdByTmp.get(ref);
-        if (!real) throw new Error(`apply: unresolved tmp axiom id ${ref}`);
-        return real;
-      }
-      const id = normalizePositiveId(ref);
-      if (!id) throw new Error(`apply: invalid axiom id ${ref}`);
-      return id;
-    };
-    const resolveRefId = (ref: unknown) => {
-      if (ref === null || ref === undefined) return null;
-      if (isTmpId(ref)) {
-        const real = refIdByTmp.get(ref);
-        if (!real) throw new Error(`apply: unresolved tmp ref id ${ref}`);
-        return real;
-      }
-      const id = normalizePositiveId(ref);
-      if (!id) throw new Error(`apply: invalid ref id ${ref}`);
-      return id;
-    };
-    const resolveEntityId = (ref: unknown) => {
-      if (ref === null || ref === undefined) return null;
-      if (isTmpId(ref)) {
-        const real = entityIdByTmp.get(ref);
-        if (!real) throw new Error(`apply: unresolved tmp entity id ${ref}`);
-        return real;
-      }
-      const id = normalizePositiveId(ref);
-      if (!id) throw new Error(`apply: invalid entity id ${ref}`);
-      return id;
-    };
-    // 位置类容错（非快进合并后允许的降级）：锚点/排序对象已被主干删除时，位置意图失效，
-    // 跳过或退化为追加——位置不进内容身份（A5-2），不算丢改动。内容类缺失仍由前置验证拦在重放前。
-    const nodeRowExists = (id: unknown) => Boolean(store.db!.prepare('SELECT 1 FROM nodes WHERE id = ?').get<unknown>(id));
-
-    for (const entry of entries) {
-      if (!isSupportedEditBranchEntryKind(entry?.kind)) {
-        throw new Error(`Unsupported edit branch diff entry: ${entry?.kind || ''}`);
-      }
-      switch (entry.kind) {
-        case 'node.update': {
-          const nodeId = resolveNodeId(entry.node_id);
-          store.updateNode(nodeId, entry.patch as RowObject);
-          break;
-        }
-        case 'node.insert': {
-          const fields = (entry.fields || {}) as RowObject;
-          const afterId = entry.after_ref ? resolveNodeId(entry.after_ref) : null;
-          const inserted = store.insertNode({
-            docId: baseDocId,
-            parentId: resolveNodeId(entry.parent_ref),
-            afterNodeId: afterId && nodeRowExists(afterId) ? afterId : null,
-            text: fields.text ?? '',
-            nodeType: fields.node_type ?? fields.nodeType ?? 'TEXT',
-            nodeTitle: fields.node_title ?? fields.nodeTitle ?? '',
-            nodeNote: fields.node_note ?? fields.nodeNote ?? '',
-            sourcePosition: fields.source_position ?? null,
-            // 兼容旧 diff / 历史摘取里已经存在的 trust_level 字段；新的 edit branch
-            // stage 与 commit 入口不再接受 trust_level，标受控只走 human certify。
-            trustLevel: fields.trust_level ?? fields.trustLevel ?? null
-          });
-          if (entry.tmp_id) nodeIdByTmp.set(entry.tmp_id, inserted.id);
-          break;
-        }
-        case 'node.delete': {
-          const targetId = resolveNodeId(entry.target_ref);
-          if (nodeRowExists(targetId)) store.deleteNodeSubtree(targetId); // 主干也删了 → 收敛跳过
-          break;
-        }
-        case 'node.move': {
-          const targetId = resolveNodeId(entry.target_ref);
-          if (nodeRowExists(targetId)) store.moveNode(targetId, entry.direction === 'up' ? 'up' : 'down');
-          break;
-        }
-        case 'node.promote': {
-          const targetId = resolveNodeId(entry.target_ref);
-          if (nodeRowExists(targetId)) store.promoteNode(targetId);
-          break;
-        }
-        case 'node.split': {
-          const targetId = resolveNodeId(entry.target_ref);
-          const subtreeIds = store.db!.prepare(`
-            WITH RECURSIVE subtree(id) AS (
-              SELECT id FROM nodes WHERE id = ?
-              UNION ALL
-              SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
-            )
-            SELECT id FROM subtree
-          `);
-          const beforeIds = new Set(subtreeIds.all<IdRow>(targetId).map((row: IdRow) => String(row.id)));
-          store.splitNodeIntoChildren(targetId);
-          // Build tmp_id -> real id mapping so later entries that reference
-          // the freshly-split children resolve correctly.
-          if (entry.strategy === 'source_paragraphs' && Array.isArray(entry.paragraph_splits)) {
-            for (const split of entry.paragraph_splits) {
-              const realParagraphId = resolveNodeId(split.paragraph_node_id);
-              const realChildren = store.db!.prepare(`
-                SELECT id FROM nodes WHERE parent_id = ?
-                ORDER BY sort_order, id
-              `).all<IdRow>(realParagraphId);
-              const newChildren = realChildren.filter((row: IdRow) => !beforeIds.has(String(row.id)));
-              const spans = Array.isArray(split.spans) ? split.spans : [];
-              spans.forEach((span, position: number) => {
-                const row = newChildren[position];
-                if (span?.tmp_id && row) nodeIdByTmp.set(span.tmp_id, row.id);
-              });
-            }
-          } else if (entry.strategy === 'split_sentences' && Array.isArray(entry.new_node_ids)) {
-            const realChildren = store.db!.prepare(`
-              SELECT id FROM nodes WHERE parent_id = ?
-              ORDER BY sort_order, id
-            `).all<IdRow>(targetId);
-            const newChildren = realChildren.filter((row: IdRow) => !beforeIds.has(String(row.id)));
-            entry.new_node_ids.forEach((tmpId, position) => {
-              const row = newChildren[position];
-              if (tmpId && row) nodeIdByTmp.set(tmpId, row.id);
-            });
-          }
-          break;
-        }
-        case 'node.mergeInto': {
-          store.mergeNodeIntoTarget({
-            nodeId: resolveNodeId(entry.source_ref),
-            targetNodeId: resolveNodeId(entry.target_ref)
-          });
-          break;
-        }
-        case 'node.mergePrevious': {
-          // stage 端已把"前一兄弟"物化为 target_ref；按定死目标重放，与投影所见一致。
-          // 无 target_ref 的旧 entry 退回重放时现查（防御兜底；现行 stage 必写 target_ref）。
-          if (entry.target_ref !== null && entry.target_ref !== undefined) {
-            store.mergeNodeIntoTarget({
-              nodeId: resolveNodeId(entry.source_ref),
-              targetNodeId: resolveNodeId(entry.target_ref)
-            });
-          } else {
-            store.mergeNodeIntoPreviousSibling(resolveNodeId(entry.source_ref));
-          }
-          break;
-        }
-        case 'node.reparent': {
-          store.moveNodeToParent({
-            nodeId: resolveNodeId(entry.node_ref),
-            newParentId: resolveNodeId(entry.new_parent_ref)
-          });
-          break;
-        }
-        case 'node.moveBefore': {
-          const nodeId = resolveNodeId(entry.node_ref);
-          const targetId = resolveNodeId(entry.target_ref);
-          if (nodeRowExists(nodeId) && nodeRowExists(targetId)) {
-            store.moveNodeBeforeSibling({ nodeId, targetNodeId: targetId });
-          }
-          break;
-        }
-        case 'node.moveAfter': {
-          const nodeId = resolveNodeId(entry.node_ref);
-          const targetId = resolveNodeId(entry.target_ref);
-          if (nodeRowExists(nodeId) && nodeRowExists(targetId)) {
-            store.moveNodeAfterSibling({ nodeId, targetNodeId: targetId });
-          }
-          break;
-        }
-        case 'axiom.add': {
-          const fields = (entry.fields || {}) as RowObject;
-          const created = store.addAxiom({
-            docId: baseDocId,
-            content: fields.content ?? '',
-            status: fields.status ?? 'pending',
-            nodeTitle: fields.node_title ?? '',
-            nodeNote: fields.node_note ?? ''
-          }) as IdRow;
-          if (entry.tmp_id) axiomIdByTmp.set(entry.tmp_id, created.id);
-          break;
-        }
-        case 'axiom.update': {
-          store.updateAxiom(resolveAxiomId(entry.axiom_ref), entry.patch as RowObject);
-          break;
-        }
-        case 'axiom.delete': {
-          store.deleteAxiom(resolveAxiomId(entry.axiom_ref));
-          break;
-        }
-        case 'axiom.move': {
-          store.moveAxiom({
-            docId: baseDocId,
-            axiomId: resolveAxiomId(entry.axiom_ref),
-            direction: entry.direction === 'up' ? 'up' : 'down'
-          });
-          break;
-        }
-        case 'ref.addAxiomToNode': {
-          const created = store.addAxiomRefToNode({
-            docId: baseDocId,
-            nodeId: resolveNodeId(entry.node_ref),
-            axiomId: resolveAxiomId(entry.axiom_ref),
-            note: entry.note ?? null
-          }) as IdRow;
-          if (entry.tmp_id) refIdByTmp.set(entry.tmp_id, created.id);
-          break;
-        }
-        case 'ref.addNodeToNode': {
-          const created = store.addNodeRefToNode({
-            docId: baseDocId,
-            sourceNodeId: resolveNodeId(entry.source_ref),
-            targetNodeId: resolveNodeId(entry.target_ref),
-            refKind: entry.ref_kind,
-            note: entry.note ?? null
-          }) as IdRow;
-          if (entry.tmp_id) refIdByTmp.set(entry.tmp_id, created.id);
-          break;
-        }
-        case 'ref.delete': {
-          store.deleteRef(resolveRefId(entry.ref_ref));
-          break;
-        }
-        case 'entity.create':
-        case 'entity.update':
-        case 'entity.delete':
-        case 'entity.link':
-        case 'entity.unlink':
-        case 'entity.bindNode':
-        case 'entity.ignoreNode':
-        case 'entity.clearNodeBinding':
-          // entity 落库已下沉 entities/write.mjs（解耦第 4 步）；提交循环只把横切解析器交给它。
-          applyEntityEntry(store, entry, { resolveEntityId, resolveNodeId, entityIdByTmp, baseDocId });
-          break;
-        default: {
-          // 上面 switch 已穷尽 EditBranchEntry 全部 26 个 variant；走到 default 是 entry 形状不合约。
-          const exhaustive: never = entry;
-          throw new Error(`Unhandled edit branch diff entry kind: ${String((exhaustive as { kind?: unknown })?.kind ?? '')}`);
-        }
-      }
-    }
   }
 
 export function beginEditBranch(store: EditBranchStore, docId: unknown, owner: unknown = 'human', { fresh = false }: { fresh?: boolean } = {}) {
     const normalizedDocId = normalizePositiveId(docId);
-    const identity = store.normalizeEditBranchOwner(owner);
+    const identity = normalizeEditBranchOwner(store, owner);
     if (!normalizedDocId) throw new Error('beginEditBranch requires docId');
 
     // 默认复用该身份（role:user 前缀）下最新 active 草稿；fresh=true 才另起一行。
@@ -1770,7 +956,7 @@ export function beginEditBranch(store: EditBranchStore, docId: unknown, owner: u
   }
 
 export function findEditBranch(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: BranchLookupPayload = {}) {
-    const normalizedOwner = owner == null ? null : store.normalizeEditBranchOwner(owner);
+    const normalizedOwner = owner == null ? null : normalizeEditBranchOwner(store, owner);
     const acceptOwner = (branch: EditBranchRow | null) => (
       branch && (!normalizedOwner || ownerIdentity(branch.owner) === ownerIdentity(normalizedOwner)) ? branch : null
     );
@@ -1785,7 +971,7 @@ export function findEditBranch(store: EditBranchStore, { branchId = null, shadow
   }
 
 export function rebaseEditBranch(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: EditBranchPayload = {}) {
-    const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
+    const branch = findEditBranch(store, { branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) throw new Error('Edit branch not found');
     const head = store.db!.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?').get<HeadRow>(branch.base_doc_id);
     const previousBaseSnapshot = JSON.parse(branch.base_snapshot || '{}') as RowObject;
@@ -1810,6 +996,7 @@ export function rebaseEditBranch(store: EditBranchStore, { branchId = null, shad
       changed: true,
       branch: freshBranch,
       baseCommitId: baseSnapshot.baseCommitId,
+      previousBaseCommitId: baseSnapshot.previousBaseCommitId ?? null,
       ...editBranchHistoryState(store, freshBranch)
     };
   }
@@ -1823,12 +1010,12 @@ export function cherryPickEditBranchEntries(store: EditBranchStore, {
     entryId = null,
     entryIndex = null
   }: CherryPickPayload = {}) {
-    const source = store._cherryPickSource({ sourceHistoryId, sourceBranchId }) as CherryPickSource;
-    const selectedEntries = store._selectCherryPickEntries(source.entries, { entryId, entryIndex }) as EditBranchEntry[];
+    const source = _cherryPickSource(store, { sourceHistoryId, sourceBranchId }) as CherryPickSource;
+    const selectedEntries = _selectCherryPickEntries(store, source.entries, { entryId, entryIndex }) as EditBranchEntry[];
     if (selectedEntries.length === 0) throw new Error('cherry-pick found no entries');
     const targetBranch = targetBranchId
-      ? store.findEditBranch({ branchId: targetBranchId, owner: null } as BranchLookupPayload) as EditBranchRow | null
-      : store.beginEditBranch(targetBaseDocId || source.docId, targetOwner) as EditBranchRow | null;
+      ? findEditBranch(store, { branchId: targetBranchId, owner: null } as BranchLookupPayload) as EditBranchRow | null
+      : beginEditBranch(store, targetBaseDocId || source.docId, targetOwner) as EditBranchRow | null;
     if (!targetBranch) throw new Error('Target edit branch not found');
     if (!sameStableId(targetBranch.base_doc_id, source.docId)) {
       throw new Error('cherry-pick source and target must belong to the same document');
@@ -1853,14 +1040,14 @@ export function cherryPickEditBranchEntries(store: EditBranchStore, {
 
 export function _cherryPickSource(store: EditBranchStore, { sourceHistoryId = null, sourceBranchId = null }: Pick<CherryPickPayload, 'sourceHistoryId' | 'sourceBranchId'> = {}): CherryPickSource {
     if (sourceBranchId) {
-      const branch = store.findEditBranch({ branchId: sourceBranchId, owner: null } as BranchLookupPayload) as EditBranchRow | null;
+      const branch = findEditBranch(store, { branchId: sourceBranchId, owner: null } as BranchLookupPayload) as EditBranchRow | null;
       if (!branch) throw new Error(`Source edit branch not found: ${sourceBranchId}`);
       const diff = JSON.parse(branch.diff || '{}') as EditBranchDiff;
       return {
         kind: 'branch',
         id: branch.id,
         docId: branch.base_doc_id,
-        entries: activeEntries(diff.entries)
+        entries: activeEntries(store, diff.entries)
       };
     }
     if (sourceHistoryId) {
@@ -1869,7 +1056,7 @@ export function _cherryPickSource(store: EditBranchStore, { sourceHistoryId = nu
       // 操作级条目内联在 meta.entries。
       const meta = (parseJsonObject(commit.meta) || {}) as EditBranchDiff;
       const rawEntries = Array.isArray(meta.entries) ? meta.entries : null;
-      const entries = activeEntries(rawEntries);
+      const entries = activeEntries(store, rawEntries);
       if (entries.length === 0 && Array.isArray(rawEntries) && rawEntries.length > 0) {
         throw new Error('cherry-pick commit does not contain edit-branch entries');
       }
@@ -1942,7 +1129,7 @@ export function _docNodeSignatures(store: EditBranchStore, docId: unknown) {
   // saveEditBranch 用分支存储的 entries 调用；三方合并人裁后用折进 resolution 的 entries 调用。
   // 返回 touchedNodeIds/deletedNodeIds 供派生索引按受影响节点增量同步（4-6-2）。
 export function _commitEditBranchPayload(store: EditBranchStore, branch: EditBranchRow, rawPayload: EditBranchDiff = {}, summary = '保存编辑分支'): BranchCommitResult {
-    const entries = activeEntries(rawPayload.entries);
+    const entries = activeEntries(store, rawPayload.entries);
     if (entries.some(editBranchEntryTouchesTrust)) {
       throw new Error('edit branch diff no longer supports trust_level; use human certify to set trust_level');
     }
@@ -1966,8 +1153,8 @@ export function _commitEditBranchPayload(store: EditBranchStore, branch: EditBra
         for (const id of before.keys()) {
           if (!after.has(id)) deletedNodeIds.push(id);
         }
-        const currentSnapshot = store.createSnapshot(branch.base_doc_id);
-        store.createCommit({
+        const currentSnapshot = history.createSnapshot(store, branch.base_doc_id);
+        history.createCommit(store, {
           docId: branch.base_doc_id,
           summary,
           snapshot: currentSnapshot,
@@ -2001,7 +1188,7 @@ export function _commitEditBranchPayload(store: EditBranchStore, branch: EditBra
   }
 
 export function discardEditBranch(store: EditBranchStore, { branchId = null, shadowDocId = null, baseDocId = null, owner = 'human' }: EditBranchPayload = {}) {
-    const branch = store.findEditBranch({ branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
+    const branch = findEditBranch(store, { branchId, shadowDocId, baseDocId, owner } as BranchLookupPayload) as EditBranchRow | null;
     if (!branch) return false;
     // Lazy mode: base tables are never modified during the edit session, so
     // discarding the branch simply drops the staged entries.

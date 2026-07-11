@@ -2,6 +2,44 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.6 — 2026-07-11
+
+本版主线是**代码分层收敛**：`store` 门面 / `db-shell` / `mutation-api` / `query-api` / `electron/main` / `mcp-server` / `agent-runtime` 各自剥去掺进来的业务规则，只剩薄装配 / 纯翻译，把业务规则统一沉降到域内 action 层。后端源码从「工具目录里堆产品部件」的碎形态整理成顶层按域分目录；前端并行完成剩余的依赖循环拆除、store 逆向依赖、edit branch stages 解耦、跨层类型收紧、C2D（MindMapView）内部规整化七刀。对外动词契约与 schema 契约均不变，本版无迁移。
+
+### 破坏性（内部集成路径）
+
+- **MCP 入口路径迁移**：`src/mcp/mcp-server.ts` 是新的产品级入口位置，产物路径由 `dist/scripts/mcp-server.js` 迁到 `dist/src/mcp/mcp-server.js`；`package.json` 的 `mcp` / `mcp:node` 已同刀更新。旧位置 `scripts/mcp-server.ts` 留了 re-export 垫片，仍可跑但会打警告，下版移除。外部 MCP client 若硬编码旧路径请跟着改。
+- **electron launcher 出屋**：启动器从 `electron/main.ts` 内联脚本抽到独立 `electron/launcher.ts`，产物 `dist/electron/launcher.js`；`launcher-html-script.test.mjs` 已同步指向新路径。用户侧无感知（`start.bat` / `npm run app` 不变）。
+
+### 后端（分层收敛）
+
+- **store 门面还原为薄根**：`store` 从「持业务规则的门面」剥回「按域组装的薄根」。PDF 高亮几何计算、快照 token 消费、`store` 对 `memory` 的运行时反向依赖等业务规则下沉到域内 action；快照 token 直用域实例，不再借道 `store` 的公共入口。
+- **db-shell 恢复纯翻译**：`db-shell` 是给 agent 用的 SQL-like read-only 顶层，之前掺了大量业务查询。三刀落地——(a) 历史快照读三函数改纯翻译；(b) `find` 编排（`minScore` 过滤、实体同义扩展）下沉 action；(c) `import` / `vectors` / `delete` 三组编排下沉，`context` 注入旁路消除。收尾把 `debug.sql` 里最后两处业务查询也搬走。
+- **query-api 拆 handlers/read**：`query-api` 照 `mutation-api` 样板拆分——`handlers/read/` 下 content / doc / history / node / search / edit-branch-view / shared 七件按读动词拆开，`query-api` 只做分发。
+- **MCP 层收窄**：`mcp-server.ts` 迁 `src/mcp/`（见上）；MCP 写 / 查动词全量转发 `db-shell`，回执文本化收敛到单一调用点，杜绝两处独立生成回执文本导致的口径漂移。
+- **agent-runtime 按职责拆件**：`agent-runtime.ts` 由 2335 行拆成 1297 行主循环 + `agent-history` / `agent-protocol` / `agent-shared` / `agent-tools-schema` / `agent-volume` / `agent-web` 等职责单一的邻居模块（工具装载 / 上下文管理 / 请求生命周期等）。
+- **electron/main 与 host 拆分**：`electron/main.ts` 里的启动器、E2E 捕获、设置读写、memory 锚运维四块出屋——`electron/launcher.ts` / `electron/e2e-capture.ts` / `electron/settings-io.ts` / `backend/memory/host-anchor.ts` 各归各家。`main.ts` 收敛成薄装配根。
+- **顶层按域建目录**：`src/backend/` 顶层 40+ 散文件按域重排——`derived-index/` / `diff/` / `editor-session/` / `import/` / `library/` / `handlers/read/` 等新目录归位，把「产品部件散在工具目录」的碎结构收敛成按域分目录；引用一次性同刀更新。
+- **database-service 恢复真签名**：`database-service` 的 `unknown` 洗宽 `cast` 清零，签名恢复真类型；跨模块契约不再靠边界 `as unknown as` 中转。
+
+### 后端（性能与修复）
+
+- **nodeHistory 剪枝 O(K)**：节点历史面板刷新时的逐 commit 物化改为对象库 tree 指纹定位，剪枝成本从 O(全部 commit) 降到 O(该节点实际变更次数)；大历史下面板响应从秒级降到十毫秒级。
+- **MCP / CLI 写回执可读性**：`update` / `unset` / `mv` / `apply` 等写回执的字段与顺序统一走 `write-result-text`，agent 侧解析可预期。
+- **导入初始 commit 时序修复**：修复 `db import` 首次插入时 commit 顺序导致的对象库空引用；导入过程中 `agent.run` 检索到中间态的窗口消失。
+- **校验硬化小活批次**：写路径 3 处、读路径 2 处的输入校验从「相信调用方」改为 fail-fast，异常场景下的错误位置从堆栈中段前移到入口。
+
+### 前端（架构重构收尾）
+
+- **C2D（MindMapView）内部规整化七刀**：深度 / 热点纯逻辑外提 + 行为锁定单测；卡片 / 菜单 / 浮层静态拆件；命令 / 行内编辑 / 拖拽三个交互 hook 外提；`useC2DCamera` 镜头状态机收编 6 个 flag ref；深度命令 seq 脉冲换 `useImperativeHandle`；`c2d/` 目录归位 + 命名清理。`MindMapView.tsx` 由大杂烩瘦成薄装配根 + 明确职责的邻居文件。
+- **store 拆包**：`frontend/stores/` 内部按职责继续拆——history 源与节点操作分离、结构性节点操作独立成刀、store 逆向依赖（不再反向依赖 library 与 entity 域）、import 与 projection 编排移出 store、edit branch stages 解耦。store 门面变薄，模块间边界清晰化。
+- **前端依赖循环拆除**：`frontend` 内的循环依赖整体消除；跨层类型收紧——横向依赖解除，投影类型不再走 `unknown`。
+- **僵尸文件删除**：前端重构留下的一批零引用死代码（组件 / hook / 工具函数）逐一确认后删除。
+
+### 测试
+
+- 顶层套件全绿，新增 C2D 深度 / 热点 / 几何三个行为锁定测试文件、entity write transaction 一件；drag-drop / hitbox / mindmap / mindmap-renderer 四个旧测试随组件重排删除。
+
 ## 0.6.5 — 2026-07-06
 
 本版两条主线：一批后端性能手术（merkle 增量维护、undo 快照对象库化、读写分离、编辑分支拆表、投影缓存），把大文档下的几处 O(N) / O(K²) 热点收敛到增量成本；以及前端架构重构阶段 0–5（命令层 / store 状态机 / render 拆分 / 数据窗口化），`App.tsx` 从 2720 行瘦到 736 行的薄装配根。对外动词契约不变；schema 有新增表 / 列，旧库打开时自动完成一次性迁移（幂等、可中断续跑）。

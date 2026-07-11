@@ -15,12 +15,12 @@ interface DeleteRefPayload {
 
 export const refRepository = {
   async addAxiomRefToNode(payload: AddAxiomRefPayload) {
-    const result = await writeDatabase({ action: 'ref.addAxiomToNode', ...(payload || {}) }) as { doc?: unknown } | null | undefined;
+    const result = await writeDatabase({ action: 'ref.addAxiomToNode', ...(payload || {}) });
     return result?.doc || result;
   },
 
   async deleteRef(payload: DeleteRefPayload) {
-    const result = await writeDatabase({ action: 'ref.delete', ...(payload || {}) }) as { doc?: unknown } | null | undefined;
+    const result = await writeDatabase({ action: 'ref.delete', ...(payload || {}) });
     return result?.doc || result;
   }
 };

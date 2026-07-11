@@ -155,7 +155,7 @@ test('db edit --set node_type 归一化中文标签，--set trust_level 被拒',
     await beginBranch(dbPath, docId, owner);
 
     const typeResult = parseJsonStdout(await runBashDb(dbPath, [
-      'edit', docId, '1-1-6-1-1', '--set', 'node_type', '如果', '--base', docId, '--owner', owner
+      'edit', docId, '1-1-6-1-1', '--set', 'node_type', '如果', '--base', docId, '--owner', owner, '--json'
     ]));
     assert.equal(typeResult.ok, true);
     assert.equal(typeResult.changed, true);

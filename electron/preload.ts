@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import channels from './ipc-channels.js';
+import type { TypedDatabaseReadRequest, TypedDatabaseReadResult } from '../src/backend/query-api.js';
+import type { MutationPayload, MutationResult } from '../src/backend/mutation-api.js';
 
 let menuHandler: ((action: unknown) => void) | null = null;
 
@@ -16,6 +18,10 @@ function wrap(channel: string) {
     throw err;
   });
 }
+
+type DatabaseReadBridge = <Request extends TypedDatabaseReadRequest>(payload: Request) => Promise<TypedDatabaseReadResult<Request>>;
+const readDatabase = wrap(channels.DATABASE_READ) as DatabaseReadBridge;
+const writeDatabase = wrap(channels.DATABASE_WRITE) as (payload: MutationPayload) => Promise<MutationResult>;
 
 contextBridge.exposeInMainWorld('iftree', {
   minimizeWindow: wrap(channels.WINDOW_MINIMIZE),
@@ -34,8 +40,8 @@ contextBridge.exposeInMainWorld('iftree', {
   readLibraryTree: wrap(channels.LIBRARY_READ_TREE),
   moveLibraryEntry: wrap(channels.LIBRARY_MOVE),
   runDatabaseCommand: wrap(channels.DATABASE_RUN),
-  readDatabase: wrap(channels.DATABASE_READ),
-  writeDatabase: wrap(channels.DATABASE_WRITE),
+  readDatabase,
+  writeDatabase,
   readSourcePdfData: wrap(channels.SOURCE_READ_PDF_DATA),
   readSourcePdfHighlights: wrap(channels.SOURCE_READ_PDF_HIGHLIGHTS),
   readSourcePdfSpanRects: wrap(channels.SOURCE_READ_PDF_SPAN_RECTS),

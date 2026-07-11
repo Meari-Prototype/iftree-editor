@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { IftreeStore } from '../src/backend/store/index.js';
+import { createDocFromStructuredRecords } from '../src/backend/import/store-write.js';
 import { flattenTree } from '../src/core/tree.js';
 import { importRecordsForFile } from '../src/core/import-formats/router.js';
 
@@ -193,8 +194,8 @@ test('导入夹具文档并校验节点结构', async () => {
     const routed = await importRecordsForFile(FIXTURE_PATH, { mode: 'complete' });
     assert.ok(Array.isArray(routed.structured) && routed.structured.length > 0, '夹具解析出结构化记录');
 
-    type CreateRecords = Parameters<typeof store.createDocFromStructuredRecords>[0]['records'];
-    const doc = store.createDocFromStructuredRecords({
+    type CreateRecords = Parameters<typeof createDocFromStructuredRecords>[1]['records'];
+    const doc = createDocFromStructuredRecords(store, {
       title: 'IFTreeEditor导入导出测试夹具',
       sourcePath: FIXTURE_PATH,
       records: routed.structured as CreateRecords
@@ -233,8 +234,8 @@ test('导入夹具后导出 Markdown 保留层级与内容', async () => {
   const { store } = tempStore();
   try {
     const routed = await importRecordsForFile(FIXTURE_PATH, { mode: 'complete' });
-    type CreateRecords = Parameters<typeof store.createDocFromStructuredRecords>[0]['records'];
-    const doc = store.createDocFromStructuredRecords({
+    type CreateRecords = Parameters<typeof createDocFromStructuredRecords>[1]['records'];
+    const doc = createDocFromStructuredRecords(store, {
       title: 'IFTreeEditor导入导出测试夹具',
       sourcePath: FIXTURE_PATH,
       records: routed.structured as CreateRecords

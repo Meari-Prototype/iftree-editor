@@ -13,7 +13,7 @@ import type {
   NodeRow
 } from '../db/rows.js';
 import type { EditBranchRow } from '../db/rows.js';
-import type { EditBranchEntry } from '../edit-branch-projection.js';
+import type { EditBranchEntry } from '../projection/edit-branch-projection.js';
 import { buildAhoCorasickMatcher } from '../../core/aho-corasick.js';
 
 // IftreeStore 的 edit-branch 转调壳现已经从 (...args: unknown[]) 收紧到真签名（store/index.ts:1053-）。
@@ -24,6 +24,8 @@ export interface EntityStore {
   db: Database | null;
   activeEditBranchForDoc?: (docId: unknown, owner?: unknown) => EditBranchRow | null;
   _appendEditBranchEntry?: (branch: EditBranchRow, entry: EditBranchEntry) => EditBranchRow;
+  // 与 IftreeStore.withTransaction 对齐（嵌套安全：已在事务中直接执行）；测试窄 store 可不带。
+  withTransaction?: <T>(fn: () => T) => T;
 }
 
 // 派生：entities JOIN docs 后的常用形状，外加投影层会带的 pending/命中计数。

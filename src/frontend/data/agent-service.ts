@@ -1,8 +1,36 @@
 import { callIftree, hasIftreeMethod, onAgentStream } from './iftree-api.js';
 import { settingsRepository } from './settings-service.js';
+import type {
+  AgentBranch,
+  AgentSession,
+  AgentSettingsLike,
+  AgentToolEvent,
+  AgentUsage
+} from '../lib/agent-utils.js';
 
 type AgentPayload = Record<string, unknown>;
-type AgentStreamCallback = (event: unknown) => void;
+export interface AgentStreamEvent {
+  type: 'delta' | 'reasoning' | 'status' | 'usage' | 'tool' | 'done' | string;
+  requestId: string;
+  text?: string;
+  answer?: string;
+  diffCount?: number;
+  usage?: AgentUsage | null;
+  tool?: AgentToolEvent;
+}
+
+export interface AgentDeleteSessionResult {
+  ok: boolean;
+  sessions: AgentSession[];
+}
+
+export interface AgentDiffMutationResult {
+  ok?: boolean;
+  diffs?: AgentBranch[];
+  result?: Record<string, unknown>;
+}
+
+type AgentStreamCallback = (event: AgentStreamEvent) => void;
 
 export const agentRepository = {
   onStream(callback: AgentStreamCallback) {
@@ -13,8 +41,8 @@ export const agentRepository = {
     return hasIftreeMethod('onAgentStream');
   },
 
-  saveSettings(settings: AgentPayload) {
-    return settingsRepository.saveAgentSettings(settings);
+  saveSettings(settings: AgentSettingsLike): Promise<AgentSettingsLike> {
+    return settingsRepository.saveAgentSettings(settings) as Promise<AgentSettingsLike>;
   },
 
   runAgentRequest(payload: AgentPayload) {
@@ -30,19 +58,19 @@ export const agentRepository = {
   },
 
   listDiffs() {
-    return callIftree('listAgentDiffs');
+    return callIftree<AgentBranch[]>('listAgentDiffs');
   },
 
   applyDiff(payload: AgentPayload) {
-    return callIftree('applyAgentDiff', payload);
+    return callIftree<AgentDiffMutationResult>('applyAgentDiff', payload);
   },
 
   rejectDiff(payload: AgentPayload) {
-    return callIftree('rejectAgentDiff', payload);
+    return callIftree<AgentDiffMutationResult>('rejectAgentDiff', payload);
   },
 
   listSessions(payload: AgentPayload) {
-    return callIftree('listAgentSessions', payload);
+    return callIftree<AgentSession[]>('listAgentSessions', payload);
   },
 
   canListSessions() {
@@ -50,7 +78,7 @@ export const agentRepository = {
   },
 
   getSession(payload: AgentPayload) {
-    return callIftree('getAgentSession', payload);
+    return callIftree<AgentSession | null>('getAgentSession', payload);
   },
 
   canGetSession() {
@@ -58,7 +86,7 @@ export const agentRepository = {
   },
 
   deleteSession(payload: AgentPayload) {
-    return callIftree('deleteAgentSession', payload);
+    return callIftree<AgentDeleteSessionResult>('deleteAgentSession', payload);
   },
 
   canDeleteSession() {

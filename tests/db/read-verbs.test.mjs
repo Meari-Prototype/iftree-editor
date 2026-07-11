@@ -135,7 +135,7 @@ test('read 档全动词批量冒烟', { timeout: 240000 }, async () => {
       [['find', 'DBT_DIFF_MODIFY', '--scope', docId, '1', '--at', commitRef], /历史命中/],
       [['log', docId], /commit:/],
       [['diff', docId, commitRef], /改/],
-      [['sql', 'SELECT COUNT(*) AS n FROM nodes'], /"n"/]
+      [['sql', 'SELECT COUNT(*) AS n FROM nodes'], /n=50/]
     ];
     for (const [argv, must] of calls) {
       const normalized = Array.isArray(argv) ? argv : [argv];

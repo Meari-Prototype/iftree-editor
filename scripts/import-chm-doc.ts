@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { IftreeStore } from '../src/backend/store/index.js';
+import { createDocFromStructuredRecords } from '../src/backend/import/store-write.js';
 import { readChmSourceDocument } from '../src/core/source-chm.js';
 import { normalizeImportBaseName } from '../src/core/source-markdown.js';
 
@@ -150,23 +151,11 @@ try {
 
   stage = 'write-sqlite';
   print({ type: 'import-stage', stage, records: records.length });
-  // 本脚本只用 IftreeStore 的几个方法表面，定 minimal 桥接接口避开拉整套 store 真类型（IftreeStore 已收紧，但 saveSourceDocument 形参形态是 record-shape，桥接更省签名）。
-  interface StoreBridge {
-    init(options?: unknown): void;
-    createDocFromStructuredRecords(payload: { title: string; sourcePath: string; records: unknown[] }): {
-      id: unknown;
-      importedNodeIds: unknown[];
-      importedNodeIdsByRecordIndex?: Record<number, unknown>;
-    };
-    saveSourceDocument(payload: Record<string, unknown>): unknown;
-    db: { prepare(sql: string): { get(...args: unknown[]): unknown } };
-    close(): void;
-  }
-  const store = new IftreeStore(dbPath) as unknown as StoreBridge;
+  const store = new IftreeStore(dbPath);
   store.init();
   try {
     const title = normalizeImportBaseName(filePath);
-    const doc = store.createDocFromStructuredRecords({ title, sourcePath: filePath, records });
+    const doc = createDocFromStructuredRecords(store, { title, sourcePath: filePath, records });
 
     stage = 'write-source-spans';
     print({ type: 'import-stage', stage, docId: doc.id, spanCount: sourceDocument.spans.length });
@@ -189,7 +178,7 @@ try {
       nodeIdsBySentenceIndex
     });
 
-    const info = store.db.prepare('SELECT COUNT(*) AS node_count FROM nodes WHERE doc_id = ?').get(doc.id) as { node_count?: number } | undefined;
+    const info = store.db!.prepare('SELECT COUNT(*) AS node_count FROM nodes WHERE doc_id = ?').get(doc.id) as { node_count?: number } | undefined;
     print({
       type: 'import-result',
       ok: true,

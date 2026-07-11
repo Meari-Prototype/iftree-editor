@@ -14,22 +14,81 @@ const IMPORT_MODE_OPTIONS: ImportModeOption[] = [
   { mode: 'complete', label: '完整导入' },
   { mode: 'smart', label: '智能导入', title: '调用内置 agent 按 skill 解析结构并入库（过程在 AgentPanel 可见）' },
   { mode: 'direct', label: '直接导入' },
-  { mode: 'vector', label: '向量式导入', title: '按字数定长切块导入（块 512 字、相邻块重叠 10%），适合需要切块向量化的数据' }
+  { mode: 'vector', label: '向量式导入', title: '按字数定长切块导入（可设块大小与重叠比例，默认块 512 字、重叠 10%），适合需要切块向量化的数据' }
 ];
+
+export interface VectorImportOptions {
+  chunkSize: number;
+  /** 相邻块重叠 = 块长比例（0~0.9），与后端 normalizeVectorChunkOptions 口径一致。 */
+  overlap: number;
+}
 
 export interface LibraryEntryLike {
   name?: string;
   type?: string;
-  [extra: string]: unknown;
+}
+
+// 向量式导入参数对话框：块大小 + 重叠百分比（界面按 % 收，回调换算为比例）。
+function VectorImportParamsDialog({ onConfirm, onCancel }: {
+  onConfirm(options: VectorImportOptions): void;
+  onCancel(): void;
+}) {
+  const [chunkSizeText, setChunkSizeText] = useState('512');
+  const [overlapText, setOverlapText] = useState('10');
+  const chunkSize = Math.floor(Number(chunkSizeText));
+  const overlapPercent = Number(overlapText);
+  const chunkSizeValid = Number.isFinite(chunkSize) && chunkSize >= 1;
+  // 上限 90%：与后端 normalizeVectorChunkOptions 的 0.9 夹紧一致（重叠 ≥ 块长切不动）。
+  const overlapValid = Number.isFinite(overlapPercent) && overlapPercent >= 0 && overlapPercent <= 90;
+  return (
+    <div className="dialog-overlay" onClick={onCancel}>
+      <div className="dialog-box node-dialog" onClick={(event) => event.stopPropagation()}>
+        <header className="dialog-header">向量式导入参数</header>
+        <label className="dialog-field">
+          <span>块大小（字符数，默认 512）</span>
+          <input
+            className="dialog-input"
+            type="number"
+            min={1}
+            value={chunkSizeText}
+            onChange={(event) => setChunkSizeText(event.target.value)}
+            autoFocus
+          />
+        </label>
+        <label className="dialog-field">
+          <span>相邻块重叠（占块长 %，0-90，默认 10）</span>
+          <input
+            className="dialog-input"
+            type="number"
+            min={0}
+            max={90}
+            value={overlapText}
+            onChange={(event) => setOverlapText(event.target.value)}
+          />
+        </label>
+        <div className="dialog-actions">
+          <button
+            type="button"
+            disabled={!chunkSizeValid || !overlapValid}
+            onClick={() => onConfirm({ chunkSize, overlap: overlapPercent / 100 })}
+          >
+            导入
+          </button>
+          <button type="button" onClick={onCancel}>取消</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 interface ViewPromptCardProps {
   selectedLibraryEntry: LibraryEntryLike | null | undefined;
-  onImport?: (mode: string) => void;
+  onImport?: (mode: string, options?: VectorImportOptions) => void;
 }
 
 export function ViewPromptCard({ selectedLibraryEntry, onImport }: ViewPromptCardProps) {
   const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const [vectorParamsOpen, setVectorParamsOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -43,6 +102,11 @@ export function ViewPromptCard({ selectedLibraryEntry, onImport }: ViewPromptCar
 
   const runImport = (mode: string): void => {
     setImportMenuOpen(false);
+    // 向量式导入先收 chunkSize/overlap 参数再执行；其它模式直接跑。
+    if (mode === 'vector') {
+      setVectorParamsOpen(true);
+      return;
+    }
     onImport?.(mode);
   };
 
@@ -85,6 +149,15 @@ export function ViewPromptCard({ selectedLibraryEntry, onImport }: ViewPromptCar
           </div>
         )}
       </div>
+      {vectorParamsOpen && (
+        <VectorImportParamsDialog
+          onConfirm={(options) => {
+            setVectorParamsOpen(false);
+            onImport?.('vector', options);
+          }}
+          onCancel={() => setVectorParamsOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -92,7 +165,7 @@ export function ViewPromptCard({ selectedLibraryEntry, onImport }: ViewPromptCar
 interface ViewAlignedEmptyStateProps {
   activeTab?: string;
   selectedLibraryEntry: LibraryEntryLike | null | undefined;
-  onImport?: (mode: string) => void;
+  onImport?: (mode: string, options?: VectorImportOptions) => void;
 }
 
 export function ViewAlignedEmptyState({ activeTab, selectedLibraryEntry, onImport }: ViewAlignedEmptyStateProps) {

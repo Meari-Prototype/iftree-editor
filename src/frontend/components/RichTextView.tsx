@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { plainNodeNote } from '../../core/node-notes.js';
-import { flattenTree } from '../../core/tree.js';
+import { collectNodeAndDescendantIds, flattenTree } from '../../core/tree.js';
 import {
   depthOf
 } from '../lib/doc-utils.js';
@@ -9,20 +9,18 @@ import {
 
 import { PdfRichTextView } from './PdfRichTextView.jsx';
 import { RichNodeView } from './RichNodeView';
-import type { LocateRequest } from './RichNodeView';
-import { renderInlineMarkdownText, sourceSpanKey } from './SourceBlocks.jsx';
+import type { LocateRequest } from '../hooks/useNodeSelection.js';
+import { renderInlineMarkdownText, sourceSpanKey, type SourceSpanLike } from './SourceBlocks.jsx';
+import type { TreeNode } from '../../core/node-model.js';
+import type { AxiomRow } from '../../backend/db/schema.js';
+import type { ProjectedDoc } from '../hooks/useDocumentState.js';
 export const SOURCE_VIRTUAL_OVERSCAN = 1200;
 export const SOURCE_WINDOW_CHAR_LIMIT = 50000;
 export const SOURCE_WINDOW_AUTO_LOAD_GAP = 240;
 
-export type RichTreeNode = Record<string, unknown> & { id?: unknown; address?: unknown; children?: RichTreeNode[] };
-type SourceSpan = Record<string, unknown>;
-type RichCurrentDoc = Record<string, unknown> & {
-  tree?: RichTreeNode | null;
-  sourceDocument?: Record<string, unknown> | null;
-  sourceWindow?: { raw_markdown?: string; sourceSpans?: SourceSpan[] } | null;
-  sourceSpans?: SourceSpan[];
-};
+export type RichTreeNode = TreeNode;
+type SourceSpan = SourceSpanLike;
+type RichCurrentDoc = ProjectedDoc;
 
 // 源文档块的渲染视图（解析输出在前端的最小读取面）。
 interface SourceBlockView {
@@ -30,19 +28,15 @@ interface SourceBlockView {
   start?: number;
   end?: number;
   text?: string;
-  rows?: unknown[];
-  items?: unknown[];
-  lines?: unknown[];
+  rows?: readonly object[];
+  items?: readonly object[];
+  lines?: readonly string[];
 }
 
 // 事实前提条目的渲染视图。
-interface AxiomView {
-  id?: unknown;
-  label?: unknown;
-  content?: unknown;
-}
+type AxiomView = AxiomRow;
 
-export function estimateSourceBlockHeight(block: SourceBlockView, rawMarkdown: unknown) {
+export function estimateSourceBlockHeight(block: SourceBlockView, rawMarkdown?: string | null) {
   const textLength = Math.max(1, Number(block?.end || 0) - Number(block?.start || 0));
   if (block?.type === 'heading') return 56;
   if (block?.type === 'code') {
@@ -68,13 +62,13 @@ export function estimateSourceBlockHeight(block: SourceBlockView, rawMarkdown: u
 }
 
 export function nodeMapFromTree(tree: RichTreeNode | null | undefined) {
-  return new Map((flattenTree(tree as unknown) as RichTreeNode[]).map((node) => [String(node.id), node]));
+  return new Map(flattenTree(tree).map((node) => [node.id, node]));
 }
 
-export function buildRichDepthModel(tree: RichTreeNode | null | undefined, sourceSpans: SourceSpan[], depthLimit: unknown) {
+export function buildRichDepthModel(tree: RichTreeNode | null | undefined, sourceSpans: SourceSpan[], depthLimit: number) {
   if (!tree) return { targetNodes: [], allowedNodeIds: new Set(), allowedSpanIds: null, visibleSpans: [] };
   const targetDepth = Math.max(1, Number(depthLimit) || 1);
-  const flat = flattenTree(tree as unknown) as RichTreeNode[];
+  const flat = flattenTree(tree);
   const targetNodes = flat.filter((node) => depthOf(String(node.address || '1')) === targetDepth);
   if (targetNodes.length === 0) return { targetNodes: [], allowedNodeIds: new Set(), allowedSpanIds: new Set(), visibleSpans: [] };
   const allowedNodeIds = new Set<string>();
@@ -87,12 +81,6 @@ export function buildRichDepthModel(tree: RichTreeNode | null | undefined, sourc
   return { targetNodes, allowedNodeIds, allowedSpanIds, visibleSpans };
 }
 
-export function collectNodeAndDescendantIds(node: RichTreeNode | null | undefined, output: Set<string>) {
-  if (!node) return;
-  output.add(String(node.id));
-  for (const child of node.children || []) collectNodeAndDescendantIds(child, output);
-}
-
 export function isSourceSpanAllowed(allowedSpanIds: Set<string> | null, span: SourceSpan | null | undefined) {
   if (!allowedSpanIds) return true;
   if (!span) return false;
@@ -103,8 +91,8 @@ export function RichTextView({
   currentDoc,
   docId,
   selectedNodeId,
-  setSelectedNodeId,
-  depthLimit,
+  setSelectedNodeId = () => {},
+  depthLimit = 1,
   collapsed = new Set(),
   expanded = new Set(),
   toggleCollapsed,
@@ -113,31 +101,27 @@ export function RichTextView({
   showNotes,
   showAxioms = true,
   onAddAxiom,
-  loadSourceWindow,
-  sourceWindowLoading = false,
   locateRequest = null
 }: {
   currentDoc?: RichCurrentDoc | null;
-  docId?: unknown;
-  selectedNodeId?: unknown;
-  setSelectedNodeId?: (nodeId: unknown) => void;
-  depthLimit?: unknown;
-  collapsed?: Set<unknown>;
-  expanded?: Set<unknown>;
-  toggleCollapsed?: (nodeId: unknown) => void;
+  docId?: string | null;
+  selectedNodeId?: string | null;
+  setSelectedNodeId?: (nodeId: string | null) => void;
+  depthLimit?: number;
+  collapsed?: Set<string>;
+  expanded?: Set<string>;
+  toggleCollapsed?: (nodeId: string, options?: { promoteDepth?: boolean }) => void;
   showLeftInfo?: boolean;
   showTitles?: boolean;
   showNotes?: boolean;
   showAxioms?: boolean;
   onAddAxiom?: () => void;
-  loadSourceWindow?: (...args: unknown[]) => unknown;
-  sourceWindowLoading?: boolean;
-  locateRequest?: LocateRequest;
+  locateRequest?: LocateRequest | null;
 }) {
   const tree = currentDoc?.tree;
   const sourceDocument = currentDoc?.sourceDocument;
   const sourceWindow = currentDoc?.sourceWindow;
-  const sourceSpans = sourceWindow?.sourceSpans || currentDoc?.sourceSpans || [];
+  const sourceSpans: SourceSpan[] = sourceWindow?.sourceSpans || currentDoc?.sourceSpans || [];
   const usingSourceWindow = Boolean(sourceWindow?.raw_markdown);
   const nodeById = useMemo(() => nodeMapFromTree(tree), [tree]);
   const depthModel = useMemo(() => (
@@ -153,16 +137,16 @@ export function RichTextView({
   if (isPdfSource) {
     return (
       <PdfRichTextView
-        currentDoc={currentDoc as Parameters<typeof PdfRichTextView>[0]['currentDoc']}
+        currentDoc={currentDoc}
         docId={String(docId ?? '')}
-        selectedNodeId={selectedNodeId as Parameters<typeof PdfRichTextView>[0]['selectedNodeId']}
-        setSelectedNodeId={setSelectedNodeId as Parameters<typeof PdfRichTextView>[0]['setSelectedNodeId']}
+        selectedNodeId={selectedNodeId}
+        setSelectedNodeId={setSelectedNodeId}
         depthModel={depthModel}
         nodeById={nodeById}
         depthLimit={Number(depthLimit) || 1}
-        collapsed={collapsed as Parameters<typeof PdfRichTextView>[0]['collapsed']}
-        expanded={expanded as Parameters<typeof PdfRichTextView>[0]['expanded']}
-        toggleCollapsed={toggleCollapsed as Parameters<typeof PdfRichTextView>[0]['toggleCollapsed']}
+        collapsed={collapsed}
+        expanded={expanded}
+        toggleCollapsed={toggleCollapsed}
         showLeftInfo={showLeftInfo}
         showTitles={Boolean(showTitles)}
         showNotes={Boolean(showNotes)}
@@ -216,7 +200,7 @@ export function RichAxiomProperties({ axioms = [], onAddAxiom }: { axioms?: Axio
   );
 }
 
-export function SourceDocumentLead({ node, showNotes }: { node?: { note?: unknown } | null; showNotes?: boolean }) {
+export function SourceDocumentLead({ node, showNotes }: { node?: Pick<TreeNode, 'note'> | null; showNotes?: boolean }) {
   const note = plainNodeNote(node?.note || '');
   if (!showNotes || !note) return null;
   return (

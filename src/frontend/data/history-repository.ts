@@ -10,12 +10,12 @@ interface HistoryPayload {
 
 export const historyRepository = {
   async saveDocumentSnapshot(payload: HistoryPayload) {
-    const result = await writeDatabase({ action: 'history.save', ...(payload || {}) }) as { doc?: unknown } | null | undefined;
+    const result = await writeDatabase({ action: 'history.save', ...(payload || {}) });
     return result?.doc || result;
   },
 
   async restoreDocumentSnapshot(payload: HistoryPayload) {
-    const result = await writeDatabase({ action: 'history.restore', ...(payload || {}) }) as { doc?: unknown } | null | undefined;
+    const result = await writeDatabase({ action: 'history.restore', ...(payload || {}) });
     return result?.doc || result;
   },
 

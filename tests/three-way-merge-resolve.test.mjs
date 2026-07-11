@@ -6,12 +6,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createConfiguredIftreeStore } from '../dist/src/backend/store-domain-adapter.js';
 import { createDatabaseService } from '../dist/src/backend/database-service.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-3way-resolve-'));
-  const store = new IftreeStore(join(dir, 'store.sqlite'));
+  const store = createConfiguredIftreeStore(join(dir, 'store.sqlite'));
   try {
     store.init();
     await fn(store);

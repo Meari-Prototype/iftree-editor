@@ -13,27 +13,20 @@ import {
   writeFileSync
 } from 'node:fs';
 import { once } from 'node:events';
-import { spawn } from 'node:child_process';
-import type { ChildProcess } from 'node:child_process';
 import type { FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { NativeImage, OpenDialogOptions } from 'electron';
+import type { OpenDialogOptions } from 'electron';
 
 import {
-  DEFAULT_VECTOR_CONFIG,
   VECTOR_COMPUTE_OPTIONS,
-  VECTOR_MODEL_OPTIONS,
-  normalizeVectorConfig
+  VECTOR_MODEL_OPTIONS
 } from '../src/vector/embeddings.js';
 import { normalizeDocMeta, resolveMarkdownImageUrl, workspaceSearchRoots } from '../src/core/image-paths.js';
 import { createBackendClient } from '../src/backend/llm/backend-client.js';
 import { resolveNodeExecutable } from '../src/backend/llm/backend-discovery.js';
-import {
-  clampNumber,
-  normalizeAgentToolSettings
-} from '../src/backend/llm/defaults.js';
+import { normalizeAgentToolSettings } from '../src/backend/llm/defaults.js';
 import {
   huggingFaceResolveUrl,
   huggingFaceTreeUrl,
@@ -42,7 +35,6 @@ import {
 
 
 import { normalizeImportMode } from '../src/core/import-formats/shared.js';
-import { DEFAULT_NODE_LAYOUT, normalizeNodeLayout } from '../src/core/mindmap.js';
 import { normalizeStableId } from '../src/backend/db/ids.js';
 import { debugValueSummary } from '../src/core/debug-summary.js';
 import {
@@ -50,67 +42,23 @@ import {
   cleanupLegacyLlmEnvValues,
   createLlmSettingsReader,
   llmApiKeyEnvValues,
-  readDotEnv as readDotEnvFile,
   stripLlmSecrets
 } from '../src/backend/llm/settings.js';
 import {
   createLibraryFs,
   createLlmWorkspace,
-  isSameOrChildPath,
-  normalizeLibraryRelativePath,
-  pathKey
-} from '../src/backend/library-fs.js';
+  normalizeLibraryRelativePath
+} from '../src/backend/library/library-fs.js';
+import { isSameOrChildPath, pathKey } from '../src/backend/path-utils.js';
 import channels from './ipc-channels.js';
+// §6-8 拆分：启动器/watchdog、E2E 截图分析、配置读写各自成件，main 只留窗口壳、业务编排与 IPC 装配。
+import { createLauncher } from './launcher.js';
+import { analyzeE2ECapture, captureZoomedE2EWindow } from './e2e-capture.js';
+import { createSettingsIo } from './settings-io.js';
+import type { DotEnvMap, ProjectConfig, VectorConfig } from './settings-io.js';
 
 type RowObject = Record<string, unknown>;
 type HeadlessAgentClient = ReturnType<typeof createBackendClient>;
-// 对齐 backend/llm/settings.ts 的 EnvMap：readDotEnv 内部实际只赋 string，但类型签名容
-// undefined 值；这里也保持同一形状，下面 readDotEnvFile() 返回值直接接住、无需 cast。
-type DotEnvMap = Record<string, string | undefined>;
-type ProjectConfig = RowObject & {
-  llm?: RowObject;
-  renderMode?: string;
-  forceHardwareAcceleration?: boolean;
-  debugLogging?: boolean;
-};
-type SettingsFile = RowObject & {
-  vector?: RowObject & { enabled?: boolean };
-  memory?: RowObject & { enabled?: boolean };
-  nodeLayout?: NodeLayoutByView;
-  node_layout?: NodeLayoutByView;
-};
-type NodeLayoutByView = {
-  tree: ReturnType<typeof normalizeNodeLayout>;
-  flow: ReturnType<typeof normalizeNodeLayout>;
-};
-type VectorConfig = ReturnType<typeof normalizeVectorConfig>;
-type RectLike = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  imageHeight?: number;
-};
-type CaptureAnalysis = RowObject & {
-  ok: boolean;
-  width: number;
-  height: number;
-  hasDarkLoadingOverlay: boolean;
-  overlayDarkPixels: number;
-  overlaySamplePixels: number;
-  mainCanvasDarkPixels: number;
-  textProbeRectCount: number;
-  textDarkPixels: number;
-  textRectsWithDark: number;
-  textInkPixels: number;
-  textRectsWithInk: number;
-  hasReadableTextPixels: boolean;
-  edgeProbeRectCount: number;
-  edgeColorPixels: number;
-  edgeRectsWithColor: number;
-  hasBezierCurvePixels: boolean;
-  fontShot?: RowObject;
-};
 type BackendDebugEvent = {
   type?: string;
   phase?: string;
@@ -137,11 +85,6 @@ const HEADLESS_AGENT_SCRIPT = join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.
 const DATABASE_ROOT = join(PROJECT_ROOT, 'database');
 const IS_MAIN_APP_PROCESS = process.env.IFTREE_MAIN_APP === '1';
 const FORCE_HARDWARE_ACCELERATION = IS_MAIN_APP_PROCESS && process.env.IFTREE_FORCE_HARDWARE_ACCELERATION !== '0';
-const STARTUP_TIMEOUT_MS = 60_000;
-// 需求 1414 运行期心跳判死：阈值须大于渲染进程后台 intensive throttling 的 ~60s 定时器间隔（最小化窗口
-// 心跳可能退化到每分钟一跳），连续 N 次 poll 均超时才判死（吸收系统睡眠唤醒瞬间的陈旧心跳，避免误杀）。
-const HEARTBEAT_STALE_MS = 120_000;
-const HEARTBEAT_STALE_TICKS = 5;
 const ELECTRON_PROFILE_ROOT = join(PROJECT_ROOT, '.iftree-cache', IS_MAIN_APP_PROCESS ? 'electron-main-profile' : 'electron-launcher-profile');
 const DIST_INDEX_PATH = resolve(PROJECT_ROOT, 'dist', 'index.html');
 const EXTERNAL_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
@@ -162,17 +105,10 @@ if (FORCE_HARDWARE_ACCELERATION) {
 }
 
 let mainWindow: BrowserWindow | null = null;
-let launcherWindow: BrowserWindow | null = null;
 let entityMaintenanceWindow: BrowserWindow | null = null;
-let launchedMainProcess: ChildProcess | null = null;
-let launcherPollTimer: NodeJS.Timeout | null = null;
-let launcherLastFailure: RowObject | null = null;
-let heartbeatStaleTicks = 0;
 let mainStartupSucceeded = false;
 let headlessAgentClient: HeadlessAgentClient | null = null;
 let llmWorkspaceState: unknown = null;
-let vectorConfigCache: VectorConfig | null = null;
-let nodeLayoutConfigCache: NodeLayoutByView | null = null;
 const imageUrlCache = new Map<string, string>();
 let libraryWatcher: FSWatcher | null = null;
 let libraryWatchTimer: NodeJS.Timeout | null = null;
@@ -300,93 +236,26 @@ function showOpenDialogForMain(options: OpenDialogOptions) {
     : dialog.showOpenDialog(options);
 }
 
-function isVectorModuleEnabled(settings: SettingsFile = readSettingsFile()) {
-  const configured = settings?.vector?.enabled;
-  return configured !== false;
-}
-
-// 记忆子系统开关（projectneed 15-10-5）：默认关闭，与向量模块并列。
-function isMemoryEnabled(settings: SettingsFile = readSettingsFile()) {
-  return settings?.memory?.enabled === true;
-}
-
-function memorySettingsPayload(settings: SettingsFile = readSettingsFile()) {
-  return { enabled: isMemoryEnabled(settings) };
-}
-
-let dotEnvCache: DotEnvMap | null = null;
-
-function projectEnvPath() {
-  return join(PROJECT_ROOT, '.env');
-}
-
-function projectConfigPath() {
-  return join(PROJECT_ROOT, 'iftree.config.json');
-}
-
-function readDotEnv(): DotEnvMap {
-  if (dotEnvCache) return dotEnvCache;
-  dotEnvCache = readDotEnvFile(projectEnvPath());
-  return dotEnvCache;
-}
-
-function encodeDotEnvValue(value: unknown) {
-  return String(value ?? '').replace(/\r?\n/g, '\\n');
-}
-
-function writeDotEnvValues(values: Record<string, string | null | undefined>) {
-  const envPath = projectEnvPath();
-  const keys = Object.keys(values || {});
-  const removeKeys = new Set(keys.filter((key) => values[key] === null));
-  const seen = new Set<string>();
-  const raw = existsSync(envPath)
-    ? readFileSync(envPath, 'utf8')
-    : '# IFTreeEditor 环境配置\n';
-  const lines = raw.split(/\r?\n/);
-  const nextLines = lines.map((line) => {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-    if (!match || !keys.includes(match[1])) return line;
-    seen.add(match[1]);
-    if (removeKeys.has(match[1])) return null;
-    return `${match[1]}=${encodeDotEnvValue(values[match[1]])}`;
-  }).filter((line) => line !== null);
-  const missing = keys.filter((key) => !seen.has(key) && !removeKeys.has(key));
-  if (missing.length > 0) {
-    if (nextLines.length > 0 && nextLines[nextLines.length - 1].trim()) nextLines.push('');
-    nextLines.push('# IF-Tree LLM 摘要配置');
-    for (const key of missing) {
-      nextLines.push(`${key}=${encodeDotEnvValue(values[key])}`);
-    }
-  }
-  mkdirSync(dirname(envPath), { recursive: true });
-  writeFileSync(envPath, `${nextLines.join('\n').replace(/\n+$/, '')}\n`, 'utf8');
-  dotEnvCache = null;
-}
-
-function readProjectConfig(): ProjectConfig {
-  const configPath = projectConfigPath();
-  if (!existsSync(configPath)) return {};
-  try {
-    return JSON.parse(readFileSync(configPath, 'utf8')) || {};
-  } catch {
-    return {};
-  }
-}
-
-function writeProjectConfig(patch: ProjectConfig = {}) {
-  const current = readProjectConfig();
-  const next = {
-    ...current,
-    ...patch,
-    llm: {
-      ...(current.llm || {}),
-      ...(patch.llm || {})
-    }
-  };
-  mkdirSync(dirname(projectConfigPath()), { recursive: true });
-  writeFileSync(projectConfigPath(), `${JSON.stringify(next, null, 2)}\n`, 'utf8');
-  return readProjectConfig();
-}
+// 配置文件读写域（./settings-io.ts，§6-8）：.env / iftree.config.json / settings.json 的读写
+// 与 vector/memory/nodeLayout 形状规整都在工厂内；解构成同名函数，调用点不变。
+// appHome 是 function 声明有提升，此处引用后文声明是安全的。
+const settingsIo = createSettingsIo({ projectRoot: PROJECT_ROOT, appHome });
+const {
+  projectEnvPath,
+  projectConfigPath,
+  readDotEnv,
+  writeDotEnvValues,
+  readProjectConfig,
+  writeProjectConfig,
+  settingsPath,
+  isVectorModuleEnabled,
+  memorySettingsPayload,
+  getVectorConfig,
+  saveVectorSettings,
+  saveMemoryConfig,
+  nodeLayoutSettingsPayload,
+  saveNodeLayoutConfig
+} = settingsIo;
 
 // LLM 三套设置读取统一走共享读取器（src/backend/llm/settings.mjs）。
 // main 进程注入带缓存的 .env 读取（writeDotEnvValues 写入后置空缓存失效）。
@@ -679,12 +548,14 @@ function getHeadlessAgentClient() {
   return headlessAgentClient;
 }
 
-function headlessDatabaseRead(payload: unknown = {}) {
+function headlessDatabaseRead<Request extends import('../src/backend/query-api.js').TypedDatabaseReadRequest>(payload: Request): Promise<import('../src/backend/query-api.js').TypedDatabaseReadResult<Request>>;
+function headlessDatabaseRead(payload?: unknown): Promise<unknown>;
+function headlessDatabaseRead(payload: unknown = {}): Promise<unknown> {
   return getHeadlessAgentClient().databaseRead(payload);
 }
 
-function headlessDatabaseWrite(payload: unknown = {}) {
-  return getHeadlessAgentClient().databaseWrite(payload);
+function headlessDatabaseWrite(payload: import('../src/backend/mutation-api.js').MutationPayload = {}): Promise<import('../src/backend/mutation-api.js').MutationResult> {
+  return getHeadlessAgentClient().databaseWrite(payload) as Promise<import('../src/backend/mutation-api.js').MutationResult>;
 }
 
 function headlessDatabaseRun(command: unknown = {}, fallbackOperation = 'read') {
@@ -716,31 +587,6 @@ function detectedOllamaBgeM3Path() {
   return existsSync(path) ? path : '';
 }
 
-function settingsPath() {
-  return join(appHome(), 'settings.json');
-}
-
-function readSettingsFile(): SettingsFile {
-  try {
-    return JSON.parse(readFileSync(settingsPath(), 'utf8').replace(/^\uFEFF/, ''));
-  } catch {
-    return {};
-  }
-}
-
-function writeSettingsFile(settings: SettingsFile) {
-  mkdirSync(dirname(settingsPath()), { recursive: true });
-  writeFileSync(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
-}
-
-function getVectorConfig() {
-  if (!vectorConfigCache) {
-    const settings = readSettingsFile();
-    vectorConfigCache = normalizeVectorConfig(settings.vector || DEFAULT_VECTOR_CONFIG);
-  }
-  return vectorConfigCache;
-}
-
 function vectorSettingsPayload(config: VectorConfig = getVectorConfig(), runtime: RowObject = {}) {
   return {
     ...config,
@@ -755,28 +601,6 @@ function vectorSettingsPayload(config: VectorConfig = getVectorConfig(), runtime
     lanceDbPath: lanceDbPath(),
     vectorTable: 'nodes_vec',
     localModelBaseUrl: runtime.localModelBaseUrl || ''
-  };
-}
-
-function normalizeNodeLayoutSettingsByView(value: Partial<NodeLayoutByView> = {}): NodeLayoutByView {
-  return {
-    tree: normalizeNodeLayout(value?.tree || DEFAULT_NODE_LAYOUT),
-    flow: normalizeNodeLayout(value?.flow || value?.tree || DEFAULT_NODE_LAYOUT)
-  };
-}
-
-function getNodeLayoutConfig() {
-  if (!nodeLayoutConfigCache) {
-    const settings = readSettingsFile();
-    nodeLayoutConfigCache = normalizeNodeLayoutSettingsByView(settings.nodeLayout || settings.node_layout);
-  }
-  return nodeLayoutConfigCache;
-}
-
-function nodeLayoutSettingsPayload(config: NodeLayoutByView = getNodeLayoutConfig()) {
-  return {
-    tree: { ...(config.tree || {}) },
-    flow: { ...(config.flow || {}) }
   };
 }
 
@@ -864,63 +688,17 @@ async function resetVectorStoreTable(dimensions: unknown) {
   await getHeadlessAgentClient().resetVectorStore({ dimensions });
 }
 
+// 设置落盘走 settings-io（saveVectorSettings）；这里只保留副作用编排——模型/维度/来源变化时
+// 重建向量库表（吃后端），设置文件本身怎么写不归 main 管。
 async function saveVectorConfig(patch: RowObject = {}) {
-  const current = getVectorConfig();
-  const next = normalizeVectorConfig({ ...current, ...patch });
-  const modelChanged = current.modelId !== next.modelId;
-  const dimensionsChanged = current.dimensions !== next.dimensions;
-  const modelSourceChanged = current.localModelRoot !== next.localModelRoot;
-
-  const settings = readSettingsFile();
-  const enabled = Object.prototype.hasOwnProperty.call(patch, 'enabled')
-    ? patch.enabled === true
-    : isVectorModuleEnabled(settings);
-  settings.vector = {
-    enabled,
-    modelId: next.modelId,
-    computeTarget: next.computeTarget,
-    batchSize: next.batchSize,
-    workerCount: next.workerCount,
-    localModelRoot: next.localModelRoot,
-    remoteModelHost: next.remoteModelHost,
-    importVectors: next.importVectors
-  };
-  writeSettingsFile(settings);
-  vectorConfigCache = next;
-
-  if (enabled && (modelChanged || dimensionsChanged || modelSourceChanged)) {
+  const { previous, next, enabled } = saveVectorSettings(patch);
+  const needsReset = previous.modelId !== next.modelId
+    || previous.dimensions !== next.dimensions
+    || previous.localModelRoot !== next.localModelRoot;
+  if (enabled && needsReset) {
     await resetVectorStoreTable(next.dimensions);
   }
-
   return vectorSettingsPayload(next);
-}
-
-function saveMemoryConfig(patch: RowObject = {}) {
-  const settings = readSettingsFile();
-  settings.memory = { ...(settings.memory || {}), enabled: patch?.enabled === true };
-  writeSettingsFile(settings);
-  return memorySettingsPayload(settings);
-}
-
-function saveNodeLayoutConfig(patch: RowObject = {}) {
-  const settings = readSettingsFile();
-  const current = normalizeNodeLayoutSettingsByView(settings.nodeLayout || settings.node_layout);
-  const next = normalizeNodeLayoutSettingsByView(
-    patch && (patch.tree || patch.flow)
-      ? patch
-      : {
-        ...current,
-        [patch?.view === 'flow' ? 'flow' : 'tree']: {
-          ...(current[patch?.view === 'flow' ? 'flow' : 'tree'] || DEFAULT_NODE_LAYOUT),
-          ...((patch && typeof patch.patch === 'object') ? patch.patch : patch || {})
-        }
-      }
-  );
-  settings.nodeLayout = next;
-  delete settings.node_layout;
-  writeSettingsFile(settings);
-  nodeLayoutConfigCache = next;
-  return nodeLayoutSettingsPayload(nodeLayoutConfigCache);
 }
 
 function assetsDir(docId: unknown) {
@@ -959,394 +737,6 @@ function e2eScreenshotPath() {
   return join(parsed.dir, `${parsed.name}.png`);
 }
 
-function countDarkPixels(bitmap: Uint8Array, width: number, rect: RectLike, step = 1) {
-  const left = Math.floor(clampNumber(rect.x, 0, width, 0));
-  const top = Math.floor(clampNumber(rect.y, 0, rect.imageHeight || 0, 0));
-  const right = Math.ceil(clampNumber(rect.x + rect.width, 0, width, 0));
-  const bottom = Math.ceil(clampNumber(rect.y + rect.height, 0, rect.imageHeight || 0, 0));
-  let dark = 0;
-  let total = 0;
-  for (let y = top; y < bottom; y += step) {
-    for (let x = left; x < right; x += step) {
-      const offset = (y * width + x) * 4;
-      const b = bitmap[offset];
-      const g = bitmap[offset + 1];
-      const r = bitmap[offset + 2];
-      const a = bitmap[offset + 3];
-      if (a > 180 && r < 120 && g < 120 && b < 120) dark += 1;
-      total += 1;
-    }
-  }
-  return { dark, total, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
-}
-
-function countTextInkPixels(bitmap: Uint8Array, width: number, rect: RectLike, step = 1) {
-  const left = Math.floor(clampNumber(rect.x, 0, width, 0));
-  const top = Math.floor(clampNumber(rect.y, 0, rect.imageHeight || 0, 0));
-  const right = Math.ceil(clampNumber(rect.x + rect.width, 0, width, 0));
-  const bottom = Math.ceil(clampNumber(rect.y + rect.height, 0, rect.imageHeight || 0, 0));
-  let ink = 0;
-  let total = 0;
-  for (let y = top; y < bottom; y += step) {
-    for (let x = left; x < right; x += step) {
-      const offset = (y * width + x) * 4;
-      const b = bitmap[offset];
-      const g = bitmap[offset + 1];
-      const r = bitmap[offset + 2];
-      const a = bitmap[offset + 3];
-      if (a > 180 && r < 225 && g < 225 && b < 225 && (r + g + b) < 650) ink += 1;
-      total += 1;
-    }
-  }
-  return { ink, total, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
-}
-
-function countBezierPixels(bitmap: Uint8Array, width: number, rect: RectLike, step = 1) {
-  const left = Math.floor(clampNumber(rect.x, 0, width, 0));
-  const top = Math.floor(clampNumber(rect.y, 0, rect.imageHeight || 0, 0));
-  const right = Math.ceil(clampNumber(rect.x + rect.width, 0, width, 0));
-  const bottom = Math.ceil(clampNumber(rect.y + rect.height, 0, rect.imageHeight || 0, 0));
-  let edge = 0;
-  let total = 0;
-  for (let y = top; y < bottom; y += step) {
-    for (let x = left; x < right; x += step) {
-      const offset = (y * width + x) * 4;
-      const b = bitmap[offset];
-      const g = bitmap[offset + 1];
-      const r = bitmap[offset + 2];
-      const a = bitmap[offset + 3];
-      const treeEdge = a > 160 && r >= 160 && r <= 245 && g >= 155 && g <= 240 && b >= 145 && b <= 235;
-      const flowEdge = a > 160 && r >= 70 && r <= 120 && g >= 95 && g <= 140 && b >= 80 && b <= 125;
-      if (treeEdge || flowEdge) edge += 1;
-      total += 1;
-    }
-  }
-  return { edge, total, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
-}
-
-function analyzeE2ECapture(image: NativeImage, textProbeRects: unknown[] = [], edgeProbeRects: unknown[] = [], contentSize: Partial<RectLike> = {}): CaptureAnalysis {
-  const size = image.getSize();
-  const width = Math.max(1, Number(size.width) || 1);
-  const height = Math.max(1, Number(size.height) || 1);
-  const bitmap = image.toBitmap();
-  const overlayRegion = {
-    x: Math.floor(width * 0.12),
-    y: 0,
-    width: Math.floor(width * 0.76),
-    height: Math.min(height, Math.max(120, Math.floor(height * 0.22))),
-    imageHeight: height
-  };
-  const overlay = countDarkPixels(bitmap, width, overlayRegion, 2);
-  const hasDarkLoadingOverlay = overlay.dark > 1200 && overlay.dark / Math.max(1, overlay.total) > 0.035;
-  const scaleX = width / Math.max(1, Number(contentSize.width) || width);
-  const scaleY = height / Math.max(1, Number(contentSize.height) || height);
-  const mainCanvasRegion = {
-    x: Math.floor(width * 0.22),
-    y: Math.floor(height * 0.16),
-    width: Math.floor(width * 0.56),
-    height: Math.floor(height * 0.76),
-    imageHeight: height
-  };
-  const mainCanvasText = countDarkPixels(bitmap, width, mainCanvasRegion, 1);
-  let textProbeRectCount = 0;
-  let textDarkPixels = 0;
-  let textRectsWithDark = 0;
-  let textInkPixels = 0;
-  let textRectsWithInk = 0;
-  for (const rect of Array.isArray(textProbeRects) ? textProbeRects.slice(0, 30) as Array<Partial<RectLike>> : []) {
-    const probe = {
-      x: Number(rect?.x || 0) * scaleX,
-      y: Number(rect?.y || 0) * scaleY,
-      width: Number(rect?.width || 0) * scaleX,
-      height: Number(rect?.height || 0) * scaleY,
-      imageHeight: height
-    };
-    if (probe.width < 8 || probe.height < 6) continue;
-    const sample = countTextInkPixels(bitmap, width, probe, 1);
-    if (sample.width < 8 || sample.height < 6) continue;
-    textProbeRectCount += 1;
-    textInkPixels += sample.ink;
-    textDarkPixels += sample.ink;
-    if (sample.ink >= 5) {
-      textRectsWithInk += 1;
-      textRectsWithDark += 1;
-    }
-  }
-  let edgeProbeRectCount = 0;
-  let edgeColorPixels = 0;
-  let edgeRectsWithColor = 0;
-  for (const rect of Array.isArray(edgeProbeRects) ? edgeProbeRects.slice(0, 30) as Array<Partial<RectLike>> : []) {
-    const probe = {
-      x: Number(rect?.x || 0) * scaleX,
-      y: Number(rect?.y || 0) * scaleY,
-      width: Number(rect?.width || 0) * scaleX,
-      height: Number(rect?.height || 0) * scaleY,
-      imageHeight: height
-    };
-    if (probe.width < 12 || probe.height < 6) continue;
-    const sample = countBezierPixels(bitmap, width, probe, 1);
-    if (sample.width < 12 || sample.height < 6) continue;
-    edgeProbeRectCount += 1;
-    edgeColorPixels += sample.edge;
-    if (sample.edge >= 6) edgeRectsWithColor += 1;
-  }
-  const hasReadableTextPixels = (
-    textProbeRectCount >= 2 &&
-    textInkPixels >= Math.max(10, textProbeRectCount * 4) &&
-    textRectsWithInk >= 1
-  ) || mainCanvasText.dark >= 180;
-  const hasBezierCurvePixels = edgeProbeRectCount > 0 &&
-    edgeColorPixels >= Math.max(12, edgeProbeRectCount * 4) &&
-    edgeRectsWithColor >= 1;
-  return {
-    ok: !hasDarkLoadingOverlay && hasReadableTextPixels && hasBezierCurvePixels,
-    width,
-    height,
-    hasDarkLoadingOverlay,
-    overlayDarkPixels: overlay.dark,
-    overlaySamplePixels: overlay.total,
-    mainCanvasDarkPixels: mainCanvasText.dark,
-    textProbeRectCount,
-    textDarkPixels,
-    textRectsWithDark,
-    textInkPixels,
-    textRectsWithInk,
-    hasReadableTextPixels,
-    edgeProbeRectCount,
-    edgeColorPixels,
-    edgeRectsWithColor,
-    hasBezierCurvePixels
-  };
-}
-
-async function captureZoomedE2EWindow(win: BrowserWindow) {
-  const target = process.env.IFTREE_E2E_FONT_SCREENSHOT_PATH;
-  if (!target) return null;
-  const steps = Math.max(1, Number(process.env.IFTREE_E2E_FONT_ZOOM_STEPS) || 5);
-  const configuredDelta = Number(process.env.IFTREE_E2E_FONT_ZOOM_DELTA);
-  const deltaY = Number.isFinite(configuredDelta) && configuredDelta !== 0 ? configuredDelta : 720;
-  const contentBounds = win.getContentBounds();
-  const x = Math.floor(Math.max(1, contentBounds.width) * 0.5);
-  const y = Math.floor(Math.max(1, contentBounds.height) * 0.5);
-  for (let index = 0; index < steps; index += 1) {
-    win.webContents.sendInputEvent({
-      type: 'mouseWheel',
-      x,
-      y,
-      deltaX: 0,
-      deltaY,
-      wheelTicksX: 0,
-      wheelTicksY: deltaY > 0 ? 1 : -1
-    });
-    await new Promise((resolve) => setTimeout(resolve, 80));
-  }
-  const dragX = Math.floor(Math.max(1, contentBounds.width) * 0.36);
-  const dragY = Math.floor(Math.max(1, contentBounds.height) * 0.5);
-  const dragDx = 96;
-  const dragDy = 18;
-  win.webContents.sendInputEvent({ type: 'mouseDown', x: dragX, y: dragY, button: 'left', clickCount: 1 });
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  win.webContents.sendInputEvent({
-    type: 'mouseMove',
-    x: dragX + dragDx,
-    y: dragY + dragDy,
-    button: 'left',
-    movementX: dragDx,
-    movementY: dragDy
-  });
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  win.webContents.sendInputEvent({
-    type: 'mouseUp',
-    x: dragX + dragDx,
-    y: dragY + dragDy,
-    button: 'left',
-    clickCount: 1
-  });
-  await new Promise((resolve) => setTimeout(resolve, 240));
-  const image = await win.webContents.capturePage();
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, image.toPNG());
-  return {
-    path: target,
-    zoomSteps: steps,
-    deltaY
-  };
-}
-
-async function launcherDocs() {
-  const result = await headlessDatabaseRead({ action: 'doc.list' });
-  const resultObject = (result && typeof result === 'object' ? result : {}) as RowObject;
-  const docs = Array.isArray(result) ? result : (Array.isArray(resultObject.rows) ? resultObject.rows : (Array.isArray(resultObject.docs) ? resultObject.docs : []));
-  return docs.map((doc: RowObject) => ({
-    id: doc.id,
-    title: doc.title || `Doc ${doc.id}`,
-    node_count: doc.node_count ?? doc.nodeCount ?? 0,
-    updated_at: doc.updated_at || doc.updatedAt || null
-  }));
-}
-
-async function launcherState() {
-  const config = readProjectConfig();
-  return {
-    renderMode: config.renderMode || 'hardware',
-    forceHardwareAcceleration: config.forceHardwareAcceleration !== false,
-    debugLogging: config.debugLogging === true,
-    docs: await launcherDocs(),
-    failure: launcherLastFailure || readStartupStatus().failure || null
-  };
-}
-
-function launcherHtml() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>条件树编辑器启动器</title>
-  <style>
-    :root { color-scheme: light; font-family: "Microsoft YaHei", "Segoe UI", sans-serif; }
-    body { margin: 0; background: #f6f5f2; color: #25231f; }
-    .shell { max-width: 920px; margin: 0 auto; padding: 56px 32px; }
-    h1 { margin: 0 0 8px; font-size: 28px; font-weight: 700; }
-    p { margin: 0; color: #686158; line-height: 1.6; }
-    .bar { display: flex; gap: 12px; align-items: center; margin: 28px 0; }
-    select, button { height: 36px; border: 1px solid #c9c2b8; background: #fff; border-radius: 6px; padding: 0 12px; font-size: 14px; }
-    button { cursor: pointer; background: #2f6f5e; border-color: #2f6f5e; color: #fff; }
-    button.secondary { background: #fff; color: #25231f; border-color: #c9c2b8; }
-    button.danger { background: #9b3d3d; border-color: #9b3d3d; }
-    .force-gpu { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 1px solid #c9c2b8; border-radius: 6px; background: #fff; font-size: 14px; }
-    .force-gpu input { width: 16px; height: 16px; margin: 0; }
-    .failure { display: none; margin: 24px 0; padding: 16px; border: 1px solid #c99191; border-radius: 6px; background: #fff4f4; color: #662d2d; white-space: pre-wrap; }
-    .docs { margin-top: 32px; border-top: 1px solid #ddd6ca; }
-    .doc { display: grid; grid-template-columns: 96px 1fr 120px 132px; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid #e6dfd4; }
-    .doc-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .muted { color: #736c62; font-size: 13px; }
-    #status { min-height: 20px; color: #4e6b60; }
-  </style>
-</head>
-<body>
-  <main class="shell">
-    <h1>条件树编辑器启动器</h1>
-    <p>启动器只负责让主服务安全启动；主服务加载失败时，可在这里删除异常文档数据后重试。</p>
-    <section class="bar">
-      <select id="renderMode">
-        <option value="hardware">硬件加速</option>
-        <option value="compatible">兼容模式（JS Canvas 2D）</option>
-      </select>
-      <label class="force-gpu"><input id="forceHardwareAcceleration" type="checkbox">强制启用硬件加速</label>
-      <label class="force-gpu"><input id="debugLogging" type="checkbox">debug 日志</label>
-      <button id="start">启动</button>
-      <button id="refresh" class="secondary">刷新</button>
-      <span id="status"></span>
-    </section>
-    <section id="failure" class="failure"></section>
-    <section class="docs">
-      <h2>已导入文档</h2>
-      <div id="docs"></div>
-    </section>
-  </main>
-  <script>
-    const renderMode = document.getElementById('renderMode');
-    const forceHardwareAcceleration = document.getElementById('forceHardwareAcceleration');
-    const debugLogging = document.getElementById('debugLogging');
-    const docsEl = document.getElementById('docs');
-    const failureEl = document.getElementById('failure');
-    const statusEl = document.getElementById('status');
-
-    function text(value) {
-      return value == null ? '' : String(value);
-    }
-
-    function showFailure(failure) {
-      if (!failure) {
-        failureEl.style.display = 'none';
-        failureEl.textContent = '';
-        return;
-      }
-      const lines = [
-        failure.message || '启动失败，请切换渲染模式、删除异常文档数据后重试。',
-        failure.stage ? '卡点：' + failure.stage : '',
-        failure.progress ? '进度：' + failure.progress : ''
-      ].filter(Boolean);
-      failureEl.textContent = lines.join('\\n');
-      failureEl.style.display = 'block';
-    }
-
-    function renderDocs(docs) {
-      docsEl.innerHTML = '';
-      if (!docs.length) {
-        const empty = document.createElement('p');
-        empty.className = 'muted';
-        empty.textContent = '暂无导入文档。';
-        docsEl.appendChild(empty);
-        return;
-      }
-      for (const doc of docs) {
-        const row = document.createElement('div');
-        row.className = 'doc';
-        const id = document.createElement('div');
-        id.className = 'muted';
-        id.textContent = '#' + text(doc.id);
-        const title = document.createElement('div');
-        title.className = 'doc-title';
-        title.title = text(doc.title);
-        title.textContent = text(doc.title);
-        const count = document.createElement('div');
-        count.className = 'muted';
-        count.textContent = text(doc.node_count) + ' 节点';
-        const button = document.createElement('button');
-        button.className = 'danger';
-        button.textContent = '删除文档数据';
-        row.append(id, title, count, button);
-        button.addEventListener('click', async () => {
-          if (!confirm('删除该文档数据？不会删除 library 中的真实文件。')) return;
-          statusEl.textContent = '正在删除...';
-          const state = await window.iftree.deleteLauncherDoc({ docId: doc.id });
-          statusEl.textContent = '已删除';
-          applyState(state);
-        });
-        docsEl.appendChild(row);
-      }
-    }
-
-    function applyState(state) {
-      renderMode.value = state.renderMode || 'hardware';
-      forceHardwareAcceleration.checked = state.forceHardwareAcceleration !== false;
-      debugLogging.checked = state.debugLogging === true;
-      renderDocs(Array.isArray(state.docs) ? state.docs : []);
-      showFailure(state.failure || null);
-    }
-
-    async function load() {
-      statusEl.textContent = '正在读取...';
-      applyState(await window.iftree.getLauncherState());
-      statusEl.textContent = '';
-    }
-
-    document.getElementById('start').addEventListener('click', async () => {
-      statusEl.textContent = '正在启动主服务...';
-      showFailure(null);
-      await window.iftree.startMainApp({
-        renderMode: renderMode.value,
-        forceHardwareAcceleration: forceHardwareAcceleration.checked,
-        debugLogging: debugLogging.checked
-      });
-    });
-    document.getElementById('refresh').addEventListener('click', load);
-    load().catch((error) => {
-      statusEl.textContent = '';
-      showFailure({ message: (error && error.message) || String(error) });
-    });
-  </script>
-</body>
-</html>`;
-}
-
-async function loadLauncherPage() {
-  if (!launcherWindow || launcherWindow.isDestroyed()) return;
-  await launcherWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(launcherHtml())}`);
-  showWindowForE2E(launcherWindow);
-}
-
 function showWindowForE2E(win: BrowserWindow) {
   if (!win || win.isDestroyed()) return;
   if (process.env.IFTREE_E2E_NO_FOCUS === '1' && typeof win.showInactive === 'function') {
@@ -1357,177 +747,21 @@ function showWindowForE2E(win: BrowserWindow) {
   win.focus();
 }
 
-async function createLauncherWindow() {
-  launcherWindow = new BrowserWindow({
-    title: '条件树编辑器启动器',
-    width: 980,
-    height: 720,
-    minWidth: 760,
-    minHeight: 520,
-    autoHideMenuBar: true,
-    backgroundColor: '#f6f5f2',
-    webPreferences: {
-      preload: join(__dirname, 'preload.cjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      // sandbox 关：preload.cjs 要 require 本地 ipc-channels.cjs；sandboxed preload 只能
-      // require electron 内置模块，会崩在 exposeInMainWorld 之前导致 window.iftree 整个丢失。
-      sandbox: false,
-      backgroundThrottling: false
-    }
-  });
-  launcherWindow.on('closed', () => {
-    launcherWindow = null;
-  });
-  await loadLauncherPage();
-  attachExternalNavigationGuards(launcherWindow);
-  if (process.env.IFTREE_LAUNCHER_AUTOSTART === '1') {
-    setTimeout(() => {
-      const config = readProjectConfig();
-      startMainAppFromLauncher({
-        renderMode: config.renderMode || 'hardware',
-        forceHardwareAcceleration: config.forceHardwareAcceleration !== false,
-        debugLogging: config.debugLogging === true
-      });
-    }, 200);
-  }
-}
-
-function mainAppSpawnArgs() {
-  return app.isPackaged ? [] : [PROJECT_ROOT];
-}
-
-function killLaunchedMainProcess() {
-  const child = launchedMainProcess;
-  if (!child || child.exitCode !== null || child.signalCode) return;
-  if (process.platform === 'win32') {
-    spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
-    return;
-  }
-  child.kill('SIGKILL');
-}
-
-function showLauncherFailure(failure: RowObject) {
-  launcherLastFailure = failure;
-  if (launcherWindow && !launcherWindow.isDestroyed()) {
-    launcherWindow.show();
-    loadLauncherPage().catch((error) => console.error(`[launcher] failed to load: ${(error as { stack?: string }).stack || (error as { message?: string }).message}`));
-  }
-}
-
-function pollLauncherStartup() {
-  if (!launchedMainProcess || launchedMainProcess.exitCode !== null || launchedMainProcess.signalCode) return;
-  const status = readStartupStatus();
-  if (status.success === true) {
-    // 需求 1414：运行期心跳停止（主线程卡死 / 渲染停跳）→ watchdog 销毁主服务进程并回到启动器。
-    const heartbeatAt = Number(status.heartbeatAt || 0);
-    if (heartbeatAt && Date.now() - heartbeatAt > HEARTBEAT_STALE_MS) {
-      heartbeatStaleTicks += 1;
-      if (heartbeatStaleTicks < HEARTBEAT_STALE_TICKS) return;
-      heartbeatStaleTicks = 0;
-      const failure = {
-        message: `主服务心跳已停止超过 ${Math.round(HEARTBEAT_STALE_MS / 1000)} 秒，已自动销毁主服务并回到启动器。`,
-        stage: status.stage || 'heartbeat-stopped'
-      };
-      // failure 落盘：进程被杀后 exit 回调读的是状态文件，不落盘会被「主服务已退出 code=…」覆盖。
-      writeStartupStatus({ success: false, failed: true, failure });
-      killLaunchedMainProcess();
-      showLauncherFailure(failure);
-      return;
-    }
-    heartbeatStaleTicks = 0;
-    launcherLastFailure = null;
-    if (launcherWindow && !launcherWindow.isDestroyed()) launcherWindow.hide();
-    return;
-  }
-  heartbeatStaleTicks = 0;
-  if (status.failed === true) {
-    killLaunchedMainProcess();
-    showLauncherFailure(status.failure || { message: '启动失败，请切换渲染模式、删除异常文档数据后重试。' });
-    return;
-  }
-  const startedAt = Number(status.startedAt || 0) || Date.now();
-  if (Date.now() - startedAt <= STARTUP_TIMEOUT_MS) return;
-  const progress = status.progress
-    ? `${status.progress.step ?? 0} / ${status.progress.total ?? 0}`
-    : '';
-  const failure = {
-    message: '启动超过 60 秒未完成，已自动回到启动器。',
-    stage: status.stage || 'unknown',
-    progress
-  };
-  writeStartupStatus({ failed: true, failure });
-  killLaunchedMainProcess();
-  showLauncherFailure(failure);
-}
-
-function startLauncherPoll() {
-  if (launcherPollTimer) clearInterval(launcherPollTimer);
-  launcherPollTimer = setInterval(pollLauncherStartup, 1000);
-}
-
-function startMainAppFromLauncher(payload: RowObject = {}) {
-  if (launchedMainProcess && launchedMainProcess.exitCode === null && !launchedMainProcess.signalCode) {
-    return { ok: true, alreadyRunning: true };
-  }
-  const renderMode = payload.renderMode === 'compatible' ? 'compatible' : 'hardware';
-  const forceHardwareAcceleration = payload.forceHardwareAcceleration !== false;
-  const debugLogging = payload.debugLogging === true;
-  writeProjectConfig({ renderMode, forceHardwareAcceleration, debugLogging });
-  appendDebugLog('backend', {
-    event: 'launcher.start',
-    renderMode,
-    forceHardwareAcceleration,
-    debugLogging
-  });
-  const statusPath = startupStatusPath();
-  launcherLastFailure = null;
-  heartbeatStaleTicks = 0;
-  writeStartupStatus({
-    startedAt: Date.now(),
-    heartbeatAt: Date.now(),
-    success: false,
-    failed: false,
-    stage: 'launcher-started-main-app',
-    progress: null,
-    failure: null
-  });
-  const env = {
-    ...process.env,
-    IFTREE_MAIN_APP: '1',
-    IFTREE_RENDER_MODE: renderMode,
-    IFTREE_FORCE_HARDWARE_ACCELERATION: forceHardwareAcceleration ? '1' : '0',
-    IFTREE_DEBUG_LOGGING: debugLogging ? '1' : '0',
-    IFTREE_STARTUP_STATUS_PATH: statusPath
-  };
-  launchedMainProcess = spawn(process.execPath, mainAppSpawnArgs(), {
-    cwd: PROJECT_ROOT,
-    env,
-    stdio: 'inherit',
-    windowsHide: false
-  });
-  launchedMainProcess.on('exit', (code, signal) => {
-    if (launcherPollTimer) {
-      clearInterval(launcherPollTimer);
-      launcherPollTimer = null;
-    }
-    launchedMainProcess = null;
-    const status = readStartupStatus();
-    if (status.success === true && code === 0) {
-      showLauncherFailure({
-        message: '主服务已关闭，可重新启动。',
-        stage: 'main-service-closed'
-      });
-      return;
-    }
-    showLauncherFailure(status.failure || {
-      message: `主服务已退出：code=${code ?? ''} signal=${signal ?? ''}`,
-      stage: status.stage || 'process-exit'
-    });
-  });
-  startLauncherPoll();
-  return { ok: true, pid: launchedMainProcess.pid };
-}
+// 启动器/watchdog 工厂（./launcher.ts，§6-8）：状态自持，main 只注入设置读写、启动状态文件、
+// 后端读通道与窗口工具。function 声明有提升，此处引用后文声明的函数是安全的。
+const launcher = createLauncher({
+  projectRoot: PROJECT_ROOT,
+  preloadPath: join(__dirname, 'preload.cjs'),
+  headlessDatabaseRead,
+  readProjectConfig,
+  writeProjectConfig,
+  readStartupStatus,
+  writeStartupStatus,
+  startupStatusPath,
+  appendDebugLog,
+  attachExternalNavigationGuards,
+  showWindowForE2E
+});
 
 async function createWindow() {
   writeStartupStatus({
@@ -1719,7 +953,7 @@ async function refreshDoc(docId: unknown, options: RowObject = {}) {
     includeSourceDocumentContent: options.includeSourceDocumentContent === true
   });
   if (!data || typeof data !== 'object') return null;
-  const dataObject = data as RowObject;
+  const dataObject: RowObject = { ...data };
   const includeNodes = options.includeNodes === true;
   const includeSourceSpans = options.includeSourceSpans === true;
   // Ensure plain JSON-compatible return for IPC
@@ -1792,15 +1026,15 @@ function stripTree(node: RowObject | null): RowObject | null {
 }
 
 function registerLauncherIpc() {
-  ipcMain.handle(channels.LAUNCHER_STATE, async () => await launcherState());
-  ipcMain.handle(channels.LAUNCHER_START, (_event, payload) => startMainAppFromLauncher(payload || {}));
+  ipcMain.handle(channels.LAUNCHER_STATE, async () => await launcher.launcherState());
+  ipcMain.handle(channels.LAUNCHER_START, (_event, payload) => launcher.startMainAppFromLauncher(payload || {}));
   ipcMain.handle(channels.LAUNCHER_DELETE_DOC, async (_event, payload) => {
     const docId = normalizeMainDocId(payload?.docId ?? payload?.doc_id, null);
     if (!docId) throw new Error('deleteDoc requires docId');
     const result = await headlessDatabaseWrite({ action: 'doc.delete', docId });
-    launcherLastFailure = null;
+    launcher.clearLastFailure();
     return {
-      ...(await launcherState()),
+      ...(await launcher.launcherState()),
       deleteResult: result
     };
   });
@@ -2177,7 +1411,7 @@ app.whenReady().then(async () => {
     return;
   }
   registerLauncherIpc();
-  await createLauncherWindow();
+  await launcher.createLauncherWindow();
 });
 
 app.on('window-all-closed', () => {
@@ -2188,12 +1422,12 @@ app.on('before-quit', () => {
   // 关停清理集中一处（原先 before-quit 注册了两次、stopHeadlessAgent 跑两遍）：停文件监听 +
   // 清启动器轮询 + 断后端连接（共享管道模式只断连、不杀别的客户端在用的后端）。
   stopLibraryWatcher();
-  if (launcherPollTimer) clearInterval(launcherPollTimer);
+  launcher.dispose();
   stopHeadlessAgent();
 });
 
 app.on('activate', async () => {
   if (BrowserWindow.getAllWindows().length > 0) return;
   if (IS_MAIN_APP_PROCESS) await createWindow();
-  else await createLauncherWindow();
+  else await launcher.createLauncherWindow();
 });

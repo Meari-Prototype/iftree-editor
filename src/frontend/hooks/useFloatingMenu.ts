@@ -16,7 +16,7 @@ import { useEffect, useRef, useState } from 'react';
 //   'summary'/'view'/'diff'，DocBrowser 用各 menuKey）。
 //
 // 不适用：CSS 锚点定位（AgentPanel ×3、common.tsx ×1，无 JS 位置计算）；
-//         鼠标坐标 + 挂载夹紧（MindMapView 右键/拖拽菜单）——定位机制不同。
+//         鼠标坐标 + 挂载夹紧（C2DMapView 右键/拖拽菜单）——定位机制不同。
 
 interface FloatingMenuSpec {
   className?: string;

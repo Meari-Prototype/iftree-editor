@@ -6,12 +6,13 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createConfiguredIftreeStore } from '../dist/src/backend/store-domain-adapter.js';
+import { getEditBranchDiffView } from '../dist/src/backend/handlers/read/edit-branch-view.js';
 import { createDatabaseService } from '../dist/src/backend/database-service.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-3way-'));
-  const store = new IftreeStore(join(dir, 'store.sqlite'));
+  const store = createConfiguredIftreeStore(join(dir, 'store.sqlite'));
   try {
     store.init();
     await fn(store);
@@ -268,7 +269,7 @@ test('diffView 包含公理（事实前提）差异：新增/修改/删除入行
     branch = store.stageEditBranchAxiomUpdate(branch, { axiomId: edited.id, patch: { content: '改后内容', status: 'confirmed' } }).branch;
     store.stageEditBranchAxiomDelete(branch, { axiomId: removed.id });
 
-    const view = store.getEditBranchDiffView({ baseDocId: doc.id, owner: 'human' });
+    const view = getEditBranchDiffView(store, { baseDocId: doc.id, owner: 'human' });
     const axiomRows = view.rows.filter((row) => row.kind === 'axiom');
     assert.equal(axiomRows.length, 3, '新增/修改/删除各一行，未修改公理不显示');
 

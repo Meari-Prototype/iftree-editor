@@ -1,5 +1,6 @@
 import { normalizeStableId } from '../../db/ids.js';
 import type { IftreeStore } from '../../store/index.js';
+import { getProjectedDoc } from '../../projection/doc-view.js';
 
 type MutationPayload = Record<string, unknown>;
 type PlainObject = Record<string, unknown>;
@@ -10,9 +11,13 @@ type WriteStore = IftreeStore;
 
 // stream.push 等会调 ctx.isVectorModuleEnabled() 判断向量是否启用（来自 derived-index-reconciler
 // 注入的 ctx）；refreshDoc 是 maybeRefreshDoc 用的回调。本接口是所有 write handler 共享的 ctx 形状。
+// import/vector 三件是 host 装配的域服务（handlers/write/import.ts 消费）：无 host 环境可缺省。
 export interface WriteContext {
   refreshDoc?: (docId: unknown, options?: unknown) => unknown;
   isVectorModuleEnabled?: () => boolean;
+  importLibraryDocument?: (payload: Record<string, unknown>) => unknown;
+  deleteImportedDocument?: (payload: Record<string, unknown>) => unknown;
+  ensureDocVectors?: (docId: unknown, options?: Record<string, unknown>) => unknown;
 }
 
 export function requireDocId(payload: MutationPayload = {}): string {
@@ -81,7 +86,7 @@ export function maybeRefreshDoc(store: WriteStore, ctx: WriteContext = {}, docId
   if (!docId) return null;
   if (typeof ctx.refreshDoc === 'function') return ctx.refreshDoc(docId, options);
   // IftreeStore.getDoc 现在签真签名（options 是精确字段集），unknown options 边界 cast 一次。
-  return store.getDoc(docId, options as Parameters<IftreeStore['getDoc']>[1]);
+  return getProjectedDoc(store, docId, options as Parameters<IftreeStore['getDoc']>[1]);
 }
 
 export function listDocs(store: WriteStore) {

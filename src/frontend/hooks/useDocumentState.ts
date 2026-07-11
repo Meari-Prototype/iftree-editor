@@ -10,7 +10,8 @@ import type {
 import type { AxiomRow, DocFolderRow, SourceDocumentRow } from '../../backend/db/schema.js';
 import type { EditBranchRow } from '../../backend/db/rows.js';
 import type { HistoryEntry } from '../../backend/store/history.js';
-import type { LibraryEntry } from '../../backend/library-fs.js';
+import type { LibraryEntry } from '../../backend/library/library-fs.js';
+import type { IftreeStore } from '../../backend/store/index.js';
 import {
   NODE_CHILDREN_PAGE_SIZE,
   SOURCE_WINDOW_BEFORE_CHARS,
@@ -52,6 +53,7 @@ import {
   type ViewSnapshotOut,
   type FetchRequest
 } from '../session/document-session.js';
+import type { TreeNode } from '../../core/node-model.js';
 
 // 前台热区半径：打开/展开/定位时围绕焦点即时铺多少个 DFS 邻居（后台再尽力预取至全量）。
 const HOT_REGION_RADIUS = 48;
@@ -61,10 +63,12 @@ type AnyRecord = Record<string, unknown>;
 // 沿数据流总根：ProjectedDoc 的 nodes/refs/axioms/history 接后端真投影行类型（DocGetNodeRow / DocGetRefRow / AxiomRow / HistoryEntry）。
 // editBranch / sourceDocument 同步接 EditBranchRow / SourceDocumentRow；idByAddress 接 Record<string, string>。
 // 删 [extra: string]: unknown 兜底——字段写错运行时才炸的真隐患就此消除。
-type ProjectedDoc = DocLike & {
+export type ProjectedDoc = DocLike & {
+  doc?: BackendDocGetResult['doc'];
+  tree?: TreeNode | null;
   view?: Session['view'];
   editBranch?: EditBranchRow | null;
-  sourceWindow?: { sourceSpans?: DocGetSourceSpanRow[]; anchorNodeId?: unknown; [extra: string]: unknown } | null;
+  sourceWindow?: NonNullable<ReturnType<IftreeStore['getSourceWindow']>> | null;
   sourceSpans?: DocGetSourceSpanRow[];
   sourceDocument?: SourceDocumentRow | null;
   nodes?: DocGetNodeRow[];
@@ -175,7 +179,7 @@ export function useDocumentState() {
       parentId: fetch.parentId,
       offset: fetch.offset || 0,
       limit: fetch.limit || NODE_CHILDREN_PAGE_SIZE
-    }) as { rows?: unknown[]; total?: number; offset?: number; hasMore?: boolean } | null | undefined;
+    });
     if (bgRef.current.token !== generation || !sessionRef.current) return;
     sessionRef.current = ingestChildren(sessionRef.current, {
       parentId: fetch.parentId,
@@ -196,7 +200,7 @@ export function useDocumentState() {
       parentId,
       offset: 0,
       limit: NODE_CHILDREN_PAGE_SIZE
-    }) as { rows?: unknown[]; total?: number; hasMore?: boolean } | null | undefined;
+    });
     sessionRef.current = viewReconcileChildren(sessionRef.current, {
       parentId,
       rows: result?.rows || [],
@@ -258,17 +262,16 @@ export function useDocumentState() {
       documentRepository.listDocFolders(),
       documentRepository.readLibraryTree()
     ]);
-    // IPC 返回 unknown：repository 那层未给具体类型，沿数据流在此处收口为投影类型。
-    const docList = (nextDocs as DocListItem[] | null | undefined) || [];
+    const docList = nextDocs || [];
     setDocs(docList);
-    setDocFolders((nextFolders as DocFolderRow[] | null | undefined) || []);
-    if (nextLibraryTree) setLibraryTree(nextLibraryTree as LibraryEntry);
+    setDocFolders(nextFolders || []);
+    if (nextLibraryTree) setLibraryTree(nextLibraryTree);
     return docList;
   }
 
   async function refreshLibrary(): Promise<LibraryEntry | null> {
     try {
-      const tree = await documentRepository.readLibraryTree() as LibraryEntry | null;
+      const tree = await documentRepository.readLibraryTree();
       setLibraryTree(tree);
       return tree;
     } catch (error) {
@@ -284,7 +287,7 @@ export function useDocumentState() {
     try {
       const initial = await documentRepository.getDoc(treeDocRequest(docId, 1, {
         includeEditBranch: options.includeEditBranch
-      }) as never) as DocGetResult | null | undefined;
+      }));
       const normalizedDocId = normalizeDocId(initial?.doc?.id || docId);
       if (!normalizedDocId) return initial ?? null;
 
@@ -377,7 +380,7 @@ export function useDocumentState() {
     setCurrentDocState(next);
   }
 
-  async function loadSourceWindow(request: SourceWindowRequest = {}): Promise<unknown> {
+  async function loadSourceWindow(request: SourceWindowRequest = {}) {
     const docId = normalizeDocId(request.docId ?? docMetaRef.current?.doc?.id);
     if (!docId || !documentRepository.canRead()) return null;
     setSourceWindowLoading(true);
@@ -388,7 +391,7 @@ export function useDocumentState() {
         startOffset: request.startOffset,
         limit: request.limit || SOURCE_WINDOW_CHAR_LIMIT,
         before: request.before ?? SOURCE_WINDOW_BEFORE_CHARS
-      }) as { docId?: unknown; sourceDocument?: Record<string, unknown> | null; [extra: string]: unknown } | null | undefined;
+      });
       if (sourceWindow) {
         docMetaRef.current = (mergeSourceWindow(docMetaRef.current as DocLike | null, sourceWindow) as DocMeta | null) || docMetaRef.current;
         project();

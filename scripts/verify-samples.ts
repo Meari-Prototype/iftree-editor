@@ -4,6 +4,7 @@ import { basename, join, parse } from 'node:path';
 
 import { readSentences } from '../src/core/source-text.js';
 import { IftreeStore } from '../src/backend/store/index.js';
+import { createDocFromSentences } from '../src/backend/import/store-write.js';
 
 const verifyDir = join(tmpdir(), 'iftree-editor-verify');
 const dbPath = join(verifyDir, 'verify.sqlite');
@@ -35,7 +36,7 @@ try {
     const filePath = join(verifyDir, sample.file);
     const sentences = await readSentences(filePath);
     const title = parse(filePath).name.replace(/_sentences$/i, '');
-    const doc = store.createDocFromSentences({ title, sourcePath: filePath, sentences });
+    const doc = createDocFromSentences(store, { title, sourcePath: filePath, sentences });
     const loaded = store.getDoc(doc.id)!;
 
     rows.push({

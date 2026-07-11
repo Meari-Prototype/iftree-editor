@@ -1,5 +1,5 @@
 import { compareNodeAddress } from '../shared.js';
-import { keywordIndexRowsForDoc } from '../keyword-index.js';
+import { nodeContentRowsForDoc } from '../db/node-content-rows.js';
 import type { EditBranchRow, EntityRow, NodeRow } from '../db/rows.js';
 import {
   formatEntity,
@@ -373,7 +373,7 @@ async function bm25RankByNodeId(
     query: payload.query ?? payload.q ?? payload.keyword ?? entity.literal
   });
   if (terms.length === 0) return new Map();
-  await ctx.ensureKeywordIndexRows(keywordIndexRowsForDoc(store, entity.doc_id));
+  await ctx.ensureKeywordIndexRows(nodeContentRowsForDoc(store, entity.doc_id));
   const candidates = await ctx.keywordSearch({ terms, docId: entity.doc_id });
   const ranks = new Map<string, number>();
   candidates.forEach((candidate, index) => {

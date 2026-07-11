@@ -10,14 +10,18 @@ test('db export 已停用（未启用，待重新设计）；delete 正常读删
     const exported = await runBashDb(dbPath, ['export', docId], { expectFailure: true });
     assert.match(exported.stderr || exported.stdout, /已停用（未启用，待重新设计）/);
 
-    // —— delete：返回 {ok, action, docId, changed, title, nodeCount} ——
-    const deleteResult = parseJsonStdout(await runBashDb(dbPath, ['delete', docId]));
+    // —— delete --json：返回 {ok, action, docId, changed, title, nodeCount}；默认文本「已删除 doc …」——
+    const deleteResult = parseJsonStdout(await runBashDb(dbPath, ['delete', docId, '--json']));
     assert.equal(deleteResult.ok, true);
     assert.equal(deleteResult.action, 'import.deleteDocument');
     assert.equal(deleteResult.changed, true);
     assert.equal(deleteResult.docId, docId);
     assert.equal(deleteResult.title, 'IFTreeEditor数据库读写测试样例');
     assert.ok(deleteResult.nodeCount > 0, 'delete 应返回原节点数');
+
+    // —— delete 文本渲染：已删对象再次 delete 返回「未找到」一行（formatDeleteResult）——
+    const deleteAgainText = stdoutOf(await runBashDb(dbPath, ['delete', docId]));
+    assert.match(deleteAgainText, /未找到 doc /);
 
     // —— delete 后 read 报 not found ——
     const readAfterDelete = await runBashDb(dbPath, ['read', docId, '1'], { expectFailure: true });

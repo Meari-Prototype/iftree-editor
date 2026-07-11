@@ -22,6 +22,8 @@ import type { Store } from './stores/create-store.js';
 import type { EditorState } from './stores/editor-store.js';
 import type { AxiomRefDialogPayload } from './commands/axiom-commands.js';
 import type { EditBranchRow } from '../backend/db/schema.js';
+import type { VectorContentSearchItem } from './data/operation-services.js';
+import type { AppTab } from './hooks/useAppUI.js';
 
 export interface AppState {
   docState: ReturnType<typeof useDocumentState>;
@@ -38,7 +40,7 @@ export interface AppState {
   search: {
     query: string;
     setQuery: Dispatch<SetStateAction<string>>;
-    results: unknown[];
+    results: VectorContentSearchItem[];
     runVectorSearch(): Promise<void> | void;
     vectorModuleDisabled: boolean;
     vectorDisabledMessage: string;
@@ -67,7 +69,7 @@ export interface AppState {
     saveAgentSettings(next: unknown): Promise<void>;
     chooseLocalModelRoot(): Promise<void>;
     downloadVectorModel(): Promise<void>;
-    changeActiveTab(nextTab: unknown): void;
+    changeActiveTab(nextTab: AppTab): void;
   };
 }
 

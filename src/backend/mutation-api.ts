@@ -1,5 +1,6 @@
 import { handleAxiomMutation, handleRefMutation } from './handlers/write/axiom-ref.js';
 import { handleDocFolderMutation, handleDocMutation, handleStreamMutation } from './handlers/write/doc.js';
+import { handleImportServiceMutation } from './handlers/write/import.js';
 import { handleMemoryMutation } from './memory/index.js';
 import { handleEditorHistoryMutation, handleHistoryMutation } from './handlers/write/history.js';
 import { handleNodeMutation } from './handlers/write/node.js';
@@ -25,6 +26,9 @@ const ACTIONS = Object.freeze([
   'stream.bulkBegin',
   'stream.bulkEnd',
   'stream.attachSource',
+  'import.libraryDocument',
+  'import.deleteDocument',
+  'vector.ensureDoc',
   'memory.deliverVolume',
   'memory.appendSessionTurn',
   'memory.markDistilled',
@@ -204,6 +208,8 @@ export function databaseWriteToolSchema() {
       force: { type: 'boolean', description: 'memory.markDistilled：用户明确指示时跳过冷却期立即触发' },
       sourcePath: { type: 'string' },
       sourceType: { type: 'string' },
+      relativePath: { type: 'string', description: 'import.libraryDocument：library 相对路径' },
+      embed: { type: 'boolean', description: 'import.libraryDocument：导入时同步建向量（默认后补）' },
       rawMarkdown: { type: 'string' },
       spans: { type: 'array' },
       pdfPages: { type: 'array' },
@@ -336,8 +342,16 @@ function dispatchEditBranchStage(
       return stagedDocResult(action, store.stageEditBranchNodeMove(branch, payload) as StagedShape);
     case 'node.promote':
       return stagedDocResult(action, store.stageEditBranchNodePromote(branch, payload) as StagedShape);
-    case 'node.split':
-      return stagedDocResult(action, store.stageEditBranchNodeSplit(branch, payload) as StagedShape);
+    case 'node.split': {
+      // 拆分规模透传（逐动作计数对 split 恒 +1）：句子模式给 splitSentenceCount、段落模式给
+      // splitParagraphCount，渲染层据此交代「切成 N 句 / N 段、M 节点下沉」。
+      const staged = store.stageEditBranchNodeSplit(branch, payload) as StagedShape;
+      return stagedDocResult(action, staged, {
+        splitSentenceCount: staged.splitSentenceCount,
+        splitParagraphCount: staged.splitParagraphCount,
+        splitNewNodeCount: staged.splitNewNodeCount
+      });
+    }
     case 'node.mergeInto':
       return stagedDocResult(action, store.stageEditBranchNodeMergeInto(branch, payload) as StagedShape);
     case 'node.mergePrevious':
@@ -412,12 +426,20 @@ async function maintainDerivedIndexAfterWrite(
     if (action === 'stream.push') {
       // bulk 中：失活累积、留 bulkEnd 统一维护；非 bulk 单推：当场维护该文档。
       if (store?.hasActiveBulkImport?.()) return;
-      if (result.docId) await ctx.maintainDerivedAfterWrite(result.docId, { embed: result.embed === true });
+      if (result.docId) {
+        await ctx.maintainDerivedAfterWrite(result.docId, { embed: result.embed === true });
+        // 非 bulk 单推同样产生 lance 增量行，计一次脏度（bulk 路径由 bulkEnd 按文档数累加）。
+        store?.maintenance?.markDirty?.();
+      }
       return;
     }
     const docId = result.docId ?? result.baseDocId ?? null;
     if (action === 'doc.delete') {
-      if (docId) await ctx.maintainDerivedAfterWrite(docId, { deleted: true });
+      if (docId) {
+        await ctx.maintainDerivedAfterWrite(docId, { deleted: true });
+        // 删文档批量删向量/关键词行，lance 碎片一次性增大，计脏度让后台回收。
+        store?.maintenance?.markDirty?.();
+      }
     } else if (action === 'doc.refreshAddresses') {
       await ctx.maintainDerivedAfterWrite(docId || null, { allDocs: !docId });
     } else if (KEYWORD_REBUILD_ACTIONS.has(action) && docId) {
@@ -440,8 +462,10 @@ async function maintainDerivedIndexAfterWrite(
   }
 }
 
+// store 容 null：mutation.actions 不落库（database-service 传 null），其余 action 由 requireStore
+// 断言拦下——这是真签名，不再靠调用侧 as unknown 洗宽（§6-10）。
 export async function runDatabaseWrite(
-  store: MutationStore,
+  store: MutationStore | null,
   payload: MutationPayload = {},
   ctx: MutationContext = {}
 ): Promise<MutationResult> {
@@ -488,6 +512,7 @@ export async function runDatabaseWrite(
   else if (action.startsWith('history.')) result = await handleHistoryMutation(store, payload, ctx, action, effects) as MutationResult;
   else if (action.startsWith('entity.')) result = runEntityWrite(store, payload, action) as unknown as MutationResult;
   else if (action.startsWith('stream.')) result = await handleStreamMutation(store, payload, ctx, action, effects) as MutationResult;
+  else if (action.startsWith('import.') || action === 'vector.ensureDoc') result = await handleImportServiceMutation(store, payload, ctx, action, effects) as MutationResult;
   else if (action.startsWith('memory.')) result = await handleMemoryMutation(store, payload, ctx, action, effects) as MutationResult;
   else throw new Error(`Unhandled database_write action: ${action}`);
 

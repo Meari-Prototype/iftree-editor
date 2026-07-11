@@ -6052,7 +6052,7 @@ body.ide-resizing {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  /* 32px 兜底值须与 c2d-measure.mjs 的 EXPAND_BTN 保持一致 */
+  /* 32px 兜底值须与 c2d/c2d-measure.ts 的 EXPAND_BTN 保持一致 */
   width: var(--c2d-expand-button-size, 32px);
   height: var(--c2d-expand-button-size, 32px);
   border: 0;

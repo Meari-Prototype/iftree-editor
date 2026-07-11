@@ -5,11 +5,11 @@ import { useEffect, useState } from 'react';
 import {
   DEFAULT_SUMMARY_STRATEGIES, normalizeSummaryStrategy,
   summarySkipBelowCount, summaryStrategyLabel,
-  type SummaryItem
+  type SummaryItem, type SummaryStrategy as NormalizedSummaryStrategy
 } from '../lib/summary-utils.js';
 
 
-export interface SummaryStrategy {
+interface SummaryStrategyDraft {
   id: string;
   name: string;
   skipBelowChars: number | string;
@@ -33,7 +33,7 @@ export interface SummaryConfirmRequest {
 interface SummaryConfirmDialogProps {
   request?: SummaryConfirmRequest | null;
   onCancel: () => void;
-  onConfirm?: (strategy: SummaryStrategy) => void;
+  onConfirm?: (strategy: NormalizedSummaryStrategy) => void;
 }
 
 export function SummaryConfirmDialog({ request, onCancel, onConfirm }: SummaryConfirmDialogProps) {
@@ -48,13 +48,13 @@ export function SummaryConfirmDialog({ request, onCancel, onConfirm }: SummaryCo
     request?.strategy || options[strategyIndex] || options[0],
     strategyIndex
   );
-  const [draft, setDraft] = useState(initial);
+  const [draft, setDraft] = useState<SummaryStrategyDraft>(initial);
 
   useEffect(() => {
     setDraft(initial);
   }, [request]);
 
-  const updateNumber = (key: keyof SummaryStrategy, value: string) => {
+  const updateNumber = (key: keyof SummaryStrategyDraft, value: string) => {
     setDraft((current) => (
       value === ''
         ? { ...current, [key]: '' }

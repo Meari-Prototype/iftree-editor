@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createConfiguredIftreeStore } from '../dist/src/backend/store-domain-adapter.js';
 import { runDatabaseWrite } from '../dist/src/backend/mutation-api.js';
 import { runDatabaseRead } from '../dist/src/backend/query-api.js';
 import { runDbShellArgv } from '../dist/src/backend/db-shell.js';
@@ -25,7 +25,7 @@ const HOUR_MS = 60 * 60 * 1000;
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-memory-'));
-  const store = new IftreeStore(join(dir, 'store.sqlite'));
+  const store = createConfiguredIftreeStore(join(dir, 'store.sqlite'));
   try {
     store.init();
     await fn(store);
@@ -54,7 +54,12 @@ function deliverPayload(extra = {}) {
 function anchorCtx(store, nodes = null) {
   return {
     writeMemoryAnchor({ docId }) {
-      store.setMemoryAnchorSource(docId, `.memory/test/${docId}.jsonl`);
+      store.setSourceDocumentReference({
+        docId,
+        originalPath: `.memory/test/${docId}.jsonl`,
+        sourceType: 'memory-anchor',
+        rawMarkdown: ''
+      });
     },
     sessionVolumeNodes() {
       return nodes || [
@@ -380,15 +385,21 @@ test('db 外壳 memory 动词端到端：deliver → list --state active → dis
     };
     const delivered = await runDbShellArgv(database, [
       'memory', 'deliver',
-      JSON.stringify({ agent: 'codex', sessionId: 's9', nodes: [{ text: '收尾日志', trust_level: '不受控' }] })
+      JSON.stringify({ agent: 'codex', sessionId: 's9', nodes: [{ text: '收尾日志', trust_level: '不受控' }] }),
+      '--json'
     ], {});
     const deliverResult = JSON.parse(delivered.text);
     assert.equal(deliverResult.ok, true);
 
-    const listed = await runDbShellArgv(database, ['memory', 'list', '--state', 'active', '--agent', 'codex'], {});
+    const listed = await runDbShellArgv(database, ['memory', 'list', '--state', 'active', '--agent', 'codex', '--json'], {});
     const listResult = JSON.parse(listed.text);
     assert.equal(listResult.volumes.length, 1);
     assert.equal(listResult.volumes[0].sessionId, 's9');
+
+    // 默认文本渲染（formatVolumeList）：每卷一行，含状态/身份。
+    const listedText = await runDbShellArgv(database, ['memory', 'list', '--state', 'active', '--agent', 'codex'], {});
+    assert.match(listedText.text, /共 1 卷/);
+    assert.match(listedText.text, /codex\/s9/);
 
     await assert.rejects(
       runDbShellArgv(database, ['memory', 'distill', String(deliverResult.docId)], {}),

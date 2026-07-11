@@ -1,21 +1,55 @@
 // 历史子系统（projectneed 15-5 / 18-3）：内容寻址 commit 之上的读写业务层——文档级历史列表 /
 // 节点级历史 / 恢复（reset）/ 反向提交（revert）/ human 背书认证 / 对象库 GC。纯函数模块，门面
-// IftreeStore 实例作第一参数传入：底座的快照提交原语（store.createCommit / commitSnapshot /
-// commitSnapshotFromRow / createSnapshot / restoreSnapshot / computeDiff）与事务（store.withTransaction）
-// 和连接（store.db）经它访问，模块不反向 import 门面。index.mjs 上保留同名方法做一行转调。
+// IftreeStore 实例作第一参数传入：commit / 对象库快照原语与历史业务统一归本模块；尚留门面的
+// live snapshot/restore 原语（createSnapshot / restoreSnapshot）和事务（store.withTransaction）经它访问。
+// 模块不运行时反向 import 门面，index.ts 上保留同名方法做一行转调。
 
 import { classifyThreeWayMerge } from '../../core/merkle-merge.js';
-import { requireStableId } from '../db/ids.js';
-import { computeSnapshotDiff } from '../db/snapshot-history.js';
-import { gcObjects } from '../db/object-store.js';
-// type-only import 不产生运行时循环：store/index.ts 运行时 import history.ts，反向只取类型。
-import type { IftreeStore } from './index.js';
-import type { CommitRow, NodeRow } from '../db/schema.js';
+import type Database from 'better-sqlite3';
+import { normalizeNodeType } from '../../core/node-model.js';
+import { newStableId, requireStableId } from '../db/ids.js';
+import { assertRestorableSnapshotPayload, computeSnapshotDiff } from '../db/snapshot-history.js';
+import {
+  normalizeNodeSizeMode,
+  normalizePositiveNumber,
+  normalizeSourcePosition,
+  normalizeTreeViewState
+} from '../db/normalizers.js';
+import {
+  buildCommitMeta,
+  createTreeLocateCaches,
+  gcObjects,
+  locateNodeInTree,
+  materializeTree,
+  readSource,
+  writeSource,
+  writeTreeIncremental,
+  writeTree as writeCommitTree
+} from '../db/object-store.js';
+import type { TreeNodeLocation } from '../db/object-store.js';
+import { parseJsonObject } from '../shared.js';
+import type { AxiomRow, CommitRow, DocRow, NodeRow, RefRow, SourceDocumentRow, SourceSpanRow } from '../db/schema.js';
 import type { MerkleNode } from '../../core/merkle.js';
 
 // 从 head 沿 parent_commit_id 上溯，返回祖先链 commit id（head 在前、根在后）。git log 只走这条链——
 // restore/reset 把 head 移到旧 commit 后，被跳过的"未来" commit 不在链上、从 log 消失（仍可凭 id 直接访问，充当 reflog）。
 type RowObject = Record<string, unknown>;
+type SnapshotHistoryPayload = Parameters<typeof computeSnapshotDiff>[0];
+export type SnapshotPayload = SnapshotHistoryPayload & {
+  doc?: RowObject | null;
+  sourceDocument?: (Partial<SourceDocumentRow> & { raw_markdown?: unknown }) | null;
+};
+export type CommitPayload = {
+  docId?: unknown;
+  summary?: unknown;
+  snapshot?: SnapshotPayload;
+  entries?: unknown[] | null;
+  committedAt?: unknown;
+  author?: unknown;
+};
+export type CommitSnapshotRow = CommitRow & { snapshot?: string | null; diff?: string | null };
+type SnapshotRow = NonNullable<SnapshotPayload['nodes']>[number];
+type NodeHashContentRow = Pick<NodeRow, 'id' | 'text' | 'node_title' | 'node_note' | 'node_type' | 'trust_level'> & MerkleNode;
 
 // 对外公共 payload 形状：store 门面收到的 args 转调进来时按这几个 interface 解构。
 // 所有字段一律 unknown：IPC/CLI 入口给 unknown，函数内 requireStableId / String() 收紧。
@@ -40,7 +74,313 @@ export interface RevertCommitPayload {
   summary?: unknown;
 }
 
-function commitAncestry(store: IftreeStore, docId: string): string[] {
+export interface HistoryStore {
+  db: Database | null;
+  readonly: boolean;
+  editorSnapshots: { liveRoots(): { treeHashes: string[]; sourceHashes: string[] } };
+  listAxioms(docId: unknown): AxiomRow[];
+  refreshDocAddresses(docId: unknown): { updated: number };
+  removeRootAxiomRefs(docId?: unknown): void;
+  touchDoc(docId: unknown): void;
+  withTransaction<T>(fn: () => T): T;
+}
+
+// commit 写入（内容寻址）：节点树与源文写对象库，doc/axioms/refs 与 operation entries 内联 meta。
+export function createCommit(store: HistoryStore, {
+  docId,
+  summary = null,
+  snapshot = {},
+  entries = null,
+  committedAt = null,
+  author = null
+}: CommitPayload) {
+  const normalizedDocId = requireStableId(docId, 'commit docId');
+  const head = store.db!.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?')
+    .get<Pick<CommitRow, 'parent_commit_id'> & { head_commit_id: string | null }>(normalizedDocId);
+  const commitId = newStableId();
+  const tree = writeCommitTree(store.db!, (snapshot.nodes || []) as MerkleNode[]);
+  const sourceHash = writeSource(store.db!, snapshot.sourceDocument?.raw_markdown);
+  const meta = buildCommitMeta(snapshot, entries);
+
+  store.db!.prepare(`
+    INSERT INTO commits (id, doc_id, parent_commit_id, committed_at, summary, author, root_node_id, root_tree_hash, source_hash, meta)
+    VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?)
+  `).run(
+    commitId,
+    normalizedDocId,
+    head?.head_commit_id || null,
+    committedAt,
+    summary,
+    author || null,
+    tree?.root_node_id || null,
+    tree?.root_tree_hash || null,
+    sourceHash,
+    JSON.stringify(meta)
+  );
+  store.db!.prepare(`
+    INSERT INTO doc_heads (doc_id, head_commit_id, updated_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(doc_id) DO UPDATE SET
+      head_commit_id = excluded.head_commit_id,
+      updated_at = CURRENT_TIMESTAMP
+  `).run(normalizedDocId, commitId);
+  return store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitRow>(commitId);
+}
+
+function legacyCommitSnapshot(row: CommitSnapshotRow | null | undefined) {
+  if (!row) return null;
+  try {
+    const snapshot = JSON.parse(row.snapshot || 'null');
+    if (snapshot?.nodes) return snapshot;
+  } catch { /* fall through */ }
+  try {
+    const diff = JSON.parse(row.diff || '{}');
+    const snapshot = diff.snapshot || (diff.kind === 'snapshot' ? diff : null);
+    if (snapshot?.nodes) return snapshot;
+  } catch { /* ignore */ }
+  return null;
+}
+
+// commit 行 → 完整快照的唯一重建口；未迁移旧行回退 legacy snapshot/diff 列。
+export function commitSnapshotFromRow(store: HistoryStore, row: CommitSnapshotRow | null | undefined) {
+  if (!row) return null;
+  if (!row.root_tree_hash) {
+    const legacy = legacyCommitSnapshot(row);
+    return legacy?.nodes ? legacy : null;
+  }
+  const nodes = materializeTree(store.db!, row.root_tree_hash, row.root_node_id);
+  const meta = parseJsonObject(row.meta) || {};
+  const sourceMeta = meta.sourceDocument || null;
+  const rawMarkdown = readSource(store.db!, row.source_hash);
+  return {
+    doc: meta.doc ?? null,
+    nodes,
+    axioms: Array.isArray(meta.axioms) ? meta.axioms : [],
+    refs: Array.isArray(meta.refs) ? meta.refs : [],
+    sourceDocument: sourceMeta
+      ? { ...sourceMeta, raw_markdown: rawMarkdown }
+      : (row.source_hash ? { raw_markdown: rawMarkdown } : null)
+  };
+}
+
+export function commitSnapshot(store: HistoryStore, commitId: unknown) {
+  const row = store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitSnapshotRow>(commitId);
+  return commitSnapshotFromRow(store, row);
+}
+
+export function computeDiff(_store: HistoryStore, prevSnapshot: SnapshotPayload, currentSnapshot: SnapshotPayload) {
+  return computeSnapshotDiff(prevSnapshot, currentSnapshot);
+}
+
+export function createSnapshot(store: HistoryStore, docId: unknown): SnapshotPayload {
+  const doc = store.db!.prepare('SELECT id, meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?')
+    .get<Pick<DocRow, 'id' | 'meta' | 'axioms_collapsed' | 'tree_view_state'>>(docId) || null;
+  const sourceDocument = store.db!.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get<SourceDocumentRow>(docId) || null;
+  const nodes = store.db!.prepare('SELECT * FROM nodes WHERE doc_id = ? ORDER BY id').all<NodeRow>(docId);
+  const refs = nodes.length === 0
+    ? []
+    : store.db!.prepare(`
+      SELECT * FROM refs
+      WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+         OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+      ORDER BY id
+    `).all<RefRow>(docId, docId);
+  return {
+    doc,
+    nodes: nodes as unknown as SnapshotPayload['nodes'],
+    axioms: store.listAxioms(docId) as unknown as SnapshotPayload['axioms'],
+    refs: refs as unknown as SnapshotPayload['refs'],
+    sourceDocument
+  };
+}
+
+export function assertRestorableSnapshot(_store: HistoryStore, snapshot: SnapshotPayload | null | undefined) {
+  return assertRestorableSnapshotPayload(snapshot);
+}
+
+// live 文档直接写对象库快照，供 editor undo token 持有，不建 commits/doc_heads 行。
+export function writeDocSnapshotObjects(store: HistoryStore, docId: unknown) {
+  return store.withTransaction(() => {
+    const rows = store.db!.prepare(
+      'SELECT id, parent_id, sort_order, tree_object_hash FROM nodes WHERE doc_id = ?'
+    ).all<Pick<NodeRow, 'id' | 'parent_id' | 'sort_order' | 'tree_object_hash'> & MerkleNode>(docId);
+    const rootCount = rows.reduce((count, row) => (row.parent_id === null ? count + 1 : count), 0);
+    if (rows.length === 0 || rootCount !== 1) throw new Error('Refusing to restore an incomplete document snapshot');
+    const contentStmt = store.db!.prepare(
+      'SELECT id, text, node_title, node_note, node_type, trust_level FROM nodes WHERE id = ? AND doc_id = ?'
+    );
+    const tree = writeTreeIncremental(store.db!, rows, (id) => contentStmt.get<NodeHashContentRow>(id, docId));
+    if (!tree) throw new Error('Refusing to restore an incomplete document snapshot');
+    if (!store.readonly && tree.recomputed.size > 0) {
+      const update = store.db!.prepare('UPDATE nodes SET tree_object_hash = ? WHERE id = ?');
+      for (const [id, hash] of tree.recomputed) update.run(hash, id);
+    }
+    const doc = store.db!.prepare('SELECT id, meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?')
+      .get<Pick<DocRow, 'id' | 'meta' | 'axioms_collapsed' | 'tree_view_state'>>(docId) || null;
+    const sourceDocument = store.db!.prepare('SELECT * FROM source_documents WHERE doc_id = ?').get<SourceDocumentRow>(docId) || null;
+    const refs = store.db!.prepare(`
+      SELECT * FROM refs
+      WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+         OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+      ORDER BY id
+    `).all<RefRow>(docId, docId);
+    const meta = buildCommitMeta({
+      doc,
+      axioms: store.listAxioms(docId) as unknown[],
+      refs,
+      sourceDocument
+    });
+    return {
+      id: '',
+      doc_id: String(docId),
+      parent_commit_id: null,
+      committed_at: '',
+      summary: null,
+      author: null,
+      root_node_id: tree.root_node_id,
+      root_tree_hash: tree.root_tree_hash,
+      source_hash: writeSource(store.db!, sourceDocument?.raw_markdown),
+      meta: JSON.stringify(meta)
+    };
+  });
+}
+
+export function insertSnapshotNodes(store: HistoryStore, nodes: SnapshotRow[], docId: unknown = null) {
+  const nowIso = new Date().toISOString();
+  const insertNode = store.db!.prepare(`
+    INSERT INTO nodes (
+      id, doc_id, parent_id, sort_order, node_type, text, node_title, node_note, source_position,
+      trust_level, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const runInsert = (node: SnapshotRow) => insertNode.run(
+    node.id,
+    docId ?? node.doc_id,
+    node.parent_id,
+    node.sort_order,
+    normalizeNodeType(node.node_type),
+    node.text,
+    node.node_title || '',
+    node.node_note || '',
+    normalizeSourcePosition(node.source_position),
+    node.trust_level,
+    node.created_at ?? nowIso,
+    node.updated_at ?? nowIso
+  );
+  const childrenByParent = new Map<string, SnapshotRow[]>();
+  const roots: SnapshotRow[] = [];
+  for (const node of nodes) {
+    if (node.parent_id === null || node.parent_id === undefined) {
+      roots.push(node);
+      continue;
+    }
+    const key = String(node.parent_id);
+    if (!childrenByParent.has(key)) childrenByParent.set(key, []);
+    childrenByParent.get(key)!.push(node);
+  }
+  const queue = [...roots];
+  let head = 0;
+  while (head < queue.length) {
+    const node = queue[head]!;
+    head += 1;
+    runInsert(node);
+    const children = childrenByParent.get(String(node.id));
+    if (children) for (const child of children) queue.push(child);
+  }
+  if (head !== nodes.length) throw new Error('Snapshot contains unresolved node parents');
+}
+
+export function restoreSnapshot(store: HistoryStore, docId: unknown, snapshot: SnapshotPayload) {
+  const snapshotNodes = assertRestorableSnapshot(store, snapshot);
+  store.withTransaction(() => {
+    if (snapshot.doc) {
+      const hasMeta = Object.prototype.hasOwnProperty.call(snapshot.doc, 'meta');
+      const hasAxiomsCollapsed = Object.prototype.hasOwnProperty.call(snapshot.doc, 'axioms_collapsed');
+      const hasTreeViewState = Object.prototype.hasOwnProperty.call(snapshot.doc, 'tree_view_state');
+      if (hasMeta || hasAxiomsCollapsed || hasTreeViewState) {
+        const current = store.db!.prepare('SELECT meta, axioms_collapsed, tree_view_state FROM docs WHERE id = ?')
+          .get<Pick<DocRow, 'meta' | 'axioms_collapsed' | 'tree_view_state'>>(docId) ?? {
+            meta: null,
+            axioms_collapsed: 0,
+            tree_view_state: '{}'
+          };
+        store.db!.prepare('UPDATE docs SET meta = ?, axioms_collapsed = ?, tree_view_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .run(
+            hasMeta ? (snapshot.doc.meta || null) : current.meta,
+            hasAxiomsCollapsed ? (snapshot.doc.axioms_collapsed ? 1 : 0) : (current.axioms_collapsed ? 1 : 0),
+            hasTreeViewState ? normalizeTreeViewState(snapshot.doc.tree_view_state) : (current.tree_view_state || '{}'),
+            docId
+          );
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(snapshot, 'sourceDocument')) {
+      store.db!.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(docId);
+      if (snapshot.sourceDocument) {
+        store.db!.prepare(`
+          INSERT INTO source_documents (doc_id, source_type, original_path, raw_markdown, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          docId,
+          snapshot.sourceDocument.source_type || 'file',
+          snapshot.sourceDocument.original_path || null,
+          snapshot.sourceDocument.raw_markdown || '',
+          snapshot.sourceDocument.created_at || new Date().toISOString()
+        );
+      }
+    }
+    const sourceSpanLinks = store.db!.prepare(`
+      SELECT id, node_id FROM source_spans
+      WHERE doc_id = ? AND node_id IS NOT NULL
+    `).all<Pick<SourceSpanRow, 'id' | 'node_id'>>(docId);
+    const snapshotNodeIds = new Set(snapshotNodes.map((node) => node.id));
+    store.db!.prepare(`
+      DELETE FROM refs
+      WHERE (source_type = 'node' AND source_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+         OR (target_type = 'node' AND target_id IN (SELECT id FROM nodes WHERE doc_id = ?))
+    `).run(docId, docId);
+    store.db!.prepare('DELETE FROM axioms WHERE doc_id = ?').run(docId);
+    store.db!.prepare('DELETE FROM nodes WHERE doc_id = ?').run(docId);
+    insertSnapshotNodes(store, snapshotNodes, docId);
+    const restoreSourceSpan = store.db!.prepare('UPDATE source_spans SET node_id = ? WHERE id = ?');
+    for (const link of sourceSpanLinks) {
+      if (snapshotNodeIds.has(link.node_id)) restoreSourceSpan.run(link.node_id, link.id);
+    }
+    const insertAxiom = store.db!.prepare(`
+      INSERT INTO axioms (id, doc_id, label, content, status, node_title, node_note, node_width, node_height, node_size_mode)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const axiom of snapshot.axioms || []) {
+      const width = normalizePositiveNumber(axiom.node_width);
+      const height = normalizePositiveNumber(axiom.node_height);
+      const sizeMode = normalizeNodeSizeMode(axiom.node_size_mode ?? (width !== null && height !== null ? 'manual' : 'auto'));
+      insertAxiom.run(
+        axiom.id,
+        axiom.doc_id,
+        axiom.label,
+        axiom.content,
+        axiom.status,
+        axiom.node_title || '',
+        axiom.node_note || '',
+        sizeMode === 'manual' ? width : null,
+        sizeMode === 'manual' ? height : null,
+        sizeMode
+      );
+    }
+    const insertRef = store.db!.prepare(`
+      INSERT INTO refs (id, source_type, source_id, target_type, target_id, ref_kind, note)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const ref of snapshot.refs || []) {
+      insertRef.run(ref.id, ref.source_type, ref.source_id, ref.target_type, ref.target_id, ref.ref_kind, ref.note);
+    }
+    store.removeRootAxiomRefs(docId);
+    store.refreshDocAddresses(docId);
+    store.touchDoc(docId);
+  });
+}
+
+function commitAncestry(store: HistoryStore, docId: string): string[] {
   const head = store.db!.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?')
     .get<{ head_commit_id: string | null }>(docId);
   const chain: string[] = [];
@@ -81,7 +421,7 @@ export type HistoryEntry = Pick<CommitRow, 'id' | 'doc_id' | 'committed_at' | 's
   saved_at: string;
 };
 
-export function listHistory(store: IftreeStore, docId: string): HistoryEntry[] {
+export function listHistory(store: HistoryStore, docId: string): HistoryEntry[] {
   // 历史列表以 commits 为事实来源，但只列 head 祖先链（git log 语义）：restore/reset 把 head 移回后，
   // 被跳过的"未来" commit 不再出现在 log/历史里（仍可凭 commit id 直接 diff/restore 跳回）。
   // id 即 commit UUID，commit_id/saved_at 为兼容旧字段名的别名。
@@ -101,7 +441,7 @@ export function listHistory(store: IftreeStore, docId: string): HistoryEntry[] {
 // 在哪些 commit 被改动。按稳定 id 追——先把 address 解析成当前 node_id，再遍历 commit 链，
 // 对相邻快照跑 computeSnapshotDiff 并过滤目标成员；节点历史上换过地址也连得上（git log --follow）。
 // 子树成员从相邻两快照并集取，覆盖被删的子节点。
-export function nodeHistory(store: IftreeStore, docId: unknown, address: unknown, { scope = 'subtree' } = {}) {
+export function nodeHistory(store: HistoryStore, docId: unknown, address: unknown, { scope = 'subtree' } = {}) {
   const normalizedDocId = requireStableId(docId, 'nodeHistory docId');
   const target = store.db!
     .prepare('SELECT id FROM nodes WHERE doc_id = ? AND address = ?')
@@ -115,26 +455,80 @@ export function nodeHistory(store: IftreeStore, docId: unknown, address: unknown
     ORDER BY committed_at ASC, id ASC
   `).all<CommitRow>(normalizedDocId).filter((commit) => ancestry.has(String(commit.id)));
 
-  // 重建走对象库（commitSnapshotFromRow）。当前逐 commit 物化整树再 diff——正确但仍 O(K×M)；
-  // 子树 tree_hash 剪枝（相邻 commit 该子树哈希没变就跳过）到 O(K) 作为紧随的增量层接入。
+  // O(K) 剪枝：先在对象库 tree 图上定位目标（locateNodeInTree，带跨 commit memo，每个
+  // commit 只走改动路径 + 目标祖先链），相邻 commit 的目标指纹全同（scope=subtree 比子树
+  // treeHash / scope=node 比内容 blobHash，均并比 parentNodeId+childIndex 位置——子树 hash
+  // 覆盖不到目标自身被移动的 __moved__ 情形）就直接跳过；指纹不同或 legacy commit（无
+  // root_tree_hash，location=undefined）才回退物化整树 + computeSnapshotDiff，保证 entry
+  // 形态与 changeCount 语义和全量路径逐字节一致。
+  const caches = createTreeLocateCaches();
+  const locations: Array<TreeNodeLocation | null | undefined> = commits.map((commit) => (
+    commit.root_tree_hash
+      ? locateNodeInTree(store.db!, commit.root_tree_hash, commit.root_node_id, targetId, caches)
+      : undefined
+  ));
+  const sameLocation = (a: TreeNodeLocation, b: TreeNodeLocation) => (
+    (scope === 'node' ? a.blobHash === b.blobHash : a.treeHash === b.treeHash)
+    && a.parentNodeId === b.parentNodeId
+    && a.childIndex === b.childIndex
+  );
+
+  // 回退物化按需进行：上一 commit 的快照只在真要 diff 时才重建（单槽缓存避免重复物化）。
+  let materialized: { index: number; snapshot: RowObject } | null = null;
+  const snapshotAt = (index: number): RowObject => {
+    if (materialized?.index !== index) {
+      materialized = { index, snapshot: (commitSnapshotFromRow(store, commits[index]!) || { nodes: [] }) as RowObject };
+    }
+    return materialized.snapshot;
+  };
+
   const entries = [];
-  let prevSnapshot = null;
-  for (const commit of commits) {
-    const snapshot = store.commitSnapshotFromRow(commit) || { nodes: [] };
-    const members = scope === 'node'
-      ? new Set([targetId])
-      : new Set([
-        ...subtreeMemberIds(prevSnapshot, targetId),
-        ...subtreeMemberIds(snapshot, targetId)
-      ]);
-    let changes = [];
+  for (let i = 0; i < commits.length; i += 1) {
+    const commit = commits[i]!;
+    const cur = locations[i];
+    const prev = i > 0 ? locations[i - 1] : null;
+
+    let changes: RowObject[] = [];
     let changed = false;
-    if (!prevSnapshot) {
-      changed = (snapshot.nodes || []).some((node: RowObject) => members.has(node.id));
+    if (i === 0) {
+      // 首 commit：changed ⟺ 目标当时存在（原实现 members 命中判定的等价形式）；legacy 回退物化判。
+      if (cur !== undefined) {
+        changed = cur !== null;
+      } else {
+        const snapshot = snapshotAt(0);
+        changed = ((snapshot.nodes || []) as RowObject[]).some((node) => String(node.id) === String(targetId));
+      }
+    } else if (cur !== undefined && prev !== undefined) {
+      if (cur === null && prev === null) {
+        changed = false; // 两侧都无目标：diff 过滤后必为空
+      } else if (cur !== null && prev !== null && sameLocation(prev, cur)) {
+        changed = false; // 指纹全同：目标（或其子树）与挂载位置均未变
+      } else {
+        const prevSnapshot = snapshotAt(i - 1);
+        const snapshot = snapshotAt(i);
+        const members = scope === 'node'
+          ? new Set([targetId])
+          : new Set([
+            ...subtreeMemberIds(prevSnapshot, targetId),
+            ...subtreeMemberIds(snapshot, targetId)
+          ]);
+        changes = computeSnapshotDiff(prevSnapshot, snapshot).filter((entry) => members.has(entry.node_id));
+        changed = changes.length > 0;
+      }
     } else {
+      // legacy commit（任一侧无 root_tree_hash）：走原全量路径。
+      const prevSnapshot = snapshotAt(i - 1);
+      const snapshot = snapshotAt(i);
+      const members = scope === 'node'
+        ? new Set([targetId])
+        : new Set([
+          ...subtreeMemberIds(prevSnapshot, targetId),
+          ...subtreeMemberIds(snapshot, targetId)
+        ]);
       changes = computeSnapshotDiff(prevSnapshot, snapshot).filter((entry) => members.has(entry.node_id));
       changed = changes.length > 0;
     }
+
     if (changed) {
       entries.push({
         id: commit.id,
@@ -146,7 +540,6 @@ export function nodeHistory(store: IftreeStore, docId: unknown, address: unknown
         changeCount: changes.length
       });
     }
-    prevSnapshot = snapshot;
   }
   entries.reverse();
   return entries;
@@ -154,7 +547,7 @@ export function nodeHistory(store: IftreeStore, docId: unknown, address: unknown
 
 // 对象库 GC（独立运维动词，不在写热路径）：回收没被任何 commit（或活 undo token）引用的
 // blob/tree/source 对象。reset/revert 后不自动跑——留「可后悔」窗口；需要时手动触发。
-export function gcHistoryObjects(store: IftreeStore) {
+export function gcHistoryObjects(store: HistoryStore) {
   return store.withTransaction(() => {
     const result = gcObjects(store.db!, store.editorSnapshots.liveRoots());
     // 列缓存的前提是「hash 在列上 ⇒ 对象在库里」；sweep 之后无法廉价证明哪些缓存仍指向存活
@@ -164,11 +557,11 @@ export function gcHistoryObjects(store: IftreeStore) {
   });
 }
 
-export function saveHistorySnapshot(store: IftreeStore, { docId, summary = '保存版本', owner = 'human' }: SaveHistorySnapshotPayload) {
+export function saveHistorySnapshot(store: HistoryStore, { docId, summary = '保存版本', owner = 'human' }: SaveHistorySnapshotPayload) {
   return store.withTransaction(() => {
-    const currentSnapshot = store.createSnapshot(docId);
+    const currentSnapshot = createSnapshot(store, docId);
     // diff 不再持久化（按需由 query-api 现算）；createCommit 把快照拆进对象库 + 内联 meta。
-    const commit = store.createCommit({
+    const commit = createCommit(store, {
       docId,
       summary,
       snapshot: currentSnapshot,
@@ -192,7 +585,7 @@ export function saveHistorySnapshot(store: IftreeStore, { docId, summary = '保�
  * @param {*} store
  * @param {{ docId?: unknown, nodeId?: unknown, address?: unknown, scope?: string, trust?: string, owner?: string }} [args]
  */
-export function certifyNodes(store: IftreeStore, { docId, nodeId = null, address = null, scope = 'subtree', trust = '受控', owner = 'human' }: CertifyNodesPayload = {} as CertifyNodesPayload) {
+export function certifyNodes(store: HistoryStore, { docId, nodeId = null, address = null, scope = 'subtree', trust = '受控', owner = 'human' }: CertifyNodesPayload = {} as CertifyNodesPayload) {
   const normalizedDocId = requireStableId(docId, 'certify docId');
   if (trust !== '受控' && trust !== '不受控') throw new Error(`certify trust 只能是 受控/不受控，收到：${trust}`);
   // owner 现为 role:user#ts 编码（18-3 身份），取 role 段判断：标受控只允许 human 角色。
@@ -240,15 +633,15 @@ export function certifyNodes(store: IftreeStore, { docId, nodeId = null, address
 }
 
 // 按 commit_id（UUID）从 commits.snapshot 恢复——commits 是历史的事实来源（projectneed 189-191）。
-export function restoreCommit(store: IftreeStore, commitId: unknown) {
+export function restoreCommit(store: HistoryStore, commitId: unknown) {
   return store.withTransaction(() => {
     const commit = store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitRow>(commitId);
     if (!commit) throw new Error(`Commit not found: ${commitId}`);
-    const snapshot = store.commitSnapshotFromRow(commit);
+    const snapshot = commitSnapshotFromRow(store, commit);
     if (!snapshot?.nodes) {
       throw new Error(`Commit is not restorable: ${commitId}`);
     }
-    store.restoreSnapshot(commit.doc_id, snapshot);
+    restoreSnapshot(store, commit.doc_id, snapshot);
     // git reset 语义：把 head 移到目标 commit。之前只重写 nodes、head 不动，会让 head_commit_id
     // 与正文脱节（后续 diff/commit 的 parent 链挂错）。被跳过的"未来" commit 仍留在 commits 表，
     // 可凭 commit id 直接 restore 跳回，充当 reflog。
@@ -269,7 +662,7 @@ export function restoreCommit(store: IftreeStore, commitId: unknown) {
  * @param {*} store
  * @param {{ commitId?: unknown, owner?: string, summary?: unknown }} [args]
  */
-export function revertCommit(store: IftreeStore, { commitId, owner = 'human', summary = null }: RevertCommitPayload = {} as RevertCommitPayload) {
+export function revertCommit(store: HistoryStore, { commitId, owner = 'human', summary = null }: RevertCommitPayload = {} as RevertCommitPayload) {
   const normalizedCommitId = requireStableId(commitId, 'revert commitId');
   return store.withTransaction(() => {
     const target = store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitRow>(normalizedCommitId);
@@ -278,9 +671,9 @@ export function revertCommit(store: IftreeStore, { commitId, owner = 'human', su
     const parentRow = store.db!.prepare('SELECT * FROM commits WHERE id = ?').get<CommitRow>(target.parent_commit_id);
     if (!parentRow) throw new Error('revert 找不到父提交快照');
     const docId = target.doc_id;
-    const baseSnap = store.commitSnapshotFromRow(target) || {};
-    const parentSnap = store.commitSnapshotFromRow(parentRow) || {};
-    const currentSnap = store.createSnapshot(docId);
+    const baseSnap = commitSnapshotFromRow(store, target) || {};
+    const parentSnap = commitSnapshotFromRow(store, parentRow) || {};
+    const currentSnap = createSnapshot(store, docId);
 
     // classifyThreeWayMerge 用 MerkleNode 弱接口；snapshot.nodes 运行时是 NodeRow 形状但 TS 看不出。
     const merge = classifyThreeWayMerge(
@@ -347,7 +740,7 @@ export function revertCommit(store: IftreeStore, { commitId, owner = 'human', su
       && (ref.target_type !== 'node' || targetNodeIds.has(String(ref.target_id)))
     ));
 
-    store.restoreSnapshot(docId, {
+    restoreSnapshot(store, docId, {
       doc: currentSnap.doc,
       sourceDocument: currentSnap.sourceDocument,
       nodes: targetNodes,
@@ -356,15 +749,15 @@ export function revertCommit(store: IftreeStore, { commitId, owner = 'human', su
     });
 
     // 反向提交：parent = 当前 HEAD（createCommit 内部自取），保留历史链。
-    const finalSnapshot = store.createSnapshot(docId);
+    const finalSnapshot = createSnapshot(store, docId);
     // 回执 touched 集合 = revert 前后两份 live 快照之差。早先拿 HEAD commit 的 materialize 快照做 prev，
     // 会与 live 的 finalSnapshot 跨口径比较：canonicalNodeContent 把 node_title/node_note 的 null 归一成
     // ''，而 materializeTree 不还原（只还原 trust_level），于是每个标题/备注为 NULL 的节点都被误判改动——
     // 撤一处小改动却报数万 touched。改用 revert 前的 live 快照 currentSnap：两边同口径，touched 恰为本次
     // revert 实际改动的节点。
-    const entries = store.computeDiff(currentSnap, finalSnapshot);
+    const entries = computeDiff(store, currentSnap, finalSnapshot);
     const shortId = String(normalizedCommitId).slice(0, 8);
-    const commit = store.createCommit({
+    const commit = createCommit(store, {
       docId,
       summary: summary || `revert ${shortId}${target.summary ? `（${target.summary}）` : ''}`,
       snapshot: finalSnapshot,

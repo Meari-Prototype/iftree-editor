@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo } from 'react';
 
 import {
   clampDepthLimit,
@@ -43,10 +43,12 @@ function idArray(value: unknown): unknown[] {
 }
 
 // 退化为 session 转发壳：折叠/展开/深度/outline 的真相在 session.view（经 documentState 投影/动词）。
-// 本 hook 不再持有它们的 useState，只保留两类本地态：
-//   - axiomsCollapsed 从 doc.axioms_collapsed 派生（真相在 doc，写走 patchDocMeta / 写管道）；
-//   - c2dDepthControlSeq/Action 是 C2D 地图视图的命令脉冲（非文档真相），本地自持。
-// setVisibleDepth/persist/promote 等编排转发到 documentState.setViewSnapshot/setVisibleDepth。
+// 本 hook 不再持有它们的 useState，只保留 axiomsCollapsed 从 doc.axioms_collapsed 派生
+// （真相在 doc，写走 patchDocMeta / 写管道）。
+// setVisibleDepth/persist/promote 等编排转发到 documentState.setViewSnapshot/setVisibleDepth；
+// C2D 地图的深度命令由 WorkspacePane 经 C2DMapHandle.applyDepthControl ref 调用下发
+// （原 c2dDepthControlSeq/Action「seq 计数器当命令总线」已废除），本函数返回 resolved
+// 目标深度供调用方转发给 handle。
 export function useTreeViewState(documentState: TreeViewDocumentState | null | undefined) {
   const currentDoc = documentState?.currentDoc ?? null;
   const view = documentState?.view ?? null;
@@ -57,9 +59,6 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
   const collapsedOutlineNodeIds = view?.outlineCollapsed ?? EMPTY_SET;
   const c2dExpanded = view?.c2dExpanded ?? EMPTY_SET;
   const axiomsCollapsed = Boolean(currentDoc?.doc?.axioms_collapsed);
-
-  const [c2dDepthControlSeq, setC2dDepthControlSeq] = useState(0);
-  const [c2dDepthControlAction, setC2dDepthControlAction] = useState('setDepth');
 
   const treeDepthStats = useMemo(
     () => docDepthStats(currentDoc) as { maxDepth: number; depths: unknown[] },
@@ -145,19 +144,18 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
     documentState?.setViewSnapshot?.({ outlineCollapsedNodeIds: idArray(outline) }, { persist: true });
   }, [documentState]);
 
-  const setVisibleDepth = useCallback(async (nextValue: unknown, { clearAll = false, action = 'setDepth' }: { clearAll?: boolean; action?: string } = {}) => {
+  const setVisibleDepth = useCallback(async (nextValue: unknown, { clearAll = false }: { clearAll?: boolean; action?: string } = {}) => {
     const nextDepth = clampDepthLimit(Number(nextValue) || 1, actualMaxDepth);
     if (clearAll) {
       documentState?.setViewSnapshot?.({ depthLimit: nextDepth, collapsedNodeIds: [], expandedNodeIds: [] }, { persist: true });
     } else {
       await documentState?.setVisibleDepth?.(nextDepth);
     }
-    setC2dDepthControlAction(action || 'setDepth');
-    setC2dDepthControlSeq((seq) => seq + 1);
+    return nextDepth;
   }, [documentState, actualMaxDepth]);
 
   const collapseVisibleDepthOne = useCallback(() => {
-    setVisibleDepth(depthLimit - 1, { clearAll: true, action: 'collapseOne' });
+    return setVisibleDepth(depthLimit - 1, { clearAll: true });
   }, [setVisibleDepth, depthLimit]);
 
   const syncC2dVisibleDepth = useCallback((nextDepth: number) => {
@@ -181,8 +179,6 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
     actualMaxDepth,
     depthOptions,
     treeDepthStats,
-    c2dDepthControlSeq,
-    c2dDepthControlAction,
     setVisibleDepth,
     collapseVisibleDepthOne,
     syncC2dVisibleDepth,
@@ -195,7 +191,6 @@ export function useTreeViewState(documentState: TreeViewDocumentState | null | u
     depthLimit, axiomsCollapsed, collapsed, expanded, collapsedOutlineNodeIds, c2dExpanded,
     setDepthLimit, setAxiomsCollapsed, setCollapsed, setExpanded, setCollapsedOutlineNodeIds, setC2dExpanded,
     actualMaxDepth, depthOptions, treeDepthStats,
-    c2dDepthControlSeq, c2dDepthControlAction,
     setVisibleDepth, collapseVisibleDepthOne, syncC2dVisibleDepth,
     applyState, persist, persistOutline, setPersistedAfterExpansion
   ]);

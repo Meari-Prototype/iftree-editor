@@ -12,7 +12,9 @@ import {
 } from '../lib/ui-utils.js';
 import { useScrollViewport } from '../hooks/useScrollViewport.js';
 import { parseSourceNodeText, renderSyntaxLine } from './SourceBlocks.jsx';
-import type { TreeNodeLike } from '../../core/tree.js';
+import type { TreeNode } from '../../core/node-model.js';
+import type { AxiomRow } from '../../backend/db/schema.js';
+import type { LocateRequest } from '../hooks/useNodeSelection.js';
 export const IDE_HEADER_HEIGHT = 22;
 
 export const IDE_ROW_MIN_HEIGHT = 24;
@@ -26,20 +28,8 @@ export const IDE_NODE_INDENT_WIDTH = 24;
 export const IDE_NODE_BASE_WIDTH = 52;
 
 // ── IPC 边界形态：复用 core/tree.TreeNodeLike + IDE 视图字段（title/note/childCount） ───
-export type IdeTreeNode = TreeNodeLike & {
-  title?: unknown;
-  note?: unknown;
-  childCount?: unknown;
-};
-
-export interface IdeAxiomLike {
-  id?: unknown;
-  label?: unknown;
-  content?: unknown;
-  [extra: string]: unknown;
-}
-
-type IdeNodeIdSet = Set<unknown> | null | undefined;
+export type IdeTreeNode = TreeNode;
+type IdeNodeIdSet = Set<string> | null | undefined;
 
 type IdeColumn = 'node' | 'sentence';
 
@@ -79,19 +69,14 @@ interface BuildVisibleIdeRowsOptions {
   baseDepth: number;
   collapsed: IdeNodeIdSet;
   expanded?: IdeNodeIdSet;
-  depthLimit: unknown;
-  sentenceLabelByNodeId?: Map<unknown, unknown> | null;
+  depthLimit: number;
+  sentenceLabelByNodeId?: Map<string, string> | null;
   showTitles?: boolean;
   showNotes?: boolean;
 }
 
-function nodeIdSetHas(set: IdeNodeIdSet, id: unknown): boolean {
-  if (!set || id === null || id === undefined) return false;
-  if (set.has(id)) return true;
-  const text = String(id);
-  if (set.has(text)) return true;
-  const number = Number(text);
-  return Number.isInteger(number) && number > 0 && set.has(number);
+function nodeIdSetHas(set: IdeNodeIdSet, id: string): boolean {
+  return Boolean(set?.has(id));
 }
 
 export function ideRowHeight(parsed: ParsedSourceText | null | undefined, extras: IdeRowExtras = {}): number {
@@ -111,7 +96,7 @@ export function buildVisibleIdeRows(
     const parsed = parseSourceNodeText(String(node.text ?? ''));
     const title = showTitles ? String(node.title || '').trim() : '';
     const note = showNotes ? plainNodeNote(String(node.note || '')).trim() : '';
-    const hasChildren = hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]);
+    const hasChildren = hasKnownChildren(node);
     const nodeDepth = depthOf(String(node.address || '1'));
     const localDepth = Math.max(0, nodeDepth - baseDepth);
     const userExpanded = nodeIdSetHas(expanded, node.id);
@@ -148,19 +133,19 @@ export function buildVisibleIdeRows(
 }
 
 export interface IdeViewProps {
-  tree: TreeNodeLike | null | undefined;
-  selectedNodeId?: unknown;
-  setSelectedNodeId?: (id: unknown) => void;
+  tree: TreeNode | null | undefined;
+  selectedNodeId?: string | null;
+  setSelectedNodeId?: (id: string | null) => void;
   collapsed?: IdeNodeIdSet;
   expanded?: IdeNodeIdSet;
-  toggleCollapsed?: (id: unknown, options?: { promoteDepth?: boolean }) => void;
-  depthLimit?: unknown;
-  sentenceLabelByNodeId?: Map<unknown, unknown> | null;
-  axioms?: IdeAxiomLike[];
+  toggleCollapsed?: (id: string, options?: { promoteDepth?: boolean }) => void;
+  depthLimit?: number;
+  sentenceLabelByNodeId?: Map<string, string> | null;
+  axioms?: AxiomRow[];
   showTitles?: boolean;
   showNotes?: boolean;
   showAxioms?: boolean;
-  locateRequest?: { seq?: number; nodeId?: unknown } | null;
+  locateRequest?: LocateRequest | null;
 }
 
 export function IdeView({
@@ -170,7 +155,7 @@ export function IdeView({
   collapsed,
   expanded = new Set(),
   toggleCollapsed,
-  depthLimit,
+  depthLimit = 1,
   sentenceLabelByNodeId,
   axioms = [],
   showTitles = true,
@@ -337,9 +322,9 @@ export function IdeView({
 
 export interface IdeRowProps {
   row: IdeVirtualRow;
-  selectedNodeId?: unknown;
-  setSelectedNodeId?: (id: unknown) => void;
-  toggleCollapsed?: (id: unknown, options?: { promoteDepth?: boolean }) => void;
+  selectedNodeId?: string | null;
+  setSelectedNodeId?: (id: string | null) => void;
+  toggleCollapsed?: (id: string, options?: { promoteDepth?: boolean }) => void;
 }
 
 export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed }: IdeRowProps) {
@@ -403,7 +388,7 @@ export function IdeRow({ row, selectedNodeId, setSelectedNodeId, toggleCollapsed
 }
 
 export interface IdeAxiomFrontMatterProps {
-  axioms?: IdeAxiomLike[];
+  axioms?: AxiomRow[];
 }
 
 interface IdeAxiomRow {
@@ -443,14 +428,14 @@ export function maxVisibleIdeLocalDepth(
   baseDepth: number,
   collapsed: IdeNodeIdSet,
   expanded: IdeNodeIdSet = new Set(),
-  depthLimit: unknown
+  depthLimit: number
 ): number {
   let maxDepth = 0;
   const cappedDepth = Math.max(1, Number(depthLimit) || 1);
   const visit = (node: IdeTreeNode): void => {
     const nodeDepth = depthOf(String(node.address || '1'));
     maxDepth = Math.max(maxDepth, nodeDepth - baseDepth);
-    const hasChildren = hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]);
+    const hasChildren = hasKnownChildren(node);
     const rowExpanded = hasChildren
       && !nodeIdSetHas(collapsed, node.id)
       && (nodeDepth < cappedDepth || nodeIdSetHas(expanded, node.id));

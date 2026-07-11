@@ -6,14 +6,15 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createConfiguredIftreeStore } from '../dist/src/backend/store-domain-adapter.js';
+import { getProjectedDoc } from '../dist/src/backend/projection/doc-view.js';
 
 // 草稿 entries 拆表（edit_branch_entries）：存储真相在子表、diff 列退役为元壳、
 // 行出口拼合保持 diff JSON 契约。写侧 stage/undo/redo 从整包重写 O(K) 降为单行 O(1)。
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-eb-entries-'));
-  const store = new IftreeStore(join(dir, 'store.sqlite'));
+  const store = createConfiguredIftreeStore(join(dir, 'store.sqlite'));
   try {
     store.init();
     await fn(store, dir);
@@ -57,7 +58,7 @@ test('stage 是 O(1) 追加：多次 stage 后 diff 列保持元壳不膨胀，�
     assert.equal(projected.entries[N - 1].patch.text, `第${N - 1}版`);
     assert.ok(projected.entries.every((e) => e.status === 'active' && e.createdAt));
     // getDoc 投影吃到最后一版。
-    const view = store.getDoc(doc.id);
+    const view = getProjectedDoc(store, doc.id);
     const node = view.nodes.find((n) => String(n.id) === String(a.id));
     assert.equal(node.text, `第${N - 1}版`);
   });
@@ -77,7 +78,7 @@ test('undo/redo 单行翻转：LIFO 语义与 redo 复活最近撤销者', async
     result = store.undoEditBranchEntry({ baseDocId: doc.id, owner: 'human' });
     assert.equal(result.undoDepth, 1);
     assert.equal(result.redoDepth, 2);
-    assert.equal(store.getDoc(doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '一');
+    assert.equal(getProjectedDoc(store, doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '一');
 
     // 两次 undo 常落在同一毫秒（undoneAt 字符串相同，新旧实现都退化为按 seq 取）；
     // 手工拉开时间差还原真实操作节奏，验证 redo 的 LIFO——复活最近撤销的「二」。
@@ -88,7 +89,7 @@ test('undo/redo 单行翻转：LIFO 语义与 redo 复活最近撤销者', async
     `).run(branch.id);
     result = store.redoEditBranchEntry({ baseDocId: doc.id, owner: 'human' });
     assert.equal(result.undoDepth, 2);
-    assert.equal(store.getDoc(doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '二');
+    assert.equal(getProjectedDoc(store, doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '二');
 
     // 新 stage 销毁 redo 分支（「三」永久丢弃）。
     branch = store.findEditBranch({ baseDocId: doc.id, owner: 'human' });
@@ -105,7 +106,7 @@ test('旧库迁移：diff 整包 entries 的存量行启动即搬进子表、行
   const dbPath = join(dir, 'store.sqlite');
   try {
     // 第一代 store：造分支后手工把行改回旧格式（entries 整包塞 diff、清空子表）。
-    let store = new IftreeStore(dbPath);
+    let store = createConfiguredIftreeStore(dbPath);
     store.init();
     const doc = store.createDoc({ title: 'M', rootText: '根' });
     const a = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'a' });
@@ -126,7 +127,7 @@ test('旧库迁移：diff 整包 entries 的存量行启动即搬进子表、行
     store.close();
 
     // 第二代 store：init 迁移。
-    store = new IftreeStore(dbPath);
+    store = createConfiguredIftreeStore(dbPath);
     store.init();
     assert.equal(entryTableCount(store, branch.id), 2, '两条 entries 搬进子表');
     assert.equal(JSON.parse(rawDiffColumn(store, branch.id)).storage, 'entries_table');
@@ -141,11 +142,11 @@ test('旧库迁移：diff 整包 entries 的存量行启动即搬进子表、行
     assert.equal(state.undoDepth, 1);
     assert.equal(state.redoDepth, 1);
     // getDoc 投影吃 active 那条。
-    assert.equal(store.getDoc(doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '旧一');
+    assert.equal(getProjectedDoc(store, doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '旧一');
     store.close();
 
     // 第三代：再启动幂等（不重复搬运）。
-    store = new IftreeStore(dbPath);
+    store = createConfiguredIftreeStore(dbPath);
     store.init();
     assert.equal(entryTableCount(store, branch.id), 2, '迁移幂等');
     store.close();
@@ -177,26 +178,25 @@ test('投影缓存：零写之间复用（引用相等），任何写后失效�
     store._appendEditBranchEntry(branch, { kind: 'node.update', node_id: a.id, patch: { text: '草稿版' } });
 
     // 首次 miss（投影并缓存），第二次命中——投影数组是同一引用（跳过了全量 SELECT 与 replay）。
-    const first = store.getDoc(doc.id);
-    const second = store.getDoc(doc.id);
+    const first = getProjectedDoc(store, doc.id);
+    const second = getProjectedDoc(store, doc.id);
     assert.equal(second.nodes, first.nodes, '零写之间第二次 getDoc 复用缓存投影');
 
     // 分支侧写（stage）失效缓存。
     store._appendEditBranchEntry(store.findEditBranch({ baseDocId: doc.id, owner: 'human' }), {
       kind: 'node.update', node_id: a.id, patch: { text: '草稿版二' }
     });
-    const afterStage = store.getDoc(doc.id);
+    const afterStage = getProjectedDoc(store, doc.id);
     assert.notEqual(afterStage.nodes, first.nodes, 'stage 后缓存失效');
     assert.equal(afterStage.nodes.find((n) => String(n.id) === String(a.id)).text, '草稿版二');
 
     // base 侧直写（agent full 直写主干的形态）同样失效——投影输入变了。
     const b = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'base 新节点' });
-    const afterBaseWrite = store.getDoc(doc.id);
+    const afterBaseWrite = getProjectedDoc(store, doc.id);
     assert.ok(afterBaseWrite.nodes.some((n) => String(n.id) === String(b.id)), 'base 直写后投影含新节点');
 
-    // 保存分支：读到主干；保存后的首次 getDoc 走无分支路径、顺手清缓存（内存卫生）。
+    // 保存分支后读到主干；L3 视图负责丢弃已关闭分支的缓存。
     store.applyThreeWayMerge({ baseDocId: doc.id, owner: 'human', summary: '保存' });
-    assert.equal(store.getDoc(doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '草稿版二');
-    assert.equal(store._branchProjectionCache, null, '分支关闭后缓存清空');
+    assert.equal(getProjectedDoc(store, doc.id).nodes.find((n) => String(n.id) === String(a.id)).text, '草稿版二');
   });
 });

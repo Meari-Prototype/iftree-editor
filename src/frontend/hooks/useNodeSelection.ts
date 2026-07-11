@@ -1,12 +1,20 @@
 import { useCallback, useMemo, useState } from 'react';
 
-import { findNode, type TreeNodeLike } from '../../core/tree.js';
+import { findNode } from '../../core/tree.js';
+import type { TreeNode } from '../../core/node-model.js';
+import { normalizeDocId } from '../lib/doc-utils.js';
 
-const EMPTY_SET = new Set<unknown>();
+export interface LocateRequest {
+  seq: number;
+  nodeId: string | null;
+  address?: string;
+}
+
+const EMPTY_SET = new Set<string>();
 
 // tree 加 null union：useDocumentState 真返回 ProjectedDoc.tree 是 TreeNodeLike | null | undefined。
 interface SelectionDocument {
-  tree?: TreeNodeLike | null;
+  tree?: TreeNode | null;
 }
 
 // view 字段对齐 useDocumentState 真返回（SessionView）：selectedId 是 string | null 真型
@@ -15,15 +23,15 @@ interface DocumentSelectionState {
   currentDoc?: SelectionDocument | null;
   view?: {
     selectedId?: string | null;
-    multiSelected?: Set<string> | Set<unknown>;
+    multiSelected?: Set<string>;
   } | null;
-  selectNode?: (nodeId: unknown) => void;
-  setMultiSelected?: (nodeIds: Set<unknown>) => void;
+  selectNode?: (nodeId: string | null) => void;
+  setMultiSelected?: (nodeIds: Set<string>) => void;
 }
 
-function selectedNodeForDoc(doc: SelectionDocument | null | undefined, selectedNodeId: string | null): TreeNodeLike | null {
+function selectedNodeForDoc(doc: SelectionDocument | null | undefined, selectedNodeId: string | null): TreeNode | null {
   if (!doc?.tree) return null;
-  return findNode(doc.tree, selectedNodeId) || doc.tree;
+  return (findNode(doc.tree, selectedNodeId) as TreeNode | null) || doc.tree;
 }
 
 // 退化为 session 转发壳：selectedId / multiSelected 的真相在 session.view（经 documentState 投影/动词），
@@ -36,22 +44,22 @@ export function useNodeSelection(documentState: DocumentSelectionState | null | 
   const selectedNodeId = view?.selectedId ?? null;
   const multiSelectedNodeIds = view?.multiSelected ?? EMPTY_SET;
 
-  const [locateRequest, setLocateRequest] = useState<{ seq: number; nodeId: unknown }>({ seq: 0, nodeId: null });
+  const [locateRequest, setLocateRequest] = useState<LocateRequest>({ seq: 0, nodeId: null });
 
   const selectedNode = useMemo(
     () => selectedNodeForDoc(currentDoc, selectedNodeId),
     [currentDoc, selectedNodeId]
   );
 
-  const locate = useCallback((nodeId: unknown) => {
+  const locate = useCallback((nodeId: string | null) => {
     setLocateRequest((previous) => ({ seq: previous.seq + 1, nodeId }));
   }, []);
 
-  const select = useCallback((nodeId: unknown) => {
+  const select = useCallback((nodeId: string | null) => {
     setSelectedNodeId?.(nodeId ?? null);
   }, [setSelectedNodeId]);
 
-  const selectAndLocate = useCallback((nodeId: unknown) => {
+  const selectAndLocate = useCallback((nodeId: string | null) => {
     setSelectedNodeId?.(nodeId ?? null);
     setLocateRequest((previous) => ({ seq: previous.seq + 1, nodeId }));
   }, [setSelectedNodeId]);
@@ -61,7 +69,7 @@ export function useNodeSelection(documentState: DocumentSelectionState | null | 
   }, [setMultiSelectedNodeIds]);
 
   const reset = useCallback((doc: SelectionDocument | null = currentDoc) => {
-    setSelectedNodeId?.(doc?.tree?.id || null);
+    setSelectedNodeId?.(normalizeDocId(doc?.tree?.id));
     setMultiSelectedNodeIds?.(new Set());
     setLocateRequest({ seq: 0, nodeId: null });
   }, [currentDoc, setSelectedNodeId, setMultiSelectedNodeIds]);

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createConfiguredIftreeStore } from '../dist/src/backend/store-domain-adapter.js';
 import { stageEntityWrite } from '../dist/src/backend/entities/write.js';
 
 // 回归：编辑分支提交时，diff 里的 entity 条目必须经 applyEntityEntry 真实落库。
@@ -24,7 +24,7 @@ import { stageEntityWrite } from '../dist/src/backend/entities/write.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-entity-commit-'));
-  const store = new IftreeStore(join(dir, 'store.sqlite'));
+  const store = createConfiguredIftreeStore(join(dir, 'store.sqlite'));
   try {
     store.init();
     await fn(store);

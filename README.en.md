@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.5%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.6%20alpha-orange)
 
-> **Project status: 0.6.5, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.6.6, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -239,7 +239,11 @@ The app, MCP, and CLI share one backend process per database and can stay online
 ```text
 .
 ├── electron/
-│   ├── main.ts           # Main process: window, IPC, spawns the shared node backend and forwards reads/writes (no in-process database access)
+│   ├── main.ts           # Main-process assembly root: window, IPC, and preload wiring; spawns the shared node backend and forwards reads/writes (no in-process database access)
+│   ├── launcher.ts       # Launcher window (document list / render mode) + main-service startup + startup-timeout & runtime-heartbeat watchdog
+│   ├── settings-io.ts    # Reads/writes .env / iftree.config.json / settings.json
+│   ├── e2e-capture.ts    # End-to-end window screenshot and viewport analysis
+│   ├── ipc-channels.ts   # IPC channel constants
 │   └── preload.ts        # Secure bridge exposing the window.iftree API to the renderer
 ├── index.html            # Renderer entry HTML
 ├── src/
@@ -262,18 +266,27 @@ The app, MCP, and CLI share one backend process per database and can stay online
 │   │   ├── db/           # schema, ids, normalizers, snapshot history, content-addressed object store
 │   │   ├── memory/       # Memory volumes: multi-tenant isolation, anchor layout, read/write & maintenance
 │   │   ├── entities/     # Entity read/write and projection
+│   │   ├── editor-session/ # Editor session and snapshot tokens
+│   │   ├── diff/         # ref / view diff computation
+│   │   ├── derived-index/ # Derived indexes (keyword / semantic-status) and reconciliation
+│   │   ├── projection/   # Edit-branch projection cache
+│   │   ├── source/       # Source document address mapping
+│   │   ├── text/         # Text budgeting / merging
+│   │   ├── import/       # Import orchestration and JSON persistence
+│   │   ├── library/      # Library filesystem and virtual documents
 │   │   ├── handlers/     # Read / write command handlers
 │   │   └── llm/          # Agent runtime, shared backend SDK (named pipe), headless agent, LLM settings
+│   ├── mcp/              # MCP server entry (`src/mcp/mcp-server.ts`, built to `dist/src/mcp/mcp-server.js`)
 │   ├── core/             # Pure logic (no Electron dependency)
-│   │   ├── tree.ts       # Tree building, dynamic addresses, Markdown/JSON export
+│   │   ├── tree.ts       # Tree building, dynamic addresses, flatten / traversal
 │   │   ├── mindmap.ts    # Tree-view projection, depth control, layout
 │   │   ├── merkle.ts / merkle-diff.ts / merkle-merge.ts # Tree hashing, diff, three-way merge
 │   │   ├── source-text.ts / source-pdf.ts / source-docx.ts / source-chm.ts / source-epub.ts # Works with import-formats/ to parse txt/md/pdf/docx/chm/epub
 │   │   ├── source-markdown.ts # Source parsing and sentence offset mapping
-│   │   └── ...           # viewport, hitbox, drag-drop, markdown, etc.
+│   │   └── ...           # viewport, markdown, tree-cursor, tree-ui, flat-tree, etc.
 │   ├── vector/           # Semantic vectors: embeddings, vector-store, worker, model download
 │   └── agent/            # Agent config and session storage
-├── scripts/              # CLI tools: MCP server, db commands, native rebuild, verification scripts
+├── scripts/              # CLI tools: db commands, native rebuild, verification scripts, import/export/migration; `scripts/mcp-server.ts` is a compatibility shim at the old MCP location
 ├── tests/                # node:test unit tests
 ├── docs/                 # Project documentation: tutorial / how-to / reference / concepts
 ├── .iftree-llm-workspace/
@@ -308,4 +321,4 @@ Released under the [Apache License 2.0](LICENSE), copyright Meari (see [NOTICE](
 - The UI bundles the [Noto Sans CJK](src/frontend/assets/fonts/NOTICE.md) font (SIL Open Font License).
 - Semantic vectors are based on the [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) model.
 - Built with open-source projects including Electron, React, Vite, LanceDB, and Transformers.js.
-- Developed with the help of ChatGPT 5.5 xhigh, Claude Opus 4.8 max, Claude Fable 5, and DeepSeek V4.
+- Developed with the help of ChatGPT 5.6 sol, ChatGPT 5.5, Claude Opus 4.8, Claude Opus 4.7, Claude Sonnet 5, Claude Fable 5, GLM 5.2, and DeepSeek V4.

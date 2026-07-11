@@ -1,24 +1,17 @@
 import { readFileSync } from 'node:fs';
 import { normalizeStableId, isStableId } from './db/ids.js';
-import { runImportJson } from './import-json.js';
+import { runImportJson } from './import/import-json.js';
 import { normalizeNodeType, nodeTypeDisplayLabel } from '../core/node-model.js';
-import { formatBranchLine } from './branch-status.js';
-import { formatDiffText } from './diff-text.js';
-import { parseDiffRef } from './diff-refs.js';
-import { formatWriteResult } from './write-result-text.js';
-import { contentHash } from '../core/merkle.js';
+import { formatBranchLine } from './text/branch-status.js';
+import { formatDiffText, slimDiffView } from './text/diff-text.js';
+import { parseDiffRef } from './diff/diff-refs.js';
 import {
-  pruneTreeDepth,
-  snapshotAddressDepth,
-  snapshotChildrenByParent,
-  snapshotNodeId,
-  snapshotParentId,
-  snapshotReadNode,
-  snapshotSubtreeRows,
-  type SnapshotRow,
-  type SnapshotReadNodeResult
-} from '../core/snapshot-tree.js';
-import { nextInDfs, parentAddress, formatAddress, parseAddress, isAncestor } from '../core/tree-cursor.js';
+  formatWriteResult, formatPushResult, formatDeliverResult, formatVolumeList,
+  formatSqlResult, formatImportResult, formatVectorsResult, formatDeleteResult,
+  formatGcResult, slimWriteResult
+} from './text/write-result-text.js';
+import { formatThreeWayMergeText } from './text/merge-text.js';
+import type { SnapshotReadNodeResult } from '../core/snapshot-tree.js';
 
 // db-shell 是 endpoint：处理 IPC 返回的扁平 JSON（混 camelCase + snake_case + 派生字段），
 // 不接数据库真行类型——下面这组 shell-layer 接口描述显示形态、字段全 optional。
@@ -46,6 +39,7 @@ interface ParsedFlags {
   charLimit?: FlagValue;
   branch?: FlagValue;
   base?: FlagValue;
+  shadow?: FlagValue;
   owner?: FlagValue;
   history?: FlagValue;
   sourceBranch?: FlagValue;
@@ -80,6 +74,8 @@ interface ParsedFlags {
   folder?: FlagValue;
   from?: FlagValue;
   to?: FlagValue;
+  params?: FlagValue;
+  current?: FlagValue;
   // 可带可不带值（无值时为 true）
   summary?: FlagValue;
   tag?: FlagValue;
@@ -104,6 +100,7 @@ interface ParsedFlags {
   node?: boolean;
   atAddress?: boolean;
   includeHidden?: boolean;
+  fresh?: boolean;
 }
 
 interface ParsedArgs {
@@ -158,6 +155,7 @@ interface ShellNode {
   tags?: { trustLevel?: string | null } & Record<string, unknown>;
   trustLevel?: string | null;
   trust_level?: string | null;
+  contentHash?: string;
   score?: number | string;
   rowHits?: number;
   row_hits?: number;
@@ -280,6 +278,7 @@ interface ShellArticleResult {
 
 interface ShellBranchTarget {
   branchId?: FlagValue | null;
+  shadowDocId?: FlagValue | null;
   baseDocId?: FlagValue | null;
   owner?: FlagValue | null;
 }
@@ -292,11 +291,9 @@ interface ShellContext {
   currentDocId?: string | number | null;
   docId?: string | number | null;
   shellState?: ShellState;
-  // 嵌入式 helper 函数：headless-agent-host / agent-runtime 注入；存在性由动词在调用前检查（contextFunction）。
+  // agent 能力注入（headless-agent-host / agent-runtime）：ask_agent/shell/web 动词消费，不属数据面；
+  // 存在性由动词在调用前检查（contextFunction）。数据面动词一律走 database.run → db 契约 → L4。
   askAgent?: (payload: Record<string, unknown>) => Promise<any>;
-  importLibraryDocument?: (payload: Record<string, unknown>) => Promise<any>;
-  ensureDocVectors?: (payload: Record<string, unknown>) => Promise<any>;
-  deleteImportedDocument?: (payload: Record<string, unknown>) => Promise<any>;
   agentTool?: (payload: Record<string, unknown>) => Promise<any>;
   [key: string]: unknown;
 }
@@ -414,7 +411,7 @@ function parseFlags(argv: string[] = []): ParsedArgs {
       index += 1;
       continue;
     }
-    if (['branch', 'base', 'owner', 'history', 'source-branch', 'target-branch', 'target-base', 'entry-id', 'entry-index', 'mode', 'doc-id', 'session-id', 'set', 'insert', 'cwd', 'at', 'state', 'agent', 'workspace', 'kind', 'trust', 'since', 'until', 'match-mode', 'exclude-folder', 'sections', 'range', 'start', 'before', 'spans-limit', 'node-id', 'min-score', 'detail'].includes(name)) {
+    if (['branch', 'base', 'shadow', 'owner', 'history', 'source-branch', 'target-branch', 'target-base', 'entry-id', 'entry-index', 'mode', 'doc-id', 'session-id', 'set', 'insert', 'cwd', 'at', 'state', 'agent', 'workspace', 'kind', 'trust', 'since', 'until', 'match-mode', 'exclude-folder', 'sections', 'range', 'start', 'before', 'spans-limit', 'node-id', 'min-score', 'detail', 'params', 'current', 'strategy', 'resolutions'].includes(name)) {
       const value = argv[index + 1];
       if (!value || value.startsWith('--')) throw new Error(`db --${name} requires a value`);
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = parseValue(value);
@@ -435,7 +432,7 @@ function parseFlags(argv: string[] = []): ParsedArgs {
       index += 1;
       continue;
     }
-    if (['entity', 'expand', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'embed', 'force', 'labels', 'spans', 'json', 'node', 'at-address', 'include-hidden'].includes(name)) {
+    if (['entity', 'expand', 'all-docs', 'all', 'or', 'semantic', 'yes', 'delete', 'uuid', 'dry-run', 'embed', 'force', 'labels', 'spans', 'json', 'node', 'at-address', 'include-hidden', 'fresh'].includes(name)) {
       flags[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
@@ -561,6 +558,12 @@ function formatNodeLine(item: ShellHitRow = {}, options: FormatNodeLineOptions =
   // 召回结果必须附带时间元数据（projectneed 15-12-6）：命中行尾缀更新时间。
   const updated = node.updatedAt || node.updated_at || null;
   if (updated) parts.push(`upd:${String(updated).replace(' ', 'T')}`);
+  // --uuid：文档标签换 doc:UUID 的同时，行尾附节点稳定 id——find 命中可直接喂给
+  // edit/read/inspect/log 的 nodeId，免去 tree --uuid / inspect 的二跳换算。
+  if (options.uuid) {
+    const nid = node.node_id ?? node.nodeId ?? node.id;
+    if (nid) parts.push(`#${nid}`);
+  }
   return parts.filter(Boolean).join(' ');
 }
 
@@ -725,52 +728,8 @@ function historyRefSpec(flags: ParsedFlags = {}, positional: string[] = []): She
   return { kind: 'committed_at_or_summary', value: ref, docId };
 }
 
-async function resolveHistoryRef(database: ShellDatabase, spec: ShellHistorySpec): Promise<ShellHistoryRow> {
-  const value = String(spec.value ?? '').trim();
-  if (!value) throw new Error('history ref requires history id, saved_at, or tag');
-
-  const clauses: string[] = [];
-  const params: Record<string, string | number> = {};
-  if (spec.kind === 'id') {
-    clauses.push('id = @value');
-    params.value = value;
-  } else if (spec.kind === 'committed_at') {
-    clauses.push('committed_at = @value');
-    params.value = value;
-  } else if (spec.kind === 'summary') {
-    clauses.push('summary = @value');
-    params.value = value;
-  } else if (spec.kind === 'committed_at_or_summary') {
-    clauses.push('(committed_at = @value OR summary = @value)');
-    params.value = value;
-  } else {
-    throw new Error(`db restore unsupported ref kind: ${spec.kind || '(empty)'}`);
-  }
-  if (spec.docId) {
-    clauses.push('doc_id = @docId');
-    params.docId = spec.docId;
-  }
-  // 快照不再随行返回（diff/snapshot 列已退役）；需要正文走 history.snapshot 动作按 id 重建（loadHistorySnapshot）。
-  const sql = `
-    SELECT id, doc_id, committed_at, summary
-    FROM commits
-    WHERE ${clauses.join(' AND ')}
-    ORDER BY committed_at DESC, id DESC
-  `;
-  const result = await database.run({
-    operation: 'read',
-    payload: { action: 'debug.sql', sql, params, limit: 2 }
-  }, 'read');
-  const rows = Array.isArray(result?.rows) ? result.rows : [];
-  if (rows.length === 0) {
-    const scope = spec.docId ? ` in doc ${spec.docId}` : '';
-    throw new Error(`db restore history ref not found${scope}: ${value}`);
-  }
-  if (rows.length > 1) {
-    throw new Error(`db restore history ref is ambiguous: ${value}; pass doc_id or history id`);
-  }
-  return rows[0];
-}
+// 历史 ref 的解析（id/committed_at/summary/模糊）已下沉 L4（handlers/read/history.resolveHistoryCommitRow）；
+// shell 只把 CLI 语法解析成 ref/refKind 参数转发（historyRefSpec），不再自查 commits 表。
 
 // article 原文窗口文本化：窗口头一行 + 原文（含 [原文开始]/[原文结束] 边界标记）+ 可选 source spans 紧凑行。
 // db article（CLI/测试）与 MCP article 工具共用这一个格式化器——一套实现。传 --json 给原始结构。
@@ -795,53 +754,8 @@ function formatArticleWindow(res: ShellArticleResult = {}) {
   return lines.join('\n');
 }
 
-function historyRefFromReadAt(ref: unknown, docId: string | null): ShellHistorySpec {
-  const value = String(ref || '').trim();
-  if (isStableId(value)) return { kind: 'id', value, docId };
-  return { kind: 'committed_at_or_summary', value, docId };
-}
-
-async function resolveCurrentNodeId(database: ShellDatabase, docId: string, address: string): Promise<string | null> {
-  const res = await database.run({
-    operation: 'read',
-    payload: {
-      action: 'debug.sql',
-      sql: 'SELECT id FROM nodes WHERE doc_id = @docId AND address = @address',
-      params: { docId, address: String(address) },
-      limit: 1
-    }
-  }, 'read');
-  const rows = Array.isArray(res?.rows) ? res.rows : [];
-  return rows.length ? String(rows[0].id) : null;
-}
-
-// 历史快照里定位目标节点。默认按稳定身份穿透：当前 address → node_id → 快照里按 id 找，
-// 节点历史上换过地址也认得（git log --follow 的「认人不认位置」），节点不在该版本则明确报错、
-// 绝不静默命中同址的别的节点。--at-address 退回 git <commit>:<path> 语义按历史地址定位，
-// 供查已删节点或纯「那个版本那个位置」的查询。
-async function resolveHistoryTarget(
-  database: ShellDatabase,
-  docId: string,
-  address: string,
-  rows: SnapshotRow[],
-  history: ShellHistoryRow,
-  flags: ParsedFlags = {}
-): Promise<SnapshotRow> {
-  if (flags.atAddress) {
-    const target = rows.find((row) => String(row.address || '') === String(address || '')) || null;
-    if (!target) throw new Error(`db --at-address target not found: doc ${docId} ${address} @${history.id}`);
-    return target;
-  }
-  const currentId = await resolveCurrentNodeId(database, docId, address);
-  if (!currentId) {
-    throw new Error(`db --at: 当前文档无地址 ${address}；查已删节点或某版本某位置请加 --at-address`);
-  }
-  const target = rows.find((row) => snapshotNodeId(row) === currentId) || null;
-  if (!target) {
-    throw new Error(`db --at: 节点 ${currentId}（当前 ${address}）在版本 ${history.id} 尚未存在`);
-  }
-  return target;
-}
+// 快照内目标定位（稳定身份穿透 / --at-address 历史地址）已下沉 L4：
+// history.snapshot/read 的 address + atAddress 参数（handlers/read/history.resolveSnapshotTarget）。
 
 function formatAxiomLine(row: ShellAxiomRow = {}) {
   const label = cleanLine(row.label || row.address || row.id || '');
@@ -908,6 +822,7 @@ function branchTarget(
   const baseDocId = normalizeShellDocId(fallbackBaseDocId, null);
   return {
     branchId: flags.branch ?? selected.branchId ?? null,
+    shadowDocId: flags.shadow ?? null,
     baseDocId: flags.base ?? baseDocId ?? selected.baseDocId ?? null,
     owner: flags.owner ? String(flags.owner) : (selected.owner || null)
   };
@@ -916,6 +831,7 @@ function branchTarget(
 function branchTargetLabel(target: ShellBranchTarget = {}) {
   return [
     target.branchId ? `branch:${target.branchId}` : '',
+    target.shadowDocId ? `shadow:${target.shadowDocId}` : '',
     target.baseDocId ? `doc:${target.baseDocId}` : '',
     target.owner ? `owner:${target.owner}` : ''
   ].filter(Boolean).join(' ');
@@ -925,6 +841,7 @@ function branchTargetLabel(target: ShellBranchTarget = {}) {
 // 共用，省得逐处抄这三行；缺一报错信息各动词不同，仍留在各处。
 function applyBranchTarget(payload: Record<string, unknown>, target: ShellBranchTarget = {}) {
   if (target.branchId) payload.branchId = target.branchId;
+  if (target.shadowDocId) payload.shadowDocId = target.shadowDocId;
   if (target.baseDocId) payload.baseDocId = target.baseDocId;
   if (target.owner) payload.owner = String(target.owner);
   return payload;
@@ -977,14 +894,15 @@ function editBranchWriteTarget(
   flags: ParsedFlags = {},
   context: ShellContext = {},
   docId: string | null = null
-): { owner: string; baseDocId: FlagValue | null } {
+): { owner: string; baseDocId: FlagValue | null; branchId: FlagValue | null } {
   const target = branchTarget(flags, context);
   if (target.baseDocId && docId && String(target.baseDocId) !== String(docId)) {
     throw new Error('db edit target doc_id must match selected --base doc_id');
   }
   return {
     owner: String(target.owner || 'llm'),
-    baseDocId: target.baseDocId || docId
+    baseDocId: target.baseDocId || docId,
+    branchId: target.branchId ?? null
   };
 }
 
@@ -1007,29 +925,31 @@ async function runFriendlyEdit(
     const value = field === 'node_type' ? normalizeNodeType(rawValue) : rawValue;
     const node = await readEditTargetNode(database, docId, address);
     const target = editBranchWriteTarget(flags, context, docId);
-    const payload = {
+    const payload: Record<string, unknown> = {
       action: 'node.update',
       nodeId: node.id,
       patch: { [field]: value },
       editBranchOwner: target.owner,
       editBranchBaseDocId: target.baseDocId
     };
+    if (target.branchId) payload.editBranchId = target.branchId;
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: 'db_edit', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_edit', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result) };
   }
 
   if (flags.delete) {
     const { docId, address } = requireEditNodeArgs(positional, '--delete');
     const node = await readEditTargetNode(database, docId, address);
     const target = editBranchWriteTarget(flags, context, docId);
-    const payload = {
+    const payload: Record<string, unknown> = {
       action: 'node.delete',
       nodeId: node.id,
       editBranchOwner: target.owner,
       editBranchBaseDocId: target.baseDocId
     };
+    if (target.branchId) payload.editBranchId = target.branchId;
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: 'db_edit', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_edit', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result) };
   }
 
   if (flags.insert) {
@@ -1049,8 +969,9 @@ async function runFriendlyEdit(
       editBranchBaseDocId: target.baseDocId
     };
     if (mode === 'sibling') payload.afterNodeId = node.id;
+    if (target.branchId) payload.editBranchId = target.branchId;
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: 'db_edit', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_edit', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result) };
   }
 
   return null;
@@ -1148,51 +1069,23 @@ interface FlatSubtreeText {
   used: number;
 }
 
-// 子树扁平正文：按 core 的 DFS 先序（tree-cursor.nextInDfs）拼接子树各节点正文、按【字符数】截断，
-// 而非 content.getSubtree 的分层早停。后者对大章节（一层就上万字）只能整层取舍，撞门禁时只剩标题层
-// （整回 28k 字 → 仅 42 字标题）；这里改成「按 DFS 阅读序累加正文、到 budget 字即停」，大章也能拿到
-// 前 budget 字的真实正文。整棵子树一次取回（节点带 address+text），childCountOf 由地址集现算，DFS 在内存里推。
+// 子树扁平正文（DFS 先序 + 字符预算）已下沉 L4（subtree.getFlatText，§6-2）；这里只转发。
 async function collectFlatSubtreeText(
   database: ShellDatabase,
   docId: string,
   rootAddress: string,
   budget: number
 ): Promise<FlatSubtreeText> {
-  const root = formatAddress(parseAddress(rootAddress));
   const res = await database.run({
     operation: 'read',
-    payload: {
-      action: 'debug.sql',
-      sql: 'SELECT address, text FROM nodes WHERE doc_id = @docId AND (address = @root OR address GLOB @glob)',
-      params: { docId, root, glob: `${root}-*` },
-      limit: 1000000
-    }
+    payload: { action: 'subtree.getFlatText', docId, address: rootAddress, charLimit: budget }
   }, 'read');
-  const rows = Array.isArray(res?.rows) ? res.rows : [];
-  const byAddress = new Map<string, string>();
-  const childCount = new Map<string, number>();
-  for (const row of rows) {
-    const addr = String(row.address || '');
-    if (!addr) continue;
-    byAddress.set(addr, String(row.text || ''));
-    const parent = parentAddress(addr);
-    if (parent) childCount.set(parent, (childCount.get(parent) || 0) + 1);
-  }
-  const childCountOf = (addr: string) => childCount.get(addr) || 0;
-  const parts: string[] = [];
-  let used = 0;
-  let totalChars = 0;
-  let truncated = false;
-  // DFS 先序遍历子树（root 自身 + 后代），到 root 子树之外即停。
-  for (let cur: string | null = root; cur && (cur === root || isAncestor(root, cur)); cur = nextInDfs(cur, childCountOf)) {
-    const text = byAddress.get(cur) || '';
-    if (!text) continue;
-    totalChars += text.length;
-    if (used >= budget) { truncated = true; continue; }
-    const remain = budget - used;
-    if (text.length <= remain) { parts.push(text); used += text.length; } else { parts.push(text.slice(0, remain)); used = budget; truncated = true; }
-  }
-  return { text: parts.join('\n'), truncated, totalChars, used };
+  return {
+    text: typeof res?.text === 'string' ? res.text : '',
+    truncated: res?.truncated === true,
+    totalChars: Number(res?.totalChars) || 0,
+    used: Number(res?.used) || 0
+  };
 }
 
 // read scope=siblings：同父前/中/后三条的纯正文，带轻量导航标 〈role 地址〉、不带节点头。
@@ -1363,11 +1256,6 @@ interface InspectOptions {
   limit?: number | string | boolean;
 }
 
-// 历史快照走 core/snapshot-tree 的 SnapshotRow（字段都是 unknown，DAO 真行类型），不走 ShellNode（shell 显示形态）。
-interface ShellSnapshot {
-  doc?: ShellDoc;
-  nodes: SnapshotRow[];
-}
 
 // inspect（D1）：节点/文档档案——身份段(总在) + 选取的 meta/source/links/axioms/note 段，输出一种一致结构。
 // 吸收旧 read --meta/--blame/--links/--axioms；read 因此回归纯正文，身份/元信息一律来这里。
@@ -1380,7 +1268,7 @@ async function dbInspect(
   const sections = Array.isArray(options.sections) && options.sections.length ? options.sections : ['meta', 'note'];
   const nodeResult = await database.run({
     operation: 'read',
-    payload: { action: 'content.getNode', docId, address, detail: 'summary', include: ['source', 'timestamps', 'tags', 'note'] }
+    payload: { action: 'content.getNode', docId, address, detail: 'summary', include: ['source', 'timestamps', 'tags', 'note', 'hash'] }
   }, 'read');
   const node: ShellNode | null = nodeResult?.node || null;
   if (!node?.id) throw dbReadTargetNotFoundError(docId, address);
@@ -1394,11 +1282,8 @@ async function dbInspect(
     return docCache;
   };
   if (sections.includes('meta')) {
-    const metaRow = (await database.run({
-      operation: 'read',
-      payload: { action: 'debug.sql', sql: 'SELECT sort_order, content_hash, text, node_title, node_note, node_type, trust_level FROM nodes WHERE doc_id = ? AND id = ?', params: [docId, node.id], limit: 1 }
-    }, 'read'))?.rows?.[0] || {};
-    lines.push(`[meta] updated:${valueOrNull(node.updatedAt)} created:${valueOrNull(node.createdAt)} sort:${valueOrNull(metaRow.sort_order)} chars:${valueOrNull(node.meta?.textChars)} hash:${metaRow.content_hash || (metaRow.text === undefined ? 'null' : contentHash(metaRow))}`);
+    // sort/hash 随 content.getNode 的 include=hash 口径返回（原 debug.sql 自查已下沉，§6-2）。
+    lines.push(`[meta] updated:${valueOrNull(node.updatedAt)} created:${valueOrNull(node.createdAt)} sort:${valueOrNull(node.sortOrder)} chars:${valueOrNull(node.meta?.textChars)} hash:${node.contentHash || 'null'}`);
   }
   if (sections.includes('note')) {
     const note = node.note ?? node.node_note ?? '';
@@ -1427,69 +1312,37 @@ async function dbInspect(
   return lines.join('\n');
 }
 
-// 历史快照按 commit id 走后端 history.snapshot 动作重建（对象库展开 + 内联 meta）；
-// 不再客户端解析 diff/snapshot 列（已退役）。
-async function loadHistorySnapshot(database: ShellDatabase, history: ShellHistoryRow = {}): Promise<ShellSnapshot> {
-  const res = await database.run({
-    operation: 'read',
-    payload: { action: 'history.snapshot', commitId: history.id }
-  }, 'read');
-  const snapshot: ShellSnapshot | undefined = res?.snapshot;
-  if (!Array.isArray(snapshot?.nodes)) throw new Error(`history snapshot is not readable: ${history.id ?? ''}`);
-  return snapshot;
-}
-
-function snapshotBodyText(
-  root: SnapshotRow,
-  byParent: Map<string, SnapshotRow[]>,
-  options: LimitReadTextOptions = {}
-): string {
-  const text = snapshotSubtreeRows(root, byParent)
-    .filter((row) => (byParent.get(snapshotNodeId(row)) || []).length === 0)
-    .map((row) => String(row.text || ''))
-    .filter((text) => text.trim())
-    .join('\n');
-  return limitReadText(text, {
-    ...options,
-    docId: options.docId || String(root.doc_id || root.docId || ''),
-    address: options.address || String(root.address || '')
-  });
-}
-
-// tree --at（D3）：从 commit 快照重建结构树，复用在线 tree 的 formatIndexNode 渲染。
+// tree --at（D3）：快照树的解析/定位/修剪已下沉 L4（history.snapshot 的 ref/address/depth 参数），
+// 这里只转发 + formatIndexNode 渲染（复用在线 tree 的渲染器）。
 async function treeHistorySnapshot(
   database: ShellDatabase,
   docId: string,
   address: string,
   flags: ParsedFlags = {}
 ): Promise<string> {
-  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId));
-  const snapshot = await loadHistorySnapshot(database, history);
-  if (String(snapshot.doc?.id ?? docId) !== String(docId)) {
-    throw new Error(`db tree --at history ${history.id} belongs to another doc`);
-  }
-  const rows = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
-  const byParent = snapshotChildrenByParent(rows);
-  let rootRows;
+  const payload: Record<string, unknown> = {
+    action: 'history.snapshot',
+    docId,
+    ref: String(flags.at ?? '').trim(),
+    depth: Number(flags.depth) > 0 ? Number(flags.depth) : 2
+  };
   if (address) {
-    const target = await resolveHistoryTarget(database, docId, address, rows, history, flags);
-    rootRows = [target];
-  } else {
-    rootRows = byParent.get('') || [];
+    payload.address = address;
+    if (flags.atAddress) payload.atAddress = true;
   }
-  const maxLevels = Number(flags.depth) > 0 ? Number(flags.depth) : 2;
-  const subtreeRows = rootRows.flatMap((row) => snapshotSubtreeRows(row, byParent));
-  const rootDepth = address ? snapshotAddressDepth(address) : 1;
-  const docDepth = subtreeRows.reduce((max, row) => Math.max(max, snapshotAddressDepth(row.address)), rootDepth) - rootDepth + 1;
-  const roots = rootRows.map((row) => pruneTreeDepth(snapshotReadNode(row, byParent), maxLevels));
+  const result = await database.run({ operation: 'read', payload }, 'read');
+  const roots: SnapshotReadNodeResult[] = Array.isArray(result?.roots) ? result.roots : [];
   const lines = roots.flatMap((root) => formatIndexNode(root, 0, { uuid: Boolean(flags.uuid) }));
-  if (docDepth > maxLevels) {
-    lines.push(`— 已展开 ${maxLevels} / 共 ${docDepth} 层（历史快照 @${flags.at}）；加大 depth 或指定 address 下钻`);
+  const docDepth = Number(result?.docDepth) || 0;
+  const prunedDepth = Number(result?.prunedDepth) || 0;
+  if (docDepth > prunedDepth) {
+    lines.push(`— 已展开 ${prunedDepth} / 共 ${docDepth} 层（历史快照 @${flags.at}）；加大 depth 或指定 address 下钻`);
   }
   return lines.join('\n');
 }
 
-// find --at（D3）：在 commit 快照的节点正文上做字面 node-AND 检索；语义/跨文档不支持（向量只建在 HEAD）。
+// find --at（D3）：快照内字面 node-AND 检索已下沉 L4（history.find），这里只转发 + 命中渲染；
+// 语义/跨文档不支持（向量只建在 HEAD）。
 async function findHistorySnapshot(
   database: ShellDatabase,
   terms: string[],
@@ -1500,44 +1353,35 @@ async function findHistorySnapshot(
   if (!scope.docId || scope.allDocs) {
     throw new Error('find --at 需限定单篇（给 docId 或 --scope）；历史快照不支持跨文档检索');
   }
-  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, scope.docId));
-  const snapshot = await loadHistorySnapshot(database, history);
-  const rows = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
-  const scopeAddress = flags.scopeAddress ? String(flags.scopeAddress) : '';
-  const matched = rows.filter((row) => {
-    if (scopeAddress && !(String(row.address || '') === scopeAddress || String(row.address || '').startsWith(`${scopeAddress}-`))) return false;
-    const text = String(row.text || '');
-    return terms.every((term) => text.includes(term));
-  });
+  const payload: Record<string, unknown> = {
+    action: 'history.find',
+    docId: scope.docId,
+    ref: String(flags.at ?? '').trim(),
+    terms
+  };
+  if (flags.scopeAddress) payload.scopeAddress = String(flags.scopeAddress);
+  if (Number(flags.limit) > 0) payload.limit = Number(flags.limit);
+  const result = await database.run({ operation: 'read', payload }, 'read');
+  const hitRows: ShellHitRow[] = Array.isArray(result?.rows) ? result.rows : [];
   const docLabel = await readDocDisplayLabel(database, scope.docId, { uuid: flags.uuid });
-  // SnapshotRow 字段都是 unknown，构造 ShellHitRow 时按需 String() / 兜底成具体类型。
-  const hitRows: ShellHitRow[] = matched.map((row): ShellHitRow => ({
-    node: {
-      id: row.id as string | number | undefined,
-      address: String(row.address || ''),
-      node_type: String(row.node_type ?? row.nodeType ?? 'TEXT'),
-      node_title: String(row.node_title ?? row.nodeTitle ?? ''),
-      text: String(row.text || ''),
-      updatedAt: (row.updated_at ?? row.updatedAt ?? null) as string | null
-    },
-    doc: { docId: scope.docId, title: snapshot.doc?.title }
-  }));
-  const limited = Number(flags.limit) > 0 ? hitRows.slice(0, Number(flags.limit)) : hitRows;
-  const body = formatGroupedHits(limited, {
+  const body = formatGroupedHits(hitRows, {
     uuid: flags.uuid,
     scoreKind: 'hit',
     fallbackDocId: scope.docId,
     fallbackTitle: flags.uuid ? '' : docLabel
   });
-  const more = limited.length < hitRows.length ? `，共 ${hitRows.length}（已截 ${limited.length}）` : '';
-  const stats = limited.length === 0
+  const total = Number(result?.total) || 0;
+  const returned = Number(result?.returned) || hitRows.length;
+  const more = returned < total ? `，共 ${total}（已截 ${returned}）` : '';
+  const stats = returned === 0
     ? `— 0 命中（历史快照 @${flags.at}，字面 node-AND）；可拆词重试`
-    : `— 历史命中 ${limited.length} 节点${more}（历史快照 @${flags.at}，字面 node-AND；语义/跨文档不支持）`;
+    : `— 历史命中 ${returned} 节点${more}（历史快照 @${flags.at}，字面 node-AND；语义/跨文档不支持）`;
   return [body, stats].filter(Boolean).join('\n\n').replace(/^\n+/, '') || stats;
 }
 
-// read --at（历史快照）：与在线 read 一致，只回正文、按 range 取范围（不带节点头）。
-// 历史元信息/出处/引用是另一回事（snapshot 也不存 source spans），不在 read 里兼。
+// read --at（历史快照）：正文读取已下沉 L4（history.read 的 range 参数），这里只转发 +
+// siblings 三段拼排 + subtree 的 L5 文本预算截断。历史元信息/出处/引用是另一回事
+//（snapshot 也不存 source spans），不在 read 里兼。
 async function readHistorySnapshot(
   database: ShellDatabase,
   docId: string,
@@ -1545,36 +1389,35 @@ async function readHistorySnapshot(
   flags: ParsedFlags = {}
 ): Promise<string> {
   const range = ['node', 'subtree', 'siblings'].includes(String(flags.range)) ? String(flags.range) : 'subtree';
-  const history = await resolveHistoryRef(database, historyRefFromReadAt(flags.at, docId));
-  const snapshot = await loadHistorySnapshot(database, history);
-  if (String(snapshot.doc?.id ?? docId) !== String(docId)) {
-    throw new Error(`db read --at history ${history.id} belongs to another doc`);
-  }
-  const rows = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
-  const target = await resolveHistoryTarget(database, docId, address, rows, history, flags);
-  const byParent = snapshotChildrenByParent(rows);
+  const payload: Record<string, unknown> = {
+    action: 'history.read',
+    docId,
+    ref: String(flags.at ?? '').trim(),
+    address,
+    range
+  };
+  if (flags.atAddress) payload.atAddress = true;
+  const result = await database.run({ operation: 'read', payload }, 'read');
   if (range === 'siblings') {
-    const siblings = byParent.get(snapshotParentId(target)) || [];
-    const index = siblings.findIndex((row) => snapshotNodeId(row) === snapshotNodeId(target));
     return ([
-      index > 0 ? ['previous', siblings[index - 1]] : ['previous', null],
-      ['target', target],
-      index >= 0 && index < siblings.length - 1 ? ['next', siblings[index + 1]] : ['next', null]
-    ] as Array<[string, SnapshotRow | null]>).map(([label, row]) => (row
+      ['previous', result?.previous ?? null],
+      ['target', result?.target ?? null],
+      ['next', result?.next ?? null]
+    ] as Array<[string, { address?: unknown; text?: unknown } | null]>).map(([label, row]) => (row
       ? [`〈${label} ${row.address || ''}〉`.trimEnd(), String(row.text || '')].filter(Boolean).join('\n')
       : `〈${label} 无〉`)).join('\n');
   }
   if (range === 'node') {
-    return String(target.text || '');
+    return String(result?.text ?? '');
   }
-  return snapshotBodyText(target, byParent, { docId, address, limit: Number(flags.limit) || READ_SUBTREE_TEXT_LIMIT });
+  return limitReadText(String(result?.text ?? ''), { docId, address, limit: Number(flags.limit) || READ_SUBTREE_TEXT_LIMIT });
 }
 
 export function dbShellHelp() {
   return [
     'Usage:',
     '  db find <term>... [--semantic] [--entity [--expand]] [--scope <doc_id> <address>] [--all-docs] [--at <ref>] [--limit N] [--uuid]',
-    '  db index [--folder <library_relative_path>] [--summary] [--uuid]',
+    '  db index [--folder <library_relative_path>] [--summary] [--include-hidden] [--uuid]',
     '  db tree <doc_id> [address] [--from <address>] [--depth N] [--at <ref>] [--uuid]',
     '  db read <doc_id> <address> [--range node|subtree|siblings] [--at <ref>] [--limit N] [--uuid]  (只回正文；元信息/出处/引用/事实用 inspect、原文窗口用 article)',
     '  db inspect <doc_id> <address> [--sections meta,source,links,axioms,note] [--limit N] [--uuid]  (节点/文档档案：身份+元信息/出处/引用/事实)',
@@ -1584,7 +1427,7 @@ export function dbShellHelp() {
     '  db diff --branch <id> | --base <doc_id>  (草稿↔正文；无参时用 switch 选中草稿；原 db changes --detail 已并入)',
     '  db diff [doc_id] --from <ref> --to <ref>  (refA↔refB；ref ∈ head · <commitId> · draft[:branchId])',
     '    diff 通用：[--detail summary|full]（默认 full 逐行，summary 出节点+计数）[--json]（结构化输出）',
-    '  db sql <SELECT_or_WITH_sql> [--limit N]',
+    '  db sql <SELECT_or_WITH_sql> [--params <json>] [--limit N] [--json]',
     '  db ask_agent <prompt> [--doc-id <doc_id>] [--session-id <id>]',
     '  db edit <database_write_action> [json_payload] [--owner <owner>] [--base <doc_id>]',
     '  db edit <doc_id> <address> --set <field> <value> [--owner <owner>] [--base <doc_id>]',
@@ -1595,6 +1438,9 @@ export function dbShellHelp() {
     '  db set-mode <doc_id> <readonly|incremental|full>  (4-16-8 编辑模式)',
     '  db bulk begin|end  (海量流式导入加速会话：begin 设异步写+延迟索引，end 恢复+重建索引)',
     '  db restore <history_id|saved_at|tag> [doc_id]',
+    '  db revert <commit_id> [doc_id] [--owner <owner>]  (反向提交：撤销该 commit、保留其后历史；撞冲突 blocked 交人裁)',
+    '  db gc  (对象库垃圾回收 mark-sweep：回收不被任何 commit 引用的历史对象)',
+    '  db certify <doc_id> <address> [--node-id <uuid>] [--node] [--trust 受控|不受控]  (human 背书：标受控唯一入口；--node 只本节点，默认整子树)',
     '  db import <library_relative_path> [--mode simple|complete|direct|smart|vector] [--embed]',
     '  db import-json <json_file> <source_file> [--dry-run] [--embed]  (智能导入 4-3-3：校验节点树 JSON 并入库；JSON 与 db push 同契约)',
     '  db vectors <doc_id>',
@@ -1603,7 +1449,7 @@ export function dbShellHelp() {
     '  db memory list [--state active|sealed|distillable|distilled] [--agent <name>] [--session-id <id>] [--limit N]',
     '  db memory deliver <json_payload|json_file>  (事件卷投递 18-8-4；payload: {agent,sessionId,hostAnchor?,title?,startedAt?,endedAt?,nodes:[...]}，节点一律 trust_level=不受控)',
     '  db memory distill <doc_id> [--force]  (提炼状态标记 15-11-5；封卷已自动化、列卷顺手封；force=用户明确指示跳过冷却期)',
-    '  db draft new <doc_id> [--owner <owner>]  (起草)',
+    '  db draft new <doc_id> [--owner <owner>] [--fresh]  (起草；默认复用同身份最新草稿，--fresh 另起新稿)',
     '  db draft list [doc_id] [--owner <owner>]  (列草稿及署名；原 db branch list / db changes 已并入)',
     '  db discard --branch <id> | --base <doc_id> [--owner <owner>] [--yes]  (弃稿；原 db branch drop 已并入)',
     '  db undo --branch <id> | --base <doc_id> [--owner <owner>]',
@@ -1673,21 +1519,16 @@ export async function runDbShellArgv(
       const query = positional.join(' ').trim();
       if (!query) throw new Error('db find --semantic requires natural language text');
       const scope = docScope(flags, context);
+      // 语义相似度下限：默认 0.51（过滤 sim < 0.51 的弱相关）；--min-score 覆盖（高级搜索可调）。
+      // 过滤与 scopeAddress 范围收窄都已下沉 L4（content.search/searchAll 的 minScore/scopeAddress 参数）。
+      const minSim = flags.minScore != null ? Number(flags.minScore) : 0.51;
       const payload = scope.allDocs
-        ? { action: 'content.searchAll', query, searchMode: 'vector', allDocs: true, limit: flags.limit, includeHidden: flags.includeHidden }
-        : { action: 'content.search', query, searchMode: 'vector', docId: scope.docId, limit: flags.limit };
+        ? { action: 'content.searchAll', query, searchMode: 'vector', allDocs: true, limit: flags.limit, includeHidden: flags.includeHidden, minScore: minSim }
+        : { action: 'content.search', query, searchMode: 'vector', docId: scope.docId, limit: flags.limit, minScore: minSim, scopeAddress: flags.scopeAddress || undefined };
       const result = await database.run({ operation: 'read', payload }, 'read');
       if (result.error) throw new Error(result.error);
-      let rows: ShellHitRow[] = result.rows || [];
-      if (!scope.allDocs && flags.scopeAddress) {
-        rows = rows.filter((node) => node.address === flags.scopeAddress || String(node.address || '').startsWith(`${flags.scopeAddress}-`));
-      }
-      // 语义相似度下限：默认 0.51（过滤 sim < 0.51 的弱相关）；--min-score 覆盖（高级搜索可调）。
-      // score 取法与 formatNodeLine 对齐：命中行可能包成 {node,doc}（score 在 node.score）或顶层 score。
-      const minSim = flags.minScore != null ? Number(flags.minScore) : 0.51;
-      const beforeMinSim = rows.length;
-      rows = rows.filter((row) => Number((row.node || row).score ?? row.score ?? 0) >= minSim);
-      const weakFilteredOut = beforeMinSim - rows.length;
+      const rows: ShellHitRow[] = result.rows || [];
+      const weakFilteredOut = Number(result.weakFilteredOut) || 0;
       const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId!, { uuid: flags.uuid });
       const body = formatGroupedHits(rows, {
         uuid: flags.uuid,
@@ -1740,36 +1581,15 @@ export async function runDbShellArgv(
           text: formatEntityTags(result.rows || [], { uuid: flags.uuid })
         };
       }
-      // --entity --expand: 用同义组扩展 terms 后做字面检索，返回节点。
-      // 每个输入词独立扩展同义组（OR），多词之间保持 AND 框架。
-      const related = await database.run({
-        operation: 'read',
-        payload: { action: 'entity.listRelated', terms: positional, ...scope, limit: 1000 }
-      }, 'read');
-      const synonymsByTerm = new Map();
-      for (const row of (related.rows || [])) {
-        if (row.relation !== 'synonym') continue;
-        const seedLiteral = String(row.seed?.literal || '').trim().toLocaleLowerCase();
-        if (!seedLiteral) continue;
-        const group = synonymsByTerm.get(seedLiteral) || new Set();
-        group.add(String(row.entity?.literal || '').trim());
-        synonymsByTerm.set(seedLiteral, group);
-      }
-      const expandedTermGroups = positional.map((term) => {
-        const key = String(term).trim().toLocaleLowerCase();
-        const synonyms = synonymsByTerm.get(key);
-        return synonyms ? [term, ...synonyms] : [term];
-      });
-      // matchMode=or + 按组 AND 过滤：先 OR 召回全部命中，再按 AND 框架过滤节点。
-      const allTerms = [...new Set(expandedTermGroups.flat())];
-      const searchResult = await database.run({
+      // --entity --expand: 同义扩展 + OR 召回 + AND 框架过滤的编排已下沉 L4
+      //（content.searchEntityExpand），这里只转发 + 渲染扩展提示行与命中。
+      const result = await database.run({
         operation: 'read',
         payload: {
-          action: 'content.searchKeyword',
-          terms: allTerms,
-          matchMode: 'or',
+          action: 'content.searchEntityExpand',
+          terms: positional,
           ...scope,
-          limit: flags.limit ? Number(flags.limit) * 5 : 500,
+          limit: flags.limit,
           workspace: flags.workspace,
           agent: flags.agent,
           kind: flags.kind,
@@ -1782,45 +1602,13 @@ export async function runDbShellArgv(
           includeHidden: flags.includeHidden
         }
       }, 'read');
-      // 按 AND 框架过滤：节点必须每个原始词组至少命中一个词。
-      const nodeTermHits = new Map();
-      for (const group of (searchResult.groups || [])) {
-        const hitTerm = String(group.term || '').trim().toLocaleLowerCase();
-        for (const row of (group.rows || [])) {
-          const nodeId = String((row.node || row).node_id || (row.node || row).id || '');
-          if (!nodeId) continue;
-          let termSet = nodeTermHits.get(nodeId);
-          if (!termSet) { termSet = new Set(); nodeTermHits.set(nodeId, termSet); }
-          termSet.add(hitTerm);
-        }
-      }
-      const matchingNodeIds = new Set();
-      for (const [nodeId, hitTerms] of nodeTermHits) {
-        const allGroupsCovered = expandedTermGroups.every((group) =>
-          group.some((term) => hitTerms.has(term.toLocaleLowerCase()))
-        );
-        if (allGroupsCovered) matchingNodeIds.add(nodeId);
-      }
-      let filteredRows: ShellHitRow[] = (searchResult.rows || []).filter((row: ShellHitRow) => {
-        const nodeId = String((row.node || row).node_id || (row.node || row).id || '');
-        return matchingNodeIds.has(nodeId);
-      });
-      // 去重（OR 召回可能有重复节点）
-      const seenNodes = new Set<string>();
-      filteredRows = filteredRows.filter((row) => {
-        const nodeId = String((row.node || row).node_id || (row.node || row).id || '');
-        if (seenNodes.has(nodeId)) return false;
-        seenNodes.add(nodeId);
-        return true;
-      });
-      const limit = flags.limit ? Number(flags.limit) : 100;
-      filteredRows = filteredRows.slice(0, limit);
+      const filteredRows: ShellHitRow[] = Array.isArray(result?.rows) ? result.rows : [];
+      const expansions: Array<{ term?: unknown; expanded?: unknown[] }> = Array.isArray(result?.expansions) ? result.expansions : [];
       const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId!, { uuid: flags.uuid });
-      const expandNote = synonymsByTerm.size > 0
-        ? `同义扩展: ${positional.map((t) => {
-            const syns = synonymsByTerm.get(t.toLocaleLowerCase());
-            return syns ? `${t} → [${[t, ...syns].join(', ')}]` : t;
-          }).join('；')}`
+      const expandNote = expansions.some((entry) => (entry.expanded || []).length > 1)
+        ? `同义扩展: ${expansions.map((entry) => ((entry.expanded || []).length > 1
+            ? `${entry.term} → [${(entry.expanded || []).join(', ')}]`
+            : String(entry.term ?? ''))).join('；')}`
         : '';
       const body = formatGroupedHits(filteredRows, {
         uuid: flags.uuid,
@@ -1846,6 +1634,8 @@ export async function runDbShellArgv(
         matchMode: flags.matchMode || 'doc',
         ...scope,
         limit: flags.limit,
+        // 字面命中次数下限（高级搜索）：过滤已下沉 L4（分页前过滤，returned/total 即真实统计）。
+        minScore: flags.minScore != null ? Number(flags.minScore) : undefined,
         workspace: flags.workspace,
         agent: flags.agent,
         kind: flags.kind,
@@ -1859,17 +1649,6 @@ export async function runDbShellArgv(
       }
     }, 'read');
     const docLabel = scope.allDocs ? '' : await readDocDisplayLabel(database, scope.docId!, { uuid: flags.uuid });
-    // 字面命中次数下限（高级搜索）：传 --min-score 时按 hit 过滤；默认不限。
-    // score 取法与 formatNodeLine 对齐：命中行包成 {node,doc} 时 score 在 node.score。
-    if (flags.minScore != null) {
-      const minHit = Number(flags.minScore);
-      result.rows = (result.rows || []).filter((row: ShellHitRow) => Number((row.node || row).score ?? row.score ?? 0) >= minHit);
-      // 客户端按命中次数过滤后同步统计来源：findStatsLine 优先读 result.returned/total，
-      // 不同步会让统计行报过滤前的数量（body 2 条却显示"命中 10"）。过滤后这批即全部，
-      // returned/total 同设为过滤后长度，避免误用"已截"（那是 limit 截断的语义）。
-      result.returned = result.rows.length;
-      result.total = result.rows.length;
-    }
     const body = formatGroupedHits(result.rows || [], {
       uuid: flags.uuid,
       scoreKind: 'hit',
@@ -1898,6 +1677,7 @@ export async function runDbShellArgv(
     const payload: Record<string, unknown> = { action: 'library.index', format: 'ascii_tree' };
     if (flags.folder) payload.path = flags.folder;
     if (flags.summary) payload.includeSummary = true;
+    if (flags.includeHidden) payload.includeHidden = true;
     if (flags.uuid) payload.uuid = true;
     const result = await database.run({ operation: 'read', payload }, 'read');
     return {
@@ -2041,7 +1821,9 @@ export async function runDbShellArgv(
     const { flags, positional } = parseFlags(args.slice(1));
     const detail = flags.detail === 'summary' ? 'summary' : 'full';
     // formatDiffText 收 DiffTextResult；IPC 返回是 unknown，cast 在边界。
-    const renderDiff = (result: any) => (flags.json ? JSON.stringify(result, null, 2) : formatDiffText(result, { detail }));
+    // --json 经 slimDiffView 收口（left/right 只留对账+内容字段、丢 branch 快照大字符串）——LLM 通道口径；
+    // 前端要完整结构走 IPC 另路，不经此处。
+    const renderDiff = (result: any) => (flags.json ? JSON.stringify(slimDiffView(result), null, 2) : formatDiffText(result, { detail }));
     // refA↔refB（15-5-2）：给了 --from/--to 即走通用 diff.refs（ref ∈ head 正文 / <commitId> 历史 / draft[:branchId] 草稿）。
     if (flags.from !== undefined || flags.to !== undefined) {
       const docId: string | null = positional[0] ? await resolveDocRef(database, positional[0]) : null;
@@ -2064,12 +1846,14 @@ export async function runDbShellArgv(
       const result = await database.run({ operation: 'read', payload }, 'read');
       return { kind: 'db_diff', text: renderDiff(result) };
     }
-    // 草稿↔正文：显式 --branch/--base，或无 doc 位置参时回退 switch 选中草稿（原 db changes --detail / db branch diff 已并入）。
+    // 草稿↔正文：显式 --branch/--base/--shadow，或无 doc 位置参时回退 switch 选中草稿（原 db changes --detail / db branch diff 已并入）。
     const selected = selectedBranch(context);
-    if (flags.branch || flags.base || (!positional[0] && (selected.branchId || selected.baseDocId))) {
+    if (flags.branch || flags.base || flags.shadow || (!positional[0] && (selected.branchId || selected.baseDocId))) {
       const target = branchTarget(flags, context);
-      if (!target.branchId && !target.baseDocId) throw new Error('db diff 需要 doc_id + history（两版历史），或 --branch/--base（草稿↔正文），或 --from/--to（任意 ref），或先 switch 到一个草稿');
+      if (!target.branchId && !target.baseDocId && !target.shadowDocId) throw new Error('db diff 需要 doc_id + history（两版历史），或 --branch/--base（草稿↔正文），或 --from/--to（任意 ref），或先 switch 到一个草稿');
       const payload: Record<string, unknown> = { action: 'editBranch.diffView', changedOnly: true };
+      // --entity：把草稿的实体改动按动作流也列进 diff（一次实体绑定常涉上千节点，默认不列避免刷屏）。
+      if (flags.entity) payload.includeEntities = true;
       applyBranchTarget(payload, target);
       const result = await database.run({ operation: 'read', payload }, 'read');
       return { kind: 'db_diff', text: renderDiff(result) };
@@ -2091,9 +1875,13 @@ export async function runDbShellArgv(
     const sql = positional.join(' ').trim();
     if (!sql) throw new Error('db sql requires a SELECT/WITH query');
     const payload: Record<string, unknown> = { action: 'debug.sql', sql };
+    if (flags.params !== undefined) {
+      try { payload.params = JSON.parse(String(flags.params)); }
+      catch { throw new Error('db sql --params 需要合法 JSON（数组对应 ? 参数，对象对应 @name 参数）'); }
+    }
     if (flags.limit) payload.limit = flags.limit;
     const result = await database.run({ operation: 'read', payload }, 'read');
-    return { kind: 'db_sql', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_sql', text: flags.json ? JSON.stringify(result, null, 2) : formatSqlResult(result) };
   }
 
   if (command === 'ask_agent') {
@@ -2125,17 +1913,18 @@ export async function runDbShellArgv(
       action,
       editBranchOwner: target.owner || 'llm'
     };
+    if (target.branchId) writePayload.editBranchId = target.branchId;
     if (target.baseDocId) writePayload.editBranchBaseDocId = target.baseDocId;
     const result = await database.run({ operation: 'write', payload: writePayload }, 'write');
-    return { kind: 'db_edit', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_edit', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result) };
   }
 
   if (command === 'push') {
     // 流式写入（projectneed 4-16）：独立于 edit branch，不加 editBranchOwner。
-    const { positional } = parseFlags(args.slice(1));
+    const { flags, positional } = parseFlags(args.slice(1));
     const payload = parseJsonObjectArgument(positional.join(' '), {});
     const result = await database.run({ operation: 'write', payload: { ...payload, action: 'stream.push' } }, 'write');
-    return { kind: 'db_push', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_push', text: flags.json ? JSON.stringify(result, null, 2) : formatPushResult(result) };
   }
 
   if (command === 'import-json') {
@@ -2155,20 +1944,21 @@ export async function runDbShellArgv(
   }
 
   if (command === 'set-mode') {
-    const { positional } = parseFlags(args.slice(1));
+    const { flags, positional } = parseFlags(args.slice(1));
     const docId = normalizeShellDocId(positional[0], null);
     const mode = String(positional[1] || '').trim();
     if (!docId || !mode) throw new Error('db set-mode requires <doc_id> <readonly|incremental|full>');
     const result = await database.run({ operation: 'write', payload: { action: 'doc.setEditMode', docId, mode, includeDoc: false } }, 'write');
-    return { kind: 'db_set_mode', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_set_mode', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'set_mode' }) };
   }
 
   if (command === 'bulk') {
-    const sub = String(args[1] || '').trim();
+    const { flags, positional } = parseFlags(args.slice(1));
+    const sub = String(positional[0] || '').trim();
     if (sub !== 'begin' && sub !== 'end') throw new Error('db bulk begin|end');
     const action = sub === 'begin' ? 'stream.bulkBegin' : 'stream.bulkEnd';
     const result = await database.run({ operation: 'write', payload: { action } }, 'write');
-    return { kind: 'db_bulk', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_bulk', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'bulk' }) };
   }
 
   if (command === 'export') {
@@ -2179,44 +1969,80 @@ export async function runDbShellArgv(
 
   if (command === 'restore') {
     const { flags, positional } = parseFlags(args.slice(1));
-    const history = await resolveHistoryRef(database, historyRefSpec(flags, positional));
-    const payload = { action: 'history.restore', commitId: history.id, docId: history.doc_id };
+    // CLI 语法 → ref/refKind 参数；模糊解析（唯一命中/歧义报错）在 L4 的 history.restore 里做。
+    const spec = historyRefSpec(flags, positional);
+    const payload: Record<string, unknown> = { action: 'history.restore', ref: spec.value ?? '' };
+    if (spec.kind) payload.refKind = spec.kind;
+    if (spec.docId) payload.docId = spec.docId;
     const result = await database.run({ operation: 'write', payload }, 'write');
     return { kind: 'db_restore', text: formatWriteResult(result, { label: 'restore' }) };
+  }
+
+  if (command === 'revert') {
+    // 反向提交：撤销某次已落改动、生成反向变更、保留其后历史（区别于 restore 的 reset 式回滚）。
+    // 三方调和与冲突 blocked 语义在 L4 history.revert；owner 是反向提交的作者身份（CLI 默认 human，MCP 转发显式传）。
+    const { flags, positional } = parseFlags(args.slice(1));
+    const commitId = String(positional[0] || '').trim();
+    if (!commitId) throw new Error('db revert requires <commit_id>');
+    const payload: Record<string, unknown> = { action: 'history.revert', commitId, owner: flags.owner ? String(flags.owner) : 'human' };
+    if (positional[1]) payload.docId = await resolveDocRef(database, positional[1]);
+    const result = await database.run({ operation: 'write', payload }, 'write');
+    return { kind: 'db_revert', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'revert' }) };
+  }
+
+  if (command === 'gc') {
+    // 对象库垃圾回收（mark-sweep，lazy/手动）：回收不被任何 commit 引用的历史对象。
+    const { flags } = parseFlags(args.slice(1));
+    const result = await database.run({ operation: 'write', payload: { action: 'objects.gc' } }, 'write');
+    return { kind: 'db_gc', text: flags.json ? JSON.stringify(result, null, 2) : formatGcResult(result) };
+  }
+
+  if (command === 'certify') {
+    // 节点级背书（18-3）：标受控的唯一合法入口，owner 恒 human、作为一次 human 提交进历史。
+    // --node 只标本节点（默认整子树）；--trust 不受控 用于撤销背书。
+    const { flags, positional } = parseFlags(args.slice(1));
+    if (!positional[0]) throw new Error('db certify requires <doc_id>');
+    const docId = await resolveDocRef(database, positional[0]);
+    const address = String(positional[1] || '').trim();
+    if (!address && flags.nodeId === undefined) throw new Error('db certify requires <address> 或 --node-id <uuid>');
+    const payload: Record<string, unknown> = { action: 'history.certify', docId, owner: 'human' };
+    if (flags.nodeId !== undefined) payload.nodeId = flags.nodeId;
+    else payload.address = address;
+    if (flags.node) payload.scope = 'node';
+    if (flags.trust) payload.trust = String(flags.trust);
+    const result = await database.run({ operation: 'write', payload }, 'write');
+    return { kind: 'db_certify', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'certify' }) };
   }
 
   if (command === 'import') {
     const { flags, positional } = parseFlags(args.slice(1));
     const relativePath = String(positional[0] || '').trim();
     if (!relativePath) throw new Error('db import requires library_relative_path');
-    const payload: Record<string, unknown> = { relativePath };
+    const payload: Record<string, unknown> = { action: 'import.libraryDocument', relativePath };
     if (flags.mode) payload.mode = String(flags.mode);
     if (flags.embed) payload.embed = true;
-    const result = await contextFunction(context, 'importLibraryDocument')(payload);
-    return { kind: 'db_import', text: JSON.stringify(result, null, 2) };
+    const result = await database.run({ operation: 'write', payload }, 'write');
+    return { kind: 'db_import', text: flags.json ? JSON.stringify(result, null, 2) : formatImportResult(result, { relativePath, embed: flags.embed === true }) };
   }
 
   if (command === 'vectors') {
-    const { positional } = parseFlags(args.slice(1));
+    const { flags, positional } = parseFlags(args.slice(1));
     const docId = normalizeShellDocId(positional[0], null);
     if (!docId) throw new Error('db vectors requires doc_id');
-    const result = await contextFunction(context, 'ensureDocVectors')({ docId });
-    return { kind: 'db_vectors', text: JSON.stringify(result, null, 2) };
+    const result = await database.run({ operation: 'write', payload: { action: 'vector.ensureDoc', docId } }, 'write');
+    return { kind: 'db_vectors', text: flags.json ? JSON.stringify(result, null, 2) : formatVectorsResult(result, { docId }) };
   }
 
   if (command === 'delete') {
-    const { positional } = parseFlags(args.slice(1));
+    const { flags, positional } = parseFlags(args.slice(1));
     const docId = normalizeShellDocId(positional[0], null);
     if (!docId) throw new Error('db delete requires doc_id');
-    if (typeof context.deleteImportedDocument === 'function') {
-      const result = await context.deleteImportedDocument({ docId });
-      return { kind: 'db_delete', text: JSON.stringify(result, null, 2) };
-    }
+    // import.deleteDocument 在 L4 内自回退：无宿主注入（独立 database-service）时走纯库 doc.delete。
     const result = await database.run({
       operation: 'write',
-      payload: { action: 'doc.delete', docId }
+      payload: { action: 'import.deleteDocument', docId }
     }, 'write');
-    return { kind: 'db_delete', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_delete', text: flags.json ? JSON.stringify(result, null, 2) : formatDeleteResult(result, { docId }) };
   }
 
   if (command === 'relink') {
@@ -2246,17 +2072,17 @@ export async function runDbShellArgv(
           limit: flags.limit
         }
       }, 'read');
-      return { kind: 'db_memory_list', text: JSON.stringify(result, null, 2) };
+      return { kind: 'db_memory_list', text: flags.json ? JSON.stringify(result, null, 2) : formatVolumeList(result) };
     }
     if (sub === 'deliver') {
-      const { positional } = parseFlags(args.slice(2));
+      const { flags, positional } = parseFlags(args.slice(2));
       const raw = positional.join(' ').trim();
       if (!raw) throw new Error('db memory deliver requires <json_payload|json_file>');
       const payload = raw.startsWith('{')
         ? parseJsonObjectArgument(raw, {})
         : parseJsonObjectArgument(readFileSync(raw, 'utf8'), {});
       const result = await database.run({ operation: 'write', payload: { ...payload, action: 'memory.deliverVolume' } }, 'write');
-      return { kind: 'db_memory_deliver', text: JSON.stringify(result, null, 2) };
+      return { kind: 'db_memory_deliver', text: flags.json ? JSON.stringify(result, null, 2) : formatDeliverResult(result) };
     }
     if (sub === 'distill') {
       const { flags, positional } = parseFlags(args.slice(2));
@@ -2266,7 +2092,7 @@ export async function runDbShellArgv(
         operation: 'write',
         payload: { action: 'memory.markDistilled', docId, force: flags.force === true }
       }, 'write');
-      return { kind: 'db_memory_distilled', text: JSON.stringify(result, null, 2) };
+      return { kind: 'db_memory_distilled', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'memory_distill' }) };
     }
     throw new Error('db memory list|deliver|distill（封卷已自动化、列卷顺手封，无 seal-due 命令）');
   }
@@ -2282,15 +2108,19 @@ export async function runDbShellArgv(
       const branches = (result.branches || []).filter((branch: { base_doc_id?: unknown }) => (
         docId ? String(branch.base_doc_id) === String(docId) : true
       ));
-      return { kind: 'db_draft_list', text: branches.map(formatBranchLine).join('\n') || '(无草稿)' };
+      // current 标注：MCP 转发时把自己进程内选中的 branchId 经 --current 显式传入（不消费 backend
+      // shellState，共享后端多客户端互不干扰）；CLI 直用会话内 switch 选择。
+      const current = flags.current ?? selectedBranch(context).branchId ?? null;
+      return { kind: 'db_draft_list', text: branches.map((b: unknown) => formatBranchLine(b as Parameters<typeof formatBranchLine>[0], { current })).join('\n') || '(无草稿)' };
     }
     if (subcommand === 'new') {
       const docId = normalizeShellDocId(positional[1], null);
       if (!docId) throw new Error('db draft new requires doc_id');
       const payload: Record<string, unknown> = { action: 'editBranch.begin', docId, includeDoc: false };
       if (flags.owner) payload.owner = String(flags.owner);
+      if (flags.fresh) payload.fresh = true;
       const result = await database.run({ operation: 'write', payload }, 'write');
-      return { kind: 'db_draft_new', text: JSON.stringify(result, null, 2) };
+      return { kind: 'db_draft_new', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'draft' }) };
     }
     throw new Error(`Unknown db draft command: ${subcommand}（对比走 db diff、弃稿走 db discard、落正文走 db commit/merge）`);
   }
@@ -2298,17 +2128,18 @@ export async function runDbShellArgv(
   if (command === 'discard') {
     const { flags } = parseFlags(args.slice(1));
     const target = branchTarget(flags, context);
-    if (!target.branchId && !target.baseDocId) throw new Error('db discard requires --branch or --base');
+    if (!target.branchId && !target.baseDocId && !target.shadowDocId) throw new Error('db discard requires --branch or --base');
     if (!flags.yes) {
       return {
         kind: 'db_discard',
-        text: `would discard ${branchTargetLabel(target)}; rerun with --yes to apply`
+        // 确认提示保持通道中性：MCP 传 yes=true、CLI 加 --yes，都落到同一个 yes 语义。
+        text: `discard 预览：将丢弃草稿 ${branchTargetLabel(target)}（正文不变）；确认后带 yes 重发执行`
       };
     }
     const payload: Record<string, unknown> = { action: 'editBranch.discard', includeDoc: false };
     applyBranchTarget(payload, target);
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: 'db_discard', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_discard', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'discard' }) };
   }
 
   if (command === 'undo' || command === 'redo') {
@@ -2319,34 +2150,63 @@ export async function runDbShellArgv(
       includeDoc: false
     };
     applyBranchTarget(payload, target);
-    if (!payload.branchId && !payload.baseDocId) throw new Error(`db ${command} requires --branch or --base`);
+    if (!payload.branchId && !payload.baseDocId && !payload.shadowDocId) throw new Error(`db ${command} requires --branch or --base`);
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: command === 'undo' ? 'db_undo' : 'db_redo', text: JSON.stringify(result, null, 2) };
+    return { kind: command === 'undo' ? 'db_undo' : 'db_redo', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: command }) };
   }
 
   if (command === 'switch') {
     const { flags } = parseFlags(args.slice(1));
+    // 选择的分支状态行渲染（diffView，与后续 edit/commit 同一套定位）：有参切换与无参查看共用。
+    // 解析不到返回 null 由调用侧回退：switch 只设选择、草稿可以后建（先 switch 再 draft new）。
+    const renderSelection = async (target: { branchId?: unknown; baseDocId?: unknown; owner?: unknown }): Promise<string | null> => {
+      try {
+        const payload: Record<string, unknown> = { action: 'editBranch.diffView', changedOnly: true };
+        if (target.branchId) payload.branchId = target.branchId;
+        if (target.baseDocId) payload.baseDocId = target.baseDocId;
+        if (target.owner) payload.owner = String(target.owner);
+        const view = await database.run({ operation: 'read', payload }, 'read');
+        const branchRow = view.branch || null;
+        if (!branchRow) return null;
+        const mergeBase = (view.mergeBase || {}) as Record<string, unknown>;
+        const lines = [formatBranchLine(branchRow, { current: branchRow.id })];
+        if (mergeBase.isFastForward === false) {
+          lines.push(`base 落后于正文 HEAD（base:${mergeBase.baseCommitId} → head:${mergeBase.currentHeadCommitId}）：commit/merge 走三方调和；rebase 会把原字段冲突改成按草稿侧覆盖，先 diff 复核`);
+        }
+        return lines.join('\n');
+      } catch { return null; /* 该定位下当前无活跃草稿 */ }
+    };
     if (!flags.branch && !flags.base) {
       const current = selectedBranch(context);
-      return { kind: 'db_switch', text: current.branchId || current.baseDocId ? JSON.stringify(current, null, 2) : '(未选择草稿)' };
+      if (!current.branchId && !current.baseDocId) return { kind: 'db_switch', text: '(未选择草稿)' };
+      // 无参查看：同样给分支状态行；选择指向的草稿已不在（如已 commit/discard）时回退 JSON 回显。
+      const rendered = await renderSelection(current);
+      return { kind: 'db_switch', text: rendered ?? JSON.stringify(current, null, 2) };
     }
     const next = updateSelectedBranch(context, {
       branchId: flags.branch ?? null,
       baseDocId: flags.base ?? null,
       owner: flags.owner ? String(flags.owner) : null
     });
+    // 回执尽力带上实际解析到的分支状态行——多草稿并存时「切到了谁」必须可见。解析不到不报错，
+    // 保持原 JSON 回显（测试与调用方依赖该形状）。
+    const rendered = await renderSelection({ branchId: flags.branch, baseDocId: flags.base, owner: flags.owner });
+    if (rendered) return { kind: 'db_switch', text: rendered };
     return { kind: 'db_switch', text: JSON.stringify(next, null, 2) };
   }
 
   if (command === 'commit' || command === 'merge') {
     const { flags } = parseFlags(args.slice(1));
     const target = branchTarget(flags, context);
-    if (command === 'merge' && !target.branchId && !target.baseDocId) throw new Error('db merge requires --branch or --base');
+    if (command === 'merge' && !target.branchId && !target.baseDocId && !target.shadowDocId) throw new Error('db merge requires --branch or --base');
     if (command === 'merge' && !flags.yes) {
-      return {
-        kind: 'db_merge',
-        text: `would merge ${branchTargetLabel(target)}; rerun with --yes to apply`
-      };
+      // 三方预览（A5-10）：fastForward/hasConflicts/逐节点 resolution 分类；带 yes 才执行落库。
+      // --json 出结构化 summary（省略 unchanged 节点）；文本走 merge-text 渲染。
+      const payload: Record<string, unknown> = { action: 'editBranch.threeWayMerge' };
+      if (flags.json) payload.detail = 'summary';
+      applyBranchTarget(payload, target);
+      const result = await database.run({ operation: 'read', payload }, 'read');
+      return { kind: 'db_merge', text: flags.json ? JSON.stringify(result, null, 2) : formatThreeWayMergeText(result) };
     }
     // commit 不带裁决走 editBranch.save（冲突→待裁清单、不落）；merge 走 applyMerge，可带 strategy/resolutions 折叠字段冲突。
     const payload: Record<string, unknown> = command === 'merge'
@@ -2362,9 +2222,9 @@ export async function runDbShellArgv(
         catch { throw new Error('db merge --resolutions 需要合法 JSON 数组，如 [{"id":"<nodeId>","field":"text","pick":"theirs"}]'); }
       }
     }
-    if (!payload.branchId && !payload.baseDocId) throw new Error(`db ${command} requires --branch or --base`);
+    if (!payload.branchId && !payload.baseDocId && !payload.shadowDocId) throw new Error(`db ${command} requires --branch or --base`);
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: command === 'commit' ? 'db_commit' : 'db_merge', text: JSON.stringify(result, null, 2) };
+    return { kind: command === 'commit' ? 'db_commit' : 'db_merge', text: flags.json ? JSON.stringify(slimWriteResult(result), null, 2) : formatWriteResult(result, { label: command }) };
   }
 
   if (command === 'rebase') {
@@ -2374,7 +2234,7 @@ export async function runDbShellArgv(
     applyBranchTarget(payload, target);
     if (!payload.branchId && !payload.baseDocId) throw new Error('db rebase requires --branch or --base');
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: 'db_rebase', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_rebase', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'rebase' }) };
   }
 
   if (command === 'cherry-pick') {
@@ -2390,7 +2250,7 @@ export async function runDbShellArgv(
     if (flags.entryIndex !== undefined) payload.entryIndex = flags.entryIndex;
     if (!payload.sourceHistoryId && !payload.sourceBranchId) throw new Error('db cherry-pick requires --history or --source-branch');
     const result = await database.run({ operation: 'write', payload }, 'write');
-    return { kind: 'db_cherry_pick', text: JSON.stringify(result, null, 2) };
+    return { kind: 'db_cherry_pick', text: flags.json ? JSON.stringify(result, null, 2) : formatWriteResult(result, { label: 'cherry-pick' }) };
   }
 
   if (command === 'shell') {

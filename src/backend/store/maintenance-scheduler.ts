@@ -6,13 +6,23 @@
 // 撞 LanceDB manifest / SQLite 写锁。serialize 缺省直接执行（私有/测试场景），host 接线时注入真队列。
 type MaintenanceHandler = (ctx: { reason: string; cleared: number }) => Promise<unknown> | unknown;
 type Serializer = (fn: () => Promise<void>) => Promise<void>;
+type MaintenanceLogger = (entry: Record<string, unknown>) => void;
+
+// 默认落点是 stderr：共享后端进程的 stderr 重定向到 backend-shared.log（spawnSharedBackend logPath），
+// 后台 tick 的维护结果/失败由此可查；私有后端/GUI 进程则进各自控制台，无害。
+function defaultMaintenanceLog(entry: Record<string, unknown>) {
+  try {
+    console.error(`[maintenance] ${JSON.stringify(entry)}`);
+  } catch {}
+}
 
 export function createMaintenanceScheduler({
   intervalMs = 300000,       // tick 周期，默认 5min
   dirtyThreshold = 200,      // 累计派生写次数阈值
   idleMs = 60000,            // 距上次写的空闲窗口，默认 60s
   now = () => Date.now(),
-  serialize = ((fn: () => Promise<void>) => Promise.resolve().then(fn)) as Serializer
+  serialize = ((fn: () => Promise<void>) => Promise.resolve().then(fn)) as Serializer,
+  log = defaultMaintenanceLog as MaintenanceLogger
 } = {}) {
   const handlers = new Map<string, MaintenanceHandler>();
   let dirty = 0;
@@ -41,6 +51,7 @@ export function createMaintenanceScheduler({
     running = true;
     const cleared = dirty;
     dirty = 0;
+    const startedAt = now();
     const results: Record<string, unknown> = {};
     try {
       await serializer(async () => {
@@ -52,6 +63,10 @@ export function createMaintenanceScheduler({
     } finally {
       running = false;
     }
+    // 结果落日志（默认 stderr → 共享后端即 backend-shared.log）：后台 tick 的维护结果/失败不再只活在返回值里。
+    try {
+      log?.({ at: new Date().toISOString(), reason, cleared, durationMs: now() - startedAt, results });
+    } catch {}
     return { ok: true, reason, cleared, results };
   }
 

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 
-import { IftreeStore } from '../dist/src/backend/store/index.js';
+import { createConfiguredIftreeStore } from '../dist/src/backend/store-domain-adapter.js';
 import { runDatabaseWrite } from '../dist/src/backend/mutation-api.js';
 
 // 投影 vs 重放一致性：编辑期 projectEditBranchDoc 给用户看的结果，必须与
@@ -15,7 +15,7 @@ import { runDatabaseWrite } from '../dist/src/backend/mutation-api.js';
 
 async function withStore(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-proj-replay-'));
-  const store = new IftreeStore(join(dir, 'store.sqlite'));
+  const store = createConfiguredIftreeStore(join(dir, 'store.sqlite'));
   try {
     store.init();
     await fn(store);

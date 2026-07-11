@@ -1,7 +1,22 @@
 import { callIftree, hasIftreeMethod } from './iftree-api.js';
 import { readDatabase } from './database-client.js';
+import type { ContentSearchResult } from '../../backend/query-api.js';
 
 type OperationPayload = Record<string, unknown>;
+
+export interface VectorContentSearchPayload {
+  docId: string;
+  query: string;
+  limit?: number;
+}
+
+export interface VectorContentSearchItem {
+  node_id: string;
+  doc_id: string;
+  text: string;
+  score: number;
+  address: string | null;
+}
 
 export const importService = {
   canImportLibraryDocument() {
@@ -31,14 +46,17 @@ export const vectorService = {
     return callIftree('downloadVectorModel');
   },
 
-  async searchContentByVector(payload: OperationPayload) {
-    const result = await readDatabase({ action: 'content.search', searchMode: 'vector', ...(payload || {}) });
-    const rows = ((result as { rows?: Array<Record<string, unknown>> } | null | undefined)?.rows || []);
-    return rows.map((row) => ({
+  async searchContentByVector(payload: VectorContentSearchPayload): Promise<VectorContentSearchItem[]> {
+    const result: ContentSearchResult = await readDatabase({
+      action: 'content.search',
+      searchMode: 'vector',
+      ...payload
+    });
+    return result.rows.map((row) => ({
       node_id: row.id,
       doc_id: row.docId,
-      text: row.text || row.textPreview || '',
-      score: row.score,
+      text: row.textPreview || row.text || '',
+      score: row.score ?? 0,
       address: row.address || null
     }));
   }

@@ -5,9 +5,9 @@ interface TreeViewStatePayload {
   state: unknown;
 }
 
-function normalizeTreeViewResult(result: unknown) {
+function normalizeTreeViewResult(result: Awaited<ReturnType<typeof writeDatabase>>) {
   if (!result) return result;
-  return (result as { doc?: unknown }).doc ? result : { doc: result };
+  return result.doc ? result : { doc: result };
 }
 
 export const treeViewRepository = {

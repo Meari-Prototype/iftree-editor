@@ -52,7 +52,7 @@ test('db import, index, and tree expose the imported fixture and reject bad args
 
     // —— import 后 SQL 校验：临时库只有这一篇文档，节点总数应=50 ——
     // db sql 经 argv 传裸 SQL，单引号字面量在 shell 层易被吞；用不依赖字面量的 COUNT(*)。
-    const sqlResult = parseJsonStdout(await runBashDb(dbPath, ['sql', 'SELECT COUNT(*) AS n FROM nodes']));
+    const sqlResult = parseJsonStdout(await runBashDb(dbPath, ['sql', 'SELECT COUNT(*) AS n FROM nodes', '--json']));
     assert.equal(Number(sqlResult.rows[0].n), 50, '导入后节点总数应为 50');
     // 根节点只有一个：用 tree --depth 1 看，而非 SQL 字面量比较。
     const rootTree = stdoutOf(await runBashDb(dbPath, ['tree', docId, '--depth', '1']));

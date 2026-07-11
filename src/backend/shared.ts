@@ -1,5 +1,20 @@
 type JsonObject = Record<string, unknown>;
 
+// 记忆卷元标记（docs.meta.memoryVolume）的纯解析；memory 域策略与装配层共用。
+// 与 parseJsonObject 不同：meta 可能已是解析过的对象，对象输入原样返回。
+export function memoryVolumeMetaOf(docMeta: unknown): Record<string, unknown> | null {
+  let meta: unknown = docMeta;
+  if (meta && typeof meta !== 'object') {
+    try {
+      meta = JSON.parse(meta as string);
+    } catch {
+      meta = null;
+    }
+  }
+  const volume = (meta as JsonObject | null)?.memoryVolume;
+  return volume && typeof volume === 'object' ? (volume as Record<string, unknown>) : null;
+}
+
 export function parseJsonObject(value: unknown, fallback: JsonObject = {}): JsonObject {
   try {
     const parsed = value ? JSON.parse(value as string) : fallback;
@@ -63,5 +78,20 @@ export function assertNoHumanTagField(source: unknown, context = 'node patch'): 
 export function assertNoEditTrustField(source: unknown, context = 'node patch'): void {
   if (hasOwnValue(source, 'trust_level', 'trustLevel', 'trust')) {
     throw new Error(`${context} no longer supports trust_level; use human certify to set trust_level`);
+  }
+}
+
+// 节点间引用的 refKind 卫生校验：按 15-5-2-1 它是必填的自由分类词（不设枚举、不提供默认值），
+// 但自由不等于不设防——挡长文本误传、控制字符、以及 axiom→node 的系统保留值。
+// 草稿 stage（edit-branch）与落库重放（store.addNodeRefToNode）共用，故下沉到这里。
+export function assertValidNodeRefKind(kind: string, context = 'ref.addNodeToNode'): void {
+  if (/[\r\n\t]/.test(kind)) {
+    throw new Error(`${context}: refKind 不能含换行/制表符——它是简短分类词（如 相关/参见/依赖），说明文字请放 note`);
+  }
+  if (kind.length > 32) {
+    throw new Error(`${context}: refKind 过长（${kind.length} > 32 字符）——它是简短分类词（如 相关/参见/依赖），说明文字请放 note`);
+  }
+  if (kind === '事实前提') {
+    throw new Error(`${context}: refKind「事实前提」是 axiom→node 引用的系统保留值；节点间引用请换其它分类词（挂公理用 ref.addAxiomToNode）`);
   }
 }

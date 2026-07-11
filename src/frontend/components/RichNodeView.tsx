@@ -6,6 +6,7 @@ import { flattenTree } from '../../core/tree.js';
 import { depthOf, docDisplayTitle } from '../lib/doc-utils.js';
 import { buildVirtualRange } from '../lib/ui-utils.js';
 import { useScrollViewport } from '../hooks/useScrollViewport.js';
+import type { LocateRequest } from '../hooks/useNodeSelection.js';
 import { RichMarkdown } from './RichMarkdown';
 
 // 富视图按节点树渲染（无版面格式 md / txt / docx）：每个节点一块,正文走统一富文本渲染,
@@ -22,8 +23,6 @@ type RichTreeNode = Record<string, unknown> & {
   node_title?: string;
   node_note?: string;
 };
-export type LocateRequest = { seq?: unknown; nodeId?: unknown } | null;
-
 interface AxiomView { id?: unknown; label?: unknown; content?: unknown; }
 type RichNodeDoc = { tree?: RichTreeNode | null; doc?: unknown; axioms?: AxiomView[] };
 
@@ -68,14 +67,14 @@ export function RichNodeView({
 }: {
   currentDoc?: RichNodeDoc | null;
   docId?: unknown;
-  selectedNodeId?: unknown;
-  setSelectedNodeId?: (nodeId: unknown) => void;
-  depthLimit?: unknown;
+  selectedNodeId?: string | null;
+  setSelectedNodeId?: (nodeId: string | null) => void;
+  depthLimit?: number;
   showTitles?: boolean;
   showNotes?: boolean;
   showAxioms?: boolean;
   onAddAxiom?: () => void;
-  locateRequest?: LocateRequest;
+  locateRequest?: LocateRequest | null;
 }) {
   const tree = currentDoc?.tree;
   const nodes = useMemo(() => (tree ? visibleNodesForDepth(tree, depthLimit) : []), [tree, depthLimit]);
@@ -174,7 +173,7 @@ function RichNodeBlock({ node, docId, selected, onSelect, showTitles, showNotes 
   node: RichTreeNode;
   docId?: unknown;
   selected?: boolean;
-  onSelect?: (nodeId: unknown) => void;
+  onSelect?: (nodeId: string | null) => void;
   showTitles?: boolean;
   showNotes?: boolean;
 }) {
@@ -183,7 +182,7 @@ function RichNodeBlock({ node, docId, selected, onSelect, showTitles, showNotes 
     <section
       data-node-id={node.id}
       className={`rich-node ${selected ? 'selected' : ''}`}
-      onClick={() => onSelect?.(node.id)}
+      onClick={() => onSelect?.(node.id == null ? null : String(node.id))}
     >
       <button type="button" className="rich-node-gutter" title={String(node.address || '')}>{String(node.address || '')}</button>
       <div className="rich-node-body">

@@ -83,7 +83,7 @@ export async function withTempDb(callback) {
 }
 
 export async function importFixture(dbPath) {
-  const imported = parseJsonStdout(await runBashDb(dbPath, ['import', fixturePath, '--mode', 'simple'], { timeout: 120000 }));
+  const imported = parseJsonStdout(await runBashDb(dbPath, ['import', fixturePath, '--mode', 'simple', '--json'], { timeout: 120000 }));
   assert.equal(imported.ok, true);
   assert.equal(imported.relativePath, fixturePath);
   assert.equal(imported.title, fixtureTitle);
@@ -97,7 +97,7 @@ export function isolatedHomeForDb(dbPath) {
 }
 
 export async function importFixtureWithOptions(dbPath, options = {}) {
-  const imported = parseJsonStdout(await runBashDb(dbPath, ['import', fixturePath, '--mode', 'simple'], { ...options, timeout: 120000 }));
+  const imported = parseJsonStdout(await runBashDb(dbPath, ['import', fixturePath, '--mode', 'simple', '--json'], { ...options, timeout: 120000 }));
   assert.equal(imported.ok, true);
   assert.equal(imported.relativePath, fixturePath);
   assert.equal(imported.title, fixtureTitle);
@@ -115,7 +115,7 @@ export async function withImportedFixture(callback, options = {}) {
 }
 
 export async function beginBranch(dbPath, docId, owner) {
-  const result = parseJsonStdout(await runBashDb(dbPath, ['draft', 'new', docId, '--owner', owner]));
+  const result = parseJsonStdout(await runBashDb(dbPath, ['draft', 'new', docId, '--owner', owner, '--json']));
   assert.equal(result.changed, true);
   result.branchId = result.branchId ?? result.branch?.id;
   assert.ok(result.branchId);
@@ -133,7 +133,8 @@ export async function editSetText(dbPath, docId, address, text, owner) {
     '--base',
     docId,
     '--owner',
-    owner
+    owner,
+    '--json'
   ]));
 }
 
@@ -148,7 +149,8 @@ export async function editInsert(dbPath, docId, address, mode, text, owner) {
     '--base',
     docId,
     '--owner',
-    owner
+    owner,
+    '--json'
   ]));
 }
 
@@ -161,7 +163,8 @@ export async function editDelete(dbPath, docId, address, owner) {
     '--base',
     docId,
     '--owner',
-    owner
+    owner,
+    '--json'
   ]));
 }
 
@@ -173,7 +176,8 @@ export async function commitBranch(dbPath, docId, owner, summary) {
     '--owner',
     owner,
     '--summary',
-    summary
+    summary,
+    '--json'
   ]));
   assert.equal(result.ok, true);
   assert.equal(result.history.summary, summary);

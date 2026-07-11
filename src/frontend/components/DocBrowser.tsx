@@ -19,7 +19,7 @@ import { createPortal } from 'react-dom';
 
 import type { DocListItem } from '../../backend/query-api.js';
 import type { DocFolderRow } from '../../backend/db/schema.js';
-import type { LibraryEntry } from '../../backend/library-fs.js';
+import type { LibraryEntry } from '../../backend/library/library-fs.js';
 import {
   buildDocBrowser,
   DEFAULT_DOC_FOLDER_NAME,

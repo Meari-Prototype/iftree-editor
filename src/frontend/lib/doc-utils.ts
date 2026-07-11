@@ -5,7 +5,7 @@ import { boundsFromNodes, fitCameraToBounds } from '../../core/viewport.js';
 import { NODE_TYPE_LABELS as CORE_NODE_TYPE_LABELS } from '../../core/node-model.js';
 import type { DocListItem as BackendDocListItem } from '../../backend/query-api.js';
 import type { DocFolderRow } from '../../backend/db/schema.js';
-import type { LibraryEntry } from '../../backend/library-fs.js';
+import type { LibraryEntry } from '../../backend/library/library-fs.js';
 
 export const TRUST_LEVELS = ['', '受控', '不受控'];
 export const DEFAULT_SIDEBAR_WIDTH = 280;

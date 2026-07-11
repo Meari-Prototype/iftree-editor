@@ -386,13 +386,14 @@ async function main() {
 
   // ── 路径 A：直写基线 + 源文档层（import-chm-doc.mjs 同款）──
   const { IftreeStore } = await import('../src/backend/store/index.js');
+  const { createDocFromStructuredRecords } = await import('../src/backend/import/store-write.js');
   const dbPathA = join(homeA, 'store.sqlite');
   const storeA = new IftreeStore(dbPathA);
   storeA.init();
   let baselineDocId;
   try {
     const tA = Date.now();
-    const docA = storeA.createDocFromStructuredRecords({ title, sourcePath: chmPath, records });
+    const docA = createDocFromStructuredRecords(storeA, { title, sourcePath: chmPath, records });
     baselineDocId = docA.id;
     const nodeIdsBySentenceIndexA = new Map();
     records.forEach((record, index) => {

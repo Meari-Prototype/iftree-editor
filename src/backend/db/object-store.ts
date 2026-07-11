@@ -272,6 +272,77 @@ export function writeTreeIncremental(
   return { root_node_id: String(root.id), root_tree_hash: writeNode(root), recomputed };
 }
 
+// ── nodeHistory 剪枝原语：在 tree 对象图中定位目标节点，不物化整树 ─────────
+//
+// 返回目标节点的三类指纹：treeHash（id+内容+全部后代，subtree 口径）、blobHash（纯内容，
+// node 口径）、位置（parentNodeId + childIndex）。位置单独给出是因为节点自身的挂载点
+// 不在它自己的子树 hash 里（id 存在父 tree 的 children 中）——相邻 commit 两类 hash 全同
+// 仍可能发生「目标被移动」（computeSnapshotDiff 的 __moved__），须并入判定。
+// childIndex 为父 children 数组次序（1 起），与 materializeTree 还原的 sort_order 同口径。
+export interface TreeNodeLocation {
+  treeHash: string;
+  blobHash: string;
+  parentNodeId: string | null;
+  childIndex: number;
+}
+
+// 跨 commit 复用的缓存（由调用方持有、单次查询生命周期）：
+// - containsMemo: `目标id\n树hash` → 该子树（根非目标时）内目标的 tree_hash（null=不含）。
+//   tree hash 含节点 id，同 hash ⇒ 同 id 同结构 ⇒ 结果确定；键并入目标 id，同一 caches
+//   可安全服务多个目标的查询（不并入会被上一个目标的「不含」判定污染）。
+// - treeCache: tree 对象反序列化缓存。
+// 相邻 commit 绝大部分子树 hash 相同：不含目标的分支查 memo O(1) 剪掉，每个 commit 只真正
+// 遍历「新出现的 tree 对象（≈改动路径）+ 目标祖先链」，K 个 commit 总代价 ~O(M + K×depth)。
+export interface TreeLocateCaches {
+  containsMemo: Map<string, string | null>;
+  treeCache: Map<string, ObjectTree | null>;
+}
+
+export function createTreeLocateCaches(): TreeLocateCaches {
+  return { containsMemo: new Map(), treeCache: new Map() };
+}
+
+export function locateNodeInTree(
+  db: DbLike,
+  rootTreeHash: unknown,
+  rootNodeId: unknown,
+  targetId: unknown,
+  caches: TreeLocateCaches
+): TreeNodeLocation | null {
+  if (!rootTreeHash) return null;
+  const target = String(targetId);
+  const { containsMemo, treeCache } = caches;
+  const treeStmt = db.prepare('SELECT data FROM objects WHERE hash = ? AND kind = ?');
+  const loadTree = (hash: string): ObjectTree | null => {
+    if (!treeCache.has(hash)) {
+      const row = treeStmt.get<Pick<ObjectRow, 'data'>>(hash, 'tree');
+      treeCache.set(hash, row ? JSON.parse(row.data) as ObjectTree : null);
+    }
+    return treeCache.get(hash) ?? null;
+  };
+  const memoKey = (treeHash: string) => `${target}\n${treeHash}`;
+  const locate = (treeHash: string, nodeId: string, parentNodeId: string | null, childIndex: number): TreeNodeLocation | null => {
+    if (nodeId === target) {
+      const tree = loadTree(treeHash);
+      if (!tree) return null; // 对象缺失：视为不可定位，调用方回退物化路径（那里会给出明确报错）
+      return { treeHash, blobHash: String(tree.blob_hash || ''), parentNodeId, childIndex };
+    }
+    if (containsMemo.get(memoKey(treeHash)) === null) return null; // 已知不含目标，整棵剪掉
+    const tree = loadTree(treeHash);
+    const kids = tree?.children || [];
+    for (let i = 0; i < kids.length; i += 1) {
+      const found = locate(kids[i]!.tree_hash, String(kids[i]!.id), nodeId, i + 1);
+      if (found) {
+        containsMemo.set(memoKey(treeHash), found.treeHash);
+        return found;
+      }
+    }
+    containsMemo.set(memoKey(treeHash), null);
+    return null;
+  };
+  return locate(String(rootTreeHash), String(rootNodeId ?? ''), null, 1);
+}
+
 // 从根 tree hash 展开对象库，还原 nodes 数组（带 id/parent/sort/address/depth + blob 内容）。
 // 前序递归：根 tree → 取 blob 内容 + children → 逐子 materialize。restore/读取的路径，有读放大（已接受）。
 // 根 id 由调用方从 commit 取（commit 存 root_node_id）。

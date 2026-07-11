@@ -1,4 +1,4 @@
-import { nextTmpId } from '../edit-branch-projection.js';
+import { nextTmpId } from '../projection/edit-branch-projection.js';
 import { compareStableIds } from '../db/ids.js';
 import type {
   EntityBindingStatus,

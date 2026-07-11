@@ -131,6 +131,7 @@ export async function handleDocMutation(store: IftreeStore, payload: WritePayloa
       branchId: result.branch.id,
       owner: result.branch.owner,
       baseCommitId: result.baseCommitId,
+      previousBaseCommitId: result.previousBaseCommitId,
       branch: plain(result.branch),
       undoDepth: result.undoDepth,
       redoDepth: result.redoDepth,

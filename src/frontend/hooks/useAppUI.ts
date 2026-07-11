@@ -15,19 +15,21 @@ interface ProgressState {
   [key: string]: unknown;
 }
 
+export type AppTab = 'tree' | 'ide' | 'rich' | 'entity' | 'search';
+
 interface AppUIValue {
   busy: boolean;
   notice: string;
   progress: ProgressState | null;
   operationLock: ProgressState | null;
   lockedProgress: ProgressState | null;
-  activeTab: string;
+  activeTab: AppTab;
   activeScreen: string;
   setBusy: Dispatch<SetStateAction<boolean>>;
   setNotice: Dispatch<SetStateAction<string>>;
   setProgress: Dispatch<SetStateAction<ProgressState | null>>;
   setOperationLock: Dispatch<SetStateAction<ProgressState | null>>;
-  setActiveTab: Dispatch<SetStateAction<string>>;
+  setActiveTab: Dispatch<SetStateAction<AppTab>>;
   setActiveScreen: Dispatch<SetStateAction<string>>;
   lock: (label: string | ProgressState, options?: ProgressState) => void;
   unlock: () => void;
@@ -44,7 +46,7 @@ export function useAppUIContext(): AppUIValue {
 export function useAppUI() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
-  const [activeTab, setActiveTab] = useState('tree');
+  const [activeTab, setActiveTab] = useState<AppTab>('tree');
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [operationLock, setOperationLock] = useState<ProgressState | null>(null);
   const [activeScreen, setActiveScreen] = useState('editor');

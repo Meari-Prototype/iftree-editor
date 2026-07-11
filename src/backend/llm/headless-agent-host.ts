@@ -1,25 +1,17 @@
 import {
   appendFileSync,
   existsSync,
-  lstatSync,
   mkdirSync,
-  readFileSync,
-  rmSync,
-  symlinkSync
+  readFileSync
 } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
 import { createDatabaseService } from '../database-service.js';
-import { createDerivedIndexReconciler } from '../derived-index-reconciler.js';
-import {
-  eventVolumeAnchorDir,
-  illegalEventVolumeMessage,
-  isLegalEventVolumeLayout,
-  PLACEHOLDER_TENANT,
-  PLACEHOLDER_WORKSPACE,
-  purgeOrphanedMemoryVolumes as purgeMemoryVolumes
-} from '../memory/index.js';
-import { createLibraryDocumentService } from '../import-service.js';
+import { createDerivedIndexReconciler } from '../derived-index/derived-index-reconciler.js';
+import { purgeOrphanedMemoryVolumes as purgeMemoryVolumes } from '../memory/index.js';
+import { anchorPathExists, createMemoryAnchorWriter, memoryAnchorTargetWorkspace } from '../memory/host-anchor.js';
+import { createLibraryDocumentService } from '../import/import-service.js';
+import { getProjectedDoc } from '../projection/doc-view.js';
 import { runDbShellArgv, resolveDocRef } from '../db-shell.js';
 import { normalizeStableId } from '../db/ids.js';
 import { AgentStore } from '../../agent/agent-store.js';
@@ -38,9 +30,9 @@ import {
 } from './settings.js';
 import {
   createLibraryFs,
-  createLlmWorkspace,
-  normalizeLibraryRelativePath
-} from '../library-fs.js';
+  createLlmWorkspace
+} from '../library/library-fs.js';
+import { normalizeRelativePath } from '../path-utils.js';
 
 const DEFAULT_TREE_SLICE_DEPTH = 1;
 
@@ -240,7 +232,7 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
     if (/^[a-zA-Z]:[\\/]/.test(raw) || raw.startsWith('/') || raw.startsWith('\\')) {
       throw new Error('Agent 本地文件路径必须是 library 工作区相对路径');
     }
-    return normalizeLibraryRelativePath(raw);
+    return normalizeRelativePath(raw);
   }
 
   const llmWorkspace = createLlmWorkspace({ workspaceRoot, workspaceBin, projectRoot, readProjectConfig });
@@ -328,64 +320,22 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
     return derivedIndexes.readContext();
   }
 
-  function memoryAnchorTargetWorkspace(anchor: unknown): { targetPath: string; workspace: string } {
-    const raw = String(anchor || '');
-    const targetPath = raw.split('#')[0].trim();
-    const matched = targetPath.match(/[\\/]\.claude[\\/]projects[\\/]([^\\/]+)[\\/]/);
-    return { targetPath, workspace: matched ? matched[1] : '' };
-  }
-
-  function sanitizeAnchorSegment(value: unknown, fallback: string): string {
-    const text = String(value || '').replace(/[\\/:*?"<>|]+/g, '_').trim();
-    // 纯 . / .. 是路径跳转（join 会规约、.. 能逃出 .memory 锚目录），空段同样非法——一律落占位 fallback，
-    // 再由 isLegalEventVolumeLayout 当占位拦下报错（健壮性：畸形 agent/工作区不许穿透成目录跳转）。
-    if (!text || text === '.' || text === '..') return fallback;
-    return text;
-  }
-
-  interface WriteMemoryAnchorInput {
-    docId?: unknown;
-    agent?: unknown;
-    sessionId?: unknown;
-    hostAnchor?: unknown;
-  }
-
-  // 记忆卷库内实体锚（projectneed 15-10-4）：library/.memory/<身份>/<工作区>/<会话>.jsonl
-  // 作 symlink 指向宿主原始记录（jsonl / agent.sqlite，允许悬空）；无可用目标则落真实占位文件，绝不留无锚。
-  // 建链后写 source_documents；任何失败抛出，由调用方回滚删卷（无锚即拒，15-10-4）。
-  function writeMemoryAnchor({ docId, agent, sessionId, hostAnchor }: WriteMemoryAnchorInput = {}): string {
-    if (!docId) throw new Error('writeMemoryAnchor requires docId');
-    const { targetPath, workspace } = memoryAnchorTargetWorkspace(hostAnchor);
-    const tenant = sanitizeAnchorSegment(agent, PLACEHOLDER_TENANT);
-    const ws = sanitizeAnchorSegment(workspace, PLACEHOLDER_WORKSPACE);
-    const dir = eventVolumeAnchorDir(libraryRoot, tenant, ws);
-    mkdirSync(dir, { recursive: true });
-    const linkPath = join(dir, `${sanitizeAnchorSegment(sessionId, 'session')}.jsonl`);
-    try {
-      if (lstatSync(linkPath)) rmSync(linkPath, { force: true });
-    } catch {
-      // 锚位不存在即可，直接建
-    }
-    // 不空卷直接造（projectneed 15-10-4）：事件卷必须锚定真实 session 文件，去掉悬空占位兜底——
-    // targetPath 的存在性由 deliverVolume 的 sessionVolumeNodes（existsSync）先行校验，这里是落库前的双保险。
-    if (!targetPath || !existsSync(targetPath)) {
-      throw new Error(`session 文件不存在、无法锚定：${targetPath || '(空)'}（不接受悬空锚，projectneed 15-10-4）`);
-    }
-    symlinkSync(targetPath, linkPath, 'file');
-    (getDatabase().getStore() as { setMemoryAnchorSource: (docId: unknown, linkPath: string) => unknown }).setMemoryAnchorSource(docId, linkPath);
-    // 多租户隔离校验（projectneed 15-10-4）：锚落占位目录（_local / unknown-agent）即结构非法。锚已写、
-    // 卷已落库——抛 illegalMemoryLayout 让投递报错但不回滚（卷留下由用户迁移或清理），绝不静默接受游离 / 跨 agent 混放。
-    if (!isLegalEventVolumeLayout(tenant, ws)) {
-      const error = new Error(illegalEventVolumeMessage({ tenant, workspace: ws, linkPath })) as Error & { illegalMemoryLayout?: boolean };
-      error.illegalMemoryLayout = true;
-      throw error;
-    }
-    return linkPath;
-  }
+  // 锚写入实现已归 memory 域（memory/host-anchor.ts，§6-8）；host 只装配（注入 libraryRoot 与 store 写入口）。
+  const writeMemoryAnchor = createMemoryAnchorWriter({
+    libraryRoot,
+    setMemoryAnchorSource: (docId, linkPath) =>
+      getDatabase().getStore().setSourceDocumentReference({
+        docId,
+        originalPath: linkPath,
+        sourceType: 'memory-anchor',
+        rawMarkdown: ''
+      })
+  });
 
   // 事件卷投递的纯规则解析（projectneed 15-10）：读 hostAnchor 指向的真实 session 文件、启发式解析成
   // turn messages、转成卷节点——与内置 agent 落卷同一条 volumeNodesFromTurnMessages 路径，确定可重复。
-  // 文件不存在/解析不出对话即抛（不空卷直接造）。memory 模块经此 ctx 拿节点、不直接碰 fs/llm。
+  // 文件不存在/解析不出对话即抛（不空卷直接造）。组合 core 解析与 agent 卷组装两域，属 host 装配职责
+  //（memory 域不横向 import agent 件）；memory 模块经此 ctx 拿节点、不直接碰 fs/llm。
   function sessionVolumeNodes(hostAnchor: unknown) {
     const { targetPath } = memoryAnchorTargetWorkspace(hostAnchor);
     if (!targetPath) throw new Error('事件卷必须提供 hostAnchor 指向真实 session 文件（不接受悬空锚，projectneed 15-10-4）');
@@ -400,6 +350,11 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
       refreshDoc,
       writeMemoryAnchor,
       sessionVolumeNodes,
+      // 导入生命周期域服务（handlers/write/import.ts 的 import.libraryDocument /
+      // import.deleteDocument 消费）；ensureDocVectors 随 derivedIndexes.writeContext() 注入。
+      // 函数体求值在写请求时，晚于下方 libraryDocService 初始化，无 TDZ 顾虑。
+      importLibraryDocument,
+      deleteImportedDocument,
       ...derivedIndexes.writeContext()
     };
   }
@@ -432,13 +387,11 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
   }
 
   function refreshDoc(docId: unknown, options: RefreshDocOptions = {}): Record<string, unknown> | null {
-    const data = (getDatabase().getStore() as {
-      getDoc: (docId: unknown, options: Record<string, unknown>) => DocFetchResult | null;
-    }).getDoc(docId, {
+    const data = getProjectedDoc(getDatabase().getStore(), docId, {
       maxTreeDepth: options.full === true ? null : (options.maxTreeDepth || DEFAULT_TREE_SLICE_DEPTH),
       includeSourceSpans: options.includeSourceSpans === true,
       includeSourceDocumentContent: options.includeSourceDocumentContent === true
-    });
+    }) as DocFetchResult | null;
     if (!data) return null;
     return {
       doc: { ...data.doc },
@@ -520,22 +473,12 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
   // 连带清 SQLite（refs/nodes/source 行）；LanceDB 派生索引不在此碰，留给自检/reconcile 对齐。
   // 解锚与删卷非同一事务，但可重入：中途中断留下的「无 source 行」卷下轮扫描仍按脱锚清除。
   async function purgeOrphanedMemoryVolumes({ dryRun = false }: { dryRun?: boolean } = {}) {
-    // 转发给 memory 模块，注入 host 的文件系统判断（lstat 不解引用）与正规删除入口。
+    // 转发给 memory 模块，注入锚判存（memory/host-anchor 的 lstat 不解引用语义）与正规删除入口。
     return purgeMemoryVolumes(getDatabase().getStore() as never, {
       anchorExists: anchorPathExists,
       deleteDoc: deleteImportedDocument,
       dryRun
     } as never);
-  }
-
-  // lstatSync 不解引用：路径本身（含悬空 symlink、空占位文件）存在即视为「锚还在」，
-  // 仅当锚文件被真正删除（lstat 抛 ENOENT）才判脱锚。
-  function anchorPathExists(anchorPath: string): boolean {
-    try {
-      return Boolean(lstatSync(anchorPath));
-    } catch {
-      return false;
-    }
   }
 
   function sendAgentStream(requestId: unknown, event: Record<string, unknown>): void {
@@ -600,16 +543,11 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
   // 调对应域模块（store / import / vector / summary / agent / memory），自身不含业务。加动词＝加一项、不接 if 链。
   const requestHandlers: Record<string, RequestHandler> = {
     ping: () => ({ ok: true, pid: process.pid }),
+    // 数据面动词（import/vectors/delete 含内）已全部经 db 契约走 L4 action（写 ctx 注入域服务，
+    // 见 databaseWriteContext）；这里只注入 agent 能力（ask_agent/shell/web 动词消费，不属数据面）。
     'db.shell': (request) => runDbShellArgv(getDatabase() as never, ((request.argv as unknown[]) || []) as never, {
       currentDocId: request.currentDocId ?? request.docId,
       shellState: dbShellState,
-      importLibraryDocument,
-      deleteImportedDocument,
-      ensureDocVectors: (payload: Record<string, unknown> = {}) => {
-        const docId = normalizeStableId(payload.docId ?? payload.doc_id, null);
-        if (!docId) throw new Error('db vectors requires docId');
-        return derivedIndexes.ensureDocVectors(docId);
-      },
       askAgent: (payload: Record<string, unknown> = {}) => runAgent(payload, request.id),
       agentTool: (payload: Record<string, unknown> = {}) => (getAgentRuntime() as unknown as { runTool: (p: Record<string, unknown>) => unknown }).runTool(payload)
     } as never),
@@ -645,19 +583,18 @@ export function createHeadlessAgentHost(options: HeadlessAgentHostOptions = {}):
         base64: readFileSync(sourceDocument.original_path).toString('base64')
       };
     },
-    'source.readPdfHighlights': (request) => {
+    // PDF 几何走 L4 action（§6-1：不再经 store 门面）；管道回执保持裸数组，前端不动。
+    'source.readPdfHighlights': async (request) => {
       const docId = normalizeStableId((request.payload?.docId as unknown) ?? request.docId, null);
       if (!docId) return [];
-      const payload = (request.payload || {}) as { ranges?: Array<{ start: unknown; end: unknown }>; startOffset?: unknown; endOffset?: unknown };
-      const ranges = Array.isArray(payload.ranges)
-        ? payload.ranges
-        : [{ start: payload.startOffset, end: payload.endOffset }];
-      return (getDatabase().getStore() as { getPdfHighlightRects: (docId: string, ranges: unknown[]) => unknown[] }).getPdfHighlightRects(docId, ranges);
+      const res = await (getDatabase().read({ ...(request.payload || {}), action: 'source.pdfHighlightRects', docId }) as Promise<{ rects?: unknown[] }>);
+      return res?.rects || [];
     },
-    'source.readPdfSpanRects': (request) => {
+    'source.readPdfSpanRects': async (request) => {
       const docId = normalizeStableId((request.payload?.docId as unknown) ?? request.docId, null);
       if (!docId) return [];
-      return (getDatabase().getStore() as { getPdfSpanHitRects: (docId: string) => unknown[] }).getPdfSpanHitRects(docId);
+      const res = await (getDatabase().read({ action: 'source.pdfHitRects', docId }) as Promise<{ rects?: unknown[] }>);
+      return res?.rects || [];
     },
     'import.libraryDocument': (request) => importLibraryDocument(request.payload || {}),
     'import.smartTask': (request) => smartImportTask(request.payload || {}),

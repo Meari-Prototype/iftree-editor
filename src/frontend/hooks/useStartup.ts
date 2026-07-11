@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, type MutableRefObject, type Dispatch, t
 
 import type { DocListItem } from '../../backend/query-api.js';
 import type { DocFolderRow } from '../../backend/db/schema.js';
-import type { LibraryEntry } from '../../backend/library-fs.js';
+import type { LibraryEntry } from '../../backend/library/library-fs.js';
 import { normalizeDocId, normalizeNodeLayoutSettingsByView, readPersistedActiveDocId, persistActiveDocId, sameDocId } from '../lib/doc-utils.js';
 import { debugLog, setDebugLoggingEnabled } from '../lib/debug-log.js';
 import {
@@ -18,6 +18,7 @@ import {
   settingsRepository
 } from '../data/repositories.js';
 import { useAppUIContext } from './useAppUI.js';
+import type { AgentBranch, AgentSettingsLike } from '../lib/agent-utils.js';
 
 // Keep these gates aligned with electron/main.mjs analyzeE2ECapture.
 const E2E_PROBE_LIMIT = 30;
@@ -96,8 +97,8 @@ export interface UseStartupOptions {
   setVectorSettings: Dispatch<SetStateAction<Record<string, unknown>>>;
   setLlmSummarySettings: Dispatch<SetStateAction<Record<string, unknown> | null>>;
   setNodeLayoutSettings: Dispatch<SetStateAction<Record<string, unknown>>>;
-  setAgentSettings: Dispatch<SetStateAction<Record<string, unknown> | null>>;
-  setAgentDiffs: Dispatch<SetStateAction<Record<string, unknown>[]>>;
+  setAgentSettings: Dispatch<SetStateAction<AgentSettingsLike | null>>;
+  setAgentDiffs: Dispatch<SetStateAction<AgentBranch[]>>;
   refreshAgentSessions: () => Promise<unknown>;
   openDoc: (docId: unknown, options?: OpenDocOptions) => Promise<unknown>;
   promptStartupEditBranchChoice: (branch: unknown) => Promise<unknown>;
@@ -644,7 +645,7 @@ export function useStartup({
       .catch((error) => setNotice((error as { message?: string }).message || ''));
     const agentTimer = window.setTimeout(() => {
       agentRepository.listDiffs()
-        .then((diffs) => setAgentDiffs((Array.isArray(diffs) ? diffs : []) as Record<string, unknown>[]))
+        .then((diffs) => setAgentDiffs(Array.isArray(diffs) ? diffs : []))
         .catch((error) => setNotice((error as { message?: string }).message || ''));
       refreshAgentSessions().catch((error) => setNotice((error as { message?: string }).message || ''));
     }, 300);

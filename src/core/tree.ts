@@ -63,6 +63,8 @@ export function buildFlatTree(rows: unknown[]): FlatTree {
   return FlatTree.fromRows(rows as Parameters<typeof FlatTree.fromRows>[0]);
 }
 
+export function flattenTree<T extends TreeNodeLike>(root: T | null | undefined): T[];
+export function flattenTree(root: unknown): TreeNodeLike[];
 export function flattenTree(root: unknown): TreeNodeLike[] {
   if (isFlatTree(root)) {
     return (root as FlatTree).slotsPreOrder().map((slot) => (root as FlatTree).rowAtSlot(slot) as unknown as TreeNodeLike).filter(Boolean);
@@ -156,6 +158,12 @@ export function collectDescendantText(node: unknown, options: Record<string, unk
   }
 
   return parts.join('\n\n');
+}
+
+export function collectNodeAndDescendantIds(node: TreeNodeLike | null | undefined, output: Set<string>): void {
+  if (!node) return;
+  output.add(String(node.id));
+  for (const child of node.children || []) collectNodeAndDescendantIds(child, output);
 }
 
 export function resolveDisplayChildren(node: unknown): TreeNodeLike[] {

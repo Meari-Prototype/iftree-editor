@@ -1,9 +1,19 @@
 import { debugElapsedMs, debugLog, debugStartedAt, summarizeArgs, summarizeResult } from '../lib/debug-log.js';
+import type { TypedDatabaseReadRequest, TypedDatabaseReadResult } from '../../backend/query-api.js';
+import type { MutationPayload, MutationResult } from '../../backend/mutation-api.js';
 
 type IftreeMethod = (...args: unknown[]) => Promise<unknown>;
 type IftreeCallback = (payload: unknown) => void;
 type IftreeUnsubscribe = () => void;
-type IftreeApi = Record<string, IftreeMethod | ((callback: IftreeCallback) => IftreeUnsubscribe) | undefined>;
+interface DatabaseReadMethod {
+  <Request extends TypedDatabaseReadRequest>(payload: Request): Promise<TypedDatabaseReadResult<Request>>;
+  (payload: Record<string, unknown>): Promise<unknown>;
+}
+type DatabaseWriteMethod = (payload: MutationPayload) => Promise<MutationResult>;
+type IftreeApi = Record<string, IftreeMethod | ((callback: IftreeCallback) => IftreeUnsubscribe) | DatabaseReadMethod | undefined> & {
+  readDatabase?: DatabaseReadMethod;
+  writeDatabase?: DatabaseWriteMethod;
+};
 
 function errorMessage(error: unknown): string {
   return String((error as { message?: unknown } | null | undefined)?.message || error || '').slice(0, 240);
@@ -22,7 +32,7 @@ export function hasIftreeMethod(name: string): boolean {
   return typeof getIftreeApi()[name] === 'function';
 }
 
-export function callIftree(name: string, ...args: unknown[]): Promise<unknown> {
+export function callIftree<Result = unknown>(name: string, ...args: unknown[]): Promise<Result> {
   const fn = getIftreeApi()[name];
   if (typeof fn !== 'function') {
     return Promise.reject(new Error(`IFTree backend method is unavailable: ${name}`));
@@ -40,7 +50,7 @@ export function callIftree(name: string, ...args: unknown[]): Promise<unknown> {
         ms: debugElapsedMs(startedAt),
         result: summarizeResult(result)
       });
-      return result;
+      return result as Result;
     })
     .catch((error: unknown) => {
       debugLog('renderer.ipc.end', {
@@ -53,10 +63,10 @@ export function callIftree(name: string, ...args: unknown[]): Promise<unknown> {
     });
 }
 
-export function subscribeIftree(name: string, callback: IftreeCallback): IftreeUnsubscribe | undefined {
+export function subscribeIftree<Payload = unknown>(name: string, callback: (payload: Payload) => void): IftreeUnsubscribe | undefined {
   const fn = getIftreeApi()[name];
   if (typeof fn !== 'function') return undefined;
-  return (fn as (callback: IftreeCallback) => IftreeUnsubscribe)(callback);
+  return (fn as (callback: (payload: Payload) => void) => IftreeUnsubscribe)(callback);
 }
 
 export function minimizeWindow() {
@@ -100,6 +110,6 @@ export function onLibraryChanged(callback: IftreeCallback) {
   return subscribeIftree('onLibraryChanged', callback);
 }
 
-export function onAgentStream(callback: IftreeCallback) {
+export function onAgentStream<Payload = unknown>(callback: (payload: Payload) => void) {
   return subscribeIftree('onAgentStream', callback);
 }

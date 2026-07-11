@@ -7,8 +7,9 @@ import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { canvas2dContextOptions } from '../../core/hardware-strategy.js';
 import { plainNodeNote } from '../../core/node-notes.js';
+import { collectNodeAndDescendantIds } from '../../core/tree.js';
+import type { TreeNode } from '../../core/node-model.js';
 
-import { type RichTreeNode, collectNodeAndDescendantIds } from './RichTextView.jsx';
 import { base64ToUint8Array, formatSourceSentenceLabel, sourceRangeForSpans, sourceRangesForSpans, sourceSpanAbsoluteStart, sourceSpanKey } from './SourceBlocks.jsx';
 import { readSourcePdfData, readSourcePdfHighlights, readSourcePdfSpanRects } from '../data/source-repository.js';
 import { depthOf, hasKnownChildren } from '../lib/doc-utils.js';
@@ -27,8 +28,8 @@ interface PdfSourceSpan {
   end_offset?: number;
   absolute_start_offset?: number;
   absolute_end_offset?: number;
-  node_id?: string | number | null;
-  node_address?: string;
+  node_id?: string | null;
+  node_address?: string | null;
 }
 
 // 后端 IPC 返回的 PDF span 命中矩形（spanHitRects/highlight rects）：
@@ -40,8 +41,8 @@ interface PdfRect {
   y1: number;
   start_offset?: number;
   end_offset?: number;
-  span_id?: string | number;
-  node_id?: string | number;
+  span_id?: string;
+  node_id?: string;
   sentence_index?: number;
 }
 
@@ -59,14 +60,14 @@ type PdfSelectionOrigin = 'pdf' | 'gutter' | 'external';
 interface PdfSelection {
   key: string;
   kind: PdfSelectionKind;
-  nodeId: string | number | null;
+  nodeId: string | null;
   range: PdfRange;
   ranges: PdfRange[];
   origin: PdfSelectionOrigin;
 }
 
 interface PdfGutterRow {
-  node: RichTreeNode;
+  node: TreeNode;
   spans: PdfSourceSpan[];
   sentenceLabel: string;
   range: PdfRange | null;
@@ -78,16 +79,12 @@ interface PdfGutterRow {
   note: string;
 }
 
-type NodeIdSet = Set<string | number>;
-type NodeIdMap = Map<string, RichTreeNode>;
+type NodeIdSet = Set<string>;
+type NodeIdMap = Map<string, TreeNode>;
 
-function nodeIdSetHas(set: NodeIdSet | null | undefined, id: string | number | null | undefined): boolean {
+function nodeIdSetHas(set: NodeIdSet | null | undefined, id: string | null | undefined): boolean {
   if (!set || id === null || id === undefined) return false;
-  if (set.has(id)) return true;
-  const text = String(id);
-  if (set.has(text)) return true;
-  const number = Number(text);
-  return Number.isInteger(number) && number > 0 && set.has(number);
+  return set.has(id);
 }
 
 interface BuildPdfGutterRowsOptions {
@@ -100,18 +97,17 @@ interface BuildPdfGutterRowsOptions {
   showNotes: boolean;
 }
 
-function buildPdfGutterRows(nodes: RichTreeNode[], { baseDepth, collapsed, expanded, depthLimit, sourceSpans, showTitles, showNotes }: BuildPdfGutterRowsOptions): PdfGutterRow[] {
+function buildPdfGutterRows(nodes: TreeNode[], { baseDepth, collapsed, expanded, depthLimit, sourceSpans, showTitles, showNotes }: BuildPdfGutterRowsOptions): PdfGutterRow[] {
   const rows: PdfGutterRow[] = [];
   const cappedDepth = Math.max(1, Number(depthLimit) || 1);
   const orderedSpans = [...(sourceSpans || [])].sort((a, b) => sourceSpanAbsoluteStart(a) - sourceSpanAbsoluteStart(b));
 
-  const visit = (node: RichTreeNode) => {
-    // RichTreeNode.id 是 unknown（IPC 边界），TreeNodeLike.id 必有；字段集兼容，cast 收口。
-    const hasChildren = hasKnownChildren(node as Parameters<typeof hasKnownChildren>[0]);
+  const visit = (node: TreeNode) => {
+    const hasChildren = hasKnownChildren(node);
     const nodeDepth = depthOf(String(node.address || '1'));
     const rowExpanded = hasChildren
-      && !nodeIdSetHas(collapsed, node.id as string | number | null | undefined)
-      && (nodeDepth < cappedDepth || nodeIdSetHas(expanded, node.id as string | number | null | undefined));
+      && !nodeIdSetHas(collapsed, node.id)
+      && (nodeDepth < cappedDepth || nodeIdSetHas(expanded, node.id));
     const ids = new Set<string>();
     collectNodeAndDescendantIds(node, ids);
     const spans = orderedSpans.filter((span) => ids.has(String(span.node_id)));
@@ -198,7 +194,7 @@ function sourceSpansForNodeSelection(nodeId: string | number | null | undefined,
     .sort((left, right) => sourceSpanAbsoluteStart(left) - sourceSpanAbsoluteStart(right));
 }
 
-function nodeSelection(nodeId: string | number | null | undefined, nodeById: NodeIdMap, sourceSpans: PdfSourceSpan[] | null | undefined, origin: PdfSelectionOrigin): PdfSelection | null {
+function nodeSelection(nodeId: string | null | undefined, nodeById: NodeIdMap, sourceSpans: PdfSourceSpan[] | null | undefined, origin: PdfSelectionOrigin): PdfSelection | null {
   if (nodeId === null || nodeId === undefined) return null;
   const spans = sourceSpansForNodeSelection(nodeId, nodeById, sourceSpans);
   const range = sourceRangeForSpans(spans);
@@ -217,14 +213,14 @@ function spanSelection(span: PdfSourceSpan | null | undefined, origin: PdfSelect
 
 // currentDoc 投影里跟 PDF 渲染相关的子集；shell-layer 形态（IPC 边界），不强绑 useDocumentState 的完整投影。
 interface PdfCurrentDoc {
-  tree?: RichTreeNode | null;
+  tree?: TreeNode | null;
   sourceWindow?: { sourceSpans?: PdfSourceSpan[] } | null;
   sourceSpans?: PdfSourceSpan[];
   sourcePdfPages?: PdfPageInfo[];
 }
 
 interface PdfDepthModel {
-  targetNodes?: RichTreeNode[];
+  targetNodes?: TreeNode[];
 }
 
 interface ToggleCollapsedOptions { promoteDepth?: boolean }
@@ -232,14 +228,14 @@ interface ToggleCollapsedOptions { promoteDepth?: boolean }
 export interface PdfRichTextViewProps {
   currentDoc: PdfCurrentDoc | null | undefined;
   docId: string;
-  selectedNodeId: string | number | null | undefined;
-  setSelectedNodeId: (id: string | number | null) => void;
+  selectedNodeId: string | null | undefined;
+  setSelectedNodeId: (id: string | null) => void;
   depthModel: PdfDepthModel;
   nodeById: NodeIdMap;
   depthLimit: number;
   collapsed?: NodeIdSet;
   expanded?: NodeIdSet;
-  toggleCollapsed?: (id: string | number, options?: ToggleCollapsedOptions) => void;
+  toggleCollapsed?: (id: string, options?: ToggleCollapsedOptions) => void;
   showLeftInfo?: boolean;
   showTitles: boolean;
   showNotes: boolean;
@@ -253,8 +249,8 @@ export function PdfRichTextView({
   depthModel,
   nodeById,
   depthLimit,
-  collapsed = new Set<string | number>(),
-  expanded = new Set<string | number>(),
+  collapsed = new Set<string>(),
+  expanded = new Set<string>(),
   toggleCollapsed,
   showLeftInfo = true,
   showTitles,
@@ -278,7 +274,7 @@ export function PdfRichTextView({
   const gutterScrollKeyRef = useRef<string>('');
   const scale = 1.25;
 
-  const roots = useMemo<RichTreeNode[]>(() => (
+  const roots = useMemo<TreeNode[]>(() => (
     currentDoc?.tree ? [currentDoc.tree] : (depthModel.targetNodes || [])
   ), [currentDoc?.tree, depthModel.targetNodes]);
   const baseDepth = roots.length > 0
@@ -467,7 +463,7 @@ export function PdfRichTextView({
   }
 
   function selectGutterRow(row: PdfGutterRow) {
-    const nodeId = row.node.id as string | number | null | undefined;
+    const nodeId = row.node.id;
     if (nodeId === null || nodeId === undefined || !row.range) return;
     const next: PdfSelection = { key: `node:${nodeId}`, kind: 'node', nodeId, range: row.range, ranges: row.ranges, origin: 'gutter' };
     if (activeSelection?.key === next.key) {
@@ -547,8 +543,8 @@ export function PdfRichTextView({
           {!gutterCollapsed && (
             <div className="pdf-gutter-rows">
               {rows.map((row) => {
-                // RichTreeNode.id/address 是 unknown（IPC 边界形态）；行渲染时统一 String() 兜底成 JSX/key 可用形态。
-                const rowNodeId = row.node.id as string | number | null | undefined;
+                // TreeNode.id/address 已是标准字符串；这里沿渲染键口径保持 String()。
+                const rowNodeId = row.node.id;
                 const rowIdText = String(rowNodeId ?? '');
                 const selected = rowNodeId === selectedNodeId;
                 return (

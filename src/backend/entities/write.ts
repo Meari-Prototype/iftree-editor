@@ -524,15 +524,21 @@ export type EntityWriteResult =
   | ClearBindingResult;
 
 export function runEntityWrite(store: EntityStore, payload: Payload = {}, action: string = ''): EntityWriteResult {
-  if (action === 'entity.create') return createEntity(store, payload);
-  if (action === 'entity.update') return updateEntity(store, payload);
-  if (action === 'entity.delete') return deleteEntity(store, payload);
-  if (action === 'entity.link') return linkEntity(store, payload);
-  if (action === 'entity.unlink') return unlinkEntity(store, payload);
-  if (action === 'entity.bindNode') return setNodeBinding(store, payload, 'bound');
-  if (action === 'entity.ignoreNode') return setNodeBinding(store, payload, 'ignored');
-  if (action === 'entity.clearNodeBinding') return clearNodeBinding(store, payload);
-  throw new Error(`Unhandled entity write action: ${action}`);
+  // 直写主库路径统一套事务（编辑分支路径在 mutation 分发上游已 staging、不到这里）：
+  // 各动作普遍一查一写两步、部分多写语句（如 deleteEntity 级联），中途失败不能留半成品，
+  // 与暂存提交 / 记忆卷写入的原子口径对齐。withTransaction 嵌套安全；测试窄 store 不带时直跑。
+  const dispatch = (): EntityWriteResult => {
+    if (action === 'entity.create') return createEntity(store, payload);
+    if (action === 'entity.update') return updateEntity(store, payload);
+    if (action === 'entity.delete') return deleteEntity(store, payload);
+    if (action === 'entity.link') return linkEntity(store, payload);
+    if (action === 'entity.unlink') return unlinkEntity(store, payload);
+    if (action === 'entity.bindNode') return setNodeBinding(store, payload, 'bound');
+    if (action === 'entity.ignoreNode') return setNodeBinding(store, payload, 'ignored');
+    if (action === 'entity.clearNodeBinding') return clearNodeBinding(store, payload);
+    throw new Error(`Unhandled entity write action: ${action}`);
+  };
+  return typeof store.withTransaction === 'function' ? store.withTransaction(dispatch) : dispatch();
 }
 
 // 提交时把编辑分支 diff 里的 entity 条目实化到主库——从 store.applyEditBranchDiffEntries 下沉
@@ -548,6 +554,75 @@ export interface ApplyEntityEntryCtx {
   resolveNodeId: (ref: unknown) => string | null;
   entityIdByTmp: Map<string, string>;
   baseDocId: string | null;
+}
+
+export function resolveEntityEntryDocId(store: EntityStore, payload: Payload): string | null {
+  const entityIds = Array.isArray(payload.entityIds) ? payload.entityIds : [];
+  const entityIdsSnake = Array.isArray(payload.entity_ids) ? payload.entity_ids : [];
+  const entityId = normalizePositiveId(
+    payload.entityId
+      ?? payload.entity_id
+      ?? payload.sourceEntityId
+      ?? payload.source_entity_id
+      ?? payload.targetEntityId
+      ?? payload.target_entity_id
+      ?? payload.entityAId
+      ?? payload.entity_a_id
+      ?? payload.entityBId
+      ?? payload.entity_b_id
+      ?? entityIds[0]
+      ?? entityIdsSnake[0]
+  );
+  if (!entityId) return null;
+  return store.db!.prepare('SELECT doc_id FROM entities WHERE id = ?')
+    .get<Pick<EntityRow, 'doc_id'>>(entityId)?.doc_id ?? null;
+}
+
+export function buildEntityEditBranchDiffEntries(
+  store: EntityStore,
+  entries: unknown,
+  addressByNode: Map<unknown, unknown>
+): Payload[] {
+  const input = Array.isArray(entries) ? entries as Payload[] : [];
+  const labelByRef = new Map<string, unknown>();
+  for (const entry of input) {
+    if (entry.kind === 'entity.create' && entry.tmp_id != null) {
+      const fields: Payload = !Array.isArray(entry.fields) && entry.fields ? entry.fields as Payload : {};
+      labelByRef.set(String(entry.tmp_id), fields.literal || '');
+    }
+  }
+  const resolveLabel = (ref: unknown) => {
+    if (ref == null) return '';
+    const key = String(ref);
+    if (labelByRef.has(key)) return labelByRef.get(key);
+    return store.db!.prepare('SELECT literal FROM entities WHERE id = ?')
+      .get<Pick<EntityRow, 'literal'>>(ref)?.literal || key;
+  };
+  const out: Payload[] = [];
+  for (const entry of input) {
+    if (!entry.kind || !String(entry.kind).startsWith('entity.')) continue;
+    const status = entry.status === 'undone' ? 'undone' : 'active';
+    if (entry.kind === 'entity.create') {
+      const fields: Payload = !Array.isArray(entry.fields) && entry.fields ? entry.fields as Payload : {};
+      out.push({ entity_action: 'create', entity_ref: entry.tmp_id, entity_label: fields.literal || '', status });
+    } else if (entry.kind === 'entity.update') {
+      out.push({ entity_action: 'update', entity_ref: entry.entity_ref, entity_label: entry.literal || resolveLabel(entry.entity_ref), status });
+    } else if (entry.kind === 'entity.delete') {
+      out.push({ entity_action: 'delete', entity_ref: entry.entity_ref, entity_label: resolveLabel(entry.entity_ref), status });
+    } else if (entry.kind === 'entity.bindNode' || entry.kind === 'entity.ignoreNode' || entry.kind === 'entity.clearNodeBinding') {
+      out.push({ entity_action: String(entry.kind).slice('entity.'.length), entity_ref: entry.entity_ref, entity_label: resolveLabel(entry.entity_ref), node_ref: entry.node_id, node_addr: addressByNode.get(entry.node_id) ?? null, status });
+    } else if (entry.kind === 'entity.link' || entry.kind === 'entity.unlink') {
+      out.push({ entity_action: String(entry.kind).slice('entity.'.length), entity_ref: entry.source_ref, entity_label: resolveLabel(entry.source_ref), target_ref: entry.target_ref, target_label: resolveLabel(entry.target_ref), link_kind: entry.link_kind || null, status });
+    }
+  }
+  return out;
+}
+
+export function tryApplyEntityEntry(store: EntityStore, entry: unknown, ctx: ApplyEntityEntryCtx): boolean {
+  const candidate = entry as { kind?: unknown };
+  if (!ENTITY_WRITE_ACTIONS.includes(candidate.kind as typeof ENTITY_WRITE_ACTIONS[number])) return false;
+  applyEntityEntry(store, entry as EntityEntry, ctx);
+  return true;
 }
 
 export function applyEntityEntry(store: EntityStore, entry: EntityEntry, ctx: ApplyEntityEntryCtx): void {

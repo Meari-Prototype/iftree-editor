@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import test from 'node:test';
 
 import { IftreeStore } from '../dist/src/backend/store/index.js';
-import { createDerivedIndexReconciler } from '../dist/src/backend/derived-index-reconciler.js';
+import { createDerivedIndexReconciler } from '../dist/src/backend/derived-index/derived-index-reconciler.js';
 import { VectorStore } from '../dist/src/vector/vector-store.js';
 import { MIN_VECTOR_DIMENSIONS } from '../dist/src/vector/embeddings.js';
 import { computeSubtreeHashes } from '../dist/src/core/merkle.js';

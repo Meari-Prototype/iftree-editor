@@ -4,7 +4,7 @@
 // 消息/diff/会话状态仍住 useAgentChat（该 hook 无倒灌——不收 AppBody 逻辑，是自洽状态桶），
 // 经 deps.chat 读写；agentStore 化留到需要 selector 级订阅时再做。
 // 依赖方向：agent → editor（undo token、审批进出）、agent → document（refreshDocs/openDoc）。
-// document → agent 的 importFiles(smart) 反向引用经 deps 注入解环（见 document-commands.ts 文件头）。
+// smart import 的跨域协调住 import-commands；agent 保持单向调用 document。
 
 import { normalizeDocId } from '../lib/doc-utils.js';
 import { agentHistoryForRequest } from '../lib/agent-utils.js';

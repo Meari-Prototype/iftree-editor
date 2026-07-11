@@ -1,5 +1,14 @@
 import { hasIftreeMethod, rawIftreeApi } from './iftree-api.js';
 import { debugElapsedMs, debugLog, debugStartedAt, summarizePayload, summarizeResult } from '../lib/debug-log.js';
+import type {
+  ContentSearchResult,
+  DocGetResult,
+  DocListItem,
+  NodeChildrenResult,
+  SourceWindowResult
+} from '../../backend/query-api.js';
+import type { DocFolderRow } from '../../backend/db/schema.js';
+import type { MutationPayload, MutationResult } from '../../backend/mutation-api.js';
 
 type DatabasePayload = Record<string, unknown>;
 type DatabaseIpcMethod = (payload: unknown) => Promise<unknown>;
@@ -47,13 +56,24 @@ export async function runDatabaseCommand(command: unknown): Promise<unknown> {
   }
 }
 
+export function readDatabase(payload: DatabasePayload & {
+  action: 'content.search';
+  searchMode: 'vector';
+  docId: string;
+}): Promise<ContentSearchResult>;
+export function readDatabase(payload: DatabasePayload & { action: 'doc.list' }): Promise<DocListItem[]>;
+export function readDatabase(payload: DatabasePayload & { action: 'docFolder.list' }): Promise<DocFolderRow[]>;
+export function readDatabase(payload: DatabasePayload & { action: 'doc.get' }): Promise<DocGetResult | null>;
+export function readDatabase(payload: DatabasePayload & { action: 'node.listChildren' }): Promise<NodeChildrenResult>;
+export function readDatabase(payload: DatabasePayload & { action: 'source.getWindow' }): Promise<SourceWindowResult>;
+export function readDatabase(payload: DatabasePayload): Promise<unknown>;
 export async function readDatabase(payload: DatabasePayload): Promise<unknown> {
   const api = rawIftreeApi();
   if (typeof api.readDatabase === 'function') {
     const startedAt = debugStartedAt();
     debugLog('renderer.database.read.start', { payload: summarizePayload(payload) });
     try {
-      const result = await (api.readDatabase as DatabaseIpcMethod)(payload || {});
+      const result = await api.readDatabase(payload);
       debugLog('renderer.database.read.end', {
         ok: true,
         ms: debugElapsedMs(startedAt),
@@ -74,13 +94,13 @@ export async function readDatabase(payload: DatabasePayload): Promise<unknown> {
   throw new Error('IFTree database read is unavailable');
 }
 
-export async function writeDatabase(payload: DatabasePayload): Promise<unknown> {
+export async function writeDatabase(payload: MutationPayload): Promise<MutationResult> {
   const api = rawIftreeApi();
   if (typeof api.writeDatabase === 'function') {
     const startedAt = debugStartedAt();
     debugLog('renderer.database.write.start', { payload: summarizePayload(payload) });
     try {
-      const result = await (api.writeDatabase as DatabaseIpcMethod)(payload || {});
+      const result = await api.writeDatabase(payload);
       debugLog('renderer.database.write.end', {
         ok: true,
         ms: debugElapsedMs(startedAt),

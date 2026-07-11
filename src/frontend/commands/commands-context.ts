@@ -13,10 +13,11 @@ import type { DocumentCommands } from './document-commands.js';
 import type { AgentCommands } from './agent-commands.js';
 import type { TreeViewCommands } from './treeview-commands.js';
 import type { AxiomCommands } from './axiom-commands.js';
+import type { ImportCommands } from './import-commands.js';
 
 export interface AppCommands {
   editor: EditorCommands;
-  document: DocumentCommands;
+  document: DocumentCommands & ImportCommands;
   agent: AgentCommands;
   treeView: TreeViewCommands;
   axiom: AxiomCommands;

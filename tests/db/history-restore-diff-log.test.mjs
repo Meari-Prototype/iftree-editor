@@ -22,10 +22,9 @@ test('db log, diff, read --at, and restore address committed history', { timeout
       'DBT_HISTORY_APPLY'
     );
     const commitRef = String(commit.history.commit_id);
-    // commit 返回结构：history 含 commit_id（=id）/saved_at/summary/doc_id；快进、applied
+    // commit --json 经 slimWriteResult 收口：history 以 commit_id 为权威主键（id 别名折叠掉）
     assert.equal(commit.applied, true);
     assert.equal(commit.fastForward, true);
-    assert.equal(commit.history.id, commitRef);
     assert.equal(commit.history.doc_id, docId);
     assert.ok(commit.history.saved_at, 'history 应有 saved_at');
     assert.match(commitRef, /^019[a-f0-9-]+$/, 'commit id 应是 UUIDv7');
