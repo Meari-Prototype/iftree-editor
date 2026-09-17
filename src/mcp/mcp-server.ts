@@ -502,8 +502,11 @@ async function forceKillBackend(pid: number): Promise<boolean> {
 }
 
 function registerLifecycleTools(server: McpServer, client: BackendClient) {
+  // 四档都注册（含 read）：read 档现在也连共享后端，重启后端对它同样是「换新构建」的必要动作。
+  // 代价是破坏半径对齐——read 档的这一下同样是全局的（会掐掉 GUI 与其它 agent 的在途请求），
+  // 描述里写明，不靠档位闸拦（18-3：分档不设安全卡）。
   server.registerTool('restart_backend', {
-    description: 'full 档运维：强制重启共享后端。先优雅关停、再按 pid 强杀整棵进程树并确认退出——确保被其他客户端（opencode/codex 等）续住、或崩在加载 native 不响应 shutdown 的旧后端也被真正杀掉。下次工具调用会拉起 node runtime 的最新实例（host 恒 node ABI，与本 shell 自己跑 node 还是 electron 无关）。会中断其余客户端正在进行的后端操作（它们下次调用自会重连/重拉）。工具 schema 未变，无需重连 MCP。'
+    description: '各档可见的后端运维（read 档同样连共享后端，故这一下同样是全局动作）：强制重启共享后端。先优雅关停、再按 pid 强杀整棵进程树并确认退出——确保被其他客户端（opencode/codex 等）续住、或崩在加载 native 不响应 shutdown 的旧后端也被真正杀掉。下次工具调用会拉起 node runtime 的最新实例（host 恒 node ABI，与本 shell 自己跑 node 还是 electron 无关）。会中断其余客户端（含 GUI）正在进行的后端操作（它们下次调用自会重连/重拉）。工具 schema 未变，无需重连 MCP。'
   }, async () => {
     // pid 取自当前连接的 ready 帧；本进程还没连过后端时回退描述文件——别的客户端/GUI 续住的游离
     // 后端 pid 一直记在那里，否则首调会因 client.pid 为 null 误判「未启动」而漏杀。
@@ -1047,7 +1050,7 @@ export function registerWriteTools(server: McpServer, client: BackendClient, tie
   if (tier === 'full' || tier === 'human') {
     // full 档运维：对象库 GC（mark-sweep，lazy/手动）——回收不被任何 commit 引用的历史对象。
     server.registerTool('gc_objects', {
-      description: 'full 档运维：对象库垃圾回收（mark-sweep）。回收不被任何 commit 引用的历史对象（blob/tree/source）——即删文档/删 commit 后变孤儿的内容寻址对象。reset/revert 跳过的 commit 仍在表中、其对象不会被收（保住可后悔窗口）。不在写热路径，需要时手动跑。'
+      description: 'full 档运维：对象库垃圾回收（mark-sweep）。回收不被任何 commit 引用的历史对象（blob/tree/source/spanmap）——即删文档/删 commit 后变孤儿的内容寻址对象。reset/revert 跳过的 commit 仍在表中、其对象不会被收（保住可后悔窗口）。不在写热路径，需要时手动跑。'
     }, async () => {
       return textResult(await dbShell(client, ['gc']));
     });
@@ -1078,16 +1081,20 @@ export function registerWriteTools(server: McpServer, client: BackendClient, tie
 }
 
 async function main() {
-  // 后端共用（projectneed 18-6-1）：写档（edit/full）实例经连接描述文件发现并复用共享后端，
-  // 连不上自行拉起（detached），单机离线回退私有 stdio；只读实例照旧各起私有后端（并发读安全）。
+  // 后端共用（projectneed 18-6-1）：**四档一律**经连接描述文件发现并复用同一个共享后端，
+  // 连不上自行拉起（detached），只在拉不起来（单机离线等）才回退私有 stdio。
+  // read 档为什么也回连：私有 host 不是只读 host——headless-agent-host 的 createDatabaseService
+  // 没开 readonly，IftreeStore.init() 本身就要 exec(TABLES_SQL) / ALTER TABLE / 迁移编辑分支表。
+  // 于是「多个 read 档客户端 + 一个共享后端」= 多条可写连接同时开同一主库、并发跑迁移，
+  // 直接破 ARCHITECTURE §1 的「一库一后端 / 单写者」不变量。并发读的性能旁路让位于架构一致性：
+  // read 档照样连共享后端，只是不注册写动词（写动词闸仍由 IS_WRITE_TIER 管，见下 registerWriteTools）。
   const hostScriptPath = join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js');
-  // 统一 backend-client SDK：写档（edit/full）走共享管道复用同一后端、只读档走私有 stdio（并发读安全）；
-  // 各动词只调 SDK 的语义方法、内部不再散写 request('database.read'...)。owner 解析 / payload 构造仍是
-  // mcp-server 的入口业务、留在动词侧不进 SDK。
+  // 统一 backend-client SDK：各动词只调 SDK 的语义方法、内部不再散写 request('database.read'...)。
+  // owner 解析 / payload 构造仍是 mcp-server 的入口业务、留在动词侧不进 SDK。
   const client = createBackendClient({
     projectRoot: PROJECT_ROOT,
     hostScriptPath,
-    mode: IS_WRITE_TIER ? 'shared' : 'private',
+    mode: 'shared',
     onStderr: (text: unknown) => { process.stderr.write(String(text ?? '')); },
     onStatus: (text: unknown) => { process.stderr.write(String(text ?? '')); }
   });
@@ -1112,7 +1119,7 @@ async function main() {
     '更详尽的记忆库使用（召回动线、find 范围过滤、写入边界与提炼、存储定位、操作踩坑）见 docs/memory.md。'
   ].join('\n');
 
-  const server = new McpServer({ name: 'iftree-library', version: '0.3.0' }, { instructions: SERVER_INSTRUCTIONS });
+  const server = new McpServer({ name: 'iftree-library', version: '0.6.7' }, { instructions: SERVER_INSTRUCTIONS });
   registerRetrievalTools(server, client);
   registerAgentTools(server, client, TIER);
   registerLifecycleTools(server, client);
@@ -1120,7 +1127,8 @@ async function main() {
 
   const shutdown = async () => {
     // 共享后端（mode==='pipe'）是多客户端复用的，不能因单个 MCP 退出而全局关停——只断开本连接。
-    // 私有兜底后端（private）/只读档自起的 headless（无 mode）由本进程独占，正常 shutdown 免泄漏子进程。
+    // 四档都走 shared 后，private 只剩「拉不起共享后端时的单机兜底」这一种：它由本进程独占，
+    // 正常 shutdown 免泄漏子进程（还没发过请求、channel 仍为 null 时 shutdown 是空操作）。
     // restart_backend 仍走 client.shutdown()（有意全局重启共享后端），不受此处影响。
     try {
       if (client.mode !== 'pipe') await client.shutdown();

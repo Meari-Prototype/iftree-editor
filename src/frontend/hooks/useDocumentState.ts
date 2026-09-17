@@ -33,6 +33,7 @@ import {
   evictToWindow,
   expandOneLevel as viewExpandOneLevel,
   ingestChildren,
+  ingestPath,
   ingestRoot,
   loadedNodeCount,
   nextBackgroundFetch,
@@ -51,7 +52,8 @@ import {
   type Session,
   type ViewSnapshot,
   type ViewSnapshotOut,
-  type FetchRequest
+  type FetchRequest,
+  type LegacyDocProjection
 } from '../session/document-session.js';
 import type { TreeNode } from '../../core/node-model.js';
 
@@ -149,12 +151,17 @@ export function useDocumentState() {
   const bgRef = useRef<{ token: number }>({ token: 0 });
 
   // 把状态机投影成 currentDoc 并触发渲染。所有改动（加载/展开/写/预取）末尾调它。
+  // 结构共享：prev 投影传回 projectToLegacyDoc，未变子树 O(1) 复用——投影成本从
+  // O(已加载量) 降到 O(变化路径)，下游 useMemo([tree]) 的引用缓存不再被每页预取击穿。
+  const projectionRef = useRef<LegacyDocProjection | null>(null);
   const project = useCallback((): ProjectedDoc | null => {
     const session = sessionRef.current;
     const meta = docMetaRef.current;
     if (!session || !meta) return null;
     // meta（DocMeta）+ LegacyDocProjection（tree/idByAddress/depthStats）+ view 合成 ProjectedDoc——字段集相容但 TS 不直接 narrow，边界 cast 收口。
-    const projected = { ...meta, ...projectToLegacyDoc(session), view: session.view } as ProjectedDoc;
+    const legacy = projectToLegacyDoc(session, projectionRef.current);
+    projectionRef.current = legacy;
+    const projected = { ...meta, ...legacy, view: session.view } as ProjectedDoc;
     setCurrentDocState(projected);
     return projected;
   }, [setCurrentDocState]);
@@ -195,12 +202,16 @@ export function useDocumentState() {
   async function reconcileChildrenFromServer(parentId: unknown): Promise<void> {
     const docId = sessionRef.current?.docId;
     if (!docId || !parentId || !sessionRef.current) return;
+    const generation = bgRef.current.token;
     const result = await documentRepository.getNodeChildren({
       docId,
       parentId,
       offset: 0,
       limit: NODE_CHILDREN_PAGE_SIZE
     });
+    // 代际校验（对齐 fetchChildrenInto）：await 期间换了文档，旧文档的权威子列表直接丢弃——
+    // 否则并进新文档 session，byAddress 被旧行占用污染。并行化后多个在途并存，窗口更宽。
+    if (bgRef.current.token !== generation || !sessionRef.current) return;
     sessionRef.current = viewReconcileChildren(sessionRef.current, {
       parentId,
       rows: result?.rows || [],
@@ -216,7 +227,9 @@ export function useDocumentState() {
       if (!sessionRef.current) break;
       const fetches = planHotFetches(sessionRef.current, { radius });
       if (fetches.length === 0) break;
-      for (const fetch of fetches) await fetchChildrenInto(fetch);
+      // 同轮内各 parent 的取数彼此无依赖，并行（原先串行 await，首开/大跳转延迟 = 各页 RTT 之和）。
+      // fetchChildrenInto 有代际校验，并行安全；轮间仍串行（下一轮 plan 依赖本轮并入的边界外推）。
+      await Promise.all(fetches.map((fetch) => fetchChildrenInto(fetch)));
     }
     maybeEvict();
   }
@@ -236,18 +249,29 @@ export function useDocumentState() {
   // 后台预取至 min(全量, W)：idle 逐个取边界；token 变了立即停（换文档/卸载作废旧循环）。
   // 达到窗口上界即停——超出部分只由热区显式拉入（用户意图），由 maybeEvict 空闲收回，
   // 避免「预取→超窗→驱逐→再预取」的振荡把整个文档流过内存。
+  // 攒批 project：原先每页一次（20 万节点 ≈ 667 次全量投影），现每 8 页一次 + 收尾一次——
+  // 结构共享后单次 project 已便宜，攒批进一步把预取期的渲染频率压到 1/8。
+  const PREFETCH_PROJECT_BATCH = 8;
   function startBackgroundPrefetch(): void {
     const token = ++bgRef.current.token;
+    let pagesSinceProject = 0;
+    const flushProject = (): void => {
+      if (pagesSinceProject > 0) {
+        pagesSinceProject = 0;
+        project();
+      }
+    };
     const step = async (): Promise<void> => {
       if (bgRef.current.token !== token) return;
       if (!sessionRef.current) return;
-      if (loadedNodeCount(sessionRef.current) >= DEFAULT_EVICT_WINDOW) return; // 预取至 W 停
+      if (loadedNodeCount(sessionRef.current) >= DEFAULT_EVICT_WINDOW) { flushProject(); return; } // 预取至 W 停
       const fetch = nextBackgroundFetch(sessionRef.current);
-      if (!fetch) return; // 全量加载完，循环自然结束
+      if (!fetch) { flushProject(); return; } // 全量加载完，循环自然结束
       try {
         await fetchChildrenInto(fetch);
         if (bgRef.current.token !== token) return;
-        project();
+        pagesSinceProject += 1;
+        if (pagesSinceProject >= PREFETCH_PROJECT_BATCH) flushProject();
       } catch {
         // 预取是可丢弃的，失败不阻塞、不报错，下一轮继续。
       }
@@ -293,6 +317,7 @@ export function useDocumentState() {
 
       bgRef.current.token += 1; // 作废上一个文档的后台预取与在途 fetch（fetchChildrenInto 代际校验同源）
       docMetaRef.current = metaFromDocResult(initial);
+      projectionRef.current = null; // 换文档：结构共享的 prev 投影同步作废（id 跨文档无意义）
       // 死分支清理：DocRow 没有 root_id 字段（之前的 `initial.doc.root_id` 永远 undefined、走不到兜底）。
       const rootRow = initial?.tree || null;
       if (!rootRow) return initial ?? null;
@@ -326,10 +351,48 @@ export function useDocumentState() {
     return project();
   }
 
+  // 定位到某节点：保证它进了镜像（可被投影/选中），并把它的子与周围热区铺好。
+  // 返回 false = 拉不回来（后端查不到 / 换文档作废 / 出错），调用方据此放弃定位并提示，
+  // 绝不能把一个不在投影里的 id 设成 selectedNodeId。
+  //
+  // 为什么需要它：session 的 ingestChildren 有孤儿闸（父不在镜像整批丢弃），fillHotRegion 的
+  // planHotFetches 也要先 byId 查到焦点才知道祖先链。大文档里后台预取没走到、或已被
+  // evictToWindow 卸载的子树，直接对着目标 id 取子会整批落空——必须先把「根→目标」整条链拉回来。
+  async function ensureNodePath(nodeId: unknown): Promise<boolean> {
+    const docId = sessionRef.current?.docId;
+    if (!sessionRef.current || !docId || !nodeId) return false;
+    const id = String(nodeId);
+    // 已在镜像且子列表也取过 → 无事可做，不白花一趟 IPC。
+    if (sessionRef.current.index.byId.has(id) && sessionRef.current.loadedParents.has(id)) return true;
+    if (!sessionRef.current.index.byId.has(id)) {
+      const generation = bgRef.current.token;
+      try {
+        const result = await documentRepository.getNodeAncestors({ docId, nodeId: id });
+        // 代际校验同 fetchChildrenInto：await 期间换了文档，迟到的链直接丢弃。
+        if (bgRef.current.token !== generation || !sessionRef.current) return false;
+        const rows = result?.rows || [];
+        if (rows.length > 0) sessionRef.current = ingestPath(sessionRef.current, { rows });
+      } catch (error) {
+        setNotice?.((error as { message?: string }).message || '');
+        return false;
+      }
+    }
+    if (!sessionRef.current?.index.byId.has(id)) return false;
+    await fetchChildrenInto({ parentId: id, offset: 0 });
+    await fillHotRegion(id);
+    project();
+    return Boolean(sessionRef.current?.index.byId.has(id));
+  }
+
   // 展开一个节点：聚焦它、取它的子（及周围热区），reconcile 进状态机后投影。
   async function ensureNodeChildren(nodeId: unknown, options: AnyRecord = {}): Promise<void> {
     if (!sessionRef.current || !nodeId) return;
     void options;
+    // 不在镜像（未预取到 / 被驱逐）→ 先经 ensureNodePath 把祖先链拉回来，它已含取子 + 填热区 + 投影。
+    if (!sessionRef.current.index.byId.has(String(nodeId))) {
+      await ensureNodePath(nodeId);
+      return;
+    }
     sessionRef.current = setFocus(sessionRef.current, nodeId);
     await fetchChildrenInto({ parentId: nodeId, offset: 0 });
     await fillHotRegion(nodeId);
@@ -349,9 +412,8 @@ export function useDocumentState() {
     if (!sessionRef.current) return null;
     const root = sessionRef.current.index.root?.id;
     const ids = Array.isArray(parentIds) && parentIds.length > 0 ? parentIds : [root];
-    for (const id of ids) {
-      if (id) await reconcileChildrenFromServer(id);
-    }
+    // 各 parent 的权威子列表重取彼此独立（各自 replace 自己的 childrenOf），并行。
+    await Promise.all(ids.filter(Boolean).map((id) => reconcileChildrenFromServer(id)));
     await fillHotRegion(sessionRef.current.focusId || root);
     return project();
   }
@@ -376,6 +438,7 @@ export function useDocumentState() {
       bgRef.current.token += 1;
       sessionRef.current = null;
       docMetaRef.current = null;
+      projectionRef.current = null;
     }
     setCurrentDocState(next);
   }
@@ -506,6 +569,7 @@ export function useDocumentState() {
     loadComplete,
     loadTreeDepth,
     loadSourceWindow,
+    ensureNodePath,
     ensureNodeChildren,
     reconcileWrittenNode,
     reloadStructuralChange,

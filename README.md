@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.6%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.7%20alpha-orange)
 
-> **项目状态：0.6.6，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
+> **项目状态：0.6.7，早期开发阶段。** 项目仍在活跃开发中，请按早期版本对待：
 >
 > - **前端**：仍有较多已知 bug 未修复。
 > - **后端写入路径**：缺少长期使用的实测——项目开发时间尚短，客观上还没有积累足够的长时运行数据。
@@ -63,7 +63,7 @@ IF-Tree Editor 是一个本地优先的文档数据管理工具，面向规模�
 
 ## 功能特性
 
-- **精确检索**：关键词检索 + 基于 `bge-m3` 的本地语义检索，配合句子级 offset 映射，把命中定位到具体几句；默认 WebGPU/fp16 推理，可切换 CPU。
+- **精确检索**：关键词检索 + 基于 `bge-m3` 的本地语义检索，配合句子级 offset 映射，把命中定位到具体几句；默认 GPU（DirectML）/fp16 推理，可切换 CPU。
 - **基于证据的回答**：内置 Agent 回答事实问题时需读取正文证据并给出证据节点地址，不以模型常识或题目措辞作答，结果可核对。
 - **本地优先存储**：文档、节点、事实前提、ERROR、引用关系与历史存于 SQLite，节点级语义向量存于 LanceDB，无需任何云服务即可使用。
 - **Agent 协作与 MCP**：内置 Agent 与 MCP 服务共用一套权限分级（问答 / 协作 / 完全）；外部 agent 框架可检索读证据，协作档起的写入一律先进编辑分支待人审。LLM 支持 OpenAI 兼容与 Anthropic 兼容接口。
@@ -94,7 +94,7 @@ IF-Tree Editor 是一个本地优先的文档数据管理工具，面向规模�
 | 界面 | React 19 + Vite 7 |
 | 本地数据库 | better-sqlite3 |
 | 向量数据库 | LanceDB |
-| 语义向量 | @huggingface/transformers（`bge-m3`，WebGPU/ONNX） |
+| 语义向量 | @huggingface/transformers（`bge-m3`，ONNX Runtime，GPU 走 DirectML） |
 | Agent / 工具协议 | @modelcontextprotocol/sdk（MCP） |
 | 其它 | pdfjs-dist、fflate、lucide-react、@radix-ui |
 
@@ -103,7 +103,7 @@ IF-Tree Editor 是一个本地优先的文档数据管理工具，面向规模�
 - **操作系统**：Windows 10 / 11（开发与验证均在 Windows 上进行；脚本以 PowerShell 为主）。
 - **Node.js**：建议 20 LTS 或更高（验证在 Node 24 上进行）。原生模块（better-sqlite3）按 node ABI 预编译（`prebuild-install` 下载，无需编译工具链）；测试、CLI、MCP、后端服务均纯 node 运行（ABI 说明见[开发与测试](#开发与测试)）。
 - **包管理器**：npm。
-- **GPU（可选）**：支持 WebGPU 的显卡可加速语义向量；无 WebGPU 时可在设置页切换到 CPU。
+- **GPU（可选）**：支持 DirectX 12 的显卡可经 DirectML 加速语义向量；没有可用 GPU 时在设置页切换到 CPU。
 
 ## 快速开始
 
@@ -188,10 +188,10 @@ database\               # 与主库 store.sqlite 同目录（IFTREE_HOME 默认�
 ## 语义向量
 
 - 默认模型为 `Xenova/bge-m3`（`BAAI/bge-m3` 的 Transformers.js ONNX 权重），数据库维度由当前模型推导并精确校验。
-- 推理在渲染进程的 module worker 池中执行：GPU 配置使用 `device: 'webgpu'`，CPU 配置使用 `device: 'wasm'`，默认 2 个 worker、每批 16 条文本。
+- 本地推理在后端 node 进程中用 Transformers.js 执行：GPU 配置使用 `device: 'dml'`（DirectML），CPU 配置使用 `device: 'cpu'`；每批 16 条文本，单篇文档内默认 4 个子批并发（设置页的 worker 数）。
 - 设置页可切换模型、计算目标（GPU/CPU）、worker 数、batch size 与本地 ONNX 模型路径，并提供当前模型的手动下载按钮。
-- 本地模型路径会通过主进程启动一个只读的 `127.0.0.1` 文件服务映射给 worker；目录可以是模型根目录，也可以是包含 `config.json` 的具体模型目录。
-- 切换模型会丢弃旧的 LanceDB 表，避免不同模型的同维向量混用。
+- 本地模型路径直接作为 Transformers.js 的本地模型根目录使用；填了本地路径就不再从远端拉取模型。
+- 在设置页保存新的模型、维度或本地模型路径时会丢弃旧的 LanceDB 表，向量不会自动重建，需要对要做语义检索的文档重新补建。经 `IFTREE_EMBED_*` 环境变量换模型不会丢表，同维度新旧向量会混在一张表里，须自己重建，见[操作指南](docs/how-to.md#构建语义向量)。
 
 ## 导入与导出
 

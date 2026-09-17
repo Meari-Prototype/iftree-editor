@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 
 import type { TreeNode } from '../../core/node-model.js';
 import { depthOf, hasKnownChildren } from '../lib/doc-utils.js';
@@ -25,7 +25,8 @@ interface OutlineNodeProps {
 const OUTLINE_STICKY_ROW_HEIGHT = 32;
 const OUTLINE_STICKY_MAX_DEPTH = 4;
 
-function OutlineNode({
+// memo：props 全部可浅比较（node/Set/回调引用稳定时），挡住 AppBody 无关 render 的全树递归重建。
+const OutlineNode = memo(function OutlineNode({
   node,
   selectedNodeId,
   collapsedOutlineNodeIds,
@@ -78,7 +79,7 @@ function OutlineNode({
       ))}
     </div>
   );
-}
+});
 
 export function OutlinePanel({
   tree,

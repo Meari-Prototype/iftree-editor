@@ -22,13 +22,18 @@ LLM 用在三处：节点 / 全文摘要、内置 agent 对话、智能导入。
 
 语义检索按含义找句子，前提是先为文档建向量。
 
-1. 设置页选择模型（默认 `Xenova/bge-m3`）与计算目标：GPU（WebGPU）或 CPU（wasm）。
+1. 设置页选择模型（默认 `Xenova/bge-m3`）与计算目标：GPU（DirectML）或 CPU。推理在后端 node 进程里跑。
 2. 下载模型（设置页有当前模型的手动下载按钮；也可填本地 ONNX 模型目录路径）。
-3. 对已导入文档补建向量：应用内触发，或命令行 `npm run vectors:ensure`。
+3. 对已导入文档补建向量：应用内触发，或命令行 `npm run vectors:ensure <docId>`（逐篇）。
 
-调优项：worker 数（默认 2）、batch size（默认每批 16 条）。切换模型会丢弃旧的 LanceDB 表，避免不同模型的同维向量混用。
+调优项：worker 数（单篇文档内并发的嵌入子批数，默认 4）、batch size（默认每批 16 条）。
 
-**远程 embedding 后端**：本机推理吃力时，可以把向量计算切到一个 HTTP embedding 服务——支持 ollama（`POST {baseUrl}/api/embed`）和 OpenAI 兼容（`POST {baseUrl}/v1/embeddings`，llama.cpp server 加 `--embedding` 即原生暴露）两类端点。向量在客户端统一做 L2 归一化，与本地推理路径的结果可比。
+**换嵌入模型后要手动重建**：向量表不记录产出它的模型，完整性检验也只按节点正文判断向量是否过期、认不出「这条是旧模型嵌的」。内置的 BGE-M3 / BGE-large-zh / BGE-large-en 都是 1024 维，同维度换模型时新旧向量会共处一表，相似度在两套向量空间之间比较、结果没有意义。系统不会因为换了模型就自动重嵌全库——本地嵌入是这台机器上最重的一笔计算，大库以小时计，什么时候付这个代价由你决定。所以换模型后请自己走一遍重建：
+
+1. 在设置页保存新模型（或新维度）——保存时会丢弃旧的向量表，旧向量一次清空。
+2. 对还需要语义检索的文档逐篇补建：应用内触发，或命令行 `npm run vectors:ensure <docId>` / `db vectors <doc_id>`。
+
+**远程 embedding 后端**：本机推理吃力时，可以把向量计算切到一个 HTTP embedding 服务——支持 ollama（`POST {baseUrl}/api/embed`）和 OpenAI 兼容（`POST {baseUrl}/v1/embeddings`，llama.cpp server 加 `--embedding` 即原生暴露）两类端点。向量在客户端统一做 L2 归一化，与本地推理路径的结果可比。注意这条路径经环境变量（`IFTREE_EMBED_*`）配置、不经设置页，换 `IFTREE_EMBED_MODEL` 不会丢表也不会提示——同维度换模型仍按上面那两步自己重建；另外后端在进程内只解析一次，改了环境变量要重启后端才生效。
 
 ## 导入各格式文档
 
@@ -96,7 +101,7 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
 注意事项：
 
 - 协作档及以上，agent 的结构性修改先进 **编辑分支**（owner=llm 影子分支）待审，不直接改主库；待审 diff 在应用内逐条或整批裁决。
-- 更新代码或原生模块后，调 `restart_backend` 工具让 MCP 重新拉起后端子进程。
+- 更新代码或原生模块后，调 `restart_backend` 重启共享后端，下次调用时加载新构建。各档共用同一个后端，重启会中断应用和其他 agent 正在进行的请求。
 - 应用、MCP、命令行共享同一个后端进程（一库一后端），可以同时开着应用和 agent，互不冲突。
 
 ## 让外部 agent 投递事件记忆卷
@@ -137,7 +142,7 @@ MCP server 以 stdio 方式运行，权限档在启动时由环境变量 `IFTREE
 - 备份：`library/` + `database/store.sqlite` 即可恢复全部内容；向量可随时重建。
 - 换库 / 隔离测试：`IFTREE_DB` 指定另一个 SQLite 路径，`IFTREE_HOME` 指定另一个派生数据目录（也可把向量库挪到大盘）。
 
-**库级迁移 / 重建**（0.6.0 起；升级或调整库结构时）：数据库带 schema 版本号、启动只读校验；schema 演进走「导出 → 建新空库 → 导入」的一次性往复，不在旧库原地改。均须先 `npm run build:runtime`、用 node 跑、在共享后端空闲时跑，默认 dry-run、`--apply` 才动：
+**库级迁移 / 重建**（0.6.0 起；升级或调整库结构时）：数据库带 schema 版本号（`PRAGMA user_version`），后端启动时校验。版本号不兼容时不在旧库原地升级，走「导出 → 建新空库 → 导入」的一次性往复；不升版本号的兼容改动（补列、补索引与触发器、放宽约束）在后端启动时原地完成，例如 0.6.7 首次启动会给 `docs`、`commits` 补句位归属相关列，并重建一次 `objects` 表。大库升级前建议先备份 `database/store.sqlite`。以下脚本均须先 `npm run build:runtime`、用 node 跑、在共享后端空闲时跑，默认 dry-run、`--apply` 才动：
 
 - `node dist/scripts/export-db-to-json.js [输出路径]` —— live 库导成单个 JSON（带 schema 版本头），只读不改源库。
 - `node dist/scripts/import-db-from-json.js <dump.json> [目标库] --apply` —— 按最新 schema 建全新空库再灌入。

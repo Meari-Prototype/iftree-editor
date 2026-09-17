@@ -436,6 +436,11 @@ export function useStartup({
       lastUiAction: lastUiActionRef?.current ?? null,
       ...extra
     });
+    // 两个全局监听只记日志、不判启动失败：STARTUP_FAILURE 在主进程是 30ms 后 app.quit，
+    // 而 window 级 error / unhandledrejection 捕捉的是整个渲染进程的任意异常——某个无关组件
+    // 或某条未 catch 的后台请求炸一下，就会把整个应用关掉（且启动早已成功也照关，因为
+    // startupSuccessReportedRef 只挡「已上报过」这一种情况）。真正的启动失败由下面编排链路
+    // 各环节显式 failStartup；这里失守的兜底是主进程 watchdog 的心跳超时，不是立即退出。
     const reportWindowError = (event: ErrorEvent): void => {
       const error = event?.error || event?.message || 'renderer-error';
       debugLog('renderer.window.error', rendererErrorPayload(error, {
@@ -443,12 +448,10 @@ export function useStartup({
         lineNumber: event?.lineno ?? null,
         columnNumber: event?.colno ?? null
       }));
-      failStartup(error, { stage: 'renderer-error' });
     };
     const reportUnhandledRejection = (event: PromiseRejectionEvent): void => {
       const reason = event?.reason || 'renderer-unhandled-rejection';
       debugLog('renderer.window.unhandledrejection', rendererErrorPayload(reason));
-      failStartup(reason, { stage: 'renderer-unhandled-rejection' });
     };
     window.addEventListener('error', reportWindowError);
     window.addEventListener('unhandledrejection', reportUnhandledRejection);

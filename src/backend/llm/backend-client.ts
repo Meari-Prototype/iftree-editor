@@ -4,8 +4,15 @@
 // 语义方法、内部不再散写 request('database.read', {...})。SDK 之下是纯后端，谁调都行、不依赖前端。
 //
 // 连接方式按入口裁剪（mode）：
-//   - shared（默认，主进程 / mcp-server 写档）：连命名管道复用同一个共享后端，连不上自拉起、回退私有。
-//   - private（mcp-server 只读档）：各起私有 stdio 后端，并发读安全、互不抢占。
+//   - shared（默认，且是经本 SDK 唯一在用的一档）：连命名管道复用同一个共享后端，连不上自拉起、
+//     拉不起才回退私有。主进程、mcp-server 四档、scripts/ 下的日常 CLI（db）/运维（ops）/压测
+//     （benchmark、bench）脚本全在这一档。
+//   - private：各起私有 stdio 后端。**经本 SDK 已无人再选它**——私有 host 不是只读 host，
+//     IftreeStore.init() 自己就要 exec(TABLES_SQL)/ALTER TABLE/迁移，多开即多写者、破
+//     「一库一后端」不变量（ARCHITECTURE §1）。它现在只剩一处活路：shared 内部的单机兜底
+//     （拉不起共享后端时由 backend-pipe-client 直接调 createHeadlessAgentClient，不经本 SDK）。
+//     唯一有意直连私有 stdio 的入口是 scripts/verify-chm-stream.ts——它跑一次性 tmp 隔离库、
+//     且断言里要真的换一个冷启动进程，理由写在那个文件的头注释里。
 // 请求观测（onDebug）也按入口裁剪：主进程注入（记每次请求 start/end），mcp-server 不注入。
 import { createSharedBackendClient } from './backend-pipe-client.js';
 import { createHeadlessAgentClient } from './headless-agent-client.js';
@@ -51,7 +58,8 @@ export function createBackendClient({
   if (!projectRoot) throw new Error('createBackendClient requires projectRoot');
   // processPath 决定 host 跑什么 runtime（路 B）：host 必须 node ABI（better-sqlite3 只编 node）。默认经
   // resolveNodeExecutable 解析真 node——无论本进程自己是 node 还是 electron（如 electron 启动的 mcp-server），
-  // host 恒为 node runtime，与「谁拉起它」解耦。调用方一般无需再传 processPath（压测等要 electron ABI 才显式覆盖）。
+  // host 恒为 node runtime，与「谁拉起它」解耦。调用方无需再传 processPath（现无人覆盖；留着是给
+  // 「非常规 runtime 的 host」一个口子，不是给调用方按自己的 runtime 挑 ABI 用的）。
   const transport = mode === 'private'
     ? createHeadlessAgentClientTyped({ cwd: projectRoot, scriptPath: hostScriptPath, processPath, env, onStderr: onStderr || undefined })
     : createSharedBackendClientTyped({ projectRoot, hostScriptPath, processPath, env, onStderr, onStatus });

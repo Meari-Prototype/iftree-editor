@@ -131,10 +131,10 @@ function entityByRef(state: EntityState, ref: unknown): ProjectedEntity | null {
 function filterEntities(state: EntityState, payload: Payload = {}): ProjectedEntity[] {
   const docIds = docIdsFromPayload(payload);
   const docSet = docIds ? new Set(docIds.map(String)) : null;
-  const query = String(payload.query ?? payload.q ?? payload.literal ?? '').trim().toLocaleLowerCase();
+  const query = String(payload.query ?? payload.q ?? payload.literal ?? '').trim().toLowerCase();
   const queryRank = (entity: ProjectedEntity): number => {
     if (!query) return 0;
-    const key = String(entity.normalized_literal || '').toLocaleLowerCase();
+    const key = String(entity.normalized_literal || '').toLowerCase();
     if (key === query) return 0;
     if (key.includes(query)) return 1;
     return 2;

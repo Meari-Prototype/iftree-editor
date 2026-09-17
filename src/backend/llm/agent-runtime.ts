@@ -47,6 +47,11 @@ import type { HistoryItem, ToolEvent, StoredSession } from './agent-history.js';
 // 兼容出口：host 与测试仍从 agent-runtime 取卷组装函数。
 export { volumeNodesFromTurnMessages } from './agent-volume.js';
 
+// 一次 runAgent 里「模型→工具→再问模型」的最大往返数。模型陷在自我重复的工具环里时（反复
+// find 同一个词、反复 read 同一节点），唯一的自然出口是它自己不再发 tool_call——没有上限就
+// 一直烧 token / 占着单写队列。到顶按普通回答收尾（不抛错）：已跑出来的工具结果与会话照常落库。
+const MAX_AGENT_STEPS = 30;
+
 interface AgentDoc {
   tree?: TreeNode | null;
   idByAddress?: Record<string, string>;
@@ -610,8 +615,11 @@ export function createAgentRuntime(deps: AgentRuntimeDeps): AgentRuntime {
       const result = await runDbShellArgv(database() as never, argv as never, {
         currentDocId: context.file?.docId,
         askAgent: runAgent,
+        // 回灌本次调用方的真实 mode，刻意忽略 db-shell payload 里的 mode：db 动词在每个模式都可用，
+        // 但 `db shell` / `db web` 是经 db 语法再入 agentTool 的回路——若在这里放大成 full，
+        // qa 档只要写 `db shell <cmd>` 就能反弹出真 shell，把下面那道「真实 shell 需要完全权限」闸绕空。
         agentTool: ({ name, args: toolArgs }: { name: string; args: AnyRecord }) => runAgentTool(name, toolArgs, {
-          mode: 'full',
+          mode: permissions.mode,
           sessionId: 0,
           context: context as AgentContext,
           signal
@@ -1083,6 +1091,11 @@ export function createAgentRuntime(deps: AgentRuntimeDeps): AgentRuntime {
       let usage: NormalizedAgentUsage | null = null;
       const changedDocIds = new Set<string>();
       for (let step = 0; ; step += 1) {
+        if (step >= MAX_AGENT_STEPS) {
+          answer = `已达最大工具调用轮次（${MAX_AGENT_STEPS}），请缩小问题或分步提问。`;
+          pushTextSegment(answer);
+          break;
+        }
         assertNotAborted(signal);
         sendAgentStream(requestId, { type: 'status', text: step === 0 ? '正在连接模型...' : '正在整理回答...' });
         const message = await callAgentChat(api, messages, tools, { requestId, reasoningEffort, signal });
@@ -1304,6 +1317,11 @@ export function createAgentRuntime(deps: AgentRuntimeDeps): AgentRuntime {
     const name = String(payload.name || payload.tool || '').trim();
     if (!name) throw new Error('agent tool name is required');
     const args = payload.args && typeof payload.args === 'object' ? payload.args as AnyRecord : {};
+    // 缺省 full 是 CLI 线的档位：本入口的实际调用方是 host 的 'db.shell' / 'agent.tool'，
+    // 而 shell / web_open 按 18-2 只留 CLI 与内置 agent 线、不对 MCP 暴露（MCP 每个动词自拼 argv，
+    // 没有透传 argv 的工具），所以这里的 full ≈ 人在本机终端。
+    // 内置 agent 自己的 db 回路不走这里——它在 agentBash 注入回调时回灌 permissions.mode，
+    // 那才是「qa 不得经 db shell 反弹真 shell」的闸。
     const mode = normalizeAgentMode(payload.mode || 'full');
     const context = await buildAgentContext({ ...payload, mode });
     return runAgentTool(name, args, {

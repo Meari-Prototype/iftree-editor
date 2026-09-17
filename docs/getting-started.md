@@ -8,7 +8,7 @@
 
 - Windows 10 / 11（脚本以 PowerShell 为主）。
 - Node.js 20 LTS 或更高，npm。
-- 可选：支持 WebGPU 的显卡（加速语义向量；没有也能用，可切 CPU）。
+- 可选：支持 DirectX 12 的显卡（经 DirectML 加速语义向量；没有也能用，可切 CPU）。
 
 ## 第一步：安装与启动
 

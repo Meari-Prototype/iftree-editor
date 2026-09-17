@@ -3,7 +3,8 @@
 import { nodeWithChildCount, normalizeLimit, normalizeNonNegativeInteger, normalizeQueryId, plainRow, requireDocId, resolveAddress } from './shared.js';
 import { pdfHighlightRects, pdfSpanHitRects } from '../../source/pdf-highlight-geometry.js';
 import { formatAddress, isAncestor, nextInDfs, parentAddress, parseAddress } from '../../../core/tree-cursor.js';
-import type { ContentNodeRow, Payload } from './shared.js';
+import { getProjectedDoc } from '../../projection/doc-view.js';
+import type { ContentNodeRow, NodeAncestorRow, NodeAncestorsResult, Payload } from './shared.js';
 import type { IftreeStore } from '../../store/index.js';
 
 export function queryNode(store: IftreeStore, payload: Payload = {}): ContentNodeRow | null {
@@ -181,5 +182,106 @@ export function queryAncestorChain(store: IftreeStore, payload: Payload = {}) {
     docId: requireDocId(payload),
     nodeId: payload.nodeId ?? payload.node_id
   }).map(plainRow);
+}
+
+// 兄弟序比较：与 node.listChildren 的分页序（SQL `ORDER BY sort_order, id`，id 是 TEXT 列按
+// BINARY 比）同口径——child_offset 只有与分页序一致才指得准「第几页」。
+function compareSiblingOrder(left: ContentNodeRow, right: ContentNodeRow): number {
+  const bySort = (Number(left.sort_order) || 0) - (Number(right.sort_order) || 0);
+  if (bySort !== 0) return bySort;
+  const a = String(left.id);
+  const b = String(right.id);
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+// 投影口径下的祖先链：有活跃 human 编辑分支时链必须从投影行上走。分支里 reparent / insert /
+// delete 过的节点在主干上要么根本不存在（tmp id）、要么还挂在旧父下，直接读主干会给前端一条
+// 与它正在看的文档对不上的链。
+function projectedAncestorRows(store: IftreeStore, docId: string, payload: Payload): NodeAncestorRow[] {
+  const data = getProjectedDoc(store, docId, {
+    includeSourceSpans: false,
+    includeSourceDocumentContent: false
+  });
+  const nodes: ContentNodeRow[] = data?.nodes ?? [];
+  if (nodes.length === 0) return [];
+  const byId = new Map<string, ContentNodeRow>();
+  const childrenByParent = new Map<string, ContentNodeRow[]>();
+  for (const row of nodes) {
+    byId.set(String(row.id), row);
+    const key = row.parent_id === null || row.parent_id === undefined ? '' : String(row.parent_id);
+    const list = childrenByParent.get(key);
+    if (list) list.push(row); else childrenByParent.set(key, [row]);
+  }
+
+  const nodeId = normalizeQueryId(payload.nodeId ?? payload.node_id);
+  const address = String(payload.address ?? '').trim();
+  let cursor = nodeId ? byId.get(String(nodeId)) ?? null : null;
+  if (!cursor && address) cursor = nodes.find((row) => String(row.address || '') === address) ?? null;
+  if (!cursor) return [];
+
+  // 自底向上收链再反转（seen 兜环：投影行理论上无环，但链遍历不该因脏数据变成死循环）。
+  const chain: ContentNodeRow[] = [];
+  const seen = new Set<string>();
+  while (cursor && !seen.has(String(cursor.id))) {
+    seen.add(String(cursor.id));
+    chain.push(cursor);
+    cursor = cursor.parent_id === null || cursor.parent_id === undefined
+      ? null
+      : byId.get(String(cursor.parent_id)) ?? null;
+  }
+  chain.reverse();
+
+  const sorted = new Set<string>();
+  return chain.map((row) => {
+    const key = row.parent_id === null || row.parent_id === undefined ? '' : String(row.parent_id);
+    const siblings = childrenByParent.get(key) ?? [];
+    if (!sorted.has(key)) { siblings.sort(compareSiblingOrder); sorted.add(key); }
+    const at = siblings.findIndex((sibling) => String(sibling.id) === String(row.id));
+    return { ...row, child_offset: Math.max(0, at) } as NodeAncestorRow;
+  });
+}
+
+// 主干口径的祖先链：递归 CTE 一次拿全链的整行 + child_count + child_offset。无分支时不走
+// getProjectedDoc——那会为一条链把整篇文档物化一遍。
+function trunkAncestorRows(store: IftreeStore, docId: string, payload: Payload): NodeAncestorRow[] {
+  const nodeId = normalizeQueryId(payload.nodeId ?? payload.node_id)
+    ?? (payload.address ? resolveAddress(store, docId, payload.address)?.id ?? null : null);
+  if (!nodeId) return [];
+  return store.db!.prepare(`
+    WITH RECURSIVE chain(id, parent_id) AS (
+      SELECT id, parent_id FROM nodes WHERE doc_id = ? AND id = ?
+      UNION ALL
+      SELECT parent.id, parent.parent_id
+      FROM nodes parent
+      JOIN chain ON parent.id = chain.parent_id
+      WHERE parent.doc_id = ?
+    )
+    SELECT nodes.*,
+      (SELECT COUNT(*) FROM nodes child
+        WHERE child.doc_id = ? AND child.parent_id = nodes.id) AS child_count,
+      (SELECT COUNT(*) FROM nodes sibling
+        WHERE sibling.doc_id = ? AND sibling.parent_id IS nodes.parent_id
+          AND (sibling.sort_order < nodes.sort_order
+            OR (sibling.sort_order = nodes.sort_order AND sibling.id < nodes.id))) AS child_offset
+    FROM nodes
+    JOIN chain ON chain.id = nodes.id
+    ORDER BY nodes.depth
+  `).all<NodeAncestorRow>(docId, nodeId, docId, docId, docId).map((row) => plainRow(row));
+}
+
+// 「根 → 目标节点」的整条链（含目标自身）。前端 session 在目标不在镜像时用它把路径整条拉回来
+// ——搜索/实体视图点深层结果、驱逐后重进的子树、后台预取还没走到的区域，都是「父行不在镜像」
+// 的场景，只取子会被 session 的孤儿闸整批丢弃。行格式与 node.listChildren 一致（nodes.* +
+// child_count），额外带 child_offset 让前端知道每一环落在父的第几页。
+export function queryNodeAncestors(store: IftreeStore, payload: Payload = {}): NodeAncestorsResult {
+  const docId = requireDocId(payload);
+  const branch = store.activeEditBranchForBaseDoc(docId, 'human');
+  const rows = branch ? projectedAncestorRows(store, docId, payload) : trunkAncestorRows(store, docId, payload);
+  return {
+    kind: 'node.ancestors',
+    docId,
+    nodeId: rows.length > 0 ? String(rows[rows.length - 1]!.id) : null,
+    rows
+  };
 }
 

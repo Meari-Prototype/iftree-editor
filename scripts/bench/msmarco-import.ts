@@ -11,10 +11,17 @@
 // 写入走 headless-agent 运行时（与 MCP 同一条路径）：stream.bulkBegin → 多次 stream.push
 // （address 直写快路径）→ stream.bulkEnd。FTS 关键字增量每批自动入库；向量按开关。
 //
-// 用法（CLI，需在 electron-as-node 下跑以匹配 better-sqlite3 ABI）：
-//   electron scripts/bench/msmarco-import.mjs --file <path .json.gz|.jsonl> [--limit N|N1,N2,...]
+// 用法（跑真 node：读回验证在本进程里 require better-sqlite3，而它只编 node ABI）：
+//   node dist/scripts/bench/msmarco-import.js --file <path .json.gz|.jsonl> [--limit N|N1,N2,...]
 //       [--batch 5000] [--embed] [--vector-backfill] [--report <csv>] [--label <name>]
+//
 // 目标库由 env 决定：IFTREE_DB（sqlite 文件）、IFTREE_HOME（settings/vectors/models 根）。
+// 走共享后端后这两个 env 的效力不对称，压测前务必核对：
+//   · IFTREE_DB 恒生效——共享后端的管道名由库的绝对路径派生，指哪个库就连（或拉起）哪个库的后端。
+//   · IFTREE_HOME 只在「本脚本亲手拉起后端」时生效；若该库的后端已经在跑，用的是它启动时的
+//     IFTREE_HOME，脚本这次设的值被忽略。要隔离向量/模型目录，就用一个没人在跑的专用 IFTREE_DB。
+// 另注意：拉起的共享后端是 detached 常驻的，压测结束只断连接、不关它（见 runImport 的 finally）；
+// 压测专用库用完想回收进程，按 database/backend-connection.json 里的 pid 处理。
 
 import { createReadStream, existsSync, mkdirSync, statSync, appendFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -23,7 +30,8 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { createHeadlessAgentClient } from '../../src/backend/llm/headless-agent-client.js';
+import { createBackendClient } from '../../src/backend/llm/backend-client.js';
+import { resolveBackendDbPath } from '../../src/backend/llm/backend-discovery.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const TRUST_LEVEL = '不受控'; // 外部网页语料；压测中标签无实际意义（与用户确认）。
@@ -250,8 +258,9 @@ export async function* streamGroups(filePath: string, { limit = Infinity }: { li
 
 // ── 导入编排：bulkBegin → 分批 push → bulkEnd ───────────────────
 
+// 与共享后端派生管道名用同一个解析：读回验证数的必须是后端刚写进去的那个库。
 function resolveDbPath(): string {
-  return process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite');
+  return resolveBackendDbPath(PROJECT_ROOT);
 }
 
 function countDocNodes(dbPath: string, docId: string): number {
@@ -283,10 +292,14 @@ export async function runImport(options: RunImportOptions): Promise<ImportResult
   } = options;
   if (!filePath || !existsSync(filePath)) throw new Error(`数据集文件不存在：${filePath}`);
 
-  const client = createHeadlessAgentClient({
-    cwd: PROJECT_ROOT,
-    scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
-    onStderr: (text: string) => process.stderr.write(text)
+  // 走共享后端（18-6-1 / ARCHITECTURE §1）：压测的就是 MCP 用的那条写入路径，且写入必须由
+  // 唯一持库的 host 做——私有 host 会以第二条可写连接开同一库并跑迁移，压测期间尤其危险。
+  const client = createBackendClient({
+    projectRoot: PROJECT_ROOT,
+    hostScriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
+    mode: 'shared',
+    onStderr: (text: unknown) => { process.stderr.write(String(text ?? '')); },
+    onStatus: (text: unknown) => { process.stderr.write(String(text ?? '')); }
   });
 
   const stats: ImportStats = {
@@ -312,7 +325,7 @@ export async function runImport(options: RunImportOptions): Promise<ImportResult
     const payload: Record<string, unknown> = { action: 'stream.push', nodes: tops, embed };
     if (docId) payload.docId = docId;
     else payload.title = title;
-    const res = await client.request('database.write', { payload }) as PushResult;
+    const res = await client.databaseWrite(payload) as PushResult;
     if (!docId && res.docId) docId = res.docId;
     rootOrder = nextOrder;
     stats.batches += 1;
@@ -322,7 +335,15 @@ export async function runImport(options: RunImportOptions): Promise<ImportResult
 
   try {
     log({ type: 'bulk-begin', filePath, limit, batchNodes, embed });
-    await client.request('database.write', { payload: { action: 'stream.bulkBegin' } });
+    // bulkBegin 要独占共享后端：backend-shared-server 在「当前连接数 > 1」时直接拒绝开批，
+    // 所以 GUI、MCP、别的脚本只要挂着一条连接，这一步就过不去。不吞不重试——拒绝理由原样抛出，
+    // 让人去关掉那些客户端；脚本自作主张重试只会让压测从半截开始、数字失真。
+    try {
+      await client.databaseWrite({ action: 'stream.bulkBegin' });
+    } catch (error) {
+      log({ type: 'bulk-begin-rejected', hint: '批量导入需独占共享后端：先退出 GUI、停掉其它 MCP/脚本连接，再重跑' });
+      throw error;
+    }
 
     for await (const group of streamGroups(filePath, { limit })) {
       const headingCount = chainLevels(group, maxChainDepth).length;
@@ -350,7 +371,7 @@ export async function runImport(options: RunImportOptions): Promise<ImportResult
     await flush();
 
     log({ type: 'bulk-end' });
-    await client.request('database.write', { payload: { action: 'stream.bulkEnd' } });
+    await client.databaseWrite({ action: 'stream.bulkEnd' });
     const importMs = Date.now() - startedAt;
     stats.nodesTotal = stats.headingNodes + stats.segmentNodes;
 
@@ -376,7 +397,7 @@ export async function runImport(options: RunImportOptions): Promise<ImportResult
     if (vectorBackfill) {
       const t0 = Date.now();
       let lastStage: string | undefined;
-      const vres = await client.request('vector.ensureDoc', { payload: { docId } }, {
+      const vres = await client.ensureDocVectors({ docId }, {
         onEvent: (raw: unknown) => {
           const event = raw as VectorProgressEvent | null | undefined;
           if (event?.type === 'vector.ensureDoc.progress' && event.stage !== lastStage) {
@@ -392,7 +413,10 @@ export async function runImport(options: RunImportOptions): Promise<ImportResult
     log({ type: 'result', ...result });
     return result;
   } finally {
-    await client.shutdown();
+    // 只断本连接：共享后端多客户端复用，一轮压测跑完不该把它关掉（--limit 给多个值时后几轮还要用它，
+    // GUI/MCP 也可能续着）。mode !== 'pipe' 才 shutdown——那是拉不起共享后端时的私有兜底 host。
+    // 注意 bulkBegin 被拒时也会走到这里：那时连接还在、后端也没被开批，断连接即恢复原状。
+    if (client.mode !== 'pipe') await client.shutdown();
     client.close();
   }
 }
@@ -463,7 +487,7 @@ async function exitProcess(code: number): Promise<void> {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || !args.file) {
-    console.log('Usage: electron scripts/bench/msmarco-import.mjs --file <.json.gz|.jsonl> [--limit N|N1,N2,...|all] [--batch 5000] [--max-depth 128] [--embed] [--vector-backfill] [--report <csv>] [--label <name>] [--state-file <path>]');
+    console.log('Usage: node dist/scripts/bench/msmarco-import.js --file <.json.gz|.jsonl> [--limit N|N1,N2,...|all] [--batch 5000] [--max-depth 128] [--embed] [--vector-backfill] [--report <csv>] [--label <name>] [--state-file <path>]');
     await exitProcess(args.file ? 0 : 1);
     return;
   }

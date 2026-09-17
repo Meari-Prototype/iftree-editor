@@ -12,7 +12,6 @@ import {
   fullDepthForDoc,
   hasKnownChildren,
   idSetFromArray,
-  loadedDepthForDoc,
   normalizeDocId,
   sameDocId,
   treeViewStateFromDoc
@@ -56,6 +55,8 @@ export interface TreeViewCommandDeps {
   getCurrentDoc(): TreeViewDocLike | null;
   docState: {
     ensureNodeChildren(nodeId: unknown): Promise<void>;
+    // 保证节点进镜像（按需拉「根→目标」祖先链 + 取子 + 填热区）；false = 拉不回来。
+    ensureNodePath(nodeId: unknown): Promise<boolean>;
   };
   tree: {
     getDepthLimit(): number;
@@ -239,23 +240,29 @@ export function createTreeViewCommands(getDeps: () => TreeViewCommandDeps) {
     const deps = getDeps();
     if (!nodeId) return;
     const address = String(result?.address || '').trim();
-    // 先确保目标深度的数据已加载，再走统一就地定位（从搜索/实体这类非节点视图会切到树视图）。
-    if (address) {
-      const targetDepth = depthOf(address);
-      const currentDoc = deps.getCurrentDoc();
-      if (loadedDepthForDoc(currentDoc as Parameters<typeof loadedDepthForDoc>[0]) < targetDepth && currentDoc?.doc?.id) {
-        try {
-          // 扩散加载下「定位」= 聚焦目标并沿 DFS 取祖先链/邻窗（不再按深度整层预拉）。
-          await deps.docState.ensureNodeChildren(nodeId);
-        } catch (error) {
-          deps.ui.setNotice(errorMessage(error));
+    // 扩散加载下「定位」= 先把目标拉进镜像（ensureNodePath 按需取「根→目标」祖先链 + 取子 +
+    // 填热区），再走统一就地定位（从搜索/实体这类非节点视图会切到树视图）。
+    if (deps.getCurrentDoc()?.doc?.id) {
+      try {
+        const reached = await deps.docState.ensureNodePath(nodeId);
+        if (!reached) {
+          deps.ui.setNotice(`节点${address ? ` ${address}` : ''}还没加载出来，请稍后重试。`);
+          return;
         }
+      } catch (error) {
+        deps.ui.setNotice(errorMessage(error));
+        return;
       }
     }
-    // 取加载后的最新投影（deps 是发起时快照，须经 getDeps() 重取）；findNode 落空时用
-    // { id, address } 兜底，focusNodeInDoc 按 address 展开祖先链仍能完成定位。
+    // 取加载后的最新投影（deps 是发起时快照，须经 getDeps() 重取）。仍查不到就放弃——
+    // 旧实现在这里用 { id, address } 兜底后照样 setSelectedNodeId，选中 id 落在投影外，
+    // Inspector 的 selectedNode 随即落空（曾回落成根 → 编辑写错节点）。
     const currentDoc = getDeps().getCurrentDoc();
-    const node = findNode(currentDoc?.tree, nodeId) || { id: nodeId, address: address || '1' };
+    const node = findNode(currentDoc?.tree, nodeId);
+    if (!node?.id) {
+      deps.ui.setNotice(`节点${address ? ` ${address}` : ''}还没加载出来，请稍后重试。`);
+      return;
+    }
     await focusNodeInDoc(currentDoc, node as Parameters<typeof focusNodeInDoc>[1]);
   }
 
@@ -275,10 +282,19 @@ export function createTreeViewCommands(getDeps: () => TreeViewCommandDeps) {
     const nodeId = currentDoc.idByAddress?.[address];
     let node = nodeId ? findNode(currentDoc.tree, nodeId) : null;
     if (!node && documentRepository.canRead()) {
-      try { node = await documentRepository.getNode({ docId, address }) as typeof node; } catch { /* 后端查不到走下方统一提示 */ }
+      let backendNode: { id?: unknown } | null = null;
+      try { backendNode = await documentRepository.getNode({ docId, address }) as { id?: unknown } | null; } catch { /* 后端查不到走下方统一提示 */ }
+      // 后端查得到 ≠ 前端投影里有：地址打到未加载区时先把祖先链拉回镜像，再从新投影里取节点。
+      // 旧实现直接拿后端裸行去 focusNodeInDoc → setSelectedNodeId，选中 id 落在投影外。
+      if (backendNode?.id) {
+        const reached = await deps.docState.ensureNodePath(backendNode.id);
+        if (!reached) return { ok: false, message: `节点 ${address} 还没加载出来，请稍后重试。` };
+        node = findNode(getDeps().getCurrentDoc()?.tree, backendNode.id);
+      }
     }
     if (!node?.id) return { ok: false, message: `当前文档没有节点 ${address}。` };
-    await focusNodeInDoc(currentDoc, node as Parameters<typeof focusNodeInDoc>[1]);
+    // 投影已被 ensureNodePath 刷新过，focusNodeInDoc 的 idByAddress 祖先链要读最新的那份。
+    await focusNodeInDoc(getDeps().getCurrentDoc(), node as Parameters<typeof focusNodeInDoc>[1]);
     return { ok: true };
   }
 
@@ -309,7 +325,9 @@ export function createTreeViewCommands(getDeps: () => TreeViewCommandDeps) {
     };
   }
 
-  function applyEditorHistoryViewState(viewState: unknown, doc: unknown) {
+  // 异步只为最后那段「选中节点可能已不在投影里」的回拉；调用方（editor-commands）不 await，
+  // 撤销后的选中恢复晚一拍落地，不影响折叠/深度/视图 tab 的同步恢复。
+  async function applyEditorHistoryViewState(viewState: unknown, doc: unknown) {
     const deps = getDeps();
     const state = normalizeEditorHistoryViewState(viewState);
     const docObj = (doc && typeof doc === 'object' ? doc : {}) as Record<string, unknown>;
@@ -330,7 +348,16 @@ export function createTreeViewCommands(getDeps: () => TreeViewCommandDeps) {
     if (state.selectedNodeId) {
       const treeIndex = docObj.treeIndex as { nodeOf?: (id: unknown) => { id?: unknown } | null | undefined } | undefined;
       const node = findNode(docObj.tree, state.selectedNodeId) || treeIndex?.nodeOf?.(state.selectedNodeId);
-      deps.selection.setSelectedNodeId(node?.id || state.selectedNodeId);
+      if (node?.id) {
+        deps.selection.setSelectedNodeId(node.id);
+        return;
+      }
+      // 快照里的节点已不在投影里（撤销后被驱逐 / 预取没到）：先把祖先链拉回来再选中。
+      // 拉不回来就保留当前选中——把投影外的 id 设进去等于「选了一个取不到的节点」，
+      // Inspector 会落空（旧实现回落成根，编辑写到根上）。
+      const reached = await deps.docState.ensureNodePath(state.selectedNodeId);
+      if (reached) deps.selection.setSelectedNodeId(state.selectedNodeId);
+      else deps.ui.setNotice('撤销前选中的节点还没加载出来，已保留当前选中。');
     }
   }
 

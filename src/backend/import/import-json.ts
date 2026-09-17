@@ -7,6 +7,13 @@ import { extname, resolve } from 'node:path';
 
 import { splitSentences } from '../../core/tree.js';
 import { isBlockMath } from '../../core/sentence-split.js';
+import {
+  IMPORTED_DOC_SOURCE_LOOKUP_BY_PATH_SQL,
+  importedDocMetaPathLikePattern,
+  matchImportedDocForSourcePaths,
+  throwDuplicateImportError,
+  type DocLookupRow
+} from './import-service.js';
 
 export interface ImportTreeNode {
   address?: string;
@@ -324,6 +331,25 @@ export interface ImportJsonDatabase {
     request: { operation: 'write'; payload: Record<string, unknown> },
     role: 'write'
   ): Promise<Record<string, unknown> | null | undefined>;
+  run(
+    request: { operation: 'read'; payload: Record<string, unknown> },
+    role: 'read'
+  ): Promise<Record<string, unknown> | null | undefined>;
+}
+
+// 与 importFilePathsToStore 同口径的源路径查重（import-service 的 matchImportedDocForSourcePaths）：
+// import-json 手上只有 db 契约、没有 store 句柄，所以用同一条 SQL 走只读 action 取候选行，判定复用纯函数。
+// 不查的话同一份源文可以被反复导成多个 doc，library 侧「文件↔文档」一对一的前提就破了。
+async function assertSourcePathNotImported(database: ImportJsonDatabase, sourcePath: string): Promise<void> {
+  const result = await database.run({
+    operation: 'read',
+    payload: {
+      action: 'debug.sql',
+      sql: IMPORTED_DOC_SOURCE_LOOKUP_BY_PATH_SQL,
+      params: { path: sourcePath, metaLike: importedDocMetaPathLikePattern(sourcePath) }
+    }
+  }, 'read') as { rows?: DocLookupRow[] } | null | undefined;
+  throwDuplicateImportError(matchImportedDocForSourcePaths(result?.rows || [], [sourcePath]));
 }
 
 export interface RunImportJsonInput {
@@ -372,37 +398,100 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
     text: source.slice(anchor.start, anchor.end)
   }));
 
-  await database.run({ operation: 'write', payload: { action: 'stream.bulkBegin' } }, 'write');
-  try {
-    const pushResult = await database.run({
-      operation: 'write',
-      payload: {
-        action: 'stream.push',
-        title: String(payload.title).trim(),
-        nodes,
-        embed: embed === true || payload.embed === true
-      }
-    }, 'write') as { docId?: unknown; created?: CreatedNode[]; createdCount?: number } | null | undefined;
-    const docId = pushResult?.docId;
-    if (!docId) throw new Error('stream.push 未返回 docId');
+  // 查重在建文档之前：撞了就什么都别开始（错误文案与普通导入同一条，见 throwDuplicateImportError）。
+  await assertSourcePathNotImported(database, resolvedSourcePath);
 
-    const idByAddress = zipCreatedIds(nodes, pushResult?.created);
-    const nodeIdsBySentenceIndex: Record<number, string> = {};
-    for (const [address, sentenceIndex] of anchorIndexByAddress) {
-      const nodeId = idByAddress.get(address);
-      if (nodeId) nodeIdsBySentenceIndex[sentenceIndex] = nodeId;
+  const shouldEmbed = embed === true || payload.embed === true;
+  // 先 doc.create、再往这个 docId 上推（而不是 push 省略 docId 的首推自建）：首推自建的文档没有源文件锚，
+  // library_index 按文件系统匹配找不到它，stream.push 已为此立守卫拒收（handlers/write/doc.ts）。
+  // 锚在第一笔写入就写死在 meta.sourcePath 上——library_index 与源路径查重都读它，不靠后面的 attachSource 补；
+  // 中途失败留下的半成品也因此带着源路径，下次导入同一份源文查重拦得住。
+  // meta 必须是 JSON 文本：store.createDoc 把它原样写进 docs.meta 列，给对象会存成 "[object Object]"。
+  // 字段与 importFilePathsToStore 建文档时同构（sourcePath / importedAt + 一个导入方式标记）。
+  // skipInitialCommit：此刻文档只有一个空根、没有源文档层，立 commit 就是把「空文章」写进历史——
+  // 用户回退到初始版本等于删空文章、连 source 行一起没掉。唯一的 commit 留到内容落齐后建（见下）。
+  const createResult = await database.run({
+    operation: 'write',
+    payload: {
+      action: 'doc.create',
+      title: String(payload.title).trim(),
+      meta: JSON.stringify({
+        sourcePath: resolvedSourcePath,
+        importedAt: new Date().toISOString(),
+        smartImport: true
+      }),
+      skipInitialCommit: true
     }
+  }, 'write') as { docId?: unknown } | null | undefined;
+  const docId = createResult?.docId;
+  if (!docId) throw new Error('doc.create 未返回 docId');
+
+  // doc.create 之后任何一步失败都要把这篇收走：留下的是「有壳无内容」或「有节点、无源文档层」的
+  // 残缺文档——它绕过了导入的原子性承诺。回滚放在 bulkEnd 之后（外层 try 包内层 try/finally）：
+  // bulk 会话还开着就删文档，等于让派生索引维护跨在会话里收尾，顺序上更容易出二次错。
+  let createdCount: number | undefined;
+  try {
+    // push 只收 incremental 文档（4-16 流式写入不走 edit branch），doc.create 建出来的是 full。
+    // incremental 只是这段推送的通行证，推完切回 full（见下）。
     await database.run({
       operation: 'write',
-      payload: {
-        action: 'stream.attachSource',
-        docId,
-        sourcePath: resolvedSourcePath,
-        sourceType: extname(resolvedSourcePath).slice(1).toLowerCase() || 'md',
-        rawMarkdown: source,
-        spans,
-        nodeIdsBySentenceIndex
+      payload: { action: 'doc.setEditMode', docId, mode: 'incremental', includeDoc: false }
+    }, 'write');
+
+    await database.run({ operation: 'write', payload: { action: 'stream.bulkBegin' } }, 'write');
+    try {
+      // 不传 parentId：挂载点默认取该文档的根节点（address 恒为 '1'），正是校验器假定的挂载点
+      //（validateAddresses 以 '1' 为父前缀校验顶层）。于是顶层 1-1、1-2… 原样落库、地址零偏移，
+      // zipCreatedIds / anchorIndexByAddress / nodeIdsBySentenceIndex 这三套按地址对齐的映射照旧成立。
+      // 树里不含根：根节点由 doc.create 建、正文取 title（与普通导入的 rootText 同口径），它不参与句位锚定。
+      const pushResult = await database.run({
+        operation: 'write',
+        payload: {
+          action: 'stream.push',
+          docId,
+          nodes,
+          embed: shouldEmbed
+        }
+      }, 'write') as { created?: CreatedNode[]; createdCount?: number } | null | undefined;
+
+      const idByAddress = zipCreatedIds(nodes, pushResult?.created);
+      const nodeIdsBySentenceIndex: Record<number, string> = {};
+      for (const [address, sentenceIndex] of anchorIndexByAddress) {
+        const nodeId = idByAddress.get(address);
+        if (nodeId) nodeIdsBySentenceIndex[sentenceIndex] = nodeId;
       }
+      await database.run({
+        operation: 'write',
+        payload: {
+          action: 'stream.attachSource',
+          docId,
+          sourcePath: resolvedSourcePath,
+          sourceType: extname(resolvedSourcePath).slice(1).toLowerCase() || 'md',
+          rawMarkdown: source,
+          spans,
+          nodeIdsBySentenceIndex
+        }
+      }, 'write');
+
+      createdCount = pushResult?.createdCount;
+    } finally {
+      // bulkEnd 带 embed：写分发收尾据此对本批文档统一建（或不建）向量。
+      await database.run({ operation: 'write', payload: { action: 'stream.bulkEnd', embed: shouldEmbed } }, 'write');
+    }
+
+    // 切回 full：智能导入产物是一篇完整文档，该和普通导入产物一样能正常编辑，
+    // 不该停在「只能追加」的 incremental 档上。
+    await database.run({
+      operation: 'write',
+      payload: { action: 'doc.setEditMode', docId, mode: 'full', includeDoc: false }
+    }, 'write');
+    // 「导入」commit 押到 attachSource 之后才建，与 importFilePathsToStore 同一条纪律
+    //（见 import-service 的 createImportInitialCommit 注释）：建树时就建 commit 的话快照缺原文层，
+    // restore 回那一版会把 source 行静默删掉。配合上面的 skipInitialCommit，这是本文档唯一的 commit，
+    // 也是 head 所指——历史里没有可以把文章回退成空的那一版。
+    await database.run({
+      operation: 'write',
+      payload: { action: 'history.save', docId, summary: '导入', owner: 'import' }
     }, 'write');
 
     return {
@@ -410,11 +499,14 @@ export async function runImportJson({ database, jsonPath, sourcePath, dryRun = f
       ok: true,
       imported: true,
       docId,
-      createdCount: pushResult?.createdCount,
+      createdCount,
       spanCount: spans.length
     };
-  } finally {
-    // bulkEnd 带 embed：写分发收尾据此对本批文档统一建（或不建）向量。
-    await database.run({ operation: 'write', payload: { action: 'stream.bulkEnd', embed: embed === true || payload.embed === true } }, 'write');
+  } catch (error) {
+    // best-effort 回滚：删不掉也要把原始错误抛给调用方（回滚失败不该盖住真正的失败原因）。
+    try {
+      await database.run({ operation: 'write', payload: { action: 'doc.delete', docId } }, 'write');
+    } catch { /* 回滚失败：残留文档交由用户/运维删除，原始错误照常上抛 */ }
+    throw error;
   }
 }

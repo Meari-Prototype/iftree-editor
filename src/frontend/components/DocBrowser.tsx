@@ -1,14 +1,16 @@
+// 本组件只渲染 library（主文件夹）树。doc 文件夹 / doc 行那套渲染自仓库 baseline 起就没有
+// 入口——`.doc-list` 一直只挂 renderRootDocFolder() → library 树，那批函数只在彼此间递归，
+// 从未上屏，已于此次清理删除（含 doc 拖拽、文件夹增删改名、docs/docFolders props）。
+// 后端与 repository 侧的 doc folder / moveDoc 能力仍在，未来要接回从那里重新接线即可。
+
 import {
   ChevronDown,
   ChevronRight,
-  FilePlus2,
   FileText,
   Folder,
   FolderOpen,
-  FolderPlus,
   ListTree,
   MoreHorizontal,
-  Pencil,
   RotateCcw,
   Scissors,
   Search as SearchIcon,
@@ -18,59 +20,45 @@ import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 
 import type { DocListItem } from '../../backend/query-api.js';
-import type { DocFolderRow } from '../../backend/db/schema.js';
 import type { LibraryEntry } from '../../backend/library/library-fs.js';
 import {
-  buildDocBrowser,
-  DEFAULT_DOC_FOLDER_NAME,
   DOC_MENU_WIDTH,
   filterLibraryTree,
   isSupportedLibraryImport,
   libraryCollapseKey,
   libraryFolderCollapseKeys,
-  limitDocFolderName,
-  MAX_DOC_FOLDER_NAME_LENGTH,
-  normalizeDocFolderName,
   normalizeFsPath
 } from '../lib/doc-utils.js';
 import { IconButton } from './common.jsx';
 import { useFloatingMenu } from '../hooks/useFloatingMenu.js';
 
-// 折叠键统一容器：doc folder 用其 id(number)、library 文件夹用 libraryCollapseKey 返回的 string。
-type CollapseKey = number | string;
+// 折叠键：只有 library 文件夹一种来源，值恒为 libraryCollapseKey() 的 `library:<path>`。
+// （原先还兼容 doc folder 的数值 id，那条路径已随 doc 树渲染一起删除。）
+type CollapseKey = string;
 
-interface RenamingFolderDraft {
-  folderId: number;
-  name: string;
-}
-
+// 拖拽中的浮层 ghost 状态。overFolderPath 为 undefined 表示指针下不是可投放的文件夹行，
+// 为 '' 表示落在根（主文件夹）——两者必须分开，抹平就再也拖不回根目录了。
 interface DocDragState {
   active: boolean;
   docId: string;
   title: string;
   x: number;
   y: number;
-  overFolderId?: number;
   overFolderPath?: string;
 }
 
-// 两种拖拽（library 项 vs doc）共用同一个 ref，按 item / doc 区分。
 interface DocDragRefState {
   item?: LibraryEntry;
-  doc?: DocListItem;
   active: boolean;
   startX: number;
   startY: number;
   x: number;
   y: number;
   overFolderPath?: string;
-  overFolderId?: number;
 }
 
 export interface DocBrowserProps {
   busy: boolean;
-  docs: DocListItem[];
-  docFolders: DocFolderRow[];
   libraryTree: LibraryEntry | null;
   docBySourcePath: Map<string, DocListItem>;
   currentDocId: string | null;
@@ -79,12 +67,6 @@ export interface DocBrowserProps {
   docPanelHeight?: string | number | null;
   onRefreshLibrary?: () => void;
   onOpenDoc?: (docId: string) => void;
-  onCreateDoc?: (title: string, folderId: number | null) => void;
-  onCreateFolder?: (parentId?: number | null) => Promise<unknown> | unknown;
-  onRenameFolder?: (folderId: number, name: string) => Promise<unknown> | unknown;
-  onDeleteFolder?: (folder: DocFolderRow) => void;
-  onDeleteDoc?: (doc: DocListItem) => void;
-  onMoveDoc?: (doc: DocListItem, targetFolderId: number | null | undefined) => void;
   libraryNavigationOpen?: boolean;
   onOpenLibraryNavigation?: () => void;
   onSelectLibraryFile?: (item: LibraryEntry) => void;
@@ -96,8 +78,6 @@ export interface DocBrowserProps {
 
 export function DocBrowser({
   busy,
-  docs,
-  docFolders,
   libraryTree,
   docBySourcePath,
   currentDocId,
@@ -106,12 +86,6 @@ export function DocBrowser({
   docPanelHeight,
   onRefreshLibrary,
   onOpenDoc,
-  onCreateDoc,
-  onCreateFolder,
-  onRenameFolder,
-  onDeleteFolder,
-  onDeleteDoc,
-  onMoveDoc,
   libraryNavigationOpen = false,
   onOpenLibraryNavigation,
   onSelectLibraryFile,
@@ -121,25 +95,15 @@ export function DocBrowser({
   onDeleteLibraryImport
 }: DocBrowserProps) {
   const [collapsedDocFolders, setCollapsedDocFolders] = useState<Set<CollapseKey>>(() => new Set());
-  const [renamingFolderDraft, setRenamingFolderDraft] = useState<RenamingFolderDraft | null>(null);
   const [docSearchOpen, setDocSearchOpen] = useState<boolean>(false);
   const [docSearchQuery, setDocSearchQuery] = useState<string>('');
   const [docDragState, setDocDragState] = useState<DocDragState | null>(null);
-  const renameFolderInputRef = useRef<HTMLInputElement | null>(null);
   const docSearchInputRef = useRef<HTMLInputElement | null>(null);
-  const renamingFolderRef = useRef<boolean>(false);
-  const skipFolderSaveRef = useRef<boolean>(false);
   const docDragRef = useRef<DocDragRefState | null>(null);
   const docDragTimerRef = useRef<number | null>(null);
   const suppressDocClickRef = useRef<boolean>(false);
   const libraryCollapseInitializedRef = useRef<boolean>(false);
 
-  const filteredDocs = useMemo(() => {
-    const query = docSearchQuery.trim().toLocaleLowerCase();
-    if (!query) return docs;
-    return docs.filter((doc) => String(doc.title || '').toLocaleLowerCase().includes(query));
-  }, [docs, docSearchQuery]);
-  const docBrowser = useMemo(() => buildDocBrowser(docFolders, filteredDocs), [docFolders, filteredDocs]);
   const visibleLibraryTree = useMemo(
     () => filterLibraryTree(libraryTree, docSearchQuery),
     [libraryTree, docSearchQuery]
@@ -165,14 +129,6 @@ export function DocBrowser({
   const docMenu = useFloatingMenu({ specs: docMenuSpecFor, offset: 4 });
 
   useEffect(() => {
-    if (!renamingFolderDraft) return;
-    requestAnimationFrame(() => {
-      renameFolderInputRef.current?.focus();
-      renameFolderInputRef.current?.select();
-    });
-  }, [renamingFolderDraft]);
-
-  useEffect(() => {
     if (!docSearchOpen) return;
     requestAnimationFrame(() => {
       docSearchInputRef.current?.focus();
@@ -196,7 +152,6 @@ export function DocBrowser({
   function docMenuHeightFor(menuKey: string): number {
     if (String(menuKey).startsWith('library-file:')) return libraryCutPath ? 160 : 128;
     if (String(menuKey).startsWith('library-folder:') || menuKey === 'folder:root') return libraryCutPath ? 150 : 118;
-    if (String(menuKey).startsWith('doc:')) return 116;
     return 150;
   }
 
@@ -234,15 +189,6 @@ export function DocBrowser({
     }
   }
 
-  function folderIdFromPoint(clientX: number, clientY: number): number | null | undefined {
-    const element = document.elementFromPoint(clientX, clientY);
-    const folderRow = element?.closest?.('[data-doc-folder-id]');
-    const raw = folderRow?.getAttribute('data-doc-folder-id');
-    if (raw === 'root') return null;
-    const folderId = Number(raw);
-    return Number.isInteger(folderId) && folderId > 0 ? folderId : undefined;
-  }
-
   function libraryFolderPathFromPoint(clientX: number, clientY: number): string | undefined {
     const element = document.elementFromPoint(clientX, clientY);
     const folderRow = element?.closest?.('[data-library-folder-path]');
@@ -258,7 +204,7 @@ export function DocBrowser({
   }
 
   function startLibraryDrag(item: LibraryEntry, event: React.PointerEvent<HTMLElement>) {
-    if (event.button !== 0 || busy || renamingFolderDraft || !item?.relativePath) return;
+    if (event.button !== 0 || busy || !item?.relativePath) return;
     event.preventDefault();
     const startX = event.clientX;
     const startY = event.clientY;
@@ -337,139 +283,6 @@ export function DocBrowser({
     window.addEventListener('pointercancel', stop);
   }
 
-  function startDocDrag(doc: DocListItem, event: React.PointerEvent<HTMLElement>) {
-    if (event.button !== 0 || busy || renamingFolderDraft) return;
-    event.preventDefault();
-    const startX = event.clientX;
-    const startY = event.clientY;
-    const drag: DocDragRefState = {
-      doc,
-      active: false,
-      startX,
-      startY,
-      x: startX,
-      y: startY,
-      overFolderId: undefined
-    };
-    docDragRef.current = drag;
-
-    const move = (moveEvent: PointerEvent) => {
-      const current = docDragRef.current;
-      if (!current) return;
-      const distance = Math.hypot(moveEvent.clientX - current.startX, moveEvent.clientY - current.startY);
-      if (!current.active) {
-        if (distance > 7) stop();
-        return;
-      }
-      moveEvent.preventDefault();
-      current.x = moveEvent.clientX;
-      current.y = moveEvent.clientY;
-      current.overFolderId = folderIdFromPoint(moveEvent.clientX, moveEvent.clientY) ?? undefined;
-      setDocDragState({
-        active: true,
-        docId: current.doc!.id,
-        title: current.doc!.title,
-        x: current.x,
-        y: current.y,
-        overFolderId: current.overFolderId
-      });
-    };
-
-    const stop = () => {
-      const current = docDragRef.current;
-      const hasTarget = Boolean(current?.active) && current?.overFolderId !== undefined;
-      const targetFolderId = hasTarget ? current?.overFolderId : undefined;
-      const draggedDoc = current?.doc;
-      const didDrag = Boolean(current?.active);
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', stop);
-      window.removeEventListener('pointercancel', stop);
-      resetDocDragState();
-      if (didDrag) {
-        suppressDocClickRef.current = true;
-        if (hasTarget && draggedDoc && (draggedDoc.folder_id ?? null) !== (targetFolderId ?? null)) {
-          onMoveDoc?.(draggedDoc, targetFolderId);
-        }
-        window.setTimeout(() => {
-          suppressDocClickRef.current = false;
-        }, 120);
-      }
-    };
-
-    docDragTimerRef.current = window.setTimeout(() => {
-      const current = docDragRef.current;
-      if (!current) return;
-      current.active = true;
-      suppressDocClickRef.current = true;
-      document.body.classList.add('is-dragging-doc');
-      setDocDragState({
-        active: true,
-        docId: current.doc!.id,
-        title: current.doc!.title,
-        x: current.x,
-        y: current.y,
-        overFolderId: undefined
-      });
-    }, 260);
-
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', stop);
-    window.addEventListener('pointercancel', stop);
-  }
-
-  async function handleCreateFolder(parentId: number | null = null) {
-    if (busy) return;
-    docMenu.close();
-    skipFolderSaveRef.current = false;
-    setRenamingFolderDraft(null);
-    if (parentId !== null && parentId !== undefined) {
-      setCollapsedDocFolders((previous) => {
-        const next = new Set(previous);
-        next.delete(Number(parentId));
-        return next;
-      });
-    }
-    const folder = await onCreateFolder?.(parentId) as DocFolderRow | null | undefined;
-    if (folder) {
-      setRenamingFolderDraft({ folderId: folder.id, name: folder.name || DEFAULT_DOC_FOLDER_NAME });
-    }
-  }
-
-  function startRenameDocFolder(folder: DocFolderRow | null | undefined) {
-    if (!folder) return;
-    docMenu.close();
-    skipFolderSaveRef.current = false;
-    setRenamingFolderDraft({ folderId: folder.id, name: folder.name || DEFAULT_DOC_FOLDER_NAME });
-  }
-
-  async function confirmRenameDocFolder() {
-    if (!renamingFolderDraft || renamingFolderRef.current) return;
-    if (skipFolderSaveRef.current) {
-      skipFolderSaveRef.current = false;
-      return;
-    }
-    const draft = renamingFolderDraft;
-    const name = normalizeDocFolderName(draft.name);
-    const folder = docFolders.find((item) => item.id === draft.folderId);
-    if (folder && name === folder.name) {
-      setRenamingFolderDraft(null);
-      return;
-    }
-    renamingFolderRef.current = true;
-    setRenamingFolderDraft(null);
-    try {
-      await onRenameFolder?.(draft.folderId, name);
-      docMenu.close();
-    } finally {
-      renamingFolderRef.current = false;
-    }
-  }
-
-  function handleCreateDoc(title: string, folderId: number | null = null) {
-    docMenu.close();
-    onCreateDoc?.(title, folderId);
-  }
-
   function handleCutLibraryItem(item: LibraryEntry) {
     docMenu.close();
     onCutLibraryItem?.(item);
@@ -478,14 +291,6 @@ export function DocBrowser({
   function handlePasteLibraryItem(targetFolderRelativePath: string = '') {
     docMenu.close();
     onPasteLibraryItem?.(targetFolderRelativePath);
-  }
-
-  // buildDocBrowser 返回 DocBrowserItem，已沿数据流接 DocFolderRow / DocListItem 真类型。
-  type DocBrowserItem = ReturnType<typeof buildDocBrowser>['items'][number];
-  function renderDocBrowserItems(items: DocBrowserItem[], depthOffset = 0) {
-    return items.map((item) => (
-      item.type === 'folder' ? renderDocFolder(item, depthOffset) : renderDocRow(item.doc!, item.depth + depthOffset)
-    ));
   }
 
   function renderLibraryItems(items: LibraryEntry[] = [], depth = 0) {
@@ -714,164 +519,6 @@ export function DocBrowser({
                 删除导入
               </button>
             )}
-          </>
-        ))}
-      </div>
-    );
-  }
-
-  function renderDocFolder(item: DocBrowserItem, depthOffset = 0) {
-    // renderDocFolder 只在 type === 'folder' 时被调用，folder/children 此时必有；narrow 一次给下游统一类型。
-    const { folder, children = [], depth } = item;
-    if (!folder) return null;
-    const displayDepth = depth + depthOffset;
-    const menuKey = `folder:${folder.id}`;
-    const collapsedFolder = collapsedDocFolders.has(folder.id);
-    const renamingFolder = renamingFolderDraft?.folderId === folder.id;
-    return (
-      <div key={menuKey} className="doc-folder-block">
-        <div
-          className={`doc-row doc-folder-row ${docMenu.openId === menuKey ? 'menu-open' : ''} ${docDragState?.overFolderId === folder.id ? 'drop-target' : ''}`}
-          data-doc-folder-id={folder.id}
-        >
-          {renamingFolder ? (
-            <div
-              className="doc-item doc-folder-item doc-folder-edit-item"
-              style={{ paddingLeft: `${displayDepth * 10 + 4}px` }}
-              onClick={(event) => event.stopPropagation()}
-            >
-              {collapsedFolder ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
-              {collapsedFolder ? <Folder size={12} /> : <FolderOpen size={12} />}
-              <input
-                ref={renameFolderInputRef}
-                type="text"
-                maxLength={MAX_DOC_FOLDER_NAME_LENGTH}
-                value={renamingFolderDraft?.name || ''}
-                onChange={(event) => setRenamingFolderDraft((draft) => (
-                  draft ? { ...draft, name: limitDocFolderName(event.target.value) } : draft
-                ))}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    event.preventDefault();
-                    confirmRenameDocFolder();
-                  } else if (event.key === 'Escape') {
-                    event.preventDefault();
-                    skipFolderSaveRef.current = true;
-                    setRenamingFolderDraft(null);
-                  }
-                }}
-                onBlur={confirmRenameDocFolder}
-              />
-            </div>
-          ) : (
-            <button
-              type="button"
-              className="doc-item doc-folder-item"
-              style={{ paddingLeft: `${displayDepth * 10 + 4}px` }}
-              title={folder.name}
-              onClick={() => toggleDocFolder(folder.id)}
-              onDoubleClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                startRenameDocFolder(folder);
-              }}
-            >
-              {collapsedFolder ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
-              {collapsedFolder ? <Folder size={12} /> : <FolderOpen size={12} />}
-              <span>{folder.name}</span>
-            </button>
-          )}
-          <button
-            type="button"
-            className="doc-menu-button"
-            title="文件夹操作"
-            aria-label="文件夹操作"
-            onClick={(event) => docMenu.toggle(menuKey, event)}
-          >
-            <MoreHorizontal size={12} />
-          </button>
-          {renderDocMenu(menuKey, (
-            <>
-              <button type="button" onClick={() => handleCreateDoc('未命名条件树文档', folder.id)}>
-                <FilePlus2 size={13} />
-                新建文档
-              </button>
-              <button type="button" onClick={() => handleCreateFolder(folder.id)}>
-                <FolderPlus size={13} />
-                新建子文件夹
-              </button>
-              <button type="button" onClick={() => startRenameDocFolder(folder)}>
-                <Pencil size={13} />
-                重命名
-              </button>
-              <button type="button" className="doc-menu-danger" onClick={() => { docMenu.close(); onDeleteFolder?.(folder); }}>
-                <Trash2 size={13} />
-                删除文件夹
-              </button>
-            </>
-          ))}
-        </div>
-        {!collapsedFolder && children.length > 0 && renderDocBrowserItems(children, depthOffset)}
-      </div>
-    );
-  }
-
-  function renderDocRow(doc: DocListItem, depth: number) {
-    const menuKey = `doc:${doc.id}`;
-    return (
-      <div
-        key={menuKey}
-        className={`doc-row doc-file-row ${doc.id === currentDocId ? 'active' : ''} ${docMenu.openId === menuKey ? 'menu-open' : ''} ${docDragState?.docId === doc.id ? 'dragging-source' : ''}`}
-      >
-        <button
-          type="button"
-          className="doc-item doc-file-item"
-          style={{ paddingLeft: `${depth * 10 + 16}px` }}
-          title={doc.title}
-          onPointerDown={(event) => startDocDrag(doc, event)}
-          onClick={(event) => {
-            if (suppressDocClickRef.current) {
-              event.preventDefault();
-              event.stopPropagation();
-              return;
-            }
-            docMenu.close();
-            onOpenDoc?.(doc.id);
-          }}
-        >
-          <FileText size={11} />
-          <span>{doc.title}</span>
-          <small>{doc.node_count || 0} 个节点</small>
-        </button>
-        <button
-          type="button"
-          className="doc-menu-button"
-          title="文档操作"
-          aria-label="文档操作"
-          onClick={(event) => docMenu.toggle(menuKey, event)}
-        >
-          <MoreHorizontal size={12} />
-        </button>
-        {renderDocMenu(menuKey, (
-          <>
-            <label className="doc-menu-field">
-              <span>移动到</span>
-              <select
-                value={doc.folder_id ?? ''}
-                onChange={(event) => { docMenu.close(); onMoveDoc?.(doc, event.target.value ? Number(event.target.value) : null); }}
-              >
-                <option value="">主文件夹</option>
-                {docBrowser.flatFolders.map((folder) => (
-                  <option key={folder.id} value={folder.id}>
-                    {`${'  '.repeat(folder.depth)}${folder.name}`}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button type="button" className="doc-menu-danger" onClick={() => { docMenu.close(); onDeleteDoc?.(doc); }}>
-              <Trash2 size={13} />
-              删除文档
-            </button>
           </>
         ))}
       </div>

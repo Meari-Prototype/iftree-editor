@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { extname, join, resolve } from 'node:path';
+import { extname, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import { readTextFile } from './source-text-utils.js';
@@ -62,6 +62,14 @@ export interface ChmSourceDocument {
   pdfChars?: unknown[];
 }
 
+// 「目标是否仍在目录内」的最小判定：core 层不 import backend 的 library-fs（分层规则 1），就地写一份。
+// 两侧都 resolve 成绝对路径再比前缀，前缀补分隔符——否则 /tmp/foo 会把 /tmp/foobar 认成内部路径。
+function isInside(dir: string, target: string): boolean {
+  const root = resolve(dir);
+  const path = resolve(target);
+  return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+
 function chmItemsToSourceDocument(items: { name: string; local?: string; level: number }[], outputDir: string, sourcePath: string, options: { granularity?: string } = {}): ChmSourceDocument {
   const granularity = options.granularity === 'sentence' ? 'sentence' : 'paragraph';
   const records: ChmRecord[] = [];
@@ -106,8 +114,10 @@ function chmItemsToSourceDocument(items: { name: string; local?: string; level: 
     if (!heading) continue;
     stack.push({ level, address: heading.address });
 
+    // .hhc 的 local 是 CHM 文件内的相对路径，但里面完全可以写 `../../..`——不校验就等于让任意
+    // CHM 文件读走本机任意文件（内容会被切成节点入库）。只认解压目录内的路径，越界直接跳过。
     const localPath = item.local ? resolve(outputDir, decodeChmLocal(item.local)) : null;
-    if (!localPath || !existsSync(localPath)) continue;
+    if (!localPath || !isInside(outputDir, localPath) || !existsSync(localPath)) continue;
     const htmlBlocks = htmlToTextBlocks(readTextFile(localPath));
     const htmlStack = [];
     for (const block of htmlBlocks) {

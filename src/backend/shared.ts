@@ -24,6 +24,23 @@ export function parseJsonObject(value: unknown, fallback: JsonObject = {}): Json
   }
 }
 
+// 时间戳比较归一：库里 created_at/updated_at 两种格式混存——表默认 CURRENT_TIMESTAMP 产
+// 'YYYY-MM-DD HH:MM:SS'（空格、UTC、无毫秒），restore/导入等 JS 写入路径产 ISO 'YYYY-MM-DDTHH:MM:SS.sssZ'。
+// 直接字典序比较在异格式相遇时出错（' ' 0x20 < 'T' 0x54：ISO 格式的 since 会把同日下午的空格格式行
+// 错误排除——「放进去了却搜不出来」）。归一到同一形态（'YYYY-MM-DDTHH:MM:SS.sssZ'）后字典序=时间序。
+// 归一是同构映射（两格式表示同一时间轴），比较双方同过此函数即数学等价。
+// 输入必须是无偏移 UTC：带 ±hh:mm 时区尾的输入不匹配本正则、原样返回（与垃圾输入同策略——
+// 静默丢弃偏移会把本地时刻错标成 UTC）。不用 Date.parse：非 ISO 串按本地时区解析，反而引入新漂移。
+const TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?Z?)?$/;
+
+export function normalizeTimestampForCompare(value: unknown): string {
+  const text = String(value ?? '').trim();
+  const m = TIMESTAMP_RE.exec(text);
+  if (!m) return text;
+  const [, year, month, day, hour = '00', minute = '00', second = '00', ms = '0'] = m;
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}.${(ms as string).padEnd(3, '0')}Z`;
+}
+
 interface AddressedNode {
   id?: unknown;
   address?: unknown;

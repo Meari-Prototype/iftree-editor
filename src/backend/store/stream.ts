@@ -33,6 +33,8 @@ export function setDocEditMode(store: StreamStore, docId: unknown, mode: unknown
     }
     const doc = store.db!.prepare('SELECT id FROM docs WHERE id = ?').get<Pick<DocRow, 'id'>>(docId);
     if (!doc) throw new Error(`Doc not found: ${docId}`);
+    // 领域闸（封卷的记忆卷不得改回可写等）：store 只管模式字面合法，是否允许由领域端口裁。
+    store.domainPorts.documentPolicy?.beforeSetEditMode(store, docId, normalized);
     store.db!.prepare('UPDATE docs SET edit_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(normalized, docId);
     return store.db!.prepare('SELECT id, title, edit_mode FROM docs WHERE id = ?').get<Pick<DocRow, 'id' | 'title' | 'edit_mode'>>(docId);
   }

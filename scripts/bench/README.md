@@ -57,8 +57,8 @@ electron scripts/bench/msmarco-import.mjs --file <分片.jsonl> --limit all --ve
 导出 docId 后，对同一查询分别跑关键字与语义检索比较召回：
 
 ```
-electron scripts/db.mjs shell -- db find --scope <docId> ""  <关键字>      # 关键字
-electron scripts/db.mjs shell -- db find --semantic <docId> "<自然语言>"   # 语义（需向量已补建）
+node dist/scripts/db.js find --scope <docId> ""  <关键字>      # 关键字
+node dist/scripts/db.js find --semantic <docId> "<自然语言>"   # 语义（需向量已补建）
 ```
 
 ## 嵌入引擎微基准（定位吞吐瓶颈）

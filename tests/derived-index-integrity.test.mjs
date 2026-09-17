@@ -258,3 +258,67 @@ test('哈希同口径：整篇 reconcile 写进 lance 的 contentHash/subtreeHas
     assert.ok(written.has(String(A1.id)) && written.has(String(A2.id)), '非 root 的中间/深层节点都在写入集里');
   });
 });
+
+// ── 全库写活动不得把本篇的对账/检索判成失败 ──
+// PRAGMA data_version + total_changes 是全库粒度的戳：任何无关文档的写入都会把它推走。
+// 写路径据此重跑一轮对账（幂等、增量），不据此抛错；检索路径不设这道闸，只逐条核对命中有效性。
+// 现实触发源：database.read 按设计绕单写队列，检索与写并发是常态；启动期的 backfillDocSemanticMeta
+// 逐篇刷 docs.meta 更是稳定的「无关写入」来源。
+
+function semanticMetaOf(store, docId) {
+  const row = store.db.prepare('SELECT meta FROM docs WHERE id = ?').get(docId);
+  return JSON.parse(row?.meta || '{}').semantic || null;
+}
+
+test('对账期间别的文档被写入：reconcile 不抛错，照常 ok 且语义 meta 已刷', async () => {
+  // embedTexts 每被调一次就顺手写一次「别的文档」——把无关写入精确穿插进对账执行期间。
+  const hook = { store: null, otherNodeId: null, writes: 0 };
+  const embedTexts = (texts) => {
+    if (hook.store) hook.store.updateNode(hook.otherNodeId, { text: `别的文档-${(hook.writes += 1)}` });
+    return fakeEmbedTexts(texts);
+  };
+  await withReconciler(async (reconciler, store) => {
+    const other = store.createDoc({ title: 'Other', rootText: '别的文档' });
+    const doc = store.createDoc({ title: 'Target', rootText: '根' });
+    store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'alpha' });
+    store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'beta' });
+    hook.store = store;
+    hook.otherNodeId = other.rootNodeId;
+
+    const res = await reconciler.reconcile(doc.id, { fillNow: true });
+    assert.ok(hook.writes > 0, '确有无关写入穿插进对账期间（否则本用例没测到东西）');
+    assert.equal(res.ok, true, '无关文档的写入不构成失败');
+    assert.equal(res.ready, true, '本篇向量已补齐 → 就绪');
+    // 「按实际状态刷 meta 并正常返回」：meta.semantic 必须被写到、且是 ready。
+    assert.equal(semanticMetaOf(store, doc.id)?.status, 'ready', '语义状态列已按实际状态刷新');
+    assert.ok(await reconciler.requireDocVectorIndex(doc.id), '检索闸放行');
+  }, { embedTexts });
+});
+
+test('检索期间别的文档被写入：语义检索不抛错，照常返回命中', async () => {
+  await withReconciler(async (reconciler, store) => {
+    const other = store.createDoc({ title: 'Other', rootText: '别的文档' });
+    const doc = store.createDoc({ title: 'Search', rootText: '根' });
+    store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'alpha' });
+    store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: 'beta' });
+    await reconciler.reconcile(doc.id, { fillNow: true });
+
+    // 把无关写入钉在最容易踩的位置：完整性闸查 lance 哈希的那一步中间。
+    // 本篇一个字没改，全库戳却变了——单篇语义检索不得因此失败。
+    let writes = 0;
+    const original = VectorStore.prototype.hashesByNodeIds;
+    VectorStore.prototype.hashesByNodeIds = async function spy(ids) {
+      store.updateNode(other.rootNodeId, { text: `别的文档-${(writes += 1)}` });
+      return original.call(this, ids);
+    };
+    let hits;
+    try {
+      hits = await reconciler.vectorSearch({ docId: doc.id, query: 'alpha', limit: 5 });
+    } finally {
+      VectorStore.prototype.hashesByNodeIds = original;
+    }
+    assert.ok(writes > 0, '确有无关写入穿插进检索期间（否则本用例没测到东西）');
+    assert.ok(Array.isArray(hits) && hits.length > 0, '照常返回命中，不抛「检索期间源节点内容发生变化」');
+    for (const hit of hits) assert.equal(String(hit.doc_id), String(doc.id), '命中限定在本篇');
+  });
+});

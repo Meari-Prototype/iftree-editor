@@ -5,6 +5,7 @@ import {
   isSupportedEditBranchEntryKind,
   isTmpId,
   nextTmpId,
+  patchNodeRow,
   projectEditBranchDoc,
   resolveConflictEntries,
   undoneEditBranchEntries
@@ -14,7 +15,11 @@ import {
   resolveEntityEntryDocId,
   tryApplyEntityEntry
 } from './entities/write.js';
-import { assertMemoryVolumeDeleteAllowed, validateMemoryVolumeStreamPush } from './memory/volumes.js';
+import {
+  assertMemoryVolumeDeleteAllowed,
+  assertMemoryVolumeEditModeAllowed,
+  validateMemoryVolumeStreamPush
+} from './memory/volumes.js';
 import { ensureLibraryNavigationDoc } from './library/virtual-docs.js';
 import type { DomainStoreCapability, StoreDomainPorts } from './store/domain-port.js';
 import { IftreeStore } from './store/index.js';
@@ -31,7 +36,8 @@ export function createStoreDomainPorts(): StoreDomainPorts {
     },
     documentPolicy: {
       beforeDeleteDoc: (store, docId) => assertMemoryVolumeDeleteAllowed(initializedStore(store), docId),
-      beforeStreamPush: (store, docId, nodes) => validateMemoryVolumeStreamPush(initializedStore(store), docId, nodes)
+      beforeStreamPush: (store, docId, nodes) => validateMemoryVolumeStreamPush(initializedStore(store), docId, nodes),
+      beforeSetEditMode: (store, docId, nextMode) => assertMemoryVolumeEditModeAllowed(initializedStore(store), docId, nextMode)
     },
     editBranch: {
       activeEditBranchEntries,
@@ -43,7 +49,8 @@ export function createStoreDomainPorts(): StoreDomainPorts {
       resolveConflictEntries,
       buildEditBranchDiffRows,
       buildAxiomDiffRows,
-      nodeRowWithClientAliases
+      nodeRowWithClientAliases,
+      patchProjectedNode: (row, patch) => patchNodeRow(row as never, patch)
     },
     externalEntries: {
       resolveExternalEntryDocId: (store, payload) => resolveEntityEntryDocId(store, payload),

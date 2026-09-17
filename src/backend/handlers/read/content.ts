@@ -100,9 +100,15 @@ export function attachFullSubtreeTextChars<T extends ContentNodeRow>(store: Iftr
 }
 
 export function groupMeta(rows: ContentNodeRow[] = []) {
-  const depths = rows.map((row) => Number(row.depth)).filter(Number.isFinite);
-  const maxDepth = depths.length ? Math.max(...depths) : null;
-  const minDepth = depths.length ? Math.min(...depths) : null;
+  // 单遍累计而非 Math.max(...depths)：rows 是未截断的全量行，十几万元素的展开会让 V8 撑爆调用栈参数上限（RangeError）。
+  let minDepth: number | null = null;
+  let maxDepth: number | null = null;
+  for (const row of rows) {
+    const depth = Number(row.depth);
+    if (!Number.isFinite(depth)) continue;
+    if (minDepth === null || depth < minDepth) minDepth = depth;
+    if (maxDepth === null || depth > maxDepth) maxDepth = depth;
+  }
   return {
     nodeCount: rows.length,
     minDepth,
@@ -176,12 +182,21 @@ export function contentFormat(payload: Payload = {}) {
   return 'json';
 }
 
-export function subtreeBodyText(rows: Array<Pick<NodeRow, 'parent_id' | 'text'>> = []) {
+// 子树正文行的最小形状：HEAD 侧是 nodes 行（snake_case），历史快照行 snake/camel 混排，两个键都认。
+export interface BodyTextRow {
+  parent_id?: unknown;
+  parentId?: unknown;
+  text?: unknown;
+}
+
+export function subtreeBodyText(rows: BodyTextRow[] = []) {
   // 整棵子树正文 = 容器节点自身 + 子树（projectneed 4-16）：流式写入「一条消息一个节点」，
   // 消息正文可能落在之后挂了子节点的容器节点上，旧逻辑只取叶子会漏读。
   // 排除文档根（其 text 是文件名、非正文，parent_id 为 NULL）。
+  // 唯一口径：HEAD 侧（read）与历史快照侧（read --at，handlers/read/history.ts）共用本函数，
+  // 免得两侧各写一遍过滤、口径再度分叉。
   return rows
-    .filter((row) => row.parent_id !== null && row.parent_id !== undefined)
+    .filter((row) => (row.parent_id ?? row.parentId) !== null && (row.parent_id ?? row.parentId) !== undefined)
     .map((row) => String(row.text || ''))
     .filter((text) => text.trim())
     .join('\n');

@@ -188,6 +188,16 @@ export class VectorStore {
     const table = await this.connection.openTable(TABLE_NAME);
     const schema = await table.schema();
     const fieldNames = schema.fields.map((f: FieldLike) => f.name);
+    // 开表只校验结构（id/doc_id 为文本、向量维度相符），**不记也不校验嵌入模型签名**——设计如此，别当缺陷修。
+    // 后果要知道：三个内置模型 bge-m3 / bge-large-zh-v1.5 / bge-large-en-v1.5 都是 1024 维，同维度换模型
+    // 时这里一个条件都不落，旧模型的向量与新模型的向量会共处同一张表，相似度在两套空间之间比较、结果无意义。
+    // 为什么不自动重建：全库重嵌是本机最重的一笔开销（本地嵌入吃满 GPU/CPU，一般机器不独占跑不动，
+    // 大库以小时计），这种代价不能由「打开一张表」这种系统内部动作替用户决定何时付。
+    // 故换模型后重建是用户的显式动作：Electron 设置页保存向量设置时，若 modelId/dimensions/localModelRoot
+    // 变化会发 vector.resetStore 丢表重来（electron/main.ts saveVectorConfig）；随后逐篇补建走
+    // db-shell `db vectors <doc_id>`（MCP 同名 `vectors` 工具，full 档）。绕开设置页换模型的路径
+    // （IFTREE_EMBED_MODEL / IFTREE_EMBED_BACKEND 环境变量切远程后端、或直接改配置文件）不经 saveVectorConfig、
+    // 不会自动丢表，须用户自己走上面两步重建。
     if (
       !fieldNames.includes('id')
       || !fieldNames.includes('doc_id')

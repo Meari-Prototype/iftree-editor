@@ -29,9 +29,15 @@ interface DocumentSelectionState {
   setMultiSelected?: (nodeIds: Set<string>) => void;
 }
 
+// 落空返回 null，不再回落成根（doc.tree）。回落成根有两处真伤害：
+//   · 没有选中（切文档后 selectedNodeId 为 null）时 Inspector 显示根的信息，违反 16「没有选中
+//     节点时显示『没有选中节点』」；
+//   · 选中 id 在投影外（未预取到 / 已被驱逐 / 撤销快照里的旧 id）时，Inspector 的类型/信任/
+//     备注编辑会静默写到根节点上——改错节点比不显示危险得多。
+// 「选中了但没加载出来」交给调用方处理（treeViewCommands 先 ensureNodePath，Inspector 提示未加载）。
 function selectedNodeForDoc(doc: SelectionDocument | null | undefined, selectedNodeId: string | null): TreeNode | null {
-  if (!doc?.tree) return null;
-  return (findNode(doc.tree, selectedNodeId) as TreeNode | null) || doc.tree;
+  if (!doc?.tree || !selectedNodeId) return null;
+  return (findNode(doc.tree, selectedNodeId) as TreeNode | null) || null;
 }
 
 // 退化为 session 转发壳：selectedId / multiSelected 的真相在 session.view（经 documentState 投影/动词），

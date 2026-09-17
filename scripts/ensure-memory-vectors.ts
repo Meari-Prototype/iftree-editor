@@ -1,15 +1,17 @@
 #!/usr/bin/env node
-// 批量为「记忆卷」补建语义向量：一个 headless host 内遍历所有带 memoryVolume meta 的
-// 文档逐个 vector.ensureDoc，避免逐 doc 冷启 host 的开销。知识文档/压测语料不在范围内。
-// 用法：配好 IFTREE_EMBED_* 后 `electron scripts/ensure-memory-vectors.mjs`。
+// 批量为「记忆卷」补建语义向量：一条共享后端连接上遍历所有带 memoryVolume meta 的文档
+// 逐个 vector.ensureDoc。知识文档/压测语料不在范围内。
+// 用法：配好 IFTREE_EMBED_* 后 `node dist/scripts/ensure-memory-vectors.js`。
 import Database from 'better-sqlite3';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
+import { createBackendClient } from '../src/backend/llm/backend-client.js';
+import { resolveBackendDbPath } from '../src/backend/llm/backend-discovery.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const dbPath = process.env.IFTREE_DB || join(PROJECT_ROOT, 'database', 'store.sqlite');
+// 与共享后端派生管道名用同一个解析（IFTREE_DB 优先）：保证这里列卷的库就是后端持有的库。
+const dbPath = resolveBackendDbPath(PROJECT_ROOT);
 
 interface MemoryDocRow {
   id: string;
@@ -21,6 +23,8 @@ interface EnsureDocResult {
   vectorCountAfter?: unknown;
 }
 
+// 清单查询走 better-sqlite3 只读连接：readonly 连接不 init/不迁移/不写，和共享后端的
+// WAL 快照读并存是安全的，不算第二个写者（补建本身仍全程经共享后端，见 main）。
 function listMemoryDocs(): MemoryDocRow[] {
   const db = new Database(dbPath, { readonly: true });
   try {
@@ -50,10 +54,14 @@ async function exitProcess(code: number) {
 async function main() {
   const docs = listMemoryDocs();
   console.log(`[ensure-memory-vectors] ${docs.length} 记忆卷待补；db=${dbPath}`);
-  const client = createHeadlessAgentClient({
-    cwd: PROJECT_ROOT,
-    scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
-    onStderr: (text) => process.stderr.write(text)
+  // 走共享后端（18-6-1 / ARCHITECTURE §1）：整轮补建复用同一条连接（原先「一个 host 内跑完」
+  // 的省冷启初衷不变），但持库的是那个唯一的共享 host，不再自起私有 host 当第二个写者。
+  const client = createBackendClient({
+    projectRoot: PROJECT_ROOT,
+    hostScriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
+    mode: 'shared',
+    onStderr: (text: unknown) => { process.stderr.write(String(text ?? '')); },
+    onStatus: (text: unknown) => { process.stderr.write(String(text ?? '')); }
   });
   let done = 0;
   let inserted = 0;
@@ -61,7 +69,7 @@ async function main() {
   try {
     for (const doc of docs) {
       try {
-        const result = await client.request('vector.ensureDoc', { payload: { docId: doc.id } }) as EnsureDocResult;
+        const result = await client.ensureDocVectors({ docId: doc.id }) as EnsureDocResult;
         const add = Number(result?.missingInserted) || 0;
         inserted += add;
         done += 1;
@@ -78,7 +86,8 @@ async function main() {
       `[ensure-memory-vectors] 完成 processed=${done} failed=${failed} totalInserted=${inserted}`
     );
   } finally {
-    await client.shutdown();
+    // 只断本连接：共享后端多客户端复用；私有兜底 host（mode !== 'pipe'）才由本进程收尸。
+    if (client.mode !== 'pipe') await client.shutdown();
     client.close();
   }
 }

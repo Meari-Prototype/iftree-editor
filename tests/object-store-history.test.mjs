@@ -117,7 +117,7 @@ test('object store dedups: re-committing an unchanged doc adds no objects', asyn
   });
 });
 
-test('source_position is dropped on restore (truth lives in source_spans), node survives', async () => {
+test('source_position is restored from the commit spanmap, node survives', async () => {
   await withStore(async (store) => {
     const doc = store.createDoc({ title: 'Pos', rootText: '根' });
     const n = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '带句位', nodeType: 'TEXT', sourcePosition: 5 });
@@ -130,7 +130,9 @@ test('source_position is dropped on restore (truth lives in source_spans), node 
     store.restoreCommit(c1.id);
     const row = store.db.prepare('SELECT text, source_position FROM nodes WHERE id = ?').get(n.id);
     assert.equal(row.text, '带句位', '节点正文应恢复');
-    assert.equal(row.source_position, null, 'source_position 不进对象库，restore 后为 NULL（路径丙）');
+    // 对象树本身仍不存 source_position（materializeTree 写 NULL），但 commit 带的 spanmap 对象
+    // 一并记了节点句位，restoreSpanMap 在重插节点后回填——restore 到有 spanmap 的 commit 应精确复原。
+    assert.equal(row.source_position, 5, 'source_position 随 spanmap 进对象库，restore 后回填');
   });
 });
 

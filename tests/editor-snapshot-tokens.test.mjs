@@ -144,3 +144,82 @@ test('空文档拒绝 capture（与旧行为一致）', async () => {
     );
   });
 });
+
+test('undo token 跨拆句边界保真：restore 回 token 时刻的句位归属', async () => {
+  await withStore(async (store) => {
+    // 一篇「导入后未拆句」的文档：三句 span 全挂段落容器 P（source_position 带 .5 半步偏移）。
+    const doc = store.createDoc({ title: '原文', rootText: '根' });
+    const paragraph = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '甲句。乙句。丙句。' });
+    store.db.prepare('UPDATE nodes SET source_position = ? WHERE id = ?').run(1.5, paragraph.id);
+    store.saveSourceDocument({
+      docId: doc.id,
+      sourcePath: 'x.md',
+      sourceType: 'md',
+      rawMarkdown: '甲句。乙句。丙句。',
+      spans: [
+        { sentence_index: 1, start_offset: 0, end_offset: 3, text: '甲句。' },
+        { sentence_index: 2, start_offset: 3, end_offset: 6, text: '乙句。' },
+        { sentence_index: 3, start_offset: 6, end_offset: 9, text: '丙句。' }
+      ],
+      nodeIdsBySentenceIndex: new Map([[1, paragraph.id], [2, paragraph.id], [3, paragraph.id]])
+    });
+    const ownership = () => store.db.prepare(
+      'SELECT sentence_index, node_id FROM source_spans WHERE doc_id = ? ORDER BY sentence_index'
+    ).all(doc.id).map((row) => [Number(row.sentence_index), row.node_id ?? null]);
+
+    const beforeSplit = ownership();
+    const token = store.editorSnapshots.create(doc.id);
+    assert.equal(store.splitNodeIntoChildren(paragraph.id), true);
+    const afterSplit = ownership();
+    assert.notDeepEqual(afterSplit, beforeSplit);
+
+    // undo：回到 token 时刻，span 应挂回段落 P（旧实现这里会全变 NULL）。
+    const redoToken = store.editorSnapshots.restore({ docId: doc.id, tokenId: token.id });
+    assert.deepEqual(ownership(), beforeSplit, 'undo 后归属应回到拆句前');
+
+    // redo：回到拆句后，span 应精确回到三个句子节点。
+    store.editorSnapshots.restore({ docId: doc.id, tokenId: redoToken.id });
+    assert.deepEqual(ownership(), afterSplit, 'redo 后归属应回到拆句后');
+  });
+});
+
+test('活 token 的 spanmap 对象不被 gc 回收', async () => {
+  await withStore(async (store) => {
+    const doc = store.createDoc({ title: 'S', rootText: '根' });
+    const paragraph = store.insertNode({ docId: doc.id, parentId: doc.rootNodeId, text: '甲句。乙句。' });
+    store.saveSourceDocument({
+      docId: doc.id,
+      sourcePath: 'y.md',
+      sourceType: 'md',
+      rawMarkdown: '甲句。乙句。',
+      spans: [
+        { sentence_index: 1, start_offset: 0, end_offset: 3, text: '甲句。' },
+        { sentence_index: 2, start_offset: 3, end_offset: 6, text: '乙句。' }
+      ],
+      nodeIdsBySentenceIndex: new Map([[1, paragraph.id], [2, paragraph.id]])
+    });
+    store.saveHistorySnapshot({ docId: doc.id, summary: 'v1', owner: 'human' });
+
+    // token 抓在「归属已变、还没提交」的临时态：它的 spanmap 不被任何 commit 引用，
+    // 只能靠 liveRoots().spanMapHashes 保活。漏了的话 token 一 restore 就静默丢归属。
+    store.db.prepare('UPDATE source_spans SET node_id = NULL WHERE doc_id = ? AND sentence_index = 2').run(doc.id);
+    const token = store.editorSnapshots.create(doc.id);
+
+    store.db.prepare('UPDATE source_spans SET node_id = ? WHERE doc_id = ? AND sentence_index = 2').run(paragraph.id, doc.id);
+    store.saveHistorySnapshot({ docId: doc.id, summary: 'v2', owner: 'human' });
+
+    const spanMapsBefore = store.db.prepare("SELECT COUNT(*) AS n FROM objects WHERE kind = 'spanmap'").get().n;
+    store.gcHistoryObjects();
+    assert.equal(
+      store.db.prepare("SELECT COUNT(*) AS n FROM objects WHERE kind = 'spanmap'").get().n,
+      spanMapsBefore,
+      '活 token 的 spanmap 不该被 sweep'
+    );
+    store.editorSnapshots.restore({ docId: doc.id, tokenId: token.id });
+    assert.equal(
+      store.db.prepare('SELECT node_id FROM source_spans WHERE doc_id = ? AND sentence_index = 2').get(doc.id).node_id,
+      null,
+      'token restore 后应回到「第 2 句是孤儿」的那一刻'
+    );
+  });
+});

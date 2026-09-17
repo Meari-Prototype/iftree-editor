@@ -38,6 +38,17 @@ function c2dAxiomPatch(patch: C2DAxiomPatchIn = {}): Record<string, unknown> {
   return nextPatch;
 }
 
+// 视图隐藏时冻结其 tree 类大 props：display:none 不挡 React render/reconcile，三个吃 currentDoc.tree
+// 的视图（C2D/Ide/RichText）在每次 project（含每个后台预取页）都会各自把 O(N) 派生重算一遍——
+// 渲染成本 ×3。冻结后非活动视图 props 引用不变、useMemo/卡片 memo 全命中，重派生跳过；
+// 组件保持挂载（滚动位置等 DOM 态不丢，区别于条件渲染卸载）；切回活动 tab 时解冻拿最新 tree。
+// 驱逐保护集按 session.view 的纯函数计算（document-session.childrenVisibleSet），不依赖组件是否重渲。
+function useFrozenWhileHidden<T>(hidden: boolean, value: T): T {
+  const ref = useRef(value);
+  if (!hidden) ref.current = value;
+  return hidden ? ref.current : value;
+}
+
 export function WorkspacePane() {
   const { busy, notice, activeTab, setNotice } = useAppUIContext();
   const { docState, treeView, entityTrace, selection, layout, editorStore, summary, search, startup, dialogs, misc } = useAppState();
@@ -72,21 +83,26 @@ export function WorkspacePane() {
   } = entityTrace;
 
   const activeSourceSpans = currentDoc?.sourceWindow?.sourceSpans || currentDoc?.sourceSpans || null;
+  // 非活动视图的 tree 类 props 冻结（见 useFrozenWhileHidden）：隐藏期间不追新 tree，派生不重算。
+  const frozenC2dRootNode = useFrozenWhileHidden(activeTab !== 'tree', currentDoc?.tree);
+  const frozenIdeTree = useFrozenWhileHidden(activeTab !== 'ide', currentDoc?.tree);
+  const frozenRichDoc = useFrozenWhileHidden(activeTab !== 'rich', currentDoc);
   const sentenceLabelByNodeId = useMemo(() => {
     if (!((activeSourceSpans?.length ?? 0) > 0)) return new Map();
     // debug 模式下测全树 sentence label 聚合耗时——这个会在 sourceSpans 变化（如翻窗口）时重跑
+    // 只喂 IdeView：基于冻结 tree 计算，ide 隐藏时不重算。
     const perfToken = debugPerfBegin('buildNodeSentenceLabelMap');
-    const map = buildNodeSentenceLabelMap(currentDoc?.tree ?? null, activeSourceSpans || []);
+    const map = buildNodeSentenceLabelMap(frozenIdeTree ?? null, activeSourceSpans || []);
     debugPerfEnd('buildNodeSentenceLabelMap', perfToken, { spans: activeSourceSpans!.length, nodes: map.size });
     return map;
-  }, [currentDoc?.tree, currentDoc?.sourceSpans, currentDoc?.sourceWindow?.sourceSpans]);
+  }, [frozenIdeTree, currentDoc?.sourceSpans, currentDoc?.sourceWindow?.sourceSpans]);
   const paragraphLabelByNodeId = useMemo(() => {
-    // debug 模式下测段落 label 聚合耗时
+    // debug 模式下测段落 label 聚合耗时。只喂 C2DMapView：基于冻结 tree 计算，tree tab 隐藏时不重算。
     const perfToken = debugPerfBegin('buildParagraphLabelMap');
-    const map = buildParagraphLabelMap(currentDoc?.tree);
+    const map = buildParagraphLabelMap(frozenC2dRootNode);
     debugPerfEnd('buildParagraphLabelMap', perfToken, { nodes: map?.size ?? 0 });
     return map;
-  }, [currentDoc?.tree]);
+  }, [frozenC2dRootNode]);
 
   const diffBranchOptions = useMemo(() => {
     const branch = editor.activeEditBranch(currentDoc);
@@ -229,7 +245,7 @@ export function WorkspacePane() {
               <C2DMapView
                 ref={c2dMapRef}
                 docId={currentDoc.doc?.id}
-                rootNode={currentDoc.tree}
+                rootNode={frozenC2dRootNode}
                 expanded={treeView.c2dExpanded}
                 onExpandedChange={treeView.setC2dExpanded}
                 selectedNodeId={selectedNodeId}
@@ -253,7 +269,7 @@ export function WorkspacePane() {
             </div>
             <div style={{ display: activeTab === 'ide' ? 'contents' : 'none' }}>
               <IdeView
-                tree={currentDoc.tree}
+                tree={frozenIdeTree}
                 selectedNodeId={selectedNodeId}
                 setSelectedNodeId={setSelectedNodeId}
                 collapsed={collapsed}
@@ -270,7 +286,7 @@ export function WorkspacePane() {
             </div>
             <div style={{ display: activeTab === 'rich' ? 'contents' : 'none' }}>
               <RichTextView
-                currentDoc={currentDoc}
+                currentDoc={frozenRichDoc}
                 docId={currentDoc.doc?.id == null ? null : String(currentDoc.doc.id)}
                 selectedNodeId={selectedNodeId}
                 setSelectedNodeId={setSelectedNodeId}

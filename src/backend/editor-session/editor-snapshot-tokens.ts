@@ -22,6 +22,7 @@ interface SnapshotObjectsRow {
   root_node_id: string;
   root_tree_hash: string;
   source_hash: string | null;
+  span_map_hash: string | null;
   meta: string;
 }
 
@@ -85,13 +86,16 @@ export class EditorSnapshotTokens {
   }
 
   // 活 token 引用的对象根（gc mark 阶段的额外可达根）：不并入 gc 会把活 token 的对象 sweep 掉。
-  liveRoots(): { treeHashes: string[]; sourceHashes: string[] } {
+  // 三类都要给——句位归属的 spanmap 漏了的话，token 一 restore 就静默丢归属（span 全 NULL）。
+  liveRoots(): { treeHashes: string[]; sourceHashes: string[]; spanMapHashes: string[] } {
     const treeHashes: string[] = [];
     const sourceHashes: string[] = [];
+    const spanMapHashes: string[] = [];
     for (const entry of this.tokens.values()) {
       if (entry.row.root_tree_hash) treeHashes.push(entry.row.root_tree_hash);
       if (entry.row.source_hash) sourceHashes.push(entry.row.source_hash);
+      if (entry.row.span_map_hash) spanMapHashes.push(entry.row.span_map_hash);
     }
-    return { treeHashes, sourceHashes };
+    return { treeHashes, sourceHashes, spanMapHashes };
   }
 }

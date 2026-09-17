@@ -22,22 +22,38 @@ import {
   locateNodeInTree,
   materializeTree,
   readSource,
+  readSpanMap,
   writeSource,
+  writeSpanMap,
   writeTreeIncremental,
   writeTree as writeCommitTree
 } from '../db/object-store.js';
+import type { NodePosition, SpanLink, SpanMapPayload } from '../db/object-store.js';
 import type { TreeNodeLocation } from '../db/object-store.js';
+import type { IncrementalTreeRow } from '../db/object-store.js';
 import { parseJsonObject } from '../shared.js';
-import type { AxiomRow, CommitRow, DocRow, NodeRow, RefRow, SourceDocumentRow, SourceSpanRow } from '../db/schema.js';
+import type { AxiomRow, CommitRow, DocRow, EntityNodeBindingRow, NodeRow, RefRow, SourceDocumentRow, SourceSpanRow } from '../db/schema.js';
 import type { MerkleNode } from '../../core/merkle.js';
 
 // 从 head 沿 parent_commit_id 上溯，返回祖先链 commit id（head 在前、根在后）。git log 只走这条链——
 // restore/reset 把 head 移到旧 commit 后，被跳过的"未来" commit 不在链上、从 log 消失（仍可凭 id 直接访问，充当 reflog）。
 type RowObject = Record<string, unknown>;
 type SnapshotHistoryPayload = Parameters<typeof computeSnapshotDiff>[0];
+// live 快照标记：createSnapshot 直读 nodes 表的产物才带（Symbol 键——对象 spread 保留、
+// JSON.stringify 丢弃，投影/对象库重建的快照天然没有）。createCommit 凭它决定走增量写树：
+// writeTreeIncremental 的前提正是「行直读自 nodes 表」（tree_object_hash 列缓存对应 live 行）。
+const LIVE_ROWS_SNAPSHOT: unique symbol = Symbol('liveRowsSnapshot');
 export type SnapshotPayload = SnapshotHistoryPayload & {
   doc?: RowObject | null;
   sourceDocument?: (Partial<SourceDocumentRow> & { raw_markdown?: unknown }) | null;
+  // 句位归属（span→node + nodes.source_position）。两个字段互斥地表达同一件事：
+  // - spanMapHash：docs 列缓存命中（归属自上次写快照以来没动），createCommit 直接复用该 hash、零重算。
+  // - spanMap：脏位为 1 时 createSnapshot 现扫出的内容，由 createCommit 写成对象。
+  // restoreSnapshot 只看 spanMap，且用 hasOwnProperty 区分「字段缺失」（旧 commit / revert 自构造
+  // 快照 → 退回现行行为）与「字段在但 links 为空」（该版本确实没有归属 → 全置 NULL）。
+  spanMapHash?: string | null;
+  spanMap?: SpanMapPayload;
+  [LIVE_ROWS_SNAPSHOT]?: true;
 };
 export type CommitPayload = {
   docId?: unknown;
@@ -77,12 +93,47 @@ export interface RevertCommitPayload {
 export interface HistoryStore {
   db: Database | null;
   readonly: boolean;
-  editorSnapshots: { liveRoots(): { treeHashes: string[]; sourceHashes: string[] } };
+  editorSnapshots: { liveRoots(): { treeHashes: string[]; sourceHashes: string[]; spanMapHashes: string[] } };
   listAxioms(docId: unknown): AxiomRow[];
   refreshDocAddresses(docId: unknown): { updated: number };
   removeRootAxiomRefs(docId?: unknown): void;
   touchDoc(docId: unknown): void;
   withTransaction<T>(fn: () => T): T;
+}
+
+// 句位归属采集（只读，供 createSnapshot / writeDocSnapshotObjects 共用）。
+// 脏位为 0 且列缓存在 → 返回 { spanMapHash }，一行不读；否则现扫 source_spans + nodes.source_position。
+// 扫描顺序必须确定（ORDER BY 全给足），否则同一份归属会因行序不同算出不同 hash、白白多存对象。
+function collectSpanMap(store: HistoryStore, docId: unknown): Pick<SnapshotPayload, 'spanMapHash' | 'spanMap'> {
+  const doc = store.db!.prepare('SELECT span_map_hash, span_map_dirty FROM docs WHERE id = ?')
+    .get<Pick<DocRow, 'span_map_hash' | 'span_map_dirty'>>(docId);
+  if (doc && Number(doc.span_map_dirty) === 0) return { spanMapHash: doc.span_map_hash ?? null };
+
+  const links = store.db!.prepare(`
+    SELECT sentence_index, node_id FROM source_spans
+    WHERE doc_id = ? ORDER BY sentence_index, id
+  `).all<Pick<SourceSpanRow, 'sentence_index' | 'node_id'>>(docId)
+    .map((row): SpanLink => ({ sentenceIndex: Number(row.sentence_index), nodeId: row.node_id ?? null }));
+  const nodePositions = store.db!.prepare(`
+    SELECT id, source_position FROM nodes
+    WHERE doc_id = ? AND source_position IS NOT NULL ORDER BY id
+  `).all<Pick<NodeRow, 'id' | 'source_position'>>(docId)
+    .map((row): NodePosition => ({ nodeId: String(row.id), sourcePosition: Number(row.source_position) }));
+  return { spanMap: nodePositions.length > 0 ? { links, nodePositions } : { links } };
+}
+
+// 快照的句位归属 → 对象库，返回 commit.span_map_hash 该写什么。缓存命中直接透传 hash；
+// 现扫过则写对象并回写 docs 列缓存 + 清脏位（纪律同 tree_object_hash：**对象写完才回写列**，
+// 保证「列上有 hash ⇒ 对象在库里」；gc 之后全列作废，见 gcHistoryObjects）。
+function persistSpanMap(store: HistoryStore, docId: unknown, snapshot: SnapshotPayload): string | null {
+  if (!Object.prototype.hasOwnProperty.call(snapshot, 'spanMap')) {
+    return snapshot.spanMapHash ?? null;
+  }
+  const hash = writeSpanMap(store.db!, snapshot.spanMap || { links: [] });
+  if (!store.readonly) {
+    store.db!.prepare('UPDATE docs SET span_map_hash = ?, span_map_dirty = 0 WHERE id = ?').run(hash, docId);
+  }
+  return hash;
 }
 
 // commit 写入（内容寻址）：节点树与源文写对象库，doc/axioms/refs 与 operation entries 内联 meta。
@@ -98,13 +149,33 @@ export function createCommit(store: HistoryStore, {
   const head = store.db!.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?')
     .get<Pick<CommitRow, 'parent_commit_id'> & { head_commit_id: string | null }>(normalizedDocId);
   const commitId = newStableId();
-  const tree = writeCommitTree(store.db!, (snapshot.nodes || []) as MerkleNode[]);
+  const snapshotNodes = (snapshot.nodes || []) as MerkleNode[];
+  let tree: { root_node_id: string; root_tree_hash: string } | null;
+  if (snapshot[LIVE_ROWS_SNAPSHOT] === true) {
+    // live 直读快照 → 增量写树：列缓存有效的子树整棵剪掉（不算 hash、不写对象），
+    // 稳态保存 O(N) → O(脏节点 ∪ 祖先链)。重算过的节点回写 tree_object_hash 列
+    // （纪律：对象写完才回写；触发器不监听该列，回写不自我失效）。
+    const rowsById = new Map(snapshotNodes.map((node) => [String(node.id), node]));
+    const incremental = writeTreeIncremental(
+      store.db!,
+      snapshotNodes as IncrementalTreeRow[],
+      (id) => rowsById.get(id) || null
+    );
+    if (incremental && !store.readonly && incremental.recomputed.size > 0) {
+      const updateHash = store.db!.prepare('UPDATE nodes SET tree_object_hash = ? WHERE id = ?');
+      for (const [id, hash] of incremental.recomputed) updateHash.run(hash, id);
+    }
+    tree = incremental;
+  } else {
+    tree = writeCommitTree(store.db!, snapshotNodes);
+  }
   const sourceHash = writeSource(store.db!, snapshot.sourceDocument?.raw_markdown);
+  const spanMapHash = persistSpanMap(store, normalizedDocId, snapshot);
   const meta = buildCommitMeta(snapshot, entries);
 
   store.db!.prepare(`
-    INSERT INTO commits (id, doc_id, parent_commit_id, committed_at, summary, author, root_node_id, root_tree_hash, source_hash, meta)
-    VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?)
+    INSERT INTO commits (id, doc_id, parent_commit_id, committed_at, summary, author, root_node_id, root_tree_hash, source_hash, span_map_hash, meta)
+    VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?)
   `).run(
     commitId,
     normalizedDocId,
@@ -115,6 +186,7 @@ export function createCommit(store: HistoryStore, {
     tree?.root_node_id || null,
     tree?.root_tree_hash || null,
     sourceHash,
+    spanMapHash,
     JSON.stringify(meta)
   );
   store.db!.prepare(`
@@ -159,7 +231,10 @@ export function commitSnapshotFromRow(store: HistoryStore, row: CommitSnapshotRo
     refs: Array.isArray(meta.refs) ? meta.refs : [],
     sourceDocument: sourceMeta
       ? { ...sourceMeta, raw_markdown: rawMarkdown }
-      : (row.source_hash ? { raw_markdown: rawMarkdown } : null)
+      : (row.source_hash ? { raw_markdown: rawMarkdown } : null),
+    // 句位归属：只在该 commit 真带 span_map_hash 时才设这个字段。旧 commit（本机制之前的行）
+    // 一律不设——restoreSnapshot 据 hasOwnProperty 退回现行行为（按恢复前 live 链接过滤）。
+    ...(row.span_map_hash ? { spanMap: readSpanMap(store.db!, row.span_map_hash) } : {})
   };
 }
 
@@ -186,11 +261,15 @@ export function createSnapshot(store: HistoryStore, docId: unknown): SnapshotPay
       ORDER BY id
     `).all<RefRow>(docId, docId);
   return {
+    // 直读 nodes 表的标记：createCommit 凭它走增量写树（见 LIVE_ROWS_SNAPSHOT）。
+    [LIVE_ROWS_SNAPSHOT]: true,
     doc,
     nodes: nodes as unknown as SnapshotPayload['nodes'],
     axioms: store.listAxioms(docId) as unknown as SnapshotPayload['axioms'],
     refs: refs as unknown as SnapshotPayload['refs'],
-    sourceDocument
+    sourceDocument,
+    // 句位归属：脏位为 0 时这里零读、只带一个缓存 hash（稳态保存的常态）。
+    ...collectSpanMap(store, docId)
   };
 }
 
@@ -240,6 +319,8 @@ export function writeDocSnapshotObjects(store: HistoryStore, docId: unknown) {
       root_node_id: tree.root_node_id,
       root_tree_hash: tree.root_tree_hash,
       source_hash: writeSource(store.db!, sourceDocument?.raw_markdown),
+      // undo token 与历史 commit 同一条口径：不写 spanmap，undo/redo 跨拆句边界照样丢归属。
+      span_map_hash: persistSpanMap(store, docId, collectSpanMap(store, docId)),
       meta: JSON.stringify(meta)
     };
   });
@@ -291,6 +372,70 @@ export function insertSnapshotNodes(store: HistoryStore, nodes: SnapshotRow[], d
   if (head !== nodes.length) throw new Error('Snapshot contains unresolved node parents');
 }
 
+// 句位归属写回（restore 的精确分支）。调用方保证：本文档的节点刚被 DELETE+重插，故所有
+// source_spans.node_id 已被 ON DELETE SET NULL 清成 NULL、nodes.source_position 已被
+// insertSnapshotNodes 写成 NULL（对象库不存该列）——这里只管把该 commit 时代的值盖回去。
+//
+// 走 temp 表 + UPDATE…FROM 而不是逐行 run：50 万 span 的文档逐行要 50 万次 JS↔C 往返 + 50 万次
+// 索引查找 + 50 万次脏位触发器（首行之后全是不命中的 no-op，但仍要执行）。temp 表由 json_each
+// 一次灌满（零 JS 循环），UPDATE 侧走 idx_source_spans_doc 覆盖索引 + temp 表主键查找。
+//
+// snapshotNodeIds 过滤是硬要求，不是防御性洁癖：source_spans.node_id 有 FK，指向快照里不存在的
+// 节点会直接 FOREIGN KEY constraint failed 炸掉整个 restore 事务。不在快照里的一律写 NULL。
+function restoreSpanMap(
+  store: HistoryStore,
+  docId: unknown,
+  spanMap: SpanMapPayload,
+  snapshotNodeIds: Set<unknown>
+) {
+  const linkPairs: Array<[number, string | null]> = [];
+  for (const link of spanMap.links || []) {
+    const sentenceIndex = Number(link.sentenceIndex);
+    if (!Number.isFinite(sentenceIndex)) continue;
+    const nodeId = link.nodeId != null && snapshotNodeIds.has(link.nodeId) ? link.nodeId : null;
+    linkPairs.push([sentenceIndex, nodeId]);
+  }
+  if (linkPairs.length > 0) {
+    store.db!.prepare(
+      'CREATE TEMP TABLE IF NOT EXISTS _restore_span_links (sentence_index INTEGER PRIMARY KEY, node_id TEXT)'
+    ).run();
+    store.db!.prepare('DELETE FROM _restore_span_links').run();
+    store.db!.prepare(`
+      INSERT OR REPLACE INTO _restore_span_links (sentence_index, node_id)
+      SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?)
+    `).run(JSON.stringify(linkPairs));
+    store.db!.prepare(`
+      UPDATE source_spans SET node_id = l.node_id
+      FROM _restore_span_links l
+      WHERE l.sentence_index = source_spans.sentence_index AND source_spans.doc_id = ?
+    `).run(docId);
+    store.db!.prepare('DELETE FROM _restore_span_links').run();
+  }
+
+  const positionPairs: Array<[string, number]> = [];
+  for (const entry of spanMap.nodePositions || []) {
+    const position = Number(entry.sourcePosition);
+    if (!entry.nodeId || !Number.isFinite(position) || !snapshotNodeIds.has(entry.nodeId)) continue;
+    positionPairs.push([String(entry.nodeId), position]);
+  }
+  if (positionPairs.length > 0) {
+    store.db!.prepare(
+      'CREATE TEMP TABLE IF NOT EXISTS _restore_node_positions (node_id TEXT PRIMARY KEY, source_position REAL)'
+    ).run();
+    store.db!.prepare('DELETE FROM _restore_node_positions').run();
+    store.db!.prepare(`
+      INSERT OR REPLACE INTO _restore_node_positions (node_id, source_position)
+      SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?)
+    `).run(JSON.stringify(positionPairs));
+    store.db!.prepare(`
+      UPDATE nodes SET source_position = p.source_position
+      FROM _restore_node_positions p
+      WHERE p.node_id = nodes.id AND nodes.doc_id = ?
+    `).run(docId);
+    store.db!.prepare('DELETE FROM _restore_node_positions').run();
+  }
+}
+
 export function restoreSnapshot(store: HistoryStore, docId: unknown, snapshot: SnapshotPayload) {
   const snapshotNodes = assertRestorableSnapshot(store, snapshot);
   store.withTransaction(() => {
@@ -329,10 +474,24 @@ export function restoreSnapshot(store: HistoryStore, docId: unknown, snapshot: S
         );
       }
     }
-    const sourceSpanLinks = store.db!.prepare(`
+    // 句位归属分两条路，由「快照有没有 spanMap 字段」决定（hasOwnProperty，不是真假值——
+    // 「字段在但 links 为空」表示该版本确实没有归属，要全置 NULL，与「字段缺失」语义不同）：
+    //   有 → 该 commit 带了自己的归属对象，按 (doc_id, sentence_index) 精确还原到那个时代；
+    //   无 → 旧 commit（本机制之前的行）或 revertCommit 自构造的快照，退回现行行为：
+    //        只把「恢复前 live 的链接」中节点仍在快照里的那部分挂回，其余留 NULL。
+    const hasSpanMap = Object.prototype.hasOwnProperty.call(snapshot, 'spanMap');
+    // 现行行为要的 live 链接：只在没有 spanMap 时才读（有 spanMap 时这趟 O(N) 读纯属浪费）。
+    const sourceSpanLinks = hasSpanMap ? [] : store.db!.prepare(`
       SELECT id, node_id FROM source_spans
       WHERE doc_id = ? AND node_id IS NOT NULL
     `).all<Pick<SourceSpanRow, 'id' | 'node_id'>>(docId);
+    // 实体绑定（13 章）：entity_node_bindings.node_id 是 ON DELETE CASCADE，下面的
+    // DELETE FROM nodes 会连带清空本文档的全部绑定，而快照里不含绑定、重插节点也不会带回来——
+    // 不先存后补，undo/restore/revert 就会静默清空实体标注。照 sourceSpanLinks 的做法先读后写回。
+    const entityBindings = store.db!.prepare(`
+      SELECT entity_id, node_id, status, created_at, updated_at FROM entity_node_bindings
+      WHERE node_id IN (SELECT id FROM nodes WHERE doc_id = ?)
+    `).all<Omit<EntityNodeBindingRow, 'id'>>(docId);
     const snapshotNodeIds = new Set(snapshotNodes.map((node) => node.id));
     store.db!.prepare(`
       DELETE FROM refs
@@ -342,9 +501,24 @@ export function restoreSnapshot(store: HistoryStore, docId: unknown, snapshot: S
     store.db!.prepare('DELETE FROM axioms WHERE doc_id = ?').run(docId);
     store.db!.prepare('DELETE FROM nodes WHERE doc_id = ?').run(docId);
     insertSnapshotNodes(store, snapshotNodes, docId);
-    const restoreSourceSpan = store.db!.prepare('UPDATE source_spans SET node_id = ? WHERE id = ?');
-    for (const link of sourceSpanLinks) {
-      if (snapshotNodeIds.has(link.node_id)) restoreSourceSpan.run(link.node_id, link.id);
+    if (hasSpanMap) {
+      restoreSpanMap(store, docId, snapshot.spanMap || { links: [] }, snapshotNodeIds);
+    } else {
+      const restoreSourceSpan = store.db!.prepare('UPDATE source_spans SET node_id = ? WHERE id = ?');
+      for (const link of sourceSpanLinks) {
+        if (snapshotNodeIds.has(link.node_id)) restoreSourceSpan.run(link.node_id, link.id);
+      }
+    }
+    // 绑定写回：只认快照里还在的节点（被该版本删掉的节点，其绑定随之作废）。
+    // 不保留原自增 id——id 只是内部主键、业务键是 UNIQUE(entity_id, node_id)，没有外部引用；
+    // 强行复用反而可能撞上期间别的文档占用的 id。OR IGNORE 兜 UNIQUE（正常不会撞，级联已清空）。
+    const restoreEntityBinding = store.db!.prepare(`
+      INSERT OR IGNORE INTO entity_node_bindings (entity_id, node_id, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (const binding of entityBindings) {
+      if (!snapshotNodeIds.has(binding.node_id)) continue;
+      restoreEntityBinding.run(binding.entity_id, binding.node_id, binding.status, binding.created_at, binding.updated_at);
     }
     const insertAxiom = store.db!.prepare(`
       INSERT INTO axioms (id, doc_id, label, content, status, node_title, node_note, node_width, node_height, node_size_mode)
@@ -381,16 +555,27 @@ export function restoreSnapshot(store: HistoryStore, docId: unknown, snapshot: S
 }
 
 function commitAncestry(store: HistoryStore, docId: string): string[] {
-  const head = store.db!.prepare('SELECT head_commit_id FROM doc_heads WHERE doc_id = ?')
-    .get<{ head_commit_id: string | null }>(docId);
+  // 一条递归 CTE 取整条祖先链（原先逐 commit 一次点查，C 个 commit = C 次串行查询）。
+  // 语义与原 while 循环一致：head 在前、根在后（depth 序）。环防御：depth 上限 = 表行数
+  // （无环时远达不到；有环时截断），JS 侧 seen 去重保持首个（= 链上首次）。
+  const rows = store.db!.prepare(`
+    WITH RECURSIVE ancestry(id, depth) AS (
+      SELECT head_commit_id, 0 FROM doc_heads WHERE doc_id = ? AND head_commit_id IS NOT NULL
+      UNION ALL
+      SELECT c.parent_commit_id, a.depth + 1
+      FROM commits c JOIN ancestry a ON c.id = a.id
+      WHERE c.parent_commit_id IS NOT NULL
+        AND a.depth < (SELECT COUNT(*) FROM commits)
+    )
+    SELECT id FROM ancestry ORDER BY depth
+  `).all<Pick<CommitRow, 'id'>>(docId);
   const chain: string[] = [];
   const seen = new Set<string>();
-  const parentStmt = store.db!.prepare('SELECT parent_commit_id FROM commits WHERE id = ?');
-  let cur: string | null = head?.head_commit_id || null;
-  while (cur && !seen.has(cur)) {
-    seen.add(cur);
-    chain.push(cur);
-    cur = parentStmt.get<{ parent_commit_id: string | null }>(cur)?.parent_commit_id || null;
+  for (const row of rows) {
+    const id = String(row.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    chain.push(id);
   }
   return chain;
 }
@@ -553,13 +738,18 @@ export function gcHistoryObjects(store: HistoryStore) {
     // 列缓存的前提是「hash 在列上 ⇒ 对象在库里」；sweep 之后无法廉价证明哪些缓存仍指向存活
     // 对象，一律作废（gc 低频，下次写快照全量重建缓存），换悬挂引用绝迹。
     store.db!.prepare('UPDATE nodes SET tree_object_hash = NULL WHERE tree_object_hash IS NOT NULL').run();
+    // docs 的 spanmap 列缓存同理：置脏 + 清 hash，下次写快照全量重扫一遍归属。
+    store.db!.prepare('UPDATE docs SET span_map_hash = NULL, span_map_dirty = 1 WHERE span_map_hash IS NOT NULL OR span_map_dirty = 0').run();
     return result;
   });
 }
 
 export function saveHistorySnapshot(store: HistoryStore, { docId, summary = '保存版本', owner = 'human' }: SaveHistorySnapshotPayload) {
+  // 全量读移出写事务：安全性靠「createSnapshot 与 withTransaction 之间同步连续、无 await」——
+  // 这两行之间不得引入任何 await/async 化（一旦出现异步窗口，其他写入即可插队使快照与提交脱节）。
+  // 事务内只剩增量 hash/对象写 + commits/doc_heads 两条原子写——持锁时长从 O(N) 降到 O(depth)。
+  const currentSnapshot = createSnapshot(store, docId);
   return store.withTransaction(() => {
-    const currentSnapshot = createSnapshot(store, docId);
     // diff 不再持久化（按需由 query-api 现算）；createCommit 把快照拆进对象库 + 内联 meta。
     const commit = createCommit(store, {
       docId,
@@ -740,6 +930,10 @@ export function revertCommit(store: HistoryStore, { commitId, owner = 'human', s
       && (ref.target_type !== 'node' || targetNodeIds.has(String(ref.target_id)))
     ));
 
+    // 刻意不传 spanMap：revert 是「在当前主干上撤销一次改动」，句位归属应当跟着存活节点原地留在
+    // 当前状态，而不是回到目标 commit 那个时代（那是 restore/reset 的语义）。少这个字段，
+    // restoreSnapshot 的 hasOwnProperty 判定就走「缺失」分支 = 现行行为（按恢复前 live 链接过滤，
+    // 被撤销掉的节点其 span 留 NULL）。**这一行是契约，别顺手补上 spanMap。**
     restoreSnapshot(store, docId, {
       doc: currentSnap.doc,
       sourceDocument: currentSnap.sourceDocument,

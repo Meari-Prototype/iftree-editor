@@ -27,7 +27,7 @@ test('db log, diff, read --at, and restore address committed history', { timeout
     assert.equal(commit.fastForward, true);
     assert.equal(commit.history.doc_id, docId);
     assert.ok(commit.history.saved_at, 'history 应有 saved_at');
-    assert.match(commitRef, /^019[a-f0-9-]+$/, 'commit id 应是 UUIDv7');
+    assert.match(commitRef, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, 'commit id 应是 UUIDv7');
 
     // —— log：文档级，commit 行格式 commit:ID time @author summary ——
     const logText = stdoutOf(await runBashDb(dbPath, ['log', docId, '--limit', '5']));

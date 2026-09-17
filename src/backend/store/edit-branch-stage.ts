@@ -6,7 +6,7 @@ import { contentHash, type MerkleNode } from '../../core/merkle.js';
 import { assertNoHumanTagField, assertNoEditTrustField, assertValidNodeRefKind } from '../shared.js';
 import { sameStableId } from '../db/ids.js';
 import { normalizePositiveId, normalizeSourcePosition } from '../db/normalizers.js';
-import type { EditBranchRow, SourceSpanRow } from '../db/schema.js';
+import type { EditBranchRow, NodeRow, SourceSpanRow } from '../db/schema.js';
 import type { NodePatchFields, NodeUpdateFieldsDelta, ProjectionNode } from './edit-branch-contract.js';
 import type { EditBranchStore } from './edit-branch.js';
 import {
@@ -60,9 +60,10 @@ export function stageEditBranchNodeUpdate(store: EditBranchStore, branch: EditBr
       patch,
       fields
     });
-    const after = _projectedDocForBranch(store, freshBranch);
-    const projectedNode = _findProjectedNode(store, after, currentNode.id) || currentNode;
-    return { branch: freshBranch, changed: true, node: store.requireEditBranchPort().nodeRowWithClientAliases(projectedNode) };
+    // node.update 只 patch 单节点内容字段、不动结构：改后投影中该节点 ≡ patchProjectedNode(改前节点, patch)
+    // （applyNodeUpdate 的定义即此）。省掉原先「仅为取改后节点行」的第二次全量投影重建。
+    const projectedNode = store.requireEditBranchPort().patchProjectedNode(currentNode, patch);
+    return { branch: freshBranch, changed: true, node: store.requireEditBranchPort().nodeRowWithClientAliases(projectedNode as NodeRow) };
   }
 
 export function stageEditBranchNodeInsert(store: EditBranchStore, branch: EditBranchRow, payload: EditBranchPayload = {}) {

@@ -30,7 +30,7 @@ export type DocEditMode = 'readonly' | 'incremental' | 'full';
 
 export type NodeSizeMode = 'auto' | 'manual';
 
-export type ObjectKind = 'blob' | 'tree' | 'source';
+export type ObjectKind = 'blob' | 'tree' | 'source' | 'spanmap';
 
 export type EntityLinkKind = 'synonym' | 'related';
 
@@ -47,6 +47,8 @@ export interface DocRow {
   axioms_collapsed: number;
   tree_view_state: string;
   nodes_hash_dirty: number;
+  span_map_hash: string | null;
+  span_map_dirty: number;
   edit_mode: DocEditMode;
 }
 
@@ -161,6 +163,7 @@ export interface CommitRow {
   root_node_id: string | null;
   root_tree_hash: string | null;
   source_hash: string | null;
+  span_map_hash: string | null;
   meta: string | null;
 }
 
@@ -245,6 +248,11 @@ CREATE TABLE IF NOT EXISTS docs (
   axioms_collapsed INTEGER NOT NULL DEFAULT 0,
   tree_view_state TEXT NOT NULL DEFAULT '{}',
   nodes_hash_dirty INTEGER NOT NULL DEFAULT 1,
+  -- span 归属对象（A5-1/7）的列缓存：span_map_hash = 上次算出的 spanmap 对象 hash，
+  -- span_map_dirty = source_spans 写入后由触发器置 1。归属不变时 createSnapshot 零读直接复用
+  -- 缓存 hash（纪律同 nodes.tree_object_hash：对象写完才回写；GC 之后一律作废）。
+  span_map_hash TEXT,
+  span_map_dirty INTEGER NOT NULL DEFAULT 1,
   edit_mode TEXT NOT NULL DEFAULT 'full' CHECK(edit_mode IN ('readonly', 'incremental', 'full'))
 );
 
@@ -288,6 +296,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_doc_parent_order ON nodes(doc_id, parent_id
 CREATE INDEX IF NOT EXISTS idx_nodes_doc_depth ON nodes(doc_id, depth);
 CREATE INDEX IF NOT EXISTS idx_nodes_doc_address ON nodes(doc_id, address);
 CREATE INDEX IF NOT EXISTS idx_nodes_doc_source_position ON nodes(doc_id, source_position, id);
+-- docKind 判定的 EXISTS（... WHERE doc_id = ? AND trust_level = '受控'）走它：原先靠 idx_nodes_doc
+-- 扫该 doc 全部节点直到撞见一条受控——全不受控的文档 = 全节点扫。检索/列表每次算 doc_kind 都用。
+CREATE INDEX IF NOT EXISTS idx_nodes_doc_trust ON nodes(doc_id, trust_level);
 
 CREATE TABLE IF NOT EXISTS axioms (
   id TEXT PRIMARY KEY,
@@ -337,6 +348,9 @@ CREATE INDEX IF NOT EXISTS idx_source_spans_doc ON source_spans(doc_id, sentence
 CREATE INDEX IF NOT EXISTS idx_source_spans_node ON source_spans(node_id);
 CREATE INDEX IF NOT EXISTS idx_source_spans_doc_offsets ON source_spans(doc_id, start_offset, end_offset);
 CREATE INDEX IF NOT EXISTS idx_source_spans_doc_node_offset ON source_spans(doc_id, node_id, start_offset);
+-- spanmap 采集的覆盖索引：createSnapshot 按 (doc_id, sentence_index) 顺序取 node_id，
+-- 走这条索引即可，不回表（现有 idx_source_spans_doc 不含 node_id）。
+CREATE INDEX IF NOT EXISTS idx_source_spans_doc_sentence_node ON source_spans(doc_id, sentence_index, node_id);
 
 CREATE TABLE IF NOT EXISTS source_pdf_pages (
   id INTEGER PRIMARY KEY,
@@ -390,6 +404,12 @@ CREATE TABLE IF NOT EXISTS commits (
   root_node_id TEXT,
   root_tree_hash TEXT,
   source_hash TEXT,
+  -- span 归属对象（A5-1）：source_spans 的 sentence_index → node_id 映射 + 节点 source_position，
+  -- 按 hash 去重存进对象库。与 source_hash 并列、同一套 GC 可达性处理；归属不变则跨 commit 只存一份。
+  -- 刻意不进 root_tree_hash：归属变化不该改节点树指纹（否则 writeTreeIncremental 的列缓存剪枝
+  -- 会剪掉「归属变、内容不变」的子树，而 source_spans 的写入不触发 nodes 的 hash 失效触发器）。
+  -- NULL = 该 commit 早于本机制（旧库不兼容、不修复）：restore 时退回「按恢复前 live 链接过滤」。
+  span_map_hash TEXT,
   meta TEXT
 );
 
@@ -400,7 +420,7 @@ CREATE INDEX IF NOT EXISTS idx_commits_doc_time ON commits(doc_id, committed_at,
 -- hash 纯复用 core/merkle 的 contentHash / subtreeHash（位置无关），相同子树跨 commit 跨文档只存一份。
 CREATE TABLE IF NOT EXISTS objects (
   hash TEXT PRIMARY KEY,
-  kind TEXT NOT NULL CHECK(kind IN ('blob', 'tree', 'source')),
+  kind TEXT NOT NULL CHECK(kind IN ('blob', 'tree', 'source', 'spanmap')),
   data TEXT NOT NULL
 );
 
@@ -500,6 +520,42 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_nodes_hash_dirty_delete
 AFTER DELETE ON nodes BEGIN
   UPDATE docs SET nodes_hash_dirty = 1 WHERE id = OLD.doc_id AND nodes_hash_dirty = 0;
+END;
+-- span 归属脏位（docs.span_map_dirty）：commit/undo token 写 spanmap 对象前靠它决定「要不要重扫」。
+-- 两个来源——source_spans 的归属写（含 DELETE FROM nodes 触发的 ON DELETE SET NULL）、
+-- nodes.source_position 的写（该列一并进 spanmap，restore 时回填）。AND span_map_dirty = 0 的
+-- 守卫让批量写只在第一行真正 UPDATE，之后全是不命中的 no-op；置位的 UPDATE 只动 docs 的这一列，
+-- 不在任何触发器监听列内，不递归。DROP+CREATE 同 hash 触发器：定义演进时旧库启动即拿到最新版。
+DROP TRIGGER IF EXISTS trg_span_map_dirty_span_insert;
+CREATE TRIGGER trg_span_map_dirty_span_insert
+AFTER INSERT ON source_spans BEGIN
+  UPDATE docs SET span_map_dirty = 1 WHERE id = NEW.doc_id AND span_map_dirty = 0;
+END;
+DROP TRIGGER IF EXISTS trg_span_map_dirty_span_update;
+CREATE TRIGGER trg_span_map_dirty_span_update
+AFTER UPDATE OF node_id, sentence_index ON source_spans BEGIN
+  UPDATE docs SET span_map_dirty = 1 WHERE id = NEW.doc_id AND span_map_dirty = 0;
+END;
+DROP TRIGGER IF EXISTS trg_span_map_dirty_span_delete;
+CREATE TRIGGER trg_span_map_dirty_span_delete
+AFTER DELETE ON source_spans BEGIN
+  UPDATE docs SET span_map_dirty = 1 WHERE id = OLD.doc_id AND span_map_dirty = 0;
+END;
+DROP TRIGGER IF EXISTS trg_span_map_dirty_node_insert;
+CREATE TRIGGER trg_span_map_dirty_node_insert
+AFTER INSERT ON nodes WHEN NEW.source_position IS NOT NULL BEGIN
+  UPDATE docs SET span_map_dirty = 1 WHERE id = NEW.doc_id AND span_map_dirty = 0;
+END;
+DROP TRIGGER IF EXISTS trg_span_map_dirty_node_update;
+CREATE TRIGGER trg_span_map_dirty_node_update
+AFTER UPDATE OF source_position ON nodes
+WHEN NEW.source_position IS NOT NULL OR OLD.source_position IS NOT NULL BEGIN
+  UPDATE docs SET span_map_dirty = 1 WHERE id = NEW.doc_id AND span_map_dirty = 0;
+END;
+DROP TRIGGER IF EXISTS trg_span_map_dirty_node_delete;
+CREATE TRIGGER trg_span_map_dirty_node_delete
+AFTER DELETE ON nodes WHEN OLD.source_position IS NOT NULL BEGIN
+  UPDATE docs SET span_map_dirty = 1 WHERE id = OLD.doc_id AND span_map_dirty = 0;
 END;
 -- 节点级 hash 失效触发器（增量 merkle + 增量对象树）：与上面的 doc 级粗位并存——粗位答「该
 -- doc 可能有陈旧 hash」（兼容旧库：位=1 但无 NULL 行 ⇒ 旧触发器时代的陈旧态，ensureNodeHashes

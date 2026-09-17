@@ -20,8 +20,20 @@
 //   7) FTS 可用性：新会话冷启动 content.searchKeyword 命中正文高频词（计时仅观测）
 //   8) 源文档层：source_documents/source_spans（总数与绑定数）与基线一致
 //
-// 用法（electron-as-node，匹配 better-sqlite3 ABI）：
-//   $env:ELECTRON_RUN_AS_NODE='1'; .\node_modules\.bin\electron.cmd scripts/verify-chm-stream.mjs --file <path.chm> [--batch 800]
+// 用法（跑真 node：本进程直接 new IftreeStore + require better-sqlite3，而它只编 node ABI）：
+//   node dist/scripts/verify-chm-stream.js --file <path.chm> [--batch 800]
+//
+// 【例外说明】scripts/ 下其余脚本都已改走 createBackendClient({ mode: 'shared' })，
+// 本脚本是唯一仍直连私有 stdio host（createHeadlessAgentClient）的入口，三条硬理由：
+//   1) 它不碰主库。每次跑都在 tmp/chm-stream-e2e-<ts>/ 下现造两个一次性库并把 IFTREE_DB /
+//      IFTREE_HOME 指过去，那个库从生到死只有本进程一个客户端——「一库一后端·单写者」
+//      （ARCHITECTURE §1）在这里本来就成立，不需要靠共享后端来保证。
+//   2) 断言 7 要的就是「换一个冷启动进程」。session2 必须是全新 host（LanceDB / KeywordStore
+//      从零加载）才能证明 FTS 跨会话可搜、首查不触发整库重建；走 shared 的话第二次连接复用的是
+//      同一个已经热起来的 host，这条断言就名存实亡。
+//   3) 共享后端是 detached 常驻的，脚本退出只断连接。给每个一次性 tmp 库拉起一个常驻 host，
+//      进程收不回、tmp 文件也被它攥着删不掉。
+// host 的 runtime 仍按 ABI 铁律（A3-1）钉死真 node，与本脚本自己跑什么无关。
 
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -31,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { readChmSourceDocument, type ChmRecord } from '../src/core/source-chm.js';
 import { normalizeImportBaseName } from '../src/core/source-markdown.js';
 import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
+import { resolveNodeExecutable } from '../src/backend/llm/backend-discovery.js';
 import { KeywordStore } from '../src/vector/keyword-store.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -424,9 +437,13 @@ async function main() {
 
   process.env.IFTREE_HOME = homeB;
   process.env.IFTREE_DB = join(homeB, 'store.sqlite');
+  // processPath 显式钉真 node（ABI 铁律 A3-1）：私有 stdio host 默认继承 process.execPath，
+  // 本脚本若被 electron 启动，host 就成了 electron-as-node、加载 node ABI 的 better-sqlite3 即崩。
+  // 其余入口靠 backend-client 里的 resolveNodeExecutable 兜底，这里是直连，得自己钉。
   const clientOptions = {
     cwd: PROJECT_ROOT,
     scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
+    processPath: resolveNodeExecutable(),
     onStderr: (text: string) => process.stderr.write(text)
   };
 

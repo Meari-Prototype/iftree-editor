@@ -19,7 +19,10 @@ if "%FILE%"=="" set "FILE=benchmark\repos\TREC_RAG_MS_MARCO_V2.1_segmented\extra
 set "LABEL=%~2"
 if "%LABEL%"=="" set "LABEL=full-shard"
 
-set "ELECTRON=node_modules\.bin\electron.cmd"
+rem 两步都用真 node 跑：后端 host 由 resolveNodeExecutable 恒钉 node ABI（跟谁拉起它无关），
+rem 而 msmarco-import 自己还要 require better-sqlite3 做读回验证 —— 它只编 node ABI，
+rem 用 electron 跑本脚本进程会当场加载失败。
+set "RUNTIME=node"
 set "STATE=benchmark\reports\%LABEL%.docid"
 
 echo === MS MARCO import bench (resumable) ===
@@ -40,7 +43,7 @@ if exist "%STATE%" (
   echo [skip-import] state found, docId=!DOCID!, resuming vectors
 ) else (
   echo [import] streaming import of full shard ^(vectors off^)...
-  call "%ELECTRON%" dist\scripts\bench\msmarco-import.js --file "%FILE%" --limit all --label "%LABEL%" --state-file "%STATE%"
+  call "%RUNTIME%" dist\scripts\bench\msmarco-import.js --file "%FILE%" --limit all --label "%LABEL%" --state-file "%STATE%"
   if errorlevel 1 (
     echo [import] failed. Re-run this .bat to import again.
     exit /b 1
@@ -59,7 +62,7 @@ set /a ATTEMPT=0
 set /a ATTEMPT+=1
 echo.
 echo [vectors] attempt !ATTEMPT!, docId=!DOCID! ^(missing-only, resumable, long task^)...
-call "%ELECTRON%" dist\scripts\ensure-doc-vectors.js !DOCID!
+call "%RUNTIME%" dist\scripts\ensure-doc-vectors.js !DOCID!
 if errorlevel 1 (
   if !ATTEMPT! GEQ 200 (
     echo [vectors] retry limit reached, giving up. Re-run this .bat to continue.

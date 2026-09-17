@@ -131,7 +131,8 @@ export function AppBody() {
   treeViewDepsRef.current = {
     getCurrentDoc: () => (currentDoc || null) as TreeViewDocLike | null,
     docState: {
-      ensureNodeChildren: (nodeId) => docState.ensureNodeChildren(nodeId)
+      ensureNodeChildren: (nodeId) => docState.ensureNodeChildren(nodeId),
+      ensureNodePath: (nodeId) => docState.ensureNodePath(nodeId)
     },
     tree: {
       getDepthLimit: () => depthLimit,
@@ -379,7 +380,9 @@ export function AppBody() {
     view: {
       getActiveTab: () => activeTab,
       getDepthLimit: () => depthLimit,
-      getSelectedNodeId: () => selectedNode?.id ?? null
+      // 读 selectedNodeId 而非 selectedNode?.id：选中节点未加载进投影时 selectedNode 为 null，
+      // 但「选中的是谁」是已知事实，agent 上下文不该因此丢掉选中。
+      getSelectedNodeId: () => selectedNodeId
     },
     loadDocForCurrentView: (docId, sourceDoc) => loadDocForCurrentView(docId, sourceDoc)
   };
@@ -427,7 +430,7 @@ export function AppBody() {
     view: activeTab,
     docId: currentVisualDocId,
     rawDocId: normalizeDocId(currentDoc?.doc?.id),
-    selectedNodeId: normalizeDocId(selectedNode?.id),
+    selectedNodeId: normalizeDocId(selectedNodeId),
     editMode: treeEditMode ? 'editing' : 'readonly',
     busy,
     depth: depthLimit,
@@ -674,8 +677,8 @@ export function AppBody() {
   }, [treeEditMode]);
 
   // ─── context 组装（阶段 3）：命令与数据分两条 context 下发给 screens/*。
-  // appCommands 是 useMemo 单例；appState 每 render 新对象（其字段本就随 render 变化，
-  // 与原单组件全量重渲等价），阶段 4/5 store 化后逐域瘦身。───
+  // appCommands 是 useMemo 单例；appState 也 memo——子字段引用不变时保持 appState 引用稳定，
+  // 挡住「无关 render（搜索击键/notice/进度）广播全部消费者重渲」。阶段 4/5 store 化后逐域瘦身。───
   const publicDocumentCommands = useMemo(() => ({ ...documentCommands, ...importCommands }), [documentCommands, importCommands]);
   const appCommands: AppCommands = useMemo(() => ({
     editor: editorCommands,
@@ -684,7 +687,7 @@ export function AppBody() {
     treeView: treeViewCommands,
     axiom: axiomCommands
   }), [editorCommands, publicDocumentCommands, agentCommands, treeViewCommands, axiomCommands]);
-  const appState: AppState = {
+  const appState: AppState = useMemo(() => ({
     docState,
     treeView,
     entityTrace,
@@ -728,7 +731,16 @@ export function AppBody() {
       downloadVectorModel,
       changeActiveTab
     }
-  };
+  }), [
+    docState, treeView, entityTrace, selection, layout, settingsState, agentChat, editorStore, summaryRun,
+    searchQuery, setSearchQuery, searchResults, runVectorSearch, vectorModuleDisabled, vectorDisabledMessage,
+    armRenderUnlock, handleMindMapRenderReady,
+    editExitDialog, startupEditBranchDialog, agentApprovalEditDialog, axiomRefDialog,
+    setAxiomRefDialog, confirmAxiomRefDialog, cancelAxiomRefDialog, editBranchDiffDialog,
+    openEditBranchDiff, closeEditBranchDiff,
+    treeEditMode, currentVisualDocId, handleCloseWindow, openSettings, saveAgentSettings,
+    chooseLocalModelRoot, downloadVectorModel, changeActiveTab
+  ]);
 
   return (
     <CommandsContext.Provider value={appCommands}>

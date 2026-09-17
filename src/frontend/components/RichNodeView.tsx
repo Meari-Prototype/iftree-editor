@@ -4,7 +4,7 @@ import type { RefObject } from 'react';
 import { plainNodeNote } from '../../core/node-notes.js';
 import { flattenTree } from '../../core/tree.js';
 import { depthOf, docDisplayTitle } from '../lib/doc-utils.js';
-import { buildVirtualRange } from '../lib/ui-utils.js';
+import { buildVirtualOffsets, virtualRangeFromOffsets } from '../lib/ui-utils.js';
 import { useScrollViewport } from '../hooks/useScrollViewport.js';
 import type { LocateRequest } from '../hooks/useNodeSelection.js';
 import { RichMarkdown } from './RichMarkdown';
@@ -83,19 +83,24 @@ export function RichNodeView({
   const measuredHeightsRef = useRef(new Map<string, number>());
   const [measureVersion, setMeasureVersion] = useState(0);
 
+  // 测量缓存只在「换文档」时清空（根 id 变）。原先依赖 nodes（每次 project 都是新数组）——
+  // 每拉一个预取页就把全部已测高度丢弃、虚拟列表回退估值重测，表现为滚动抖动。
+  // 内容变化引起的行高变化由测量 effect 按 0.5px 阈值就地更新（视口外行滚到时重测），无需全清。
+  const rootId = tree?.id;
   useEffect(() => {
     measuredHeightsRef.current = new Map();
     setMeasureVersion((version) => version + 1);
-  }, [nodes]);
+  }, [rootId]);
 
   const nodeHeights = useMemo(() => {
     const measured = measuredHeightsRef.current;
     return nodes.map((node) => measured.get(String(node.id)) ?? estimateNodeHeight(node));
   }, [nodes, measureVersion]);
 
+  const virtualOffsets = useMemo(() => buildVirtualOffsets(nodeHeights), [nodeHeights]);
   const virtual = useMemo(
-    () => buildVirtualRange(nodeHeights, Math.max(0, viewport.scrollTop - 96), viewport.height, NODE_OVERSCAN),
-    [nodeHeights, viewport]
+    () => virtualRangeFromOffsets(virtualOffsets, Math.max(0, viewport.scrollTop - 96), viewport.height, NODE_OVERSCAN),
+    [virtualOffsets, viewport]
   );
   const visibleNodes = nodes.slice(virtual.start, virtual.end);
 

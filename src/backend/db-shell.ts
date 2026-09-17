@@ -466,6 +466,15 @@ function parseLooseFlags(argv: unknown[] = [], valueFlagNames: string[] = []): P
   return { flags: flags as ParsedFlags, positional };
 }
 
+// --at 是 parseFlags 的通用 flag，但只有 tree/read/find 真去读历史快照（restore/revert 另有
+// 「按提交时间找 commit」的语义，见 historyRefSpec）。其余动词收下 --at 却不用 = 静默返回当前版本，
+// 用户以为在看历史其实在看现值。宁可当场拒绝，也不给一个「看起来像历史」的答案。
+function rejectUnsupportedAtFlag(command: string, flags: ParsedFlags): void {
+  if (flags.at !== undefined) {
+    throw new Error(`db ${command} 不支持 --at（读历史快照用 db tree / db read / db find --at；按提交时间定位版本用 db restore --at）`);
+  }
+}
+
 interface ShellDocScope {
   allDocs?: boolean;
   // docId 只在 allowMissing=true 且没有可用 currentDocId 时缺省；其余分支若返回则必有值。
@@ -1673,6 +1682,7 @@ export async function runDbShellArgv(
 
   if (command === 'index') {
     const { flags, positional } = parseFlags(args.slice(1));
+    rejectUnsupportedAtFlag('index', flags);
     if (positional.length > 0) throw new Error('db index does not accept doc id; use db tree <doc_id> for document structure');
     const payload: Record<string, unknown> = { action: 'library.index', format: 'ascii_tree' };
     if (flags.folder) payload.path = flags.folder;
@@ -1754,6 +1764,7 @@ export async function runDbShellArgv(
 
   if (command === 'inspect') {
     const { flags, positional } = parseFlags(args.slice(1));
+    rejectUnsupportedAtFlag('inspect', flags);
     if (!positional[0]) throw new Error('db inspect requires <doc_id>');
     const docId = await resolveDocRef(database, positional[0]);
     const address = await resolveNodeAddress(database, docId, positional[1], flags.nodeId);
@@ -1768,6 +1779,7 @@ export async function runDbShellArgv(
 
   if (command === 'article') {
     const { flags, positional } = parseFlags(args.slice(1));
+    rejectUnsupportedAtFlag('article', flags);
     if (!positional[0]) throw new Error('db article requires <doc_id>');
     const docId = await resolveDocRef(database, positional[0]);
     const payload: Record<string, unknown> = { action: 'content.getArticle', docId };
@@ -1788,6 +1800,7 @@ export async function runDbShellArgv(
 
   if (command === 'log') {
     const { flags, positional } = parseFlags(args.slice(1));
+    rejectUnsupportedAtFlag('log', flags);
     if (!positional[0]) throw new Error('db log requires doc_id');
     const docId = await resolveDocRef(database, positional[0]);
     let address = positional[1] ? String(positional[1]) : null;
@@ -1819,6 +1832,8 @@ export async function runDbShellArgv(
 
   if (command === 'diff') {
     const { flags, positional } = parseFlags(args.slice(1));
+    // diff 的版本面全靠 --from/--to/--branch/--base 与位置参的 history id；--at 没有实现。
+    rejectUnsupportedAtFlag('diff', flags);
     const detail = flags.detail === 'summary' ? 'summary' : 'full';
     // formatDiffText 收 DiffTextResult；IPC 返回是 unknown，cast 在边界。
     // --json 经 slimDiffView 收口（left/right 只留对账+内容字段、丢 branch 快照大字符串）——LLM 通道口径；
@@ -1982,6 +1997,9 @@ export async function runDbShellArgv(
     // 反向提交：撤销某次已落改动、生成反向变更、保留其后历史（区别于 restore 的 reset 式回滚）。
     // 三方调和与冲突 blocked 语义在 L4 history.revert；owner 是反向提交的作者身份（CLI 默认 human，MCP 转发显式传）。
     const { flags, positional } = parseFlags(args.slice(1));
+    // revert 只按 commit id 反转（不像 restore 走 historyRefSpec 的 ref 解析）：--at 在这里没有实现，
+    // 收下就忽略会让「按时间反转」静默变成「反转第一个位置参」。
+    rejectUnsupportedAtFlag('revert', flags);
     const commitId = String(positional[0] || '').trim();
     if (!commitId) throw new Error('db revert requires <commit_id>');
     const payload: Record<string, unknown> = { action: 'history.revert', commitId, owner: flags.owner ? String(flags.owner) : 'human' };
@@ -2257,9 +2275,10 @@ export async function runDbShellArgv(
     const { flags, positional } = parseLooseFlags(args.slice(1), ['cwd', 'timeout-ms']);
     const shellCommand = positional.join(' ').trim();
     if (!shellCommand) throw new Error('db shell requires command');
+    // 不带 mode：档位由注入 agentTool 的宿主按调用方真实权限决定（见 agent-runtime.agentBash）。
+    // 契约层写死 full 会把 `db shell` 变成绕过档位闸的提权入口。
     const result = await contextFunction(context, 'agentTool')({
       name: 'bash',
-      mode: 'full',
       docId: currentDocIdFrom(context) || undefined,
       args: {
         command: shellCommand,
@@ -2285,9 +2304,9 @@ export async function runDbShellArgv(
       : { mode, query: value };
     if (flags.limit) toolArgs.limit = flags.limit;
     if (flags.charLimit) toolArgs.charLimit = flags.charLimit;
+    // 同 `db shell`：mode 交给宿主按真实档位决定，契约层不自带档位。
     const result = await contextFunction(context, 'agentTool')({
       name: 'web_search',
-      mode: 'full',
       docId: currentDocIdFrom(context) || undefined,
       args: toolArgs
     });

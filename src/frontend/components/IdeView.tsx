@@ -8,7 +8,7 @@ import {
 
 
 import {
-  DEFAULT_IDE_COLUMN_WIDTHS, IDE_COLUMN_LIMITS, buildVirtualRange, clampIdeColumnWidth, readIdeColumnWidthFromDom, readIdeColumnWidths
+  DEFAULT_IDE_COLUMN_WIDTHS, IDE_COLUMN_LIMITS, buildVirtualOffsets, clampIdeColumnWidth, readIdeColumnWidthFromDom, readIdeColumnWidths, virtualRangeFromOffsets
 } from '../lib/ui-utils.js';
 import { useScrollViewport } from '../hooks/useScrollViewport.js';
 import { parseSourceNodeText, renderSyntaxLine } from './SourceBlocks.jsx';
@@ -165,11 +165,16 @@ export function IdeView({
 }: IdeViewProps) {
   const editorRef = useRef<HTMLDivElement | null>(null);
   const { scrollRef, viewport, onScroll } = useScrollViewport();
-  const roots: IdeTreeNode[] = tree ? [tree] : [];
+  // roots 稳定化：原先每次 render 新建数组，下游所有以它为依赖的 useMemo 全部失效。
+  const roots: IdeTreeNode[] = useMemo(() => (tree ? [tree] : []), [tree]);
   const baseDepth = roots.length > 0
     ? Math.min(...roots.map((node) => depthOf(String(node.address || '1'))))
     : 1;
-  const maxLocalDepth = maxVisibleIdeLocalDepth(roots, baseDepth, collapsed, expanded, depthLimit);
+  // 原先在 render 体直接调：useScrollViewport 每滚动帧触发重渲 → 每帧全树走一遍。memo 之。
+  const maxLocalDepth = useMemo(
+    () => maxVisibleIdeLocalDepth(roots, baseDepth, collapsed, expanded, depthLimit),
+    [roots, baseDepth, collapsed, expanded, depthLimit]
+  );
   const [columnWidths, setColumnWidths] = useState<{ node: number; sentence: number }>(readIdeColumnWidths);
   const nodeColumnMinimumWidth = Math.max(
     IDE_COLUMN_LIMITS.node.min,
@@ -192,14 +197,16 @@ export function IdeView({
     buildVisibleIdeRows(roots, { baseDepth, collapsed, expanded, depthLimit, sentenceLabelByNodeId, showTitles, showNotes })
   ), [roots, baseDepth, collapsed, expanded, depthLimit, sentenceLabelByNodeId, showTitles, showNotes]);
   const rowHeights = useMemo(() => rows.map((row) => row.height), [rows]);
+  // 前缀和与滚动位置解耦：offsets 只随行高集重算，滚动帧只做两次二分。
+  const virtualOffsets = useMemo(() => buildVirtualOffsets(rowHeights), [rowHeights]);
   const virtual = useMemo(() => (
-    buildVirtualRange(
-      rowHeights,
+    virtualRangeFromOffsets(
+      virtualOffsets,
       Math.max(0, viewport.scrollTop - IDE_HEADER_HEIGHT),
       viewport.height,
       IDE_VIRTUAL_OVERSCAN
     )
-  ), [rowHeights, viewport]);
+  ), [virtualOffsets, viewport]);
   const visibleRows = rows.slice(virtual.start, virtual.end);
 
   // 跳转定位（16-3）：收到统一定位信号时，在可见行里按累加行高算出目标纵向位置并居中滚动。

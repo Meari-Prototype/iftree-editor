@@ -191,9 +191,9 @@ export function EntityMaintenanceWindow() {
   const showEntityDocTitle = scopeAllDocs || selectedDocIds.length !== 1;
 
   const filteredDocs = useMemo(() => {
-    const q = docFilter.trim().toLocaleLowerCase();
+    const q = docFilter.trim().toLowerCase();
     if (!q) return docs;
-    return docs.filter((doc) => docDisplayTitle(doc).toLocaleLowerCase().includes(q));
+    return docs.filter((doc) => docDisplayTitle(doc).toLowerCase().includes(q));
   }, [docs, docFilter]);
 
   const scopeLabel = useMemo(() => {

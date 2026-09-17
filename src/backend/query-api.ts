@@ -52,6 +52,7 @@ import {
   querySubtreeFlatText,
   querySubtreeSlotRange,
   queryAncestorChain,
+  queryNodeAncestors,
   querySourceWindow,
   querySourcePdfHighlightRects,
   querySourcePdfHitRects
@@ -66,7 +67,9 @@ export type {
   DocGetNodeRow,
   DocGetRefRow,
   DocGetSourceSpanRow,
-  DocGetResult
+  DocGetResult,
+  NodeAncestorRow,
+  NodeAncestorsResult
 } from './handlers/read/shared.js';
 export type { ContentSearchResult } from './handlers/read/search.js';
 export type NodeChildrenResult = ReturnType<typeof queryChildren>;
@@ -130,6 +133,7 @@ const ACTIONS = Object.freeze([
   'subtree.getFlatText',
   'subtree.getSlotRange',
   'node.getAncestorChain',
+  'node.ancestors',
   'source.getWindow',
   'source.pdfHighlightRects',
   'source.pdfHitRects'
@@ -283,6 +287,7 @@ export async function runDatabaseRead(store: IftreeStore | null, payload: Payloa
   if (action === 'subtree.getFlatText') return querySubtreeFlatText(store, payload);
   if (action === 'subtree.getSlotRange') return querySubtreeSlotRange(store, payload);
   if (action === 'node.getAncestorChain') return queryAncestorChain(store, payload);
+  if (action === 'node.ancestors') return queryNodeAncestors(store, payload);
   if (action === 'source.getWindow') return querySourceWindow(store, payload);
   if (action === 'source.pdfHighlightRects') return querySourcePdfHighlightRects(store, payload);
   if (action === 'source.pdfHitRects') return querySourcePdfHitRects(store, payload);

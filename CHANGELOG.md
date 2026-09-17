@@ -2,6 +2,75 @@
 
 记录每个公开版本的主要变更。0.x 阶段次版本号之间可能包含不兼容变更。
 
+## 0.6.7 — 2026-09-17
+
+本版主要是一轮全仓审查后的修复批次（权限、数据正确性、健壮性），加上文档视图 / 关键词检索 / 历史写入三处的性能优化，以及 mac 文件名兼容修复。部分动词对 `--at` / `--branch` 的处理收紧；schema 有新增列与对象类型，旧库打开时自动迁移。
+
+### 行为变化
+
+- **`--at` 口径收紧**：`read` / `find` 带 `--at` 时与读 HEAD 的口径一致；`inspect` / `article` / `log` / `index` / `diff` / `revert` 不再接受 `--at`，传入即报错（此前这些动词会忽略 `--at`、静默返回当前版本）。`tree` / `read` / `find --at` 读历史快照、`restore --at` 按提交时间定位版本，不受影响。
+- **`--branch` 不再绕过编辑模式闸**：写动词带 `--branch` 时同样受文档编辑模式约束。
+- **编辑分支被拒返回 `changed:false`**：`editBranch.save` / `applyMerge` 被拒时回执明确为未改动。
+- **内置 agent 的 shell 权限跟随调用方**：agent 的 bash 工具进入 db shell 时沿用调用方的 mode，qa / edit 档不再拿到 full 档的 shell。agent 主循环上限 30 轮。
+- **MCP 各档与 CLI 统一连共享后端**：此前 MCP 的 read 档、以及 `db` 等 CLI 命令各自起私有后端；私有后端启动时同样会建表、补列、跑迁移，与在线的共享后端形成同一库上的两个写者。现在 MCP 四档和 `scripts/` 下的 `db` / `agent` / `ensure-doc-vectors` / `ensure-memory-vectors` 等都连共享后端（未运行时自动以 detached 方式拉起，只有拉不起来才回退私有后端），`verify-chm-stream` 仍用私有后端。随之的影响：CLI 命令结束不再关停后端，改了后端代码后 CLI 也要等共享后端重启（MCP `restart_backend`，或 `npm run rebuild:native:node` 会先关停现役后端）才生效；`restart_backend` 在各档可见，重启会中断应用和其他客户端正在进行的请求。
+- **import-json 源路径查重**：与普通导入同口径，同一份源文已导入（按 `source_documents` 原路径或文档 meta 的 `sourcePath`）时正式导入报重复，须先删除旧文档。`--dry-run` 在查重之前返回，不会提示重复。
+
+### Schema 与迁移
+
+- **句位归属随 commit 保存**：新增对象类型 `spanmap`，记录 `source_spans` 的句子→节点归属和 `nodes.source_position`，由 `commits.span_map_hash` 指向，归属不变时跨 commit 只存一份。restore / revert / undo / redo 到带这份数据的 commit 时，句位归属与 `source_position` 按该 commit 还原。此前拆句后再回滚，句子的节点归属会永久丢失。本版之前产生的 commit 没有这份数据，恢复时沿用旧行为，不补算。
+- **新增列、触发器与索引**：`docs.span_map_hash` / `span_map_dirty`（归属缓存与脏位）及维护脏位的触发器；索引 `idx_nodes_doc_trust`（文档类型判定不再扫该文档全部节点）、`idx_source_spans_doc_sentence_node`。
+- **旧库自动迁移**：打开时自动补列，并重建一次 `objects` 表以放宽 `kind` 的 CHECK 约束（SQLite 不能直接修改 CHECK）。迁移在单个事务内完成、幂等，中断后重启安全。对象库较大的库首次打开会多花一些时间，并临时占用与 `objects` 表同量级的额外磁盘空间。
+
+### 数据正确性
+
+- restore 保留实体绑定。
+- 三方合并的孤儿父节点检查改为对称判断，`revert` 不再触发写回断言。
+- `doc.setEditMode` 增加封卷守卫；`entity.update` 在 stage 时检查唯一约束。
+- import-json 先建文档（源路径写进 meta）再写入节点，中途失败时删除已建的文档；导入 commit 在源文档层落齐后才建，历史里不会出现空文章版本。
+- 向量一致性守卫：写路径检测到不一致时重跑，不再抛错；检索路径去掉全库检查；写路径无 hint 时退回刷新 meta。
+- 向量索引就绪的快速判定要求文档 hash 缓存是干净的。子节点编辑后根节点 hash 可能仍是旧值，此前可能把过期向量误判为就绪。
+- Merkle 哈希缓存此前只在只读连接上计算、从不落盘，现在在写入收尾时写回。
+- `--since` / `--until` 时间过滤：库中 `updated_at` 混存 `YYYY-MM-DD HH:MM:SS` 与 ISO 两种格式，按字符串直接比较会漏掉部分行，现归一后比较。
+
+### 安全
+
+- CHM `.hhc` 中的 `Local` 路径限制在解压目录内，不能指向目录外的文件。
+
+### 性能
+
+- **历史写入增量化**：保存 commit 时对象树改为增量写入，缓存有效的子树整棵跳过，稳态保存从 O(N) 降到 O(脏节点及其祖先链)；全量快照的读取移出写事务，持锁时间缩短；restore 取祖先链改为一条递归 CTE，不再逐 commit 查询。
+- **关键词检索流式化**：范围内的行逐行扫描，内存从 O(范围全表) 降到 O(命中数)，大库下不再因一次性物化而内存溢出；单词查询走 `indexOf` 快路径；排序与 `minScore` 过滤复用同一份拼接文本。
+- **编辑分支投影**：重放 entry 时的节点定位由线性查找改为 Map 索引，后代集合改为邻接表 + BFS（此前链式深树上一次删除即 O(N²)）；`node.update` 的 stage 省去一次仅为取改后节点的全量投影。
+- **前端文档视图**：文档会话投影做结构共享，未变子树复用原对象，下游 memo 缓存在预取期间不再逐页失效；扩散加载同轮内各父节点并行取数，投影每 8 页攒批一次；子列表合并不再全扫已加载节点；虚拟列表的前缀和与滚动位置解耦，滚动帧只做二分查找。
+- `groupMeta` 改为单遍循环；`vectorSearch` 的 `searchLimit` 设上限。
+
+### 前端
+
+- 全局未处理的 Promise rejection 不再导致应用退出。
+- 节点定位改用 `node.ancestors` + `ensureNodePath`；选中节点不存在时返回 `null`。
+- PDF 视图按页懒渲染。
+- DocBrowser 移除一段未接入渲染树的文档文件夹代码。
+
+### library
+
+- **mac 文件名兼容**：`normalizeRelativePath` 不再把 `\ / : * ? " < > |` 替换成 `_`，文件名字符原样保留。此前 mac 上的合法文件名在 `library_index` 中显示为 `_`，不同文件替换后还可能撞到同一个 key、只匹配到一个文档。越界防护由绝对路径检查负责，`..` 段直接报错。
+- library 搜索遇到悬空 symlink 不再崩溃。
+
+### 文档
+
+- README 语义向量一节按现状重写：本地推理在后端 node 进程中执行（GPU 走 DirectML、CPU 走 cpu），worker 数是单篇文档内并发的嵌入子批数（默认 4），不再有本地模型文件服务；写明设置页换模型会丢表、经 `IFTREE_EMBED_*` 换模型不会丢表，两种情况都要手动重建向量。
+- `restart_backend`、改动生效边界、`npm run mcp` / `mcp:node`、`npm run vectors:ensure <docId>`、`gc_objects` 对象类型、库迁移（兼容改动在后端启动时原地完成）等处与代码对齐；smart-import 技能文档补上源路径查重与失败处理。MCP server 上报的版本号由遗留的 0.3.0 更新为 0.6.7。
+
+### 测试
+
+- 新增 10 个测试文件：`library-service`、`document-session-path`、`document-session-structural-sharing`、`incremental-write-tree`、`timestamp-normalize`、`entity-rename-unique`、`import-json-roundtrip`、`import-source-dedupe`，以及 db 套件的 `at-flag-guard`、`span-ownership-roundtrip`；`migration-roundtrip`、`derived-index-integrity`、`editor-snapshot-tokens`、`memory-volumes`、`merkle-merge` 等补充用例。
+- 顶层套件 376 项（372 通过，4 项按平台跳过），db 套件 59 项，全部通过。
+
+### 已知问题
+
+- **批量导入的独占限制对 db shell 通道不生效**：共享后端只对 `database.write` 类型的请求检查批量会话（`src/backend/llm/backend-shared-server.ts`），而 MCP 的 `bulk`、`db bulk` 以及经 db shell 发出的写入都不走这个类型。因此有其他客户端在线时仍能开启批量导入，会话期间其他客户端经 db shell 的写入也不会被拒绝。本版 `db` 等 CLI 改连共享后端后影响范围变大。批量导入期间请避免其他客户端写入。
+- **设置页计算目标文案过时**：仍显示「GPU/WebGPU」「CPU/wasm」，实际推理在后端 node 进程中执行，GPU 走 DirectML、CPU 走 cpu。只是显示问题，不影响实际使用的设备。
+
 ## 0.6.6 — 2026-07-11
 
 本版主线是**代码分层收敛**：`store` 门面 / `db-shell` / `mutation-api` / `query-api` / `electron/main` / `mcp-server` / `agent-runtime` 各自剥去掺进来的业务规则，只剩薄装配 / 纯翻译，把业务规则统一沉降到域内 action 层。后端源码从「工具目录里堆产品部件」的碎形态整理成顶层按域分目录；前端并行完成剩余的依赖循环拆除、store 逆向依赖、edit branch stages 解耦、跨层类型收紧、C2D（MindMapView）内部规整化七刀。对外动词契约与 schema 契约均不变，本版无迁移。

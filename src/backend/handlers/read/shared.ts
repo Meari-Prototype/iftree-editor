@@ -41,7 +41,7 @@ export type ContentDocRow = {
 export type KeywordNodeRow = ContentNodeRow & { doc_title?: string; doc_kind?: string };
 export type DocFilterRow = { id: string; agent?: string | null; host_anchor?: string | null; kind?: string | null; original_path?: string | null };
 export type KeywordWhere = { sql: string; params: unknown[] };
-export type KeywordHit = { row: KeywordNodeRow; hits: Set<string> };
+export type KeywordHit = { row: KeywordNodeRow; hits: Set<string>; haystack?: string };
 export type CrossDocSearchRow = KeywordNodeRow & {
   doc_folder_id?: number | null;
   doc_updated_at?: string | null;
@@ -139,6 +139,18 @@ export type DocListItem = Omit<DocRow, 'meta' | 'tree_view_state'> & {
 export type DocGetNodeRow = NodeRow & { child_count: number; tree_depth?: number };
 export type DocGetRefRow = RefRow & { source_address: string | null; target_address: string | null };
 export type DocGetSourceSpanRow = SourceSpanRow & { node_address: string | null };
+
+// node.ancestors 的行 = node.listChildren 的行格式（nodes.* + child_count）再加 child_offset：
+// 该行在其父的子列表（sort_order, id 序，与 node.listChildren 的分页序同口径）里的 0 基序号。
+// 前端据此知道这条链上的节点落在父的第几页，不会把它误算进「已加载的连续前缀」。
+export type NodeAncestorRow = ContentNodeRow & { child_offset: number };
+
+export interface NodeAncestorsResult {
+  kind: 'node.ancestors';
+  docId: string;
+  nodeId: string | null;
+  rows: NodeAncestorRow[];
+}
 
 export interface DocGetResult {
   doc: DocRow | null;

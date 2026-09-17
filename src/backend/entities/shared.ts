@@ -72,7 +72,7 @@ export function normalizeEntityLiteral(value: unknown = ''): string {
 }
 
 export function normalizeEntityKey(value: unknown = ''): string {
-  return normalizeEntityLiteral(value).toLocaleLowerCase();
+  return normalizeEntityLiteral(value).toLowerCase();
 }
 
 export function normalizeEntityLinkKind(value: unknown = ''): EntityLinkKind {
@@ -151,7 +151,7 @@ export function nodeHaystack(row: Partial<NodeScanRow> = {}): string {
     row.node_title,
     row.text,
     row.node_note
-  ].map((value) => String(value || '').toLocaleLowerCase()).join('\n');
+  ].map((value) => String(value || '').toLowerCase()).join('\n');
 }
 
 export function countLiteralOccurrences(haystack = '', needle = ''): number {

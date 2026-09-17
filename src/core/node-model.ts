@@ -281,11 +281,34 @@ export function isAncestorAddress(ancestor: unknown, descendant: unknown): boole
 
 // ─── 索引更新（乐观更新 / 局部刷新）──────────
 
+// 两个 TreeNode 的全字段相等判定（结构共享投影的不变量基石：「引用相同 ⇒ 内容相同」靠
+// upsert/patch 处在全字段相同时保留旧引用建立）。字段集对齐 toTreeNode 的产出。
+export function sameTreeNodeFields(a: TreeNode | null | undefined, b: TreeNode | null | undefined): boolean {
+  if (!a || !b) return false;
+  return a.id === b.id
+    && a.docId === b.docId
+    && a.parentId === b.parentId
+    && a.address === b.address
+    && a.depth === b.depth
+    && a.sortOrder === b.sortOrder
+    && a.childCount === b.childCount
+    && a.nodeType === b.nodeType
+    && a.title === b.title
+    && a.text === b.text
+    && a.note === b.note
+    && a.trustLevel === b.trustLevel
+    && a.sourcePosition === b.sourcePosition
+    && a.createdAt === b.createdAt
+    && a.updatedAt === b.updatedAt;
+}
+
 export function patchNode(index: TreeIndex, updatedRow: NodeRow): TreeIndex {
   const node = toTreeNode(updatedRow);
   if (!node) return index;
 
   const prev = index.byId.get(node.id);
+  // 全字段相同 → 保留旧引用（结构共享投影的不变量：引用相同 ⇒ 内容相同）。
+  if (prev && sameTreeNodeFields(prev, node)) return index;
   index.byId.set(node.id, node);
 
   if (prev && prev.address && prev.address !== node.address) {

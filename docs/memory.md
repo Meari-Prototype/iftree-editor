@@ -47,6 +47,7 @@
 记忆侧的写入是**受约束**的，不是随便写。
 
 - **外部 agent 唯一合法的记忆写入是事件卷投递**：会话收尾（或用户说"记一下"）把结构化自述日志投成一卷（`memory_deliver`，协作档及以上）。投的是"发生过什么"的**原料**，不是结论；节点一律不受控。骨架与契约见[操作指南](how-to.md#让外部-agent-投递事件记忆卷)与 [`memory-deliver/SKILL.md`](../.iftree-llm-workspace/skills/memory-deliver/SKILL.md)。
+- **重投即自愈**：同一 agent + sessionId 再投一次，语义是「旧卷全删 + 完整重导」（session 文件是权威、解析是确定性规则）。删旧与建新不在一个事务里，所以投递中途失败（比如要求同步建向量但向量模块不可用、锚写不出）可能留下一个空卷或半卷——不用手工清理，重投一次即覆盖。
 - **不得直写当前事实层、不得绕过提炼把结论固化成记忆条目**。"现在如此"只能经提炼+人审产生。
 
 ### 提炼（事件卷 → 核心记忆）
@@ -83,7 +84,7 @@
 只有真用 MCP / CLI 动手才会撞到，schema 自述不会写：
 
 - **CLI 用 node 跑**。`db` / `query-db` 等加载的 `better-sqlite3` 是 node ABI（`prebuild-install` 下预编译，无需编译工具链）：先 `npm run build:runtime`，再 `node dist/scripts/db.js …` / `node dist/scripts/query-db.js …`。
-- **改动生效边界**：改后端代码（store/handlers/db-shell…）后端是 headless 子进程、惰性启动 → `restart_backend` 放掉旧子进程、下次调用才加载新代码；改 `src/mcp/mcp-server.ts`（工具注册/schema）→ 须**重连 MCP**，`restart_backend` 不够；`db.ts`/CLI 每次 spawn 新进程，改完即时生效。
+- **改动生效边界**：改后端代码（store/handlers/db-shell…）→ 共享后端是常驻的 headless 进程（首个客户端拉起，客户端退出后它不退出），MCP 和 `db` 等 CLI 都连它，须 `restart_backend`（或 `npm run rebuild:native:node`，它会先关停现役后端）后，下次调用才加载新代码；改 `src/mcp/mcp-server.ts`（工具注册/schema）→ 须**重连 MCP**，`restart_backend` 不够；只改 CLI 入口脚本本身（如 `scripts/db.ts`），重新 build 后即生效。
 - **`edit` 的两类 id 别混**：`baseDocId` 要 **doc id**，`parentId` / `nodeId` 要 **节点 id**。同篇文档这俩前缀常相同、尾号不同，混用直接 `FOREIGN KEY constraint failed`。
 - **reparent / move 按 uuid，不按地址**：地址会随每次结构改动重投影漂移；用稳定节点 id 作 `nodeId` / `newParentId`，叠多少次都不错位。
 - **草稿幂等复用**：同 owner 在同文档已有活跃草稿时，`draft new` / 后续 `edit` 复用它而非新建——连续动作自动叠在一份草稿上。

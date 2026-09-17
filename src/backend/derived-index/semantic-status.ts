@@ -24,7 +24,7 @@ export function normalizeSemanticStatus(status: SemanticStatusInput = {}): Norma
   const nodeCount = Math.max(0, Number(status.nodeCount ?? status.node_count) || 0);
   const enabled = status.enabled !== false && status.status !== 'disabled';
   if (!enabled) return { status: 'disabled', available: false, vectorCount, nodeCount, reason: status.reason || 'vector_disabled' };
-  if (status.available === true || (nodeCount > 0 ? vectorCount >= nodeCount : vectorCount > 0)) {
+  if (status.available === true) {
     return { status: 'ready', available: true, vectorCount, nodeCount };
   }
   return {
@@ -32,6 +32,6 @@ export function normalizeSemanticStatus(status: SemanticStatusInput = {}): Norma
     available: false,
     vectorCount,
     nodeCount,
-    reason: vectorCount > 0 ? 'vector_partial' : (status.reason || 'vector_missing')
+    reason: status.reason || (vectorCount > 0 ? 'vector_partial' : 'vector_missing')
   };
 }

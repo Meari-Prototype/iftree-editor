@@ -34,7 +34,11 @@ export interface DatabaseDump {
 const EMPTY_SET = new Set<string>();
 
 export const DERIVED_COLUMNS: Record<string, Set<string>> = {
-  nodes: new Set(['content_hash', 'subtree_hash', 'title_chars', 'text_chars', 'note_chars'])
+  nodes: new Set(['content_hash', 'subtree_hash', 'title_chars', 'text_chars', 'note_chars']),
+  // docs 的 spanmap 列缓存是派生量（source_spans + nodes.source_position 的指纹），导入后
+  // 按建表默认值落成 dirty=1 / hash=NULL，首次写快照重扫即归位。commits.span_map_hash 不在此列——
+  // 它和 root_tree_hash 一样是内容寻址历史的存储本体，必须原样搬。
+  docs: new Set(['span_map_hash', 'span_map_dirty'])
 };
 
 // 读出库里所有真实数据表（排除 sqlite 内部表），逐表导出。

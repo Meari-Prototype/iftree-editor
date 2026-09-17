@@ -246,16 +246,30 @@ export function resolveConflictEntries({ entries = [], conflicts = [], resolutio
   return { entries: [...active, ...appended], errors };
 }
 
-function cloneState(base: ProjectionBase): ProjectionState {
+function cloneState(base: ProjectionBase): ProjectorState {
+  const nodes = (base.nodes || []).map((row) => ({ ...row }));
   return {
     docId: base.docId,
-    nodes: (base.nodes || []).map((row) => ({ ...row })),
+    nodes,
     axioms: (base.axioms || []).map((row) => ({ ...row })),
     refs: (base.refs || []).map((row) => ({ ...row })),
     nodeIdSeq: -1,
     axiomIdSeq: -1,
-    refIdSeq: -1
+    refIdSeq: -1,
+    nodeIndexById: buildNodeIndex(nodes)
   };
+}
+
+// 内部投影器状态：对外 ProjectionState + 进程内查找索引。索引只活在重放期间，
+// projectEditBranchDoc 返回时剥离（对外形状逐字节不变）。
+type ProjectorState = ProjectionState & {
+  nodeIndexById: Map<string, number>;
+};
+
+function buildNodeIndex(nodes: ProjectionNode[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (let index = 0; index < nodes.length; index += 1) map.set(String(nodes[index]!.id), index);
+  return map;
 }
 
 function isTmpId(value: unknown): value is string {
@@ -268,42 +282,50 @@ function normalizeId(value: unknown): string | null {
   return normalizeStableId(value);
 }
 
-function findNodeIndex(state: ProjectionState, ref: unknown) {
+// 节点定位 O(1)：原先 findIndex 线性扫全数组，每条 entry 每次定位 O(N)——K 条 entry 重放
+// 即 O(K×N)（agent 批量上千条 × 大文档 = 亿次级比较）。id 唯一是系统不变量（writeTree 入口
+// 断言；tmp id 由 nextTmpId 单调生成），Map 查得的即旧 findIndex 的首个匹配。
+// 数组重建处（delete/mergeInto 的 filter）由调用方重建索引；push 处登记新 id。
+function findNodeIndex(state: ProjectorState, ref: unknown) {
   if (ref === null || ref === undefined) return -1;
-  if (isTmpId(ref)) return state.nodes.findIndex((node) => node.id === ref);
-  return state.nodes.findIndex((node) => sameRef(node.id, ref));
+  return state.nodeIndexById.get(String(ref)) ?? -1;
 }
 
-function findAxiomIndex(state: ProjectionState, ref: unknown) {
+function findAxiomIndex(state: ProjectorState, ref: unknown) {
   if (ref === null || ref === undefined) return -1;
   if (isTmpId(ref)) return state.axioms.findIndex((axiom) => axiom.id === ref);
   return state.axioms.findIndex((axiom) => sameRef(axiom.id, ref));
 }
 
-function findRefIndex(state: ProjectionState, ref: unknown) {
+function findRefIndex(state: ProjectorState, ref: unknown) {
   if (ref === null || ref === undefined) return -1;
   if (isTmpId(ref)) return state.refs.findIndex((entry) => entry.id === ref);
   return state.refs.findIndex((entry) => sameRef(entry.id, ref));
 }
 
-function descendantNodeIds(state: ProjectionState, rootId: StableRef) {
+// 后代集合：一次建邻接表 O(N) + BFS O(子树)——替代原先「while 收敛、逐层全表扫」的 O(N×深度)
+// （链式深树一次 delete 即 O(N²)）。集合语义不变：rootId 沿 parent_id 可达的全部后代（含自身）。
+function descendantNodeIds(state: ProjectorState, rootId: StableRef) {
+  const childrenByParent = new Map<unknown, StableRef[]>();
+  for (const node of state.nodes) {
+    const parent = node.parent_id === null || node.parent_id === undefined ? null : node.parent_id;
+    if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+    childrenByParent.get(parent)!.push(node.id);
+  }
   const result = new Set<StableRef>([rootId]);
-  let added = true;
-  while (added) {
-    added = false;
-    for (const node of state.nodes) {
-      if (result.has(node.id)) continue;
-      const parentId = node.parent_id;
-      if (parentId !== null && parentId !== undefined && result.has(parentId)) {
-        result.add(node.id);
-        added = true;
-      }
+  const stack: StableRef[] = [rootId];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    for (const child of childrenByParent.get(id) || []) {
+      if (result.has(child)) continue;
+      result.add(child);
+      stack.push(child);
     }
   }
   return result;
 }
 
-function resortSiblings(state: ProjectionState, parentRef: unknown) {
+function resortSiblings(state: ProjectorState, parentRef: unknown) {
   const parentId = parentRef === null || parentRef === undefined ? null : parentRef;
   const siblings = state.nodes.filter((node) => sameRef(node.parent_id, parentId));
   siblings.sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0)
@@ -335,13 +357,18 @@ function patchNodeRow(row: ProjectionNode, patch: NodePatchFields): ProjectionNo
   return next;
 }
 
-function applyNodeUpdate(state: ProjectionState, entry: EntryByKind<'node.update'>) {
+// 单节点内容 patch 的投影语义本体（applyNodeUpdate 即调它）。export 给 stage 路径：
+// node.update 不动结构，改后投影中该节点 ≡ patchNodeRow(改前投影节点, patch)，
+// stage 据此省掉「仅为取改后节点行」的第二次全量投影。
+export { patchNodeRow };
+
+function applyNodeUpdate(state: ProjectorState, entry: EntryByKind<'node.update'>) {
   const index = findNodeIndex(state, entry.node_id ?? entry.target_ref);
   if (index < 0) return;
   state.nodes[index] = patchNodeRow(state.nodes[index], entry.patch || {});
 }
 
-function applyNodeInsert(state: ProjectionState, entry: EntryByKind<'node.insert'>) {
+function applyNodeInsert(state: ProjectorState, entry: EntryByKind<'node.insert'>) {
   const parentRef = normalizeId(entry.parent_ref);
   const afterRef = normalizeId(entry.after_ref);
   const fields = entry.fields;
@@ -357,8 +384,9 @@ function applyNodeInsert(state: ProjectionState, entry: EntryByKind<'node.insert
     if ((Number(sibling.sort_order) || 0) >= sortOrder) sibling.sort_order = (Number(sibling.sort_order) || 0) + 1;
   }
   const now = new Date().toISOString();
+  const insertedId = asString(entry.tmp_id);
   state.nodes.push({
-    id: asString(entry.tmp_id),
+    id: insertedId,
     doc_id: state.docId,
     parent_id: parentRef,
     sort_order: sortOrder,
@@ -382,9 +410,10 @@ function applyNodeInsert(state: ProjectionState, entry: EntryByKind<'node.insert
     child_count: 0,
     pending_insert: true
   });
+  state.nodeIndexById.set(insertedId, state.nodes.length - 1);
 }
 
-function applyNodeDelete(state: ProjectionState, entry: EntryByKind<'node.delete'>) {
+function applyNodeDelete(state: ProjectorState, entry: EntryByKind<'node.delete'>) {
   const targetRef = normalizeId(entry.target_ref ?? entry.node_id);
   const index = findNodeIndex(state, targetRef);
   if (index < 0) return;
@@ -392,6 +421,7 @@ function applyNodeDelete(state: ProjectionState, entry: EntryByKind<'node.delete
   if (target.parent_id === null || target.parent_id === undefined) return;
   const removeIds = descendantNodeIds(state, target.id);
   state.nodes = state.nodes.filter((node) => !removeIds.has(node.id));
+  state.nodeIndexById = buildNodeIndex(state.nodes);
   state.refs = state.refs.filter((ref) => {
     if (ref.source_type === 'node' && removeIds.has(ref.source_id)) return false;
     if (ref.target_type === 'node' && removeIds.has(ref.target_id)) return false;
@@ -400,7 +430,7 @@ function applyNodeDelete(state: ProjectionState, entry: EntryByKind<'node.delete
   resortSiblings(state, target.parent_id);
 }
 
-function applyNodeMove(state: ProjectionState, entry: EntryByKind<'node.move'>) {
+function applyNodeMove(state: ProjectorState, entry: EntryByKind<'node.move'>) {
   const index = findNodeIndex(state, entry.target_ref ?? entry.node_id);
   if (index < 0) return;
   const node = state.nodes[index];
@@ -416,7 +446,7 @@ function applyNodeMove(state: ProjectionState, entry: EntryByKind<'node.move'>) 
   sibling.sort_order = tmp;
 }
 
-function applyNodePromote(state: ProjectionState, entry: EntryByKind<'node.promote'>) {
+function applyNodePromote(state: ProjectorState, entry: EntryByKind<'node.promote'>) {
   const index = findNodeIndex(state, entry.target_ref ?? entry.node_id);
   if (index < 0) return;
   const node = state.nodes[index];
@@ -439,7 +469,7 @@ function applyNodePromote(state: ProjectionState, entry: EntryByKind<'node.promo
   resortSiblings(state, parent.id);
 }
 
-function applyNodeSplitParagraphMode(state: ProjectionState, entry: EntryByKind<'node.split'>) {
+function applyNodeSplitParagraphMode(state: ProjectorState, entry: EntryByKind<'node.split'>) {
   const splits = Array.isArray(entry.paragraph_splits) ? entry.paragraph_splits : [];
   const now = new Date().toISOString();
   for (const split of splits) {
@@ -450,8 +480,9 @@ function applyNodeSplitParagraphMode(state: ProjectionState, entry: EntryByKind<
     paragraph.updated_at = now;
     const spans = Array.isArray(split.spans) ? split.spans : [];
     spans.forEach((span: SplitSpan, position: number) => {
+      const spanId = asString(span.tmp_id);
       state.nodes.push({
-        id: asString(span.tmp_id),
+        id: spanId,
         doc_id: state.docId,
         parent_id: paragraph.id,
         sort_order: position + 1,
@@ -474,12 +505,13 @@ function applyNodeSplitParagraphMode(state: ProjectionState, entry: EntryByKind<
         child_count: 0,
         pending_insert: true
       });
+      state.nodeIndexById.set(spanId, state.nodes.length - 1);
     });
     resortSiblings(state, paragraph.id);
   }
 }
 
-function applyNodeSplitSentenceMode(state: ProjectionState, entry: EntryByKind<'node.split'>) {
+function applyNodeSplitSentenceMode(state: ProjectorState, entry: EntryByKind<'node.split'>) {
   const index = findNodeIndex(state, entry.target_ref ?? entry.node_id);
   if (index < 0) return;
   const node = state.nodes[index];
@@ -495,8 +527,9 @@ function applyNodeSplitSentenceMode(state: ProjectionState, entry: EntryByKind<'
   }
   const now = new Date().toISOString();
   sentences.slice(1).forEach((sentence: unknown, position: number) => {
+    const sentenceId = asString(newIds[position]);
     state.nodes.push({
-      id: asString(newIds[position]),
+      id: sentenceId,
       doc_id: state.docId,
       parent_id: node.id,
       sort_order: position + 1,
@@ -519,11 +552,12 @@ function applyNodeSplitSentenceMode(state: ProjectionState, entry: EntryByKind<'
       child_count: 0,
       pending_insert: true
     });
+    state.nodeIndexById.set(sentenceId, state.nodes.length - 1);
   });
   resortSiblings(state, node.id);
 }
 
-function applyNodeSplit(state: ProjectionState, entry: EntryByKind<'node.split'>) {
+function applyNodeSplit(state: ProjectorState, entry: EntryByKind<'node.split'>) {
   if (entry.strategy === 'source_paragraphs') {
     applyNodeSplitParagraphMode(state, entry);
     return;
@@ -533,7 +567,7 @@ function applyNodeSplit(state: ProjectionState, entry: EntryByKind<'node.split'>
 
 // 与 store.mergeNodeIntoTarget 重放语义对齐：'\n\n' 连接正文、mergeNodeNotes 合并
 // 标题与备注、孩子按 sort_order 序追加到 target 尾部、target 在 source 子树内则拒绝。
-function applyNodeMergeInto(state: ProjectionState, entry: (NodeMergeEntry) & EditBranchEntryMeta) {
+function applyNodeMergeInto(state: ProjectorState, entry: (NodeMergeEntry) & EditBranchEntryMeta) {
   const sourceIndex = findNodeIndex(state, entry.source_ref ?? entry.node_id);
   const targetIndex = findNodeIndex(state, entry.target_ref ?? entry.target_node_id);
   if (sourceIndex < 0 || targetIndex < 0) return;
@@ -566,11 +600,12 @@ function applyNodeMergeInto(state: ProjectionState, entry: (NodeMergeEntry) & Ed
   });
   const sourceParent = source.parent_id;
   state.nodes = state.nodes.filter((node) => !sameRef(node.id, source.id));
+  state.nodeIndexById = buildNodeIndex(state.nodes);
   resortSiblings(state, sourceParent);
   resortSiblings(state, target.id);
 }
 
-function applyNodeReparent(state: ProjectionState, entry: EntryByKind<'node.reparent'>) {
+function applyNodeReparent(state: ProjectorState, entry: EntryByKind<'node.reparent'>) {
   const index = findNodeIndex(state, entry.node_ref ?? entry.node_id);
   if (index < 0) return;
   const node = state.nodes[index];
@@ -594,7 +629,7 @@ function applyNodeReparent(state: ProjectionState, entry: EntryByKind<'node.repa
 // 与 store.moveNode{After,Before}Sibling 重放语义对齐：在 target 父级的兄弟序列
 // （剔除 node 自身，按 sort_order, id 排序）里 splice 定位后统一重编号。不能把
 // 「剔除 node 的下标」当 sort_order 推后阈值用——同父向后移会错一位。
-function applyNodeMoveRelative(state: ProjectionState, entry: (NodeMoveBeforeAfterEntry) & EditBranchEntryMeta, placeBefore: boolean) {
+function applyNodeMoveRelative(state: ProjectorState, entry: (NodeMoveBeforeAfterEntry) & EditBranchEntryMeta, placeBefore: boolean) {
   const nodeIndex = findNodeIndex(state, entry.node_ref ?? entry.node_id);
   const targetIndex = findNodeIndex(state, entry.target_ref ?? entry.target_node_id);
   if (nodeIndex < 0 || targetIndex < 0) return;
@@ -619,15 +654,15 @@ function applyNodeMoveRelative(state: ProjectionState, entry: (NodeMoveBeforeAft
   resortSiblings(state, oldParent);
 }
 
-function applyNodeMoveAfter(state: ProjectionState, entry: EntryByKind<'node.moveAfter'>) {
+function applyNodeMoveAfter(state: ProjectorState, entry: EntryByKind<'node.moveAfter'>) {
   applyNodeMoveRelative(state, entry, false);
 }
 
-function applyNodeMoveBefore(state: ProjectionState, entry: EntryByKind<'node.moveBefore'>) {
+function applyNodeMoveBefore(state: ProjectorState, entry: EntryByKind<'node.moveBefore'>) {
   applyNodeMoveRelative(state, entry, true);
 }
 
-function applyAxiomAdd(state: ProjectionState, entry: EntryByKind<'axiom.add'>) {
+function applyAxiomAdd(state: ProjectorState, entry: EntryByKind<'axiom.add'>) {
   const fields = entry.fields;
   const nextLabelNum = state.axioms
     .map((axiom: ProjectionAxiom) => {
@@ -651,7 +686,7 @@ function applyAxiomAdd(state: ProjectionState, entry: EntryByKind<'axiom.add'>) 
   });
 }
 
-function applyAxiomUpdate(state: ProjectionState, entry: EntryByKind<'axiom.update'>) {
+function applyAxiomUpdate(state: ProjectorState, entry: EntryByKind<'axiom.update'>) {
   const index = findAxiomIndex(state, entry.axiom_ref ?? entry.axiom_id);
   if (index < 0) return;
   const axiom = state.axioms[index];
@@ -662,7 +697,7 @@ function applyAxiomUpdate(state: ProjectionState, entry: EntryByKind<'axiom.upda
   if (Object.prototype.hasOwnProperty.call(patch, 'node_note')) axiom.node_note = asString(patch.node_note);
 }
 
-function applyAxiomDelete(state: ProjectionState, entry: EntryByKind<'axiom.delete'>) {
+function applyAxiomDelete(state: ProjectorState, entry: EntryByKind<'axiom.delete'>) {
   const index = findAxiomIndex(state, entry.axiom_ref ?? entry.axiom_id);
   if (index < 0) return;
   const axiom = state.axioms[index];
@@ -683,7 +718,7 @@ function applyAxiomDelete(state: ProjectionState, entry: EntryByKind<'axiom.dele
   }
 }
 
-function applyAxiomMove(state: ProjectionState, entry: EntryByKind<'axiom.move'>) {
+function applyAxiomMove(state: ProjectorState, entry: EntryByKind<'axiom.move'>) {
   const index = findAxiomIndex(state, entry.axiom_ref ?? entry.axiom_id);
   if (index < 0) return;
   const targetIndex = entry.direction === 'up' ? index - 1 : index + 1;
@@ -700,7 +735,7 @@ function applyAxiomMove(state: ProjectionState, entry: EntryByKind<'axiom.move'>
   });
 }
 
-function applyRefAddAxiomToNode(state: ProjectionState, entry: EntryByKind<'ref.addAxiomToNode'>) {
+function applyRefAddAxiomToNode(state: ProjectorState, entry: EntryByKind<'ref.addAxiomToNode'>) {
   const nodeRef = normalizeId(entry.node_ref ?? entry.node_id);
   const axiomRef = normalizeId(entry.axiom_ref ?? entry.axiom_id);
   if (nodeRef === null || axiomRef === null) return;
@@ -716,7 +751,7 @@ function applyRefAddAxiomToNode(state: ProjectionState, entry: EntryByKind<'ref.
   });
 }
 
-function applyRefAddNodeToNode(state: ProjectionState, entry: EntryByKind<'ref.addNodeToNode'>) {
+function applyRefAddNodeToNode(state: ProjectorState, entry: EntryByKind<'ref.addNodeToNode'>) {
   const sourceRef = normalizeId(entry.source_ref ?? entry.source_node_id);
   const targetRef = normalizeId(entry.target_ref ?? entry.target_node_id);
   const refKind = String(entry.ref_kind ?? entry.kind ?? '').trim();
@@ -733,7 +768,7 @@ function applyRefAddNodeToNode(state: ProjectionState, entry: EntryByKind<'ref.a
   });
 }
 
-function applyRefDelete(state: ProjectionState, entry: EntryByKind<'ref.delete'>) {
+function applyRefDelete(state: ProjectorState, entry: EntryByKind<'ref.delete'>) {
   const index = findRefIndex(state, entry.ref_ref ?? entry.ref_id);
   if (index < 0) return;
   state.refs.splice(index, 1);
@@ -742,7 +777,7 @@ function applyRefDelete(state: ProjectionState, entry: EntryByKind<'ref.delete'>
 // 派发：switch(kind) 让 TS 把 entry 自动 narrow 到对应 variant，传给窄签名 apply* 时无 cast。
 // entity.* 走 store 重放路径上的 applyEntityEntry（带 ctx），不在投影里跑——投影只关心结构、
 // 不动 entity 表，故 entity 几个 case 直接跳过。
-function applyEntryToProjection(state: ProjectionState, entry: EditBranchEntry) {
+function applyEntryToProjection(state: ProjectorState, entry: EditBranchEntry) {
   if (!isBuiltInEditBranchEntry(entry)) return;
   switch (entry.kind) {
     case 'node.update': return applyNodeUpdate(state, entry);
@@ -766,7 +801,7 @@ function applyEntryToProjection(state: ProjectionState, entry: EditBranchEntry) 
   }
 }
 
-function recomputeAddressesAndDepth(state: ProjectionState) {
+function recomputeAddressesAndDepth(state: ProjectorState) {
   const childrenByParent = new Map<StableRef | 'root', ProjectionNode[]>();
   for (const node of state.nodes) {
     const parentKey = node.parent_id === null || node.parent_id === undefined ? 'root' : node.parent_id;
@@ -809,7 +844,9 @@ export function projectEditBranchDoc(base: ProjectionBase, entries: unknown = []
     }
   }
   recomputeAddressesAndDepth(state);
-  return state;
+  // 进程内查找索引剥离——对外返回形状（含 *IdSeq 遗留字段）逐字节不变。
+  const { nodeIndexById: _nodeIndexById, ...out } = state;
+  return out;
 }
 
 let tmpIdCounter = 0;

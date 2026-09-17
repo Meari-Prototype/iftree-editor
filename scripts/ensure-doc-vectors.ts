@@ -1,8 +1,10 @@
 #!/usr/bin/env node
+// 给单篇文档补建语义向量（npm run vectors:ensure <docId>）。
+// 用法：node dist/scripts/ensure-doc-vectors.js <docId>（目标库 = IFTREE_DB 或 database/store.sqlite）。
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
+import { createBackendClient } from '../src/backend/llm/backend-client.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -26,7 +28,7 @@ interface VectorProgressEvent {
 function docIdFromArg() {
   const value = String(process.argv[2] || '').trim();
   if (!value) {
-    throw new Error('Usage: electron scripts/ensure-doc-vectors.mjs <docId>');
+    throw new Error('Usage: node dist/scripts/ensure-doc-vectors.js <docId>');
   }
   return value;
 }
@@ -60,21 +62,27 @@ async function exitProcess(code: number) {
 
 async function main() {
   const docId = docIdFromArg();
-  const client = createHeadlessAgentClient({
-    cwd: PROJECT_ROOT,
-    scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
-    onStderr: (text) => process.stderr.write(text)
+  // 走共享后端（18-6-1 / ARCHITECTURE §1）：向量补建要写 LanceDB 并读主库的节点内容，
+  // 该由持库的那个 host 做。私有 host 不是只读 host（IftreeStore.init 要跑迁移），
+  // 共享后端在跑时另起一个就是两条可写连接压同一主库。
+  const client = createBackendClient({
+    projectRoot: PROJECT_ROOT,
+    hostScriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
+    mode: 'shared',
+    onStderr: (text: unknown) => { process.stderr.write(String(text ?? '')); },
+    onStatus: (text: unknown) => { process.stderr.write(String(text ?? '')); }
   });
   try {
-    const result = await client.request('vector.ensureDoc', { payload: { docId } }, {
-      onEvent: (event) => {
+    const result = await client.ensureDocVectors({ docId }, {
+      onEvent: (event: unknown) => {
         const line = progressLine(event as VectorProgressEvent);
         if (line) console.log(line);
       }
     });
     console.log(JSON.stringify(result, null, 2));
   } finally {
-    await client.shutdown();
+    // 只断本连接：共享后端多客户端复用；私有兜底 host（mode !== 'pipe'）才由本进程收尸。
+    if (client.mode !== 'pipe') await client.shutdown();
     client.close();
   }
 }

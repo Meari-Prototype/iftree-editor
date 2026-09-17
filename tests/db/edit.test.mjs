@@ -29,7 +29,7 @@ test('db edit records set, insert, and delete entries on a real edit branch and 
     assert.equal(setResult.docId, docId);
     assert.equal(setResult.refresh.kind, 'node');
     assert.ok(setResult.node?.id, 'node.update 应返回被改节点 id');
-    assert.match(setResult.node.id, /^019[a-f0-9-]+$/, 'node.update 的 node.id 应是真实节点 UUIDv7（非 tmp）');
+    assert.match(setResult.node.id, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, 'node.update 的 node.id 应是真实节点 UUIDv7（非 tmp）');
     assert.equal(setResult.node.address, '1-1-6-1-1', 'node.update 应返回被改节点当前地址');
     assert.equal(setResult.editBranch.id, branch.branchId);
     assert.equal(setResult.editBranch.base_doc_id, docId);

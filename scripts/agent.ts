@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
+import { createBackendClient } from '../src/backend/llm/backend-client.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -20,10 +20,9 @@ function errorLike(error: unknown): ErrorLike {
 function printHelp() {
   console.log([
     'Usage:',
-    '  $env:ELECTRON_RUN_AS_NODE = \'1\'',
-    '  .\\node_modules\\.bin\\electron.cmd scripts/agent.mjs \'{"type":"agent.run","payload":{"mode":"qa","prompt":"你好"}}\'',
+    '  node dist/scripts/agent.js \'{"type":"agent.run","payload":{"mode":"qa","prompt":"你好"}}\'',
     '  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
-    '  \'{"type":"agent.run","payload":{"mode":"qa","prompt":"你好"}}\' | .\\node_modules\\.bin\\electron.cmd scripts/agent.mjs --stdin',
+    '  \'{"type":"agent.run","payload":{"mode":"qa","prompt":"你好"}}\' | node dist/scripts/agent.js --stdin',
     '',
     'Output:',
     '  JSON lines: agent.stream events followed by one result line.'
@@ -63,20 +62,28 @@ async function main() {
     await exitProcess(0);
     return;
   }
-  const client = createHeadlessAgentClient({
-    cwd: PROJECT_ROOT,
-    scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
-    onStderr: (text) => process.stderr.write(text)
+  // 走共享后端（18-6-1 / ARCHITECTURE §1）：这条 CLI 只是把一个请求信封原样丢给后端，
+  // 该由在跑的那个 host 接（GUI/MCP 见到的会话、草稿、索引都在它进程里），不该另起一个
+  // 私有 host——私有 host 会以第二条可写连接打开同一主库并跑迁移。本脚本自己跑什么 runtime
+  // 无所谓：host 恒由 resolveNodeExecutable 钉在真 node 上。
+  const client = createBackendClient({
+    projectRoot: PROJECT_ROOT,
+    hostScriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
+    mode: 'shared',
+    onStderr: (text: unknown) => { process.stderr.write(String(text ?? '')); },
+    onStatus: (text: unknown) => { process.stderr.write(String(text ?? '')); }
   });
   try {
     const result = await client.request(String(request.type), request, {
-      onEvent: (event) => {
+      onEvent: (event: unknown) => {
         console.log(JSON.stringify({ type: 'agent.stream', event }));
       }
     });
     console.log(JSON.stringify({ type: 'result', result }));
   } finally {
-    await client.shutdown();
+    // 只断本连接：共享后端多客户端复用，不能因一条 CLI 退出而全局关停。
+    // mode !== 'pipe' 才 shutdown（拉不起共享后端时回退出来的私有兜底 host 由本进程收尸）。
+    if (client.mode !== 'pipe') await client.shutdown();
     client.close();
   }
 }

@@ -132,43 +132,52 @@ export function classifyThreeWayMerge(baseNodes: MerkleNode[] = [], oursNodes: M
     }
   }
 
-  // 结构性删改后置检查：theirs 把节点挂在某父节点下（新增 / 移入），而该父在 ours 已不存在
-  // （主干删除被上面按「接受删除」自动取）→ 合并结果里父缺失，写回重放必撞缺父。
+  // 结构性删改后置检查：一侧把节点挂在某父节点下（新增 / 移入），而该父在另一侧已不存在
+  // （那侧的删除被上面按「接受删除」自动取）→ 合并结果里父缺失，写回重放必撞缺父。
   // 这是 delete-modify 的结构变体，按节点报 __parent__ 冲突交人裁（复活父节点 v1 不支持）。
-  // 只报孤儿链的顶端：父若是 theirs 自己新建的节点，重放会一并创建，孤儿问题在更上层节点暴露。
+  // 只报孤儿链的顶端：父若是本侧自己新建的节点，重放会一并创建，孤儿问题在更上层节点暴露。
+  // 两个方向都查，因为 ours/theirs 谁是「删父的那侧」取决于调用场景：常规 merge 是主干删父、
+  // 分支在其下新增；revertCommit 反过来（base=被撤 commit C、theirs=C 的父版本），C 新建的父在
+  // theirs 侧根本不存在，ours 之后挂在它下面的节点就是孤儿——单查 theirs 时这一支会漏到写回才炸。
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  for (const [id, theirsNode] of theirsById) {
-    const parentRef = fieldVal(theirsNode, 'parent_id');
-    if (parentRef === null) continue;
-    if (oursById.has(parentRef)) continue; // 父在主干存活
-    if (!baseById.has(parentRef) && theirsById.has(parentRef)) continue; // 父由本分支新建
-    const base = baseById.get(id) || null;
-    const ours = oursById.get(id) || null;
-    // 只在「合并结果会采用 theirs 的父」时报：theirs 新增的节点，或仅 theirs 移动了该节点。
-    // base 有、ours 删 → 主循环已按 delete-modify 处理；两侧都移 → 主循环已报 parent_id 冲突。
-    let usesTheirsParent = false;
-    if (!base && !ours) usesTheirsParent = true;
-    else if (base && ours) {
-      const baseParent = fieldVal(base, 'parent_id');
-      usesTheirsParent = parentRef !== baseParent && fieldVal(ours, 'parent_id') === baseParent;
+  const checkOrphanParents = (side: 'ours' | 'theirs') => {
+    const sideById = side === 'theirs' ? theirsById : oursById;
+    const otherById = side === 'theirs' ? oursById : theirsById;
+    for (const [id, sideNode] of sideById) {
+      const parentRef = fieldVal(sideNode, 'parent_id');
+      if (parentRef === null) continue;
+      if (otherById.has(parentRef)) continue; // 父在另一侧存活
+      if (!baseById.has(parentRef) && sideById.has(parentRef)) continue; // 父由本侧新建
+      const base = baseById.get(id) || null;
+      const other = otherById.get(id) || null;
+      // 只在「合并结果会采用本侧的父」时报：本侧新增的节点，或仅本侧移动了该节点。
+      // base 有、另一侧删 → 主循环已按 delete-modify 处理；两侧都移 → 主循环已报 parent_id 冲突。
+      let usesSideParent = false;
+      if (!base && !other) usesSideParent = true;
+      else if (base && other) {
+        const baseParent = fieldVal(base, 'parent_id');
+        usesSideParent = parentRef !== baseParent && fieldVal(other, 'parent_id') === baseParent;
+      }
+      if (!usesSideParent) continue;
+      const baseParentRef = base ? fieldVal(base, 'parent_id') : null;
+      const conflict: FieldConflict = side === 'theirs'
+        ? { field: '__parent__', base: baseParentRef, ours: 'deleted', theirs: parentRef }
+        : { field: '__parent__', base: baseParentRef, ours: parentRef, theirs: 'deleted' };
+      conflicts.push({ id, ...conflict });
+      const node = nodeById.get(id);
+      if (node) {
+        node.resolution = 'conflict';
+        if (!node.kind) node.kind = 'parent-deleted';
+        node.conflicts = [...(node.conflicts || []), conflict];
+      } else {
+        const created: MergeNode = { id, resolution: 'conflict', kind: 'parent-deleted', conflicts: [conflict] };
+        nodes.push(created);
+        nodeById.set(id, created);
+      }
     }
-    if (!usesTheirsParent) continue;
-    const conflict: FieldConflict = {
-      field: '__parent__',
-      base: base ? fieldVal(base, 'parent_id') : null,
-      ours: 'deleted',
-      theirs: parentRef
-    };
-    conflicts.push({ id, ...conflict });
-    const node = nodeById.get(id);
-    if (node) {
-      node.resolution = 'conflict';
-      if (!node.kind) node.kind = 'parent-deleted';
-      node.conflicts = [...(node.conflicts || []), conflict];
-    } else {
-      nodes.push({ id, resolution: 'conflict', kind: 'parent-deleted', conflicts: [conflict] });
-    }
-  }
+  };
+  checkOrphanParents('theirs');
+  checkOrphanParents('ours');
 
   return { nodes, conflicts, hasConflicts: conflicts.length > 0 };
 }

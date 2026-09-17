@@ -143,6 +143,10 @@ export function createEmbeddingService(deps: EmbeddingDeps = {}) {
   // 解析嵌入后端（一次性、带兜底）：IFTREE_EMBED_BACKEND=ollama|openai|llamacpp 时切到
   // GPU 加速的 HTTP 服务（ollama /api/embed 或 OpenAI 兼容 /v1/embeddings = llama.cpp server）；
   // 未声明或健康检查失败（且未禁用兜底）时回落本地 transformers。
+  // embedBackendPromise 一次解析、进程内永久缓存：模型/后端在本进程生存期内不会中途换人，
+  // 换了也要重启后端才生效——这与「同维度换模型不自动重建向量表」是同一条口径（见 vector-store.ts
+  // openExistingTable）：换模型意味着全库重嵌，代价由用户显式付（设置页保存触发丢表 + 逐篇
+  // `db vectors <doc_id>` 补建），系统不在运行期偷偷切后端、也不据此自动重建。
   function resolveEmbedBackend(config: VectorConfig) {
     if (!embedBackendPromise) {
       embedBackendPromise = (async () => {

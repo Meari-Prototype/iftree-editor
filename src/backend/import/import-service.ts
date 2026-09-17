@@ -47,13 +47,32 @@ function sourcePathKey(value: unknown): string {
   return raw ? pathKey(raw) : '';
 }
 
-interface DocLookupRow {
+export interface DocLookupRow {
   id: string;
   title: string;
   meta: string | null;
   created_at: string;
   updated_at: string;
   original_path: string | null;
+}
+
+// 取数 SQL 与判定分开：import-json 只有 db 契约（没有 store 句柄），拿这条 SQL 走只读 action
+// 取候选行，再用同一个纯函数 matchImportedDocForSourcePaths 精判——两条导入路径共用一套口径。
+// WHERE 只做「宽候选」：original_path 直接比（SQLite 的 LIKE/= 对 ASCII 不分大小写），
+// meta.sourcePath 埋在 JSON 里只能 LIKE 子串（路径里的 _ 会当通配，只会放宽、不会漏），
+// 精确的 resolve+小写口径由 matchImportedDocForSourcePaths 收尾。下推是为了不把整张 docs 表
+// 拖过只读通道（debug.sql 有行数上限，全表取会被截断成漏判）。
+export const IMPORTED_DOC_SOURCE_LOOKUP_BY_PATH_SQL = `
+    SELECT docs.id, docs.title, docs.meta, docs.created_at, docs.updated_at, source_documents.original_path
+    FROM docs
+    LEFT JOIN source_documents ON source_documents.doc_id = docs.id
+    WHERE source_documents.original_path = @path OR docs.meta LIKE @metaLike
+  `;
+
+// LIKE 的比较对象是 meta 的 JSON 文本，路径里的反斜杠在 JSON 里是转义过的（D:\a → "D:\\a"）。
+export function importedDocMetaPathLikePattern(sourcePath: string): string {
+  const jsonEscaped = JSON.stringify(String(sourcePath || ''));
+  return `%${jsonEscaped.slice(1, -1)}%`;
 }
 
 function docSourcePathKeys(row: DocLookupRow): string[] {
@@ -91,19 +110,23 @@ interface CreatedDoc {
   [extra: string]: unknown;
 }
 
-function findExistingImportedDocForSourcePaths(store: ImportStore, sourcePaths: string[] = []): DocLookupRow | null {
+export function matchImportedDocForSourcePaths(rows: DocLookupRow[], sourcePaths: string[] = []): DocLookupRow | null {
   const normalizedKeys = new Set(sourcePaths.map(sourcePathKey).filter(Boolean));
-  const rows = store.db!.prepare(`
-    SELECT docs.id, docs.title, docs.meta, docs.created_at, docs.updated_at, source_documents.original_path
-    FROM docs
-    LEFT JOIN source_documents ON source_documents.doc_id = docs.id
-  `).all<DocLookupRow>();
   return rows
     .filter((row) => docSourcePathKeys(row).some((key) => normalizedKeys.has(key)))
     .sort(sortExistingDocs)[0] || null;
 }
 
-function throwDuplicateImportError(existingDoc: DocLookupRow | null): void {
+function findExistingImportedDocForSourcePaths(store: ImportStore, sourcePaths: string[] = []): DocLookupRow | null {
+  const rows = store.db!.prepare(`
+    SELECT docs.id, docs.title, docs.meta, docs.created_at, docs.updated_at, source_documents.original_path
+    FROM docs
+    LEFT JOIN source_documents ON source_documents.doc_id = docs.id
+  `).all<DocLookupRow>();
+  return matchImportedDocForSourcePaths(rows, sourcePaths);
+}
+
+export function throwDuplicateImportError(existingDoc: DocLookupRow | null): void {
   if (!existingDoc) return;
   throw new Error(`导入失败：该真实文本路径已对应数据库文档 doc ${existingDoc.id}「${existingDoc.title || ''}」。如需重新导入，请先删除旧数据库文档。`);
 }

@@ -28,7 +28,7 @@ test('db rebase 刷新分支 base 到 HEAD，返回 changed/baseCommitId/undoDep
     assert.equal(rebaseResult.baseDocId, docId);
     assert.equal(rebaseResult.branchId, branch.branchId);
     assert.equal(String(rebaseResult.owner).split('#')[0], owner);
-    assert.match(String(rebaseResult.baseCommitId), /^019[a-f0-9-]+$/, '首次 rebase：fixture 导入已建初始 commit，baseCommitId 应为该 HEAD commit（UUIDv7）');
+    assert.match(String(rebaseResult.baseCommitId), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, '首次 rebase：fixture 导入已建初始 commit，baseCommitId 应为该 HEAD commit（UUIDv7）');
     assert.equal(rebaseResult.undoDepth, 1, 'rebase 后草稿有 1 条生效 entry');
     assert.equal(rebaseResult.redoDepth, 0);
     assert.ok(rebaseResult.branch?.id);
@@ -56,7 +56,7 @@ test('db commit 快进落库：applied/fastForward/history.commit_id(UUIDv7) + r
     assert.equal(commit.baseDocId, docId);
     assert.equal(commit.history.doc_id, docId);
     assert.ok(commit.history.saved_at, 'history 应有 saved_at（committed_at 别名）');
-    assert.match(commitId, /^019[a-f0-9-]+$/, 'commit id 应是 UUIDv7');
+    assert.match(commitId, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, 'commit id 应是 UUIDv7');
     // 落库后 read 回查：正文已是改动版
     assert.equal(stdoutOf(await runBashDb(dbPath, ['read', docId, '1-1-3-2-1'])), alphaChangedText);
   });

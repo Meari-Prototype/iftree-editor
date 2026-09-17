@@ -105,18 +105,19 @@ interface NavigationStats {
   depths: number[];
 }
 
-function cleanPathPart(value: unknown = ''): string {
-  return String(value || '').replace(/[\\/:*?"<>|]/g, '_').trim();
-}
-
+// 与 path-utils.ts 的 normalizeRelativePath 同口径：只规整分隔符、挡越界，
+// 不做合法字符替换。文件名原样保留（mac 兼容：? : * 等是合法字符，
+// 早年套 Windows 非法字符集清洗会把它们显示成 _、并把不同名文件撞成同 key）。
 function normalizeRelativePath(value: unknown = ''): string {
   const text = String(value || '').replace(/\\/g, '/').trim();
-  return text
+  const normalized = text
     .split('/')
     .filter((part) => part && part !== '.')
-    .map(cleanPathPart)
-    .filter(Boolean)
     .join('/');
+  if (normalized.split('/').some((part) => part === '..')) {
+    throw new Error('Library path cannot escape the library folder');
+  }
+  return normalized;
 }
 
 function ensureInside(root: string, target: string): string {
@@ -408,18 +409,29 @@ export function createLibraryService(rootPath: string): LibraryService {
       const target = fullPath(relativePath);
       for (const dirent of readdirSync(target, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true }))) {
         if (results.length >= limit) break;
+        // 与 entry() 同一套忽略口径：`.memory` 锚目录 / `.iftree-llm-workspace` / `.git` 不进搜索结果，
+        // 也不递归下去（锚目录里全是 symlink，走进去既慢又全是噪声）。
+        if (shouldIgnoreLibraryEntry(dirent.name)) continue;
         const childRelativePath = normalizeRelativePath(join(relativePath, dirent.name));
         const text = childRelativePath.toLowerCase();
-        const stat = statSync(fullPath(childRelativePath));
+        // lstat 不跟随 symlink：悬空锚用 statSync 会 ENOENT 抛，一个坏锚就让整树搜索不可用（entry() :358 同法）。
+        // 枚举与 stat 之间文件被删也走这条：跳过该条目而不是整棵树崩。
+        let stat;
+        try {
+          stat = lstatSync(fullPath(childRelativePath));
+        } catch {
+          continue;
+        }
+        const isFolder = stat.isDirectory();
         const item: SearchResult = {
-          type: dirent.isDirectory() ? 'folder' : 'file',
+          type: isFolder ? 'folder' : 'file',
           name: dirent.name,
           relativePath: childRelativePath,
-          extension: dirent.isDirectory() ? '' : extname(dirent.name).toLowerCase(),
-          size: dirent.isDirectory() ? null : stat.size
+          extension: isFolder ? '' : extname(dirent.name).toLowerCase(),
+          size: isFolder || stat.isSymbolicLink() ? null : stat.size
         };
         if (!q || text.includes(q) || dirent.name.toLowerCase().includes(q)) results.push(item);
-        if (dirent.isDirectory()) walk(childRelativePath);
+        if (isFolder) walk(childRelativePath);
       }
     }
     walk('');

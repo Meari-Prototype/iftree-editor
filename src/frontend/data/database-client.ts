@@ -4,6 +4,7 @@ import type {
   ContentSearchResult,
   DocGetResult,
   DocListItem,
+  NodeAncestorsResult,
   NodeChildrenResult,
   SourceWindowResult
 } from '../../backend/query-api.js';
@@ -65,6 +66,7 @@ export function readDatabase(payload: DatabasePayload & { action: 'doc.list' }):
 export function readDatabase(payload: DatabasePayload & { action: 'docFolder.list' }): Promise<DocFolderRow[]>;
 export function readDatabase(payload: DatabasePayload & { action: 'doc.get' }): Promise<DocGetResult | null>;
 export function readDatabase(payload: DatabasePayload & { action: 'node.listChildren' }): Promise<NodeChildrenResult>;
+export function readDatabase(payload: DatabasePayload & { action: 'node.ancestors' }): Promise<NodeAncestorsResult>;
 export function readDatabase(payload: DatabasePayload & { action: 'source.getWindow' }): Promise<SourceWindowResult>;
 export function readDatabase(payload: DatabasePayload): Promise<unknown>;
 export async function readDatabase(payload: DatabasePayload): Promise<unknown> {

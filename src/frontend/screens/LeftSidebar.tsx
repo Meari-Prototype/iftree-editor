@@ -19,7 +19,7 @@ export function LeftSidebar() {
   const { docState, treeView, selection, layout, misc } = useAppState();
   const { document: documentCommands, editor, treeView: treeViewCommands } = useCommands();
   const {
-    docs, docFolders, libraryTree, libraryCutPath, currentDoc,
+    docs, libraryTree, libraryCutPath, currentDoc,
     setDocs, setDocFolders, setLibraryTree, setLibraryCutPath, setSelectedLibraryEntry
   } = docState;
   const { leftWidth, leftCollapsed, docPanelHeight, outlineCollapsedDown, leftSidebarRef, docPanelRef, startDocOutlineResize } = layout;
@@ -33,11 +33,10 @@ export function LeftSidebar() {
     return byPath;
   }, [docs]);
 
+  // createLibraryActions 还返回 createDocFolder / renameDocFolder / deleteDocFolder /
+  // moveDocToFolder，这里不取：DocBrowser 的 doc 文件夹渲染是死代码、已删，前端暂无入口。
+  // 能力本身保留在 library-actions（及其下的 repository），要接回 UI 时直接解构即可。
   const {
-    createDocFolder,
-    renameDocFolder,
-    deleteDocFolder,
-    moveDocToFolder,
     moveLibraryItem,
     cutLibraryItem,
     pasteLibraryItem,
@@ -84,8 +83,6 @@ export function LeftSidebar() {
 
       <DocBrowser
         busy={busy}
-        docs={docs}
-        docFolders={docFolders}
         libraryTree={libraryTree}
         docBySourcePath={docBySourcePath}
         currentDocId={misc.currentVisualDocId as Parameters<typeof DocBrowser>[0]['currentDocId']}
@@ -94,12 +91,6 @@ export function LeftSidebar() {
         docPanelHeight={docPanelHeight}
         onRefreshLibrary={docState.refreshLibrary}
         onOpenDoc={documentCommands.openDoc}
-        onCreateDoc={documentCommands.createDoc}
-        onCreateFolder={createDocFolder as (parentId?: number | null) => unknown}
-        onRenameFolder={renameDocFolder}
-        onDeleteFolder={deleteDocFolder}
-        onDeleteDoc={documentCommands.deleteDoc}
-        onMoveDoc={moveDocToFolder}
         libraryNavigationOpen={currentDoc?.virtualType === 'libraryNavigation'}
         onOpenLibraryNavigation={documentCommands.openLibraryNavigation}
         onSelectLibraryFile={selectLibraryFile}

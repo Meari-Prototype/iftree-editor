@@ -17,7 +17,7 @@ test('db import, index, and tree expose the imported fixture and reject bad args
     assert.ok(Array.isArray(imported.imported), 'imported 应是数组');
     assert.equal(imported.imported.length, 1);
     assert.equal(imported.imported[0].docId, docId);
-    assert.match(docId, /^019[a-f0-9-]+$/, 'docId 应是 UUIDv7 格式（019 前缀）');
+    assert.match(docId, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, 'docId 应是 UUIDv7 格式（版本位校验）');
 
     // —— index --folder --uuid：组头带文件名 + #docId + 字数 + semantic 状态 ——
     const indexText = stdoutOf(await runBashDb(dbPath, ['index', '--folder', 'generated', '--uuid']));

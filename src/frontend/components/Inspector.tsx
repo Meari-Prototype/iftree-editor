@@ -58,6 +58,9 @@ export interface JumpAddressResult {
 export interface InspectorProps {
   currentDoc?: InspectorDocLike | null;
   selectedNode?: InspectorSelectedNode | null;
+  // 选中的 id（与 selectedNode 分开给）：id 有、节点为 null = 选中的节点还没加载进投影
+  // （未预取到 / 已被驱逐），与「压根没选」是两回事，空态文案要分。
+  selectedNodeId?: string | null;
   runWrite?: (fn: () => Promise<unknown> | unknown) => Promise<unknown> | unknown;
   selectNode?: (nodeId: string) => void;
   canEdit?: boolean;
@@ -91,6 +94,7 @@ export interface InspectorProps {
 export function Inspector({
   currentDoc,
   selectedNode,
+  selectedNodeId = null,
   runWrite,
   selectNode,
   canEdit,
@@ -224,7 +228,8 @@ export function Inspector({
           onPointerDown={startAgentPanelResize}
         />
         <div className="inspector-scroll">
-          <div className="empty-state">没有选中节点</div>
+          {/* 选中了但节点不在投影里：只提示未加载、不显示任何可编辑字段——编辑无处可写。 */}
+          <div className="empty-state">{currentDoc && selectedNodeId ? '节点未加载' : '没有选中节点'}</div>
         </div>
       </aside>
     );

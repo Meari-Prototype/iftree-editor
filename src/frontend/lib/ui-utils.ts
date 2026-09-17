@@ -62,18 +62,31 @@ interface VirtualRange {
   totalHeight: number;
 }
 
-export function buildVirtualRange(heights: unknown[], scrollTop: number, viewportHeight: number, overscan: number): VirtualRange {
+export interface VirtualOffsets {
+  offsets: number[];
+  totalHeight: number;
+}
+
+// 前缀和只依赖 heights、与滚动位置无关。拆出来的动机：buildVirtualRange 的调用方 memo 依赖里
+// 含 viewport（每滚动帧变），于是每帧 O(N) 重建前缀和。offsets 单独 memo（[heights]）后，
+// 滚动帧只剩两次二分（O(log N)）。
+export function buildVirtualOffsets(heights: unknown[]): VirtualOffsets {
   const offsets = [0];
   let totalHeight = 0;
   for (const height of heights) {
     totalHeight += Math.max(0, Number(height) || 0);
     offsets.push(totalHeight);
   }
+  return { offsets, totalHeight };
+}
 
+export function virtualRangeFromOffsets(prepared: VirtualOffsets, scrollTop: number, viewportHeight: number, overscan: number): VirtualRange {
+  const { offsets, totalHeight } = prepared;
+  const rowCount = offsets.length - 1;
   const from = Math.max(0, scrollTop - overscan);
   const to = Math.min(totalHeight, scrollTop + viewportHeight + overscan);
   const start = Math.max(0, lowerBound(offsets, from) - 1);
-  const end = Math.min(heights.length, lowerBound(offsets, to) + 1);
+  const end = Math.min(rowCount, lowerBound(offsets, to) + 1);
   return {
     start,
     end,
@@ -81,6 +94,10 @@ export function buildVirtualRange(heights: unknown[], scrollTop: number, viewpor
     bottom: Math.max(0, totalHeight - (offsets[end] || totalHeight)),
     totalHeight
   };
+}
+
+export function buildVirtualRange(heights: unknown[], scrollTop: number, viewportHeight: number, overscan: number): VirtualRange {
+  return virtualRangeFromOffsets(buildVirtualOffsets(heights), scrollTop, viewportHeight, overscan);
 }
 
 export function buildFixedVirtualRange(count: unknown, rowHeight: unknown, scrollTop: unknown, viewportHeight: unknown, overscan: unknown): VirtualRange {

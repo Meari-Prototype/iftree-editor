@@ -4,6 +4,7 @@ import type Database from 'better-sqlite3';
 import type { NodeRow } from '../db/schema.js';
 import type {
   EditBranchEntry,
+  NodePatchFields,
   ProjectionBase,
   ProjectedDoc
 } from './edit-branch-contract.js';
@@ -72,6 +73,9 @@ export interface StoreLifecyclePort {
 export interface DocumentPolicyPort {
   beforeDeleteDoc(store: DomainStoreCapability, docId: unknown): void;
   beforeStreamPush(store: DomainStoreCapability, docId: unknown, nodes: unknown): void;
+  // 切编辑模式的领域闸：store 只知道「模式合法」，「这篇能不能离开 readonly」是领域语义
+  // （封了的记忆卷不可再变回可写，否则 set_mode 就是封卷的后门）。
+  beforeSetEditMode(store: DomainStoreCapability, docId: unknown, nextMode: string): void;
 }
 
 export interface EditBranchProjectionPort {
@@ -85,6 +89,9 @@ export interface EditBranchProjectionPort {
   buildEditBranchDiffRows(base: DomainRow[], projected: DomainRow[], hashes?: unknown): DiffResultPort;
   buildAxiomDiffRows(base: DomainRow[], projected: DomainRow[]): AxiomDiffResultPort;
   nodeRowWithClientAliases(row: NodeRow | null | undefined): DomainRow | null | undefined;
+  // 单节点内容 patch 的投影语义（node.update 改后节点行 ≡ 它）：stage 省第二次全量投影用。
+  // unknown 出入：投影行（ProjectionNode）与 DomainRow 无 index signature 交集，边界窄化留给两侧。
+  patchProjectedNode(row: unknown, patch: NodePatchFields): unknown;
 }
 
 export interface ExternalEntryPort {

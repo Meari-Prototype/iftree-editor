@@ -145,7 +145,7 @@ export function createLlmWorkspace({
     const limitBytes = llmWorkspaceLimitBytes();
     const measured = measureWorkspaceEntry(root);
     const cleanupCandidates = readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.name !== '.bin' && !entry.isSymbolicLink())
+      .filter((entry) => entry.name !== '.bin' && entry.name !== 'skills' && !entry.isSymbolicLink())
       .map((entry) => {
         const fullPath = join(root, entry.name);
         const item = measureWorkspaceEntry(fullPath);
@@ -169,12 +169,12 @@ export function createLlmWorkspace({
   }
 
   // 启动时清理顶层过期条目（按 mtime；目录被写入会刷新 mtime，活跃目录不会被清）。
-  // .bin 工具目录除外；占用中的条目删除失败留给下次启动。
+  // .bin 工具目录和长期保留的 skills 除外；占用中的条目删除失败留给下次启动。
   function cleanupExpiredWorkspaceEntries(now = Date.now()) {
     const root = ensureLlmWorkspaceRoot();
     const removed: string[] = [];
     for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (entry.name === '.bin' || entry.isSymbolicLink()) continue;
+      if (entry.name === '.bin' || entry.name === 'skills' || entry.isSymbolicLink()) continue;
       const fullPath = join(root, entry.name);
       let stat;
       try {

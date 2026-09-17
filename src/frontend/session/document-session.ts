@@ -11,7 +11,7 @@
 //                                                       0 = 叶或未加载=DFS 边界，扩散到此自然停。
 // 「声称 > 已加载」即取数边界（有子但子列表没拉）。永驻缓存：ingest 只增不删（结构写另走 reconcile）。
 
-import { buildTreeIndex, getDescendants, patchNode, removeNode, toTreeNode, type TreeIndex, type TreeNode } from '../../core/node-model.js';
+import { buildTreeIndex, getDescendants, patchNode, removeNode, sameTreeNodeFields, toTreeNode, type TreeIndex, type TreeNode } from '../../core/node-model.js';
 import { nextInDfs, spreadAddresses } from '../../core/tree-cursor.js';
 
 const DEFAULT_PAGE_LIMIT = 300;
@@ -44,6 +44,15 @@ export interface Session {
   // 后端权威树深（doc.get 的 treeDepthStats.maxDepth；0=未知）。深度 clamp 的天花板用它而非
   // 已加载最大深度——扩散加载初期/驱逐后已加载区变浅，不能把用户持久化的 depthLimit 夹低。
   claimedMaxDepth: number;
+  // 已加载区最大深度（ingest 时增量维护的 running max，只增不缩）：maxDepthOf 不再每次全扫 byId。
+  // 驱逐后不缩——它只是 claimedMaxDepth（后端权威）未知时的 fallback 天花板，偏高方向与
+  // 「不把用户持久化的 depthLimit 夹低」的设计意图同向（旧全扫在驱逐后反而偏低）。
+  loadedMaxDepth: number;
+  // 子树版本号（结构共享投影的早停判据）：任何内容变更（行替换/子列表变更/删除/驱逐）沿祖先链
+  // bump——不变量：子树内任何变化 ⇒ 其根版本号变。投影复用旧节点当且仅当版本号与行引用皆同。
+  // 原地可变（与 loadedParents/childPages 同风格），只在 ingest/reconcile/evict 路径写。
+  // 条目只增不删（被驱逐/删除节点的版本残留），单条极小；换文档时随 createSession 重建清零。
+  subtreeVersions: Map<string, number>;
   view: SessionView;
 }
 
@@ -82,7 +91,17 @@ export interface LegacyDocProjection {
   tree: (TreeNode & { children: TreeNode[] }) | null;
   idByAddress: Record<string, string>;
   depthStats: { maxDepth: number; depths: number[] };
+  // 内部：下次投影的复用索引（id → 上次投影节点）。对外消费方不使用。
+  nodeById?: Map<string, NestedTreeNode>;
 }
+
+// 投影节点 = TreeNode & children + 结构共享标记（来自的 session 行引用 / 投影时的子树版本号）。
+// 复用判据：行引用同 ∧ 版本号同 ⇒（版本不变量：子树内任何变化 ⇒ 根版本变）整棵子树内容相同。
+type NestedTreeNode = TreeNode & {
+  children: NestedTreeNode[];
+  __source?: TreeNode;
+  __version?: number;
+};
 
 function normalizeId(value: unknown): string | null {
   if (value === null || value === undefined) return null;
@@ -104,6 +123,8 @@ export function createSession(docId: unknown): Session {
     focusId: null,
     loadSeq: 0,
     claimedMaxDepth: 0,
+    loadedMaxDepth: 0,
+    subtreeVersions: new Map<string, number>(),
     view: {
       depthLimit: 1,
       collapsed: new Set<string>(),
@@ -144,6 +165,11 @@ function upsertNodes(index: TreeIndex, rows: unknown[], outlineCollapsed?: Set<s
       && (node.address ? node.address.split('-').length : 1) >= 2) {
       outlineCollapsed.add(node.id);
     }
+    // 全字段相同 → 复用旧引用（结构共享投影的不变量：引用相同 ⇒ 内容相同）。
+    if (prev && sameTreeNodeFields(prev, node)) {
+      nodes.push(prev);
+      continue;
+    }
     index.byId.set(node.id, node);
     if (node.address) index.byAddress.set(node.address, node);
     nodes.push(node);
@@ -151,18 +177,58 @@ function upsertNodes(index: TreeIndex, rows: unknown[], outlineCollapsed?: Set<s
   return nodes;
 }
 
-// 重建某 parent 的 childrenOf（合并已有 + 新并入，按 sortOrder 稳定排序）。
-function reorderChildren(index: TreeIndex, parentId: string): TreeNode[] {
+// 替换式更新单个节点对象（byId/byAddress/父的子列表/root 四处同步）。childCount 校准等
+// 场景禁止原地 mutate——「引用相同 ⇒ 内容相同」不变量一旦破坏，结构共享投影会复用到陈旧内容。
+function replaceNodeObject(index: TreeIndex, next: TreeNode): void {
+  const prev = index.byId.get(next.id);
+  if (!prev || prev === next) return;
+  index.byId.set(next.id, next);
+  if (next.address) index.byAddress.set(next.address, next);
+  const siblings = index.childrenOf.get(next.parentId ?? null);
+  if (siblings) {
+    const at = siblings.findIndex((node) => node.id === next.id);
+    if (at >= 0) siblings[at] = next;
+  }
+  if (index.root?.id === next.id) index.root = next;
+}
+
+// 重建某 parent 的 childrenOf（合并已有 + 本批并入，按 sortOrder 稳定排序）。
+// incoming = 本批 upsert 的行（调用方保证是 listChildren(parentId) 的返回）。原先每并入一页就
+// 全扫 index.byId 找该 parent 的子——扩散加载 N 节点需 N/页 次全扫，O(N²/页)（20 万节点 ≈ 1.3 亿次
+// 迭代）。incoming 已经就是这批子行，合并 existing + incoming 即可；parentId 防御性过滤保数据异常
+// 时不把异父行混进来（与旧全扫的过滤效果一致）。
+function reorderChildren(index: TreeIndex, parentId: string, incoming: TreeNode[] = []): TreeNode[] {
   const existing = index.childrenOf.get(parentId) || [];
   const merged = new Map<string, TreeNode>(existing.map((node) => [node.id, node]));
-  for (const node of index.byId.values()) {
+  for (const node of incoming) {
     if (node.parentId === parentId) merged.set(node.id, node);
   }
   const list = [...merged.values()].sort(
     (a, b) => a.sortOrder - b.sortOrder || String(a.id).localeCompare(String(b.id))
   );
+  // 逐元素引用全同 → 保留旧数组引用（结构共享的早停判据之一就是子列表引用）。
+  if (list.length === existing.length && list.every((node, i) => node === existing[i])) return existing;
   index.childrenOf.set(parentId, list);
   return list;
+}
+
+// ingest 时增量维护已加载最大深度（running max，只增不缩；驱逐后不缩见 Session.loadedMaxDepth 注释）。
+function trackLoadedMaxDepth(state: Session, nodes: TreeNode[]): void {
+  for (const node of nodes) {
+    const depth = node.address ? node.address.split('-').length : 1;
+    if (depth > state.loadedMaxDepth) state.loadedMaxDepth = depth;
+  }
+}
+
+// 子树版本 bump：从 nodeId 沿 parentId 祖先链逐级 +1。任何内容变更入口都必须调它
+// （ingest/reconcile/evict），漏一个入口 = 结构共享投影复用到陈旧内容。在删除类操作之前调
+// （删完后被删节点从 byId 消失，链从仍存在的节点起算即可）。
+function bumpSubtreeChain(state: Session, nodeId: string | null): void {
+  let cursor = nodeId ? state.index.byId.get(nodeId) : undefined;
+  while (cursor) {
+    state.subtreeVersions.set(cursor.id, (state.subtreeVersions.get(cursor.id) || 0) + 1);
+    cursor = cursor.parentId ? state.index.byId.get(cursor.parentId) : undefined;
+  }
 }
 
 // 打开文档第一步：并入根节点（root 不是任何 parent 的子，单独拿）。
@@ -170,6 +236,8 @@ export function ingestRoot(state: Session, rootRow: unknown): Session {
   const [root] = upsertNodes(state.index, [rootRow]);
   if (root) state.index.root = root;
   state.index.size = state.index.byId.size;
+  trackLoadedMaxDepth(state, root ? [root] : []);
+  if (root) bumpSubtreeChain(state, root.id);
   return bump(state);
 }
 
@@ -183,21 +251,105 @@ export function ingestChildren(state: Session, patch: IngestChildrenPatch = {}):
   if (!state.index.byId.has(parentId)) return state;
   const rows = Array.isArray(patch.rows) ? patch.rows : [];
   const index = state.index;
-  upsertNodes(index, rows, state.view.outlineCollapsed);
-  const children = reorderChildren(index, parentId);
+  const incoming = upsertNodes(index, rows, state.view.outlineCollapsed);
+  const children = reorderChildren(index, parentId, incoming);
   index.size = index.byId.size;
+  trackLoadedMaxDepth(state, incoming);
 
   const total = Number.isFinite(Number(patch.total)) ? Number(patch.total) : children.length;
   const offset = Math.max(0, Math.floor(Number(patch.offset) || 0));
-  const loaded = Math.max(children.length, offset + rows.length);
+  // loaded =「已按页取到的连续前缀长度」，不是 childrenOf 的元素数。二者在纯分页路径上相等，
+  // 但 ingestPath 会把祖先链上的那一个子先塞进 childrenOf（它可能落在第 N 页），此时
+  // children.length 虚高一位，下一页的 offset（= loaded）就会跳过一条真兄弟，留下补不回的空洞。
+  // 取「上一次记录的前缀」与「本页末端」的较大者：顺序取页时等价于旧式 children.length，
+  // 重复取已取过的页也不会把前缀缩回去。
+  const prevLoaded = state.childPages.get(parentId)?.loaded ?? 0;
+  const loaded = Math.max(prevLoaded, offset + rows.length);
   const hasMore = patch.hasMore === true ? true : loaded < total;
   state.childPages.set(parentId, { loaded, total, hasMore });
   state.loadedParents.add(parentId);
 
-  // 校准 parent 的「声称 childCount」——后端 total 比建索引时的旧值权威。
+  // 校准 parent 的「声称 childCount」——后端 total 比建索引时的旧值权威。替换式更新（不变量见 replaceNodeObject）。
   const parent = index.byId.get(parentId);
-  if (parent && total > (parent.childCount || 0)) parent.childCount = total;
+  if (parent && total > (parent.childCount || 0)) replaceNodeObject(index, { ...parent, childCount: total });
+  bumpSubtreeChain(state, parentId);
   return bump(state);
+}
+
+export interface IngestPathPatch {
+  // 后端 node.ancestors 的 rows：根 → 目标节点的整条链（含目标自身），行格式同 listChildren。
+  rows?: unknown[];
+}
+
+// 并入「根 → 某节点」的祖先链（定位到尚未加载 / 已被驱逐的节点时用）。
+//
+// 与 ingestChildren 的根本区别：链上每个父只带来「通往目标的那一个子」，不是它的完整子列表。
+// 所以本动词：
+//   · 把整条链 upsert 进 byId/byAddress，并把每一环挂到父的 childrenOf 上——投影因此能从根走到
+//     目标（selectedNode / findNode 立刻可见），这是定位能成立的前提；
+//   · 绝不写 loadedParents / childPages——链上的父在取数口径上仍是「声称有子、子列表没拉」的
+//     边界，planHotFetches/nextBackgroundFetch 照常给它们排分页请求，缺的兄弟随后按页补齐
+//     （childPages.loaded 的连续前缀语义见 ingestChildren 内注释）；
+//   · 不碰驱逐语义：链上的父不在 loadedParents，planEvictions 扫不到它们（也就驱不掉这一条链），
+//     但祖先整棵被驱逐时 removeNode 沿 childrenOf 级联，链会随之消失——不留不可达孤儿。
+//     调用方随后会把焦点/选中落到目标上，焦点祖先链本就受 planEvictions 保护。
+// 行序不作要求：先整批 upsert 再逐条接父子链接，父行与子行同批到达也能接上。
+export function ingestPath(state: Session, patch: IngestPathPatch = {}): Session {
+  const rows = Array.isArray(patch.rows) ? patch.rows : [];
+  if (rows.length === 0) return state;
+  const candidates: TreeNode[] = [];
+  for (const row of rows) {
+    const node = toTreeNode(row as Record<string, unknown> | null);
+    if (node) candidates.push(node);
+  }
+  if (candidates.length === 0) return state;
+
+  // 孤儿闸（与 ingestChildren 同规）：每一环都要么自己就是本文档的根、要么父在本批或已在镜像里。
+  // 断链 / 跨文档的批次整批丢弃——写进去就是从根不可达的行：计入窗口 W，planEvictions 又扫不到。
+  const incomingIds = new Set(candidates.map((node) => node.id));
+  const rooted = candidates.every((node) => (node.parentId == null
+    ? (!state.index.root || state.index.root.id === node.id)
+    : incomingIds.has(node.parentId) || state.index.byId.has(node.parentId)));
+  if (!rooted) return state;
+
+  const index = state.index;
+  // upsert 前记下已在镜像的那些环的旧父：链给的是权威位置，若与镜像不符（分支投影里被
+  // reparent、或主干结构写后镜像还没对账），必须把它从旧父的子列表摘掉——否则同一个 id
+  // 新旧两处都挂着，投影里出现重影。
+  const prevParentOf = new Map<string, string | null>();
+  for (const node of candidates) {
+    const prev = index.byId.get(node.id);
+    if (prev) prevParentOf.set(node.id, prev.parentId);
+  }
+
+  const incoming = upsertNodes(index, rows, state.view.outlineCollapsed);
+  let deepest: TreeNode | null = null;
+  for (const node of incoming) {
+    const prevParent = prevParentOf.get(node.id);
+    if (prevParent != null && prevParent !== node.parentId) {
+      const siblings = index.childrenOf.get(prevParent);
+      const at = siblings ? siblings.findIndex((sibling) => sibling.id === node.id) : -1;
+      if (siblings && at >= 0) siblings.splice(at, 1);
+      bumpSubtreeChain(state, prevParent); // 旧父的子树内容变了，版本必须跟着动（结构共享早停的前提）
+    }
+    if (node.parentId == null) {
+      // 链首就是文档根：镜像还没有根（定位早于 ingestRoot 的极端时序）时补上，已有则不动。
+      if (!index.root) index.root = node;
+    } else {
+      reorderChildren(index, node.parentId, [node]);
+    }
+    if (!deepest || nodeDepth(node) > nodeDepth(deepest)) deepest = node;
+  }
+  index.size = index.byId.size;
+  trackLoadedMaxDepth(state, incoming);
+  // 链尾（最深的一环）= 目标节点；bumpSubtreeChain 从它沿父链上溯，整条链的子树版本一次带到。
+  if (deepest) bumpSubtreeChain(state, deepest.id);
+  return bump(state);
+}
+
+// 节点深度：address 优先（ingest 时按真实位置存），缺失时退回行自带的 depth。
+function nodeDepth(node: TreeNode): number {
+  return node.address ? node.address.split('-').length : Math.max(1, Number(node.depth) || 1);
 }
 
 // 内容写回填：单节点 patch（node.update 返回的 kind:'node' 单行结果）。委托 node-model.patchNode
@@ -207,7 +359,13 @@ export function ingestChildren(state: Session, patch: IngestChildrenPatch = {}):
 export function reconcileNode(state: Session, row: { id?: unknown; [extra: string]: unknown } | null | undefined): Session {
   const id = normalizeId(row?.id);
   if (id == null || !state.index.byId.has(id)) return state; // 只回填已加载节点，不新增孤儿
+  const prevParentId = state.index.byId.get(id)?.parentId ?? null;
   patchNode(state.index, row as Parameters<typeof patchNode>[1]);
+  // 版本 bump：新旧父链都兜（patchNode 可能发生单节点 parentId 迁移）。
+  bumpSubtreeChain(state, id);
+  if (prevParentId && prevParentId !== (state.index.byId.get(id)?.parentId ?? null)) {
+    bumpSubtreeChain(state, prevParentId);
+  }
   return bump(state);
 }
 
@@ -218,6 +376,9 @@ export function reconcileNode(state: Session, row: { id?: unknown; [extra: strin
 export function reconcileChildren(state: Session, patch: IngestChildrenPatch = {}): Session {
   const parentId = normalizeId(patch.parentId);
   if (parentId == null) return state;
+  // 孤儿闸（与 ingestChildren 同规）：本函数语义是「结构写后重取」，parent 必然已加载；
+  // 迟到/错代的调用（await 期间换文档、祖先被驱逐）直接丢弃，不把孤儿行写进镜像。
+  if (!state.index.byId.has(parentId)) return state;
   const index = state.index;
   const rows = Array.isArray(patch.rows) ? patch.rows : [];
   const nextIds = new Set<string>();
@@ -230,16 +391,18 @@ export function reconcileChildren(state: Session, patch: IngestChildrenPatch = {
   for (const child of oldChildren) {
     if (!nextIds.has(child.id)) removeNode(index, child.id);
   }
-  upsertNodes(index, rows);
-  reorderChildren(index, parentId);
+  const incoming = upsertNodes(index, rows);
+  reorderChildren(index, parentId, incoming);
   index.size = index.byId.size;
+  trackLoadedMaxDepth(state, incoming);
 
   const loaded = (index.childrenOf.get(parentId) || []).length;
   const total = Number.isFinite(Number(patch.total)) ? Number(patch.total) : loaded;
   state.childPages.set(parentId, { loaded, total, hasMore: patch.hasMore === true ? true : loaded < total });
   state.loadedParents.add(parentId);
   const parent = index.byId.get(parentId);
-  if (parent) parent.childCount = total;
+  if (parent && parent.childCount !== total) replaceNodeObject(index, { ...parent, childCount: total });
+  bumpSubtreeChain(state, parentId);
   return bump(state);
 }
 
@@ -359,6 +522,7 @@ export function evictChildren(state: Session, parentId: unknown): Session {
   const index = state.index;
   const children = [...(index.childrenOf.get(id) || [])];
   if (children.length === 0) return state;
+  bumpSubtreeChain(state, id); // 先 bump（删除后子节点从 byId 消失，链从 id 起算不受影响）
   for (const child of children) removeNode(index, child.id); // 级联清子树 + byAddress + childrenOf
   index.childrenOf.delete(id);
   index.size = index.byId.size;
@@ -518,15 +682,10 @@ function hasChildrenById(state: Session, id: string): boolean {
 }
 
 // 树深天花板（深度调节与 promote 的 clamp 都用它）：后端权威深度（claimedMaxDepth，loadComplete
-// 喂入）优先；未知时退回遍历已加载区。不能只看已加载——扩散加载初期/折叠子树被驱逐后已加载区
-// 变浅，若据此 clamp 会把用户持久化的 depthLimit 夹低并写回（降级不可逆）。
+// 喂入）优先；未知时退回已加载最大深度标量（ingest 时增量维护）。不再每次全扫 byId——旧实现
+// 在 toggleCollapsed/expandOneLevel/setDepthLimit 等视图动词上都是 O(N) 全表扫。
 export function maxDepthOf(state: Session): number {
-  let max = Math.max(1, state.claimedMaxDepth);
-  for (const node of state.index.byId.values()) {
-    const depth = node.address ? node.address.split('-').length : 1;
-    if (depth > max) max = depth;
-  }
-  return max;
+  return Math.max(1, state.claimedMaxDepth, state.loadedMaxDepth);
 }
 
 function commitView(state: Session, patch: Partial<SessionView>): Session {
@@ -720,33 +879,83 @@ export function applyViewSnapshot(state: Session, snapshot: ViewSnapshot = {}): 
 // mindmap-utils.buildTreeWithIndex 同形（node 都是 toTreeNode + children + address）。这是
 // 渲染层切到 L5 视图模型之前的过渡桥：扩散加载下 tree 是「已加载的那部分」，未加载子树缺位。
 // 迭代组装（不递归）避免极深树爆栈；address 用 ingest 时按真实位置存的值，不重算。
-export function projectToLegacyDoc(state: Session): LegacyDocProjection {
+//
+// 结构共享（prev 传入时）：每节点先查「prevNode.__source === node && prevNode.__version === 当前子树版本」，
+// 命中即复用旧投影节点、不进栈——变化路径外的子树零对象重建、引用稳定（对象复用是 O(1) 早停；
+// idByAddress/nodeById/depths 的收录仍要遍历复用子树，O(子树) 但只读引用、不建对象）。
+// 版本号不变量（见 bumpSubtreeChain）：子树内任何变化 ⇒ 根版本号变，故版本同 ⇒ 复用安全。
+// 下游所有 useMemo([tree]) / 卡片 memo 因此在「无变化 project」下全部命中；
+// 原先每次 project（含每个预取页）全量 clone 出新对象图，下游缓存被尽数击穿。
+export function projectToLegacyDoc(state: Session, prev?: LegacyDocProjection | null): LegacyDocProjection {
   const root = state.index.root;
   if (!root) return { tree: null, idByAddress: {}, depthStats: { maxDepth: 1, depths: [1] } };
+  const prevById = prev?.nodeById;
+  const versionOf = (id: unknown): number => state.subtreeVersions.get(String(id)) || 0;
 
-  type NestedTreeNode = TreeNode & { children: NestedTreeNode[] };
-  const cloneNode = (node: TreeNode): NestedTreeNode => ({ ...node, children: [] });
-  const tree = cloneNode(root);
+  const reuseFor = (node: TreeNode): NestedTreeNode | null => {
+    const prevNode = prevById?.get(node.id);
+    if (prevNode && prevNode.__source === node && prevNode.__version === versionOf(node.id)) {
+      return prevNode;
+    }
+    return null;
+  };
+
+  // 整树未变快路径：连 idByAddress/depthStats/nodeById 一起复用。
+  const rootReuse = reuseFor(root);
+  if (rootReuse && prev) {
+    return { tree: rootReuse, idByAddress: prev.idByAddress, depthStats: prev.depthStats, nodeById: prev.nodeById };
+  }
+
   const idByAddress: Record<string, string> = {};
+  const nodeById = new Map<string, NestedTreeNode>();
   const depths = new Set<number>();
   let maxDepth = 1;
 
+  // 复用子树的索引收录：只读引用收进 idByAddress/nodeById/depths，不建对象。
+  const collectReused = (projected: NestedTreeNode) => {
+    const reusedStack: NestedTreeNode[] = [projected];
+    while (reusedStack.length > 0) {
+      const node = reusedStack.pop()!;
+      nodeById.set(node.id, node);
+      const address = node.address || '1';
+      idByAddress[address] = node.id;
+      const depth = address.split('-').length;
+      depths.add(depth);
+      if (depth > maxDepth) maxDepth = depth;
+      for (let i = node.children.length - 1; i >= 0; i -= 1) reusedStack.push(node.children[i]!);
+    }
+  };
+
+  const tree: NestedTreeNode = { ...root, children: [], __source: root, __version: versionOf(root.id) };
   const stack: NestedTreeNode[] = [tree];
   while (stack.length > 0) {
     const node = stack.pop()!;
+    nodeById.set(node.id, node);
     const address = node.address || '1';
     idByAddress[address] = node.id;
     const depth = address.split('-').length;
     depths.add(depth);
     if (depth > maxDepth) maxDepth = depth;
     const childRows = state.index.childrenOf.get(node.id) || [];
-    node.children = childRows.map(cloneNode);
-    for (let i = node.children.length - 1; i >= 0; i -= 1) stack.push(node.children[i]);
+    node.children = new Array<NestedTreeNode>(childRows.length);
+    for (let i = childRows.length - 1; i >= 0; i -= 1) {
+      const child = childRows[i]!;
+      const reused = reuseFor(child);
+      if (reused) {
+        node.children[i] = reused;
+        collectReused(reused);
+      } else {
+        const projected: NestedTreeNode = { ...child, children: [], __source: child, __version: versionOf(child.id) };
+        node.children[i] = projected;
+        stack.push(projected);
+      }
+    }
   }
 
   return {
     tree,
     idByAddress,
+    nodeById,
     depthStats: { maxDepth, depths: [...depths].sort((a, b) => a - b) }
   };
 }

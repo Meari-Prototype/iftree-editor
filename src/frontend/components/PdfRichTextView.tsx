@@ -18,6 +18,9 @@ GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const PDF_SCROLL_TOP_PADDING = 72;
 const PDF_PAGE_EDGE_PADDING = 22;
+// 懒渲染的预取窗口：observer 的 root 就是页栈滚动容器，rootMargin 百分比按 root 高度算，
+// 100% 即上下各多预取一屏——滚动到位前该页已开始 render，正常翻页看不到空白占位。
+const PDF_PAGE_PREFETCH_MARGIN = '100% 0px 100% 0px';
 
 // SourceBlocks 那刀已定 SourceSpanLike 接口；这里复述 PdfRichTextView 实际访问的字段集（含 id），
 // 用本地接口避免和 SourceBlocks 的 export 联动（同样的 IPC 边界形态，字段全 optional）。
@@ -267,6 +270,8 @@ export function PdfRichTextView({
   const [hoverNodeId, setHoverNodeId] = useState<string | number | null>(null);
   const [selection, setSelection] = useState<PdfSelection | null>(null);
   const [gutterCollapsed, setGutterCollapsed] = useState<boolean>(false);
+  // 当前该真正出位图 / 出 DOM 的页码集合，由下方 IntersectionObserver 维护。
+  const [activePages, setActivePages] = useState<Set<number>>(() => new Set<number>());
   const pageStackRef = useRef<HTMLElement | null>(null);
   const gutterRef = useRef<HTMLElement | null>(null);
   const gutterRowRefs = useRef<Map<string, HTMLElement>>(new Map<string, HTMLElement>());
@@ -416,6 +421,42 @@ export function PdfRichTextView({
       width: 595,
       height: 842
     }));
+
+  // 按页懒渲染。全部页壳始终挂在 DOM 里（尺寸按 source_pdf_pages 的真实页宽高 × scale 预留），
+  // 但只有进入视口 ±1 屏的页才 getPage + render、才铺高亮/命中 span。
+  // 一次性全挂时 300 页 = 300 张 744×1052×4B 位图（≈940MB）+ 上万命中 span，渲染进程必卡死；
+  // 占位页壳保证滚动条长度、`[data-page-number]` 锚点与 offsetTop 计算在目标页未渲染时照旧成立，
+  // 所以 scrollPdfToRect / 左右栏联动都不需要等渲染完成。
+  useEffect(() => {
+    const container = pageStackRef.current;
+    if (!container || !pdfDoc) {
+      setActivePages((previous) => (previous.size > 0 ? new Set<number>() : previous));
+      return () => {};
+    }
+    const observer = new IntersectionObserver((entries) => {
+      setActivePages((previous) => {
+        const next = new Set(previous);
+        let changed = false;
+        for (const entry of entries) {
+          const pageNumber = Number((entry.target as HTMLElement).dataset.pageNumber);
+          if (!Number.isFinite(pageNumber) || pageNumber <= 0) continue;
+          if (entry.isIntersecting) {
+            if (!next.has(pageNumber)) {
+              next.add(pageNumber);
+              changed = true;
+            }
+          } else if (next.delete(pageNumber)) {
+            changed = true;
+          }
+        }
+        return changed ? next : previous;
+      });
+    }, { root: container, rootMargin: PDF_PAGE_PREFETCH_MARGIN, threshold: 0 });
+    // 页壳是本次提交刚进 DOM 的，直接查 DOM 比逐页 ref 回调稳：内联 ref 回调每次重渲染都会
+    // 先 null 再给元素，会把 observe/unobserve 抖成每帧一轮。
+    container.querySelectorAll('[data-page-number]').forEach((shell) => observer.observe(shell));
+    return () => observer.disconnect();
+  }, [pdfDoc, pages.length]);
 
   // 取消选中必须连 hover 一起清：再次单击取消时鼠标还停在原句/原行上，
   // hover 高亮不清的话取消前后画面一个像素都不变，看起来就是"取消没生效"。
@@ -609,6 +650,7 @@ export function PdfRichTextView({
             pdfDoc={pdfDoc}
             pageInfo={page}
             scale={scale}
+            active={activePages.has(Number(page.page_number))}
             selectionHighlights={selectionRectsByPage.get(Number(page.page_number)) || []}
             hoverHighlights={hoverRectsByPage.get(Number(page.page_number)) || []}
             hitRects={hitRectsByPage.get(Number(page.page_number)) || []}
@@ -629,6 +671,8 @@ export interface PdfPageViewProps {
   pdfDoc: PDFDocumentProxy;
   pageInfo: PdfPageInfo;
   scale: number;
+  /** 该页是否在预取窗口内：false 时只留占位页壳，不出位图、不出高亮/命中 DOM。 */
+  active?: boolean;
   selectionHighlights?: PdfRect[];
   hoverHighlights?: PdfRect[];
   hitRects?: PdfRect[];
@@ -637,19 +681,35 @@ export interface PdfPageViewProps {
   onHitClick?: (rect: PdfRect) => void;
 }
 
-export function PdfPageView({ pdfDoc, pageInfo, scale, selectionHighlights = [], hoverHighlights = [], hitRects = [], onHitHover, onHitLeave, onHitClick }: PdfPageViewProps) {
+export function PdfPageView({ pdfDoc, pageInfo, scale, active = true, selectionHighlights = [], hoverHighlights = [], hitRects = [], onHitHover, onHitLeave, onHitClick }: PdfPageViewProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pageNumber = Number(pageInfo.page_number);
+  // 渲染成功一次就记住真实 viewport 尺寸，位图卸载后占位仍按它撑高。
+  // source_pdf_pages 存的就是 scale=1 的 viewport 宽高，正常文档占位与实渲染一致；
+  // 这层兜的是没有该记录、占位退回 595×842 的旧文档——否则每次进出预取窗口都抖一次版。
+  const [renderedSize, setRenderedSize] = useState<{ width: number; height: number } | null>(null);
 
   useEffect(() => {
     // pdfjs 的 PDFPageProxy.render 返回 RenderTask；用 ReturnType 取签名免去显式 import RenderTask。
-    type RenderTaskLike = ReturnType<Awaited<ReturnType<PDFDocumentProxy['getPage']>>['render']>;
-    let renderTask: RenderTaskLike | null = null;
-    let cancelled = false;
+    type PdfPageLike = Awaited<ReturnType<PDFDocumentProxy['getPage']>>;
+    type RenderTaskLike = ReturnType<PdfPageLike['render']>;
     const canvas = canvasRef.current;
     if (!canvas || !pdfDoc || !pageNumber) return () => {};
+    if (!active) {
+      // 离开预取窗口：位图必须把 width/height 归零才真正释放 backing store，
+      // 光丢引用或 display:none 都不回收——整本一次性挂载吃掉近 1GB 就是这么来的。
+      canvas.width = 0;
+      canvas.height = 0;
+      canvas.style.width = '';
+      canvas.style.height = '';
+      return () => {};
+    }
+    let renderTask: RenderTaskLike | null = null;
+    let pageProxy: PdfPageLike | null = null;
+    let cancelled = false;
     pdfDoc.getPage(pageNumber).then((page) => {
       if (cancelled) return;
+      pageProxy = page;
       const viewport = page.getViewport({ scale });
       // canvas.getContext('2d', ...) 返回 union RenderingContext；'2d' 实际就是 CanvasRenderingContext2D。
       const context = canvas.getContext('2d', canvas2dContextOptions()) as CanvasRenderingContext2D | null;
@@ -658,54 +718,69 @@ export function PdfPageView({ pdfDoc, pageInfo, scale, selectionHighlights = [],
       canvas.height = Math.ceil(viewport.height);
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
+      setRenderedSize((previous) => (
+        previous && previous.width === viewport.width && previous.height === viewport.height
+          ? previous
+          : { width: viewport.width, height: viewport.height }
+      ));
       renderTask = page.render({ canvas, canvasContext: context, viewport });
       return renderTask.promise;
     }).catch(() => {});
     return () => {
       cancelled = true;
       if (renderTask) renderTask.cancel();
+      // 取消之后再 cleanup：连该页的 operator list / 字体资源一起放掉（官方 viewer 同口径），
+      // 只 cancel 的话位图释放了、pdf.js 侧的页缓存还在。重新进窗口时 pdf.js 会按需重取。
+      if (pageProxy) pageProxy.cleanup();
     };
-  }, [pdfDoc, pageNumber, scale]);
+  }, [pdfDoc, pageNumber, scale, active]);
 
-  const width = Number(pageInfo.width || 595) * scale;
-  const height = Number(pageInfo.height || 842) * scale;
+  const width = renderedSize ? renderedSize.width : Number(pageInfo.width || 595) * scale;
+  const height = renderedSize ? renderedSize.height : Number(pageInfo.height || 842) * scale;
 
   return (
     <div className="pdf-page-shell" data-page-number={pageNumber} style={{ width, minHeight: height }}>
       <canvas ref={canvasRef} className="pdf-page-canvas" />
-      <div className="pdf-highlight-layer">
-        {(selectionHighlights || []).map((rect, index) => (
-          <span
-            key={`sel-${pageNumber}-${index}`}
-            className="pdf-highlight-rect is-selection"
-            style={pdfRectStyle(rect, scale)}
-          />
-        ))}
-        {(hoverHighlights || []).map((rect, index) => (
-          <span
-            key={`hover-${pageNumber}-${index}`}
-            className="pdf-highlight-rect"
-            style={pdfRectStyle(rect, scale)}
-          />
-        ))}
-      </div>
-      <div className="pdf-hit-layer">
-        {(hitRects || []).map((rect, index) => (
-          <span
-            key={`${pageNumber}-${rect.span_id || rect.sentence_index}-${index}`}
-            role="button"
-            tabIndex={-1}
-            className="pdf-hit-rect"
-            style={pdfRectStyle(rect, scale)}
-            onMouseEnter={() => onHitHover?.(rect)}
-            onMouseLeave={() => onHitLeave?.()}
-            onClick={(event) => {
-              event.stopPropagation();
-              onHitClick?.(rect);
-            }}
-          />
-        ))}
-      </div>
+      {/* 高亮层与命中层同样按页挂：整本文档的命中矩形一次铺成 DOM 就是上万 span，
+          选中父节点时高亮矩形是同一量级。窗口外的 span 既看不见也点不着，不必存在；
+          rects 本身一直在 state 里，页一进窗口这一帧就补上，不用等 canvas 渲完。 */}
+      {active ? (
+        <>
+          <div className="pdf-highlight-layer">
+            {(selectionHighlights || []).map((rect, index) => (
+              <span
+                key={`sel-${pageNumber}-${index}`}
+                className="pdf-highlight-rect is-selection"
+                style={pdfRectStyle(rect, scale)}
+              />
+            ))}
+            {(hoverHighlights || []).map((rect, index) => (
+              <span
+                key={`hover-${pageNumber}-${index}`}
+                className="pdf-highlight-rect"
+                style={pdfRectStyle(rect, scale)}
+              />
+            ))}
+          </div>
+          <div className="pdf-hit-layer">
+            {(hitRects || []).map((rect, index) => (
+              <span
+                key={`${pageNumber}-${rect.span_id || rect.sentence_index}-${index}`}
+                role="button"
+                tabIndex={-1}
+                className="pdf-hit-rect"
+                style={pdfRectStyle(rect, scale)}
+                onMouseEnter={() => onHitHover?.(rect)}
+                onMouseLeave={() => onHitLeave?.()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onHitClick?.(rect);
+                }}
+              />
+            ))}
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }

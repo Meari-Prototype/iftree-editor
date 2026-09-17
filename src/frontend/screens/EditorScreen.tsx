@@ -77,6 +77,7 @@ export function EditorScreen() {
         <Inspector
           currentDoc={currentDoc}
           selectedNode={selection.selectedNode}
+          selectedNodeId={selection.selectedNodeId}
           runWrite={editor.dispatchWrite}
           selectNode={treeViewCommands.selectNodeAndOpenTree}
           canEdit={misc.treeEditMode}

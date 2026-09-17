@@ -230,11 +230,20 @@ function shouldRouteToEditBranch(action: string): boolean {
   return false;
 }
 
+// docIdForMutationPayload 不认 branchId，而 db-shell `--branch` 只往 payload 写 branchId——闸门拿不到
+// docId 就直接放行，`--branch` 于是成了绕过编辑模式的后门。这里按分支反查它的 base_doc_id 补上判定依据。
+function docIdFromBranchPayload(store: MutationStore, payload: MutationPayload): unknown {
+  const branchId = payload.branchId ?? payload.branch_id ?? null;
+  if (branchId === null || branchId === undefined || branchId === '') return null;
+  const branch = store.findEditBranch({ branchId }) as EditBranchRow | null;
+  return branch?.base_doc_id ?? null;
+}
+
 // 编辑模式互斥（projectneed 4-16-8）：增量编辑（流式写入）文档拒绝分支编辑/合并；只读文档拒绝一切编辑。
 // 流式写入自身（stream.push）的模式校验在 store.pushStreamNodes 内（含首推自建文档）。
 function guardEditMode(store: MutationStore, action: string, payload: MutationPayload): void {
   if (!(shouldRouteToEditBranch(action) || action.startsWith('editBranch.'))) return;
-  const docId = store.docIdForMutationPayload(payload);
+  const docId = store.docIdForMutationPayload(payload) || docIdFromBranchPayload(store, payload);
   if (!docId) return;
   const mode = store.getDocEditMode(docId);
   if (mode === 'incremental' || mode === 'readonly') {
@@ -462,6 +471,35 @@ async function maintainDerivedIndexAfterWrite(
   }
 }
 
+// Merkle 哈希缓存物化（nodes.content_hash/subtree_hash + docs.nodes_hash_dirty）：这三列的唯一写入者是
+// store.ensureNodeHashes，而它的回写包在 `if (!this.readonly)` 里——读 handler 一律跑在 readonly 连接上
+// （headless-agent-host 的 query 连接），在那里调只拿到计算结果、永远不落盘。所以物化必须发生在写连接上，
+// 即这里的写分发收尾：否则派生索引对账的 `nodes_hash_dirty = 0` 快筛永不命中、每次就绪判定都退全量对账。
+// 增量：节点级失效触发器已把脏行的两列置 NULL，ensureNodeHashes 只补 NULL 行；大文档首次（新导入 /
+// 旧库）仍是全量 O(N)。better-sqlite3 同步，整段不含 await、不会与队列里的其它写交错。
+function materializeNodeHashes(store: MutationStore, action: string, result: MutationResult | null): void {
+  if (!result || result.changed === false || result.applied === false) return;
+  // 维护口径跟着派生索引走（同一批动作、同一条支路）：改了 nodes 的动作才物化，
+  // doc.delete（节点已没了）/ doc.refreshAddresses（address 不在 merkle 五字段内）无需物化。
+  let docIds: unknown[] = [];
+  if (action === 'stream.bulkEnd') {
+    docIds = Array.isArray(result.touchedDocIds) ? result.touchedDocIds : [];
+  } else if (action === 'stream.push') {
+    if (store?.hasActiveBulkImport?.()) return; // bulk 中：留 bulkEnd 统一物化
+    docIds = [result.docId];
+  } else if (KEYWORD_REBUILD_ACTIONS.has(action)) {
+    docIds = [result.docId ?? result.baseDocId ?? null];
+  }
+  for (const docId of docIds) {
+    if (!docId) continue;
+    try {
+      store.ensureNodeHashes(docId);
+    } catch {
+      // 物化失败不阻塞写返回：哈希是可再算的缓存，读侧 ensureNodeHashes 仍会现算返回正确结果。
+    }
+  }
+}
+
 // store 容 null：mutation.actions 不落库（database-service 传 null），其余 action 由 requireStore
 // 断言拦下——这是真签名，不再靠调用侧 as unknown 洗宽（§6-10）。
 export async function runDatabaseWrite(
@@ -520,10 +558,16 @@ export async function runDatabaseWrite(
   // 避免 merge/save 等大文档操作的维护耗时阻塞写返回、超出 MCP 客户端超时窗口
   // （主库事务已提交，客户端不知成功会重试 → 幂等灾难）。维护失败非致命：关键词
   // 可重建、检索入口有缺失补建兜底。stream/delete/refreshAddresses 保持同步。
+  // 哈希物化跟派生索引维护同支路：两者对大文档同为 O(N)（BM25 整篇重建 / 全树 merkle 重算），
+  // 放同步收尾会一起把 merge/save 的写返回拖过 MCP 客户端超时窗口——那正是这条 fire-and-forget
+  // 支路存在的理由。排在维护之后跑：维护的首个 await 已让出，写回执先发出去，再做这段同步重活。
   if (KEYWORD_REBUILD_ACTIONS.has(action)) {
-    maintainDerivedIndexAfterWrite(ctx, store, action, result).catch(() => {});
+    maintainDerivedIndexAfterWrite(ctx, store, action, result)
+      .then(() => materializeNodeHashes(store, action, result))
+      .catch(() => {});
   } else {
     await maintainDerivedIndexAfterWrite(ctx, store, action, result);
+    materializeNodeHashes(store, action, result);
   }
   // derivedSync 是给派生索引维护的内部 hint（merge/save 的受影响节点集），不进响应。
   // fire-and-forget 路径：maintainDerivedIndexAfterWrite 在首个 await 前同步读取了

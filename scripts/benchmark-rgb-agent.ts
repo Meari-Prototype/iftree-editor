@@ -1,9 +1,13 @@
 #!/usr/bin/env node
+// RGB 检索问答召回压测：按测试卡逐题跑 agent.run，统计答案/证据节点/读正文三条召回率。
+// 接后端走共享后端（18-6-1 / ARCHITECTURE §1）——压测的就是真实那条路径（内置 agent 住在
+// 共享 host 里，与 MCP、GUI 同一套动作面）；另起私有 host 既是第二个写者，量出来的也不是
+// 线上形态。代价是耗时数字会被同时在线的 GUI/MCP 请求干扰，要干净数字就先让它们闲下来。
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createHeadlessAgentClient } from '../src/backend/llm/headless-agent-client.js';
+import { createBackendClient } from '../src/backend/llm/backend-client.js';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -70,15 +74,14 @@ interface BenchmarkReport {
   results: RunCaseResult[];
 }
 
-type HeadlessAgentClient = ReturnType<typeof createHeadlessAgentClient>;
+type BackendClient = ReturnType<typeof createBackendClient>;
 
 function printHelp(): void {
   console.log([
-    'Usage:',
-    '  $env:ELECTRON_RUN_AS_NODE = \'1\'',
-    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --ids 5-10',
-    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --limit 20 --offset 0',
-    '  .\\node_modules\\.bin\\electron.cmd scripts/benchmark-rgb-agent.mjs --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --all',
+    'Usage (host 恒 node ABI，本脚本自己跑什么 runtime 无关)：',
+    '  node dist/scripts/benchmark-rgb-agent.js --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --ids 5-10',
+    '  node dist/scripts/benchmark-rgb-agent.js --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --limit 20 --offset 0',
+    '  node dist/scripts/benchmark-rgb-agent.js --doc-id 019e8e89-e1b6-72eb-b5d7-3fdc239b6e86 --testcard <path> --all',
     '',
     'Options:',
     '  --doc-id <id>          Imported corpus doc id.',
@@ -341,15 +344,15 @@ async function exitProcess(code: number): Promise<void> {
   process.exit(code);
 }
 
-async function runCase(client: HeadlessAgentClient, item: BenchmarkCase, options: BenchmarkCliOptions): Promise<RunCaseResult> {
-  const result = await client.request('agent.run', {
-    payload: {
-      mode: 'qa',
-      docId: options.docId,
-      contextDepth: options.contextDepth,
-      prompt: item.query,
-      agentApiId: options.apiId || undefined
-    }
+async function runCase(client: BackendClient, item: BenchmarkCase, options: BenchmarkCliOptions): Promise<RunCaseResult> {
+  // agent.run 属非幂等动词：连接层中断时 SDK 不自动重发（重跑会重复计费的 LLM 调用），
+  // 错误直接冒到 main 终止本轮压测——半截的召回率不如不出。
+  const result = await client.runAgent({
+    mode: 'qa',
+    docId: options.docId,
+    contextDepth: options.contextDepth,
+    prompt: item.query,
+    agentApiId: options.apiId || undefined
   }) as AgentRunResult;
   const answer = String(result.answer || '');
   const evidenceNodes = evidenceNodeAddresses(answer);
@@ -377,10 +380,12 @@ async function main(): Promise<void> {
   }
   if (!options.testcard) throw new Error('--testcard 未传入（parseArgs 应已校验）');
   const cases = selectCases(readTestcard(options.testcard), options);
-  const client = createHeadlessAgentClient({
-    cwd: PROJECT_ROOT,
-    scriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
-    onStderr: (text: string) => process.stderr.write(text)
+  const client = createBackendClient({
+    projectRoot: PROJECT_ROOT,
+    hostScriptPath: join(PROJECT_ROOT, 'dist', 'scripts', 'agent-host.js'),
+    mode: 'shared',
+    onStderr: (text: unknown) => { process.stderr.write(String(text ?? '')); },
+    onStatus: (text: unknown) => { process.stderr.write(String(text ?? '')); }
   });
   const results: RunCaseResult[] = [];
   try {
@@ -392,7 +397,9 @@ async function main(): Promise<void> {
       }
     }
   } finally {
-    await client.shutdown();
+    // 只断本连接：压测跑完不能把 GUI/MCP 也在用的共享后端关掉（它还攥着别人的会话与索引缓存）。
+    // mode !== 'pipe' 才 shutdown——那是拉不起共享后端时回退出来的私有兜底 host。
+    if (client.mode !== 'pipe') await client.shutdown();
     client.close();
   }
   const total = results.length;

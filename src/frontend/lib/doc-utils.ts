@@ -524,12 +524,12 @@ export function buildDocBrowser(folders: DocBrowserFolder[] = [], docs: DocListI
 }
 
 export function normalizeFsPath(value: unknown = ''): string {
-  return String(value || '').replace(/\\/g, '/').toLocaleLowerCase();
+  return String(value || '').replace(/\\/g, '/').toLowerCase();
 }
 
 export function isSupportedLibraryImport(item: LibraryItem | null | undefined): boolean {
   if (!item || item.type !== 'file') return true;
-  return SUPPORTED_LIBRARY_IMPORT_EXTENSIONS.has(String(item.extension || '').toLocaleLowerCase());
+  return SUPPORTED_LIBRARY_IMPORT_EXTENSIONS.has(String(item.extension || '').toLowerCase());
 }
 
 export function docSourcePath(doc: DocLike | null | undefined): string {
@@ -556,7 +556,7 @@ export function docDisplayTitle(doc: DocLike | null | undefined): string {
   const title = String(doc?.title || '').trim();
   const extension = fileExtensionFromPath(docSourcePath(doc));
   if (!title) return fileNameFromPath(docSourcePath(doc)) || '';
-  if (extension && !title.toLocaleLowerCase().endsWith(extension.toLocaleLowerCase())) {
+  if (extension && !title.toLowerCase().endsWith(extension.toLowerCase())) {
     return `${title}${extension}`;
   }
   return title;
@@ -568,9 +568,9 @@ export function libraryCollapseKey(relativePath: string = ''): string {
 
 export function filterLibraryTree(item: LibraryItem | null | undefined, query: unknown): LibraryItem | null {
   if (!item) return null;
-  const trimmed = String(query || '').trim().toLocaleLowerCase();
+  const trimmed = String(query || '').trim().toLowerCase();
   if (!trimmed) return item;
-  const ownMatch = String(item.name || '').toLocaleLowerCase().includes(trimmed);
+  const ownMatch = String(item.name || '').toLowerCase().includes(trimmed);
   if (item.type !== 'folder') return ownMatch ? item : null;
   const children = (item.children || [])
     .map((child) => filterLibraryTree(child, trimmed))

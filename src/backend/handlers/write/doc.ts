@@ -65,7 +65,11 @@ export async function handleDocMutation(store: IftreeStore, payload: WritePayloa
       title,
       rootText: payload.rootText ?? payload.root_text ?? title,
       meta: payload.meta ?? null,
-      folderId: payload.folderId ?? payload.folder_id ?? null
+      folderId: payload.folderId ?? payload.folder_id ?? null,
+      // skipInitialCommit：建文档时先不立初始 commit，留给调用方在内容落齐后自己建（导入路径在用）。
+      // 刚建出来的文档只有一个空根、没有源文档层，此刻的快照就是「空文章」——把它留在历史里，
+      // 用户回退到初始版本等于把文章删空、连 source 行一起静默删掉。默认 false 保持既有行为。
+      skipInitialCommit: (payload.skipInitialCommit ?? payload.skip_initial_commit) === true
     });
     const doc = maybeRefreshDoc(store, ctx, created.id, payload.refreshOptions || {});
     return docRefresh(action, created.id, { doc, created: plain(created), sideEffects: effects });
@@ -161,6 +165,9 @@ export async function handleDocMutation(store: IftreeStore, payload: WritePayloa
       = result as Record<string, unknown>;
     return docRefresh(action, result.baseDocId, {
       ...resultForResponse,
+      // blocked/conflicts 分支返回 applied:false 且不带 changed，会被 docRefresh 的默认 changed:true 盖住，
+      // 回执成了「合并被拒但文档已改」。显式按 applied 表述，别让调用方按 changed 去刷新/重试。
+      changed: result.applied !== false,
       doc,
       sideEffects: effects,
       derivedSync: { touchedNodeIds, deletedNodeIds, vectorStaleNodeIds }
@@ -212,6 +219,8 @@ export async function handleDocMutation(store: IftreeStore, payload: WritePayloa
       = result as Record<string, unknown>;
     return docRefresh(action, result.baseDocId, {
       ...resultForResponse,
+      // 同 applyMerge：blocked/conflicts 的 applied:false 不带 changed，默认 changed:true 会谎报「已保存」。
+      changed: result.applied !== false,
       history: plain(resultHistory),
       doc,
       sideEffects: effects,
@@ -336,6 +345,8 @@ export async function handleStreamMutation(store: IftreeStore, payload: WritePay
     // 首推新建守卫：push 省略 docId 会新建无源文件锚的文档，library_index 按文件系统匹配找不到它。
     // 要往库里新增文档请用 import（自动建锚）；要往已有文档追加内容请传 docId。记忆卷投递（memory_deliver /
     // appendSessionTurn）自己建卷后带 docId 调进来，不受此守卫影响。
+    // 智能导入（import-json）也不豁免：它自己 doc.create（meta.sourcePath 当场写锚）再往该 docId 推，
+    // 顶层地址 1-1… 正好落在新建根（address '1'）下，地址零偏移——守卫无需为它开口子。
     const resolvedDocId = payload.docId ?? payload.doc_id ?? null;
     if (resolvedDocId == null || resolvedDocId === '') {
       throw new Error('push 不允许省略 docId 新建文档（新建的文档无源文件锚，library_index 不可见）。要新增文档请用 import；要往已有文档追加内容请传 docId。');

@@ -167,6 +167,13 @@ export class IftreeStore {
     if (!readonly) mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new Database(this.dbPath, readonly ? { readonly: true, fileMustExist: true } : undefined);
     this.conn.pragma('busy_timeout = 5000');
+    // 常驻层（frontend-refactor §5.1）：页缓存 + mmap 让热数据驻后端 RAM，IPC 回源不碰盘。
+    // 在 readonly 分支 return 之前设——GUI/MCP 的全部读都走只读连接，它是最该配缓存的连接。
+    // cache_size 负值 = KB；256MB 与 bulk 导入的 1GB 相比取保守档（多连接各自持有一份）。
+    // mmap_size 是上限而非占用，按库实际大小映射；WAL 模式与 mmap 读取兼容。
+    this.conn.pragma('cache_size = -262144');
+    this.conn.pragma('temp_store = MEMORY');
+    this.conn.pragma('mmap_size = 4294967296');
     // 正文字数 UDF：与 JS 侧 bodyCharCount 同源，供读层聚合（library_index / 子树合计）按「忽略空白」口径计数，
     // 使切分粒度（simple/complete）不影响字数。只读连接也注册（library_index 等走只读读取也要它）。
     this.conn.function('body_char_count', { deterministic: true }, (value: unknown) => bodyCharCount(value));
@@ -186,10 +193,42 @@ export class IftreeStore {
     // 缺列时建触发器会失败；全新库表还不存在，ensureColumn 内部 catch 吞掉后由建表语句带上该列。
     // 加列即全 NULL = 首次全量写树，之后增量（对象树 hash 缓存，快照/undo token 剪枝依据）。
     this.ensureColumn('nodes', 'tree_object_hash', 'TEXT');
+    // 同理：span 归属脏位触发器（DROP+CREATE）引用 docs.span_map_dirty，缺列时建触发器会失败。
+    // 加列即 dirty=1 / hash=NULL = 下次写快照全量扫一遍归属，之后靠触发器维护脏位。
+    this.ensureColumn('docs', 'span_map_hash', 'TEXT');
+    this.ensureColumn('docs', 'span_map_dirty', 'INTEGER NOT NULL DEFAULT 1');
+    // commits 的 span 归属指针：旧行留 NULL（旧库不兼容、不修复——restore 时退回现行行为）。
+    this.ensureColumn('commits', 'span_map_hash', 'TEXT');
     this.conn.exec(TABLES_SQL);
+    this._migrateObjectKindCheck();
     this._migrateEditBranchEntriesToTable();
     this.applySchemaVersion();
     this.domainPorts.lifecycle?.afterStoreInit(this);
+  }
+
+  // 一次性重建 objects 表，只为把 kind 的 CHECK 从 ('blob','tree','source') 放宽到含 'spanmap'
+  // （SQLite 不能 ALTER 一个 CHECK 约束，只能重建）。objects 没有索引、没有任何外键指向它，
+  // 重建 = 建新表 + 整表搬 + 换名。幂等：直接读 sqlite_master 里的建表 SQL，已含 'spanmap' 就跳过
+  // （半途中断重启安全——整段在一个事务里，要么旧表原封不动、要么新表就位）。
+  _migrateObjectKindCheck() {
+    if (!this.hasTable('objects')) return;
+    const row = this.conn.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'objects'"
+    ).get<{ sql: string | null }>();
+    const createSql = String(row?.sql || '');
+    if (createSql.length === 0 || createSql.includes('spanmap')) return;
+    this.withTransaction(() => {
+      this.conn.exec(`
+        CREATE TABLE objects_kind_migration (
+          hash TEXT PRIMARY KEY,
+          kind TEXT NOT NULL CHECK(kind IN ('blob', 'tree', 'source', 'spanmap')),
+          data TEXT NOT NULL
+        );
+        INSERT INTO objects_kind_migration (hash, kind, data) SELECT hash, kind, data FROM objects;
+        DROP TABLE objects;
+        ALTER TABLE objects_kind_migration RENAME TO objects;
+      `);
+    });
   }
 
   // 一次性搬迁：把还整包躺在 edit_branches.diff 里的 entries 搬进子表（storage: entries_table），
@@ -268,6 +307,8 @@ export class IftreeStore {
   // 读时惰性补算 base 文档的 Merkle 哈希缓存（nodes.content_hash/subtree_hash 列）。
   // doc 未脏 → 直接读列；脏（编辑过 / 新导入 / 旧库迁移）→ 整树重算并回写、清脏标记（即「必要时整树重算」）。
   // 返回 Map<id,{contentHash,subtreeHash}> 供 diff 当 base 侧用，免去每个 session 重算整个 base。
+  // 落盘时机：读一律走 readonly 连接，下面的回写被 `!this.readonly` 挡掉、只返回计算结果；
+  // 真正的物化发生在写连接的写分发收尾（mutation-api 的 materializeNodeHashes）。
   ensureNodeHashes(docId: unknown) {
     // 结构行不拉正文：脏行（hash 为 NULL，节点级失效触发器置的）才补拉 5 个内容字段。
     const structureRows = this.conn.prepare(

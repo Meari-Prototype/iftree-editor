@@ -9,9 +9,9 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![status](https://img.shields.io/badge/status-0.6.6%20alpha-orange)
+![status](https://img.shields.io/badge/status-0.6.7%20alpha-orange)
 
-> **Project status: 0.6.6, early development.** The project is under active development; treat it as an early release:
+> **Project status: 0.6.7, early development.** The project is under active development; treat it as an early release:
 >
 > - **Frontend**: still has a number of known, unfixed bugs.
 > - **Backend write path**: lacks long-term real-world testing — the project is young, so there simply hasn't been enough accumulated runtime yet.
@@ -65,7 +65,7 @@ In-depth documentation lives in `docs/` (currently in Chinese):
 
 ## Features
 
-- **Precise retrieval**: keyword search + local semantic search based on `bge-m3`, with sentence-level offset mapping, locating a hit to specific sentences; WebGPU/fp16 inference by default, switchable to CPU.
+- **Precise retrieval**: keyword search + local semantic search based on `bge-m3`, with sentence-level offset mapping, locating a hit to specific sentences; GPU (DirectML)/fp16 inference by default, switchable to CPU.
 - **Evidence-based answers**: when answering factual questions, the built-in agent reads textual evidence and gives the evidence node address, rather than answering from the model's general knowledge or the wording of the question; results are verifiable.
 - **Local-first storage**: documents, nodes, axioms, ERRORs, references, and history live in SQLite; node-level semantic vectors live in LanceDB — usable with no cloud service.
 - **Agent collaboration & MCP**: the built-in agent and the MCP server share one permission tiering (Q&A / collaborate / full); external agent frameworks can search and read evidence, and any write from the collaborate tier up goes into an edit branch awaiting human review. The LLM layer supports both OpenAI-compatible and Anthropic-compatible APIs.
@@ -96,7 +96,7 @@ In-depth documentation lives in `docs/` (currently in Chinese):
 | UI | React 19 + Vite 7 |
 | Local database | better-sqlite3 |
 | Vector database | LanceDB |
-| Semantic vectors | @huggingface/transformers (`bge-m3`, WebGPU/ONNX) |
+| Semantic vectors | @huggingface/transformers (`bge-m3`, ONNX Runtime, GPU via DirectML) |
 | Agent / tool protocol | @modelcontextprotocol/sdk (MCP) |
 | Others | pdfjs-dist, fflate, lucide-react, @radix-ui |
 
@@ -105,7 +105,7 @@ In-depth documentation lives in `docs/` (currently in Chinese):
 - **OS**: Windows 10 / 11 (development and verification are done on Windows; scripts are mainly PowerShell).
 - **Node.js**: 20 LTS or newer recommended (verified on Node 24). Native modules (better-sqlite3) are prebuilt for the **node ABI** (downloaded via `prebuild-install`, no build toolchain needed); tests, CLI, MCP, and the backend all run on plain node (see [Development & Testing](#development--testing) for the ABI note).
 - **Package manager**: npm.
-- **GPU (optional)**: a WebGPU-capable GPU accelerates semantic vectors; without WebGPU you can switch to CPU on the settings page.
+- **GPU (optional)**: a DirectX 12 capable GPU accelerates semantic vectors through DirectML; without a usable GPU, switch to CPU on the settings page.
 
 ## Quick Start
 
@@ -190,10 +190,10 @@ The original Markdown reading source is stored in SQLite's `source_documents` / 
 ## Semantic Vectors
 
 - The default model is `Xenova/bge-m3` (Transformers.js ONNX weights of `BAAI/bge-m3`); the database dimension is derived from the current model and strictly validated.
-- Inference runs in a module worker pool in the renderer process: the GPU config uses `device: 'webgpu'`, the CPU config uses `device: 'wasm'`, with 2 workers and batches of 16 texts by default.
+- Local inference runs in the backend node process with Transformers.js: the GPU config uses `device: 'dml'` (DirectML), the CPU config uses `device: 'cpu'`. Batches hold 16 texts, and by default 4 batches run concurrently per document (the worker count in settings).
 - The settings page lets you switch the model, compute target (GPU/CPU), worker count, batch size, and local ONNX model path, and offers a manual download button for the current model.
-- The local model path is served to the worker via a read-only `127.0.0.1` file service started by the main process; the directory can be the model root or a specific model directory containing `config.json`.
-- Switching models drops the old LanceDB table to avoid mixing same-dimension vectors from different models.
+- The local model path is used directly as the Transformers.js local model root; when a local path is set, models are not fetched remotely.
+- Saving a different model, dimension, or local model path on the settings page drops the old LanceDB table. Vectors are not rebuilt automatically; re-run vector building for the documents you want to search semantically. Switching models through the `IFTREE_EMBED_*` environment variables does not drop the table, so same-dimension vectors from both models end up mixed; rebuild manually in that case (see the [how-to guide](docs/how-to.md#构建语义向量)).
 
 ## Import & Export
 

@@ -123,6 +123,24 @@ test('ours 删父、theirs 在其下新增 → __parent__ 结构冲突（只报�
   assert.equal(out.conflicts.filter((c) => c.field === '__parent__').length, 1);
 });
 
+// 对称方向：revertCommit 里 base=被撤 commit C、theirs=C 的父版本，C 新建的父在 theirs 侧压根不存在，
+// ours（当前主干）之后挂在它下面的节点就是孤儿——只查 theirs 时这一支漏到写回才炸（unresolved node parents）。
+test('theirs 删父、ours 在其下新增 → __parent__ 结构冲突（对称方向，只报孤儿链顶端）', () => {
+  const theirs = base().filter((x) => x.id !== 'b'); // theirs 侧无 b
+  const ours = [...base(), n('o1', 'b', '新增1'), n('o2', 'o1', '新增2')]; // 主干在 b 下挂链
+  const { byId, out } = resolve(base(), ours, theirs);
+  assert.equal(out.hasConflicts, true);
+  assert.equal(byId.get('b').resolution, 'deleted', 'b 本身仍是接受删除');
+  const r = byId.get('o1');
+  assert.equal(r.resolution, 'conflict');
+  assert.equal(r.kind, 'parent-deleted');
+  assert.equal(r.conflicts[0].field, '__parent__');
+  assert.equal(r.conflicts[0].ours, 'b');
+  assert.equal(r.conflicts[0].theirs, 'deleted');
+  assert.equal(byId.get('o2').resolution, 'added-ours', 'o2 的父由主干新建 → 不重复报');
+  assert.equal(out.conflicts.filter((c) => c.field === '__parent__').length, 1);
+});
+
 test('ours 删父、theirs 把已有节点移入其下 → __parent__ 结构冲突', () => {
   const ours = base().filter((x) => x.id !== 'b'); // 主干删 b
   const theirs = base().map((x) => (x.id === 'a' ? { ...x, parent_id: 'b' } : x)); // 分支把 a 移到 b 下

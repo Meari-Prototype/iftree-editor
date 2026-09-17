@@ -352,6 +352,26 @@ function assertExistingEntityInBranchDoc(store: EntityStore, branch: EditBranchR
   assertBranchDoc(branch, entity.doc_id);
 }
 
+// 改名撞 UNIQUE(doc_id, normalized_literal)（db/schema.ts）要在 stage 当场挡：
+// entry 落进分支后，commit 重放走的是裸 UPDATE（applyEntityEntry 的 entity.update），撞约束抛
+// SQLITE_CONSTRAINT 会让整批 entry 一起失败，而用户既看不出是哪条、也没法单独撤掉那条 entry 自愈。
+function assertEntityLiteralAvailable(
+  store: EntityStore,
+  branch: EditBranchRow,
+  literal: string,
+  normalizedLiteral: string,
+  selfRef: unknown
+): void {
+  // tmp id（分支内新建、尚无库内行）normalize 不出 id：排除项留空，等价于「不排除任何已存在实体」。
+  const selfId = normalizePositiveInteger(selfRef) ?? '';
+  const clash = store.db!
+    .prepare('SELECT id FROM entities WHERE doc_id = ? AND normalized_literal = ? AND id <> ?')
+    .get<Pick<EntityRow, 'id'>>(branch.base_doc_id, normalizedLiteral, selfId);
+  if (clash) {
+    throw new Error(`同文档已存在同名实体「${literal}」（entity ${clash.id}）；请改用其它名字或先合并两者`);
+  }
+}
+
 export function stageEntityWrite(
   store: EntityStore,
   branch: EditBranchRow,
@@ -394,11 +414,13 @@ export function stageEntityWrite(
     if (entityId === null || entityId === undefined || entityId === '') throw new Error('entity.update requires entityId');
     assertExistingEntityInBranchDoc(store, branch, entityId);
     const literal = requireLiteral(payload);
+    const normalizedLiteral = normalizeEntityKey(literal);
+    assertEntityLiteralAvailable(store, branch, literal, normalizedLiteral, entityId);
     return stagedResult(store, branch, action, {
       kind: 'entity.update',
       entity_ref: String(entityId),
       literal,
-      normalized_literal: normalizeEntityKey(literal)
+      normalized_literal: normalizedLiteral
     });
   }
 
@@ -627,7 +649,7 @@ export function tryApplyEntityEntry(store: EntityStore, entry: unknown, ctx: App
 
 export function applyEntityEntry(store: EntityStore, entry: EntityEntry, ctx: ApplyEntityEntryCtx): void {
   const { resolveEntityId, resolveNodeId, entityIdByTmp, baseDocId } = ctx;
-  const normalizeKey = (value: unknown = ''): string => String(value || '').trim().toLocaleLowerCase();
+  const normalizeKey = (value: unknown = ''): string => String(value || '').trim().toLowerCase();
   const orderedPair = (left: unknown, right: unknown): [string, string] => {
     const leftId = resolveEntityId(left);
     const rightId = resolveEntityId(right);

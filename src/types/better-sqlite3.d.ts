@@ -7,6 +7,8 @@ declare module 'better-sqlite3' {
     all<T = SqliteRow>(...params: unknown[]): T[];
     get<T = SqliteRow>(...params: unknown[]): T | undefined;
     run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
+    // 流式迭代：逐行产出（与 all 同执行计划、同顺序），大结果集不进 JS 堆。读路径专用。
+    iterate<T = SqliteRow>(...params: unknown[]): IterableIterator<T>;
   }
 
   export interface DatabaseOptions {

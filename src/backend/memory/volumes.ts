@@ -33,6 +33,19 @@ export function assertMemoryVolumeDeleteAllowed(store: MemoryPolicyStore, docId:
   }
 }
 
+// 封卷后不可再离开 readonly（projectneed 15-10-1 封卷不可变）：sealDueMemoryVolumes / markDistilled
+// 把卷落成 readonly + meta.sealedAt，两者恒同时写——所以「有 sealedAt」就是「已物理封卷」的权威标志。
+// 没有这道闸，MCP set_mode 把卷改回 full/incremental 就能改写已封卷，封卷形同虚设。
+// 判物理 sealedAt 而不判逻辑封卷态：写入口要的是确定性判定，逻辑态还要读 nodes 时间戳、且本就
+// 由列卷时的 sealDueMemoryVolumes 负责落地。
+export function assertMemoryVolumeEditModeAllowed(store: MemoryPolicyStore, docId: unknown, nextMode: string): void {
+  if (nextMode === 'readonly') return;
+  const doc = store.db.prepare('SELECT meta FROM docs WHERE id = ?').get<{ meta: string | null }>(docId);
+  const volume = memoryVolumeMetaOf(doc?.meta);
+  if (!volume || !volume.sealedAt) return;
+  throw new Error(`记忆卷已封卷、不可改回可写模式（projectneed 15-10-1）：${docId}（封卷时间 ${volume.sealedAt}）`);
+}
+
 export function validateMemoryVolumeStreamPush(store: MemoryPolicyStore, docId: unknown, nodes: unknown): void {
   const doc = store.db.prepare('SELECT meta FROM docs WHERE id = ?').get<{ meta: string | null }>(docId);
   if (!memoryVolumeMetaOf(doc?.meta)) return;

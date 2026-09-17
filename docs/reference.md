@@ -6,7 +6,7 @@
 
 ## MCP server
 
-- 启动：`npm run mcp`（等价于 `node dist/src/mcp/mcp-server.js`；旧路径 `dist/scripts/mcp-server.js` 是兼容垫片、继续可用），stdio 传输。
+- 启动：`npm run mcp`（用 Electron 运行 `dist/src/mcp/mcp-server.js`；纯 node 环境用 `npm run mcp:node`，等价于 `node dist/src/mcp/mcp-server.js`；旧路径 `dist/scripts/mcp-server.js` 是兼容垫片、继续可用），stdio 传输。
 - 权限档由启动时的环境变量 `IFTREE_MCP_TIER` 决定，运行中不可切换：
 
 | 取值 | 档位 | 可见工具 |
@@ -33,7 +33,7 @@
 | `sql` | 只读 SQL 调试查询（仅 SELECT / WITH，readonly 连接校验） |
 | `memory_volumes` | 列记忆卷及状态（active → sealed → distillable → distilled，附时间元数据） |
 | `ask_agent` | 问内置文档智能体（A2A）：自己检索、读证据、附地址回答；`sessionId` 多轮续接 |
-| `restart_backend` | 重启 MCP 持有的后端子进程（更新代码 / 原生模块后用） |
+| `restart_backend` | 强制重启共享后端（更新代码 / 原生模块后用）。各档可见；共享后端由应用、MCP、CLI 共用，重启会中断它们正在进行的请求，下次调用时自动重新拉起 |
 
 ### 写入工具（`edit` / `full` / `human` 档）
 
@@ -65,7 +65,7 @@
 | `memory_distill` | 标记记忆卷已提炼（提炼=人审地界；原 memory_admin 的 mark_distilled；seal 已自动化、不再设动词） |
 | `revert` | 反向提交：撤销某次已落 commit 的改动、生成反向变更并保留其后历史（区别于 `restore` 的 reset 回滚）；三方调和，撞冲突 blocked 交人裁 |
 | `web_search` | 联网检索（只读）：对齐通用 web_search，带 URL 校验与内网拦截，给 query 返回搜索结果 |
-| `gc_objects` | 对象库垃圾回收（mark-sweep）：回收不被任何 commit 引用的历史对象（blob/tree/source）；reset/revert 跳过的 commit 仍保其对象（可后悔窗口）。不在写热路径、手动跑 |
+| `gc_objects` | 对象库垃圾回收（mark-sweep）：回收不被任何 commit 引用的历史对象（blob/tree/source/spanmap）；reset/revert 跳过的 commit 仍保其对象（可后悔窗口）。不在写热路径、手动跑 |
 | `certify`（仅 `human` 档） | 节点级背书：把节点 / 子树标受控——受控内容的唯一合法来源，owner 恒 human 进历史；`scope=node/subtree`、`trust=不受控` 撤销背书；定位给 `nodeId` 或 `address` |
 
 ## db 命令契约
@@ -164,7 +164,7 @@ JSON 结构与 `db push` 同构：
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | 显式 DeepSeek 命名，与 OPENAI_* 同在时优先 |
 | `OLLAMA_BASE_URL` | Ollama 本地服务地址 |
 | `IFTREE_AGENT_BASE_URL` / `IFTREE_AGENT_MODEL` / `IFTREE_AGENT_API_KEY` | 内置问答 agent 直连模型（覆盖摘要默认，缺省复用 `OPENAI_*`）；`IFTREE_AGENT_TIMEOUT_MS` 单轮超时默认 45s |
-| `IFTREE_EMBED_BACKEND` / `IFTREE_EMBED_*` | 嵌入后端：缺省 `transformers`（本地内置），可切 `ollama` / `openai`（`_BASE_URL` / `_MODEL` / `_API_KEY` / `_BATCH` / `_FALLBACK`） |
+| `IFTREE_EMBED_BACKEND` / `IFTREE_EMBED_*` | 嵌入后端：缺省 `transformers`（本地内置），可切 `ollama` / `openai`（`_BASE_URL` / `_MODEL` / `_API_KEY` / `_BATCH` / `_FALLBACK`）。改这组变量要重启后端才生效（进程内只解析一次）；换模型后向量表不会自动重建，须手动重建，见[操作指南](how-to.md#构建语义向量) |
 | `IFTREE_LLM_*` | 设置页自动维护的多供应商配置与各 API 的 Key，一般不手编 |
 
 ### 运行时环境变量

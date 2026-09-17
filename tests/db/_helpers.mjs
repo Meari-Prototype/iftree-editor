@@ -6,6 +6,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { backendPipeName } from '../../dist/src/backend/llm/backend-discovery.js';
+import { createPipeBackendClient } from '../../dist/src/backend/llm/backend-pipe-client.js';
+
 const execFileAsync = promisify(execFile);
 
 export const fixturePath = 'generated/IFTreeEditor数据库读写测试样例.md';
@@ -71,6 +74,21 @@ export function parseJsonStdout(shellResult) {
   return JSON.parse(stdoutOf(shellResult));
 }
 
+// 关停这个临时库的共享后端。scripts/db.ts 改走共享后端（18-6-1）之后，一个用例里的第一条
+// db 命令会为该临时库拉起一个 detached host，后面几十条命令复用它（省掉逐条冷启，测试因此变快）；
+// 但它是 detached 的、不随测试进程退出。用完不关就会：① 一直攥着 store.sqlite，Windows 上
+// 临时目录删不掉 ② 每个用例漏一个游离进程。管道名由库的绝对路径派生，各临时库互不干扰。
+async function stopBackendFor(dbPath) {
+  const client = createPipeBackendClient({ pipeName: backendPipeName(dbPath), connectTimeoutMs: 2000 });
+  try {
+    await client.ensureReady();
+    await client.shutdown();
+  } catch {
+    // 连不上 = 这个用例压根没起过后端（如 help 用例），或它已经退出：都无需处理。
+  }
+  client.close();
+}
+
 export async function withTempDb(callback) {
   const dir = await mkdtemp(join(tmpdir(), 'iftree-db-contract-'));
   const dbPath = join(dir, 'store.sqlite');
@@ -78,7 +96,10 @@ export async function withTempDb(callback) {
   try {
     return await callback(dbPath);
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await stopBackendFor(dbPath);
+    // host 收到 shutdown 回执后还要一小会儿才真正释放 sqlite/lance 句柄；Windows 上删正被占用的
+    // 文件会 EBUSY。给 rm 一点重试余量，别让清理失败掀翻用例本身的结论。
+    await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 }
 

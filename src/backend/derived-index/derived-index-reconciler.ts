@@ -237,6 +237,19 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
     if (!isVectorModuleEnabled()) throw new Error(options.vectorDisabledMessage || '向量模块已由用户禁用');
   }
 
+  // 「对账期间主库被写过吗」的一次性戳，不持久化、不作向量有效性的替代判据。
+  // 粒度是全库：PRAGMA data_version（他连接提交）+ total_changes（本连接写行数）任一变化即变，
+  // 无关文档的一次 UPDATE 也会让它变——它回答不了「本篇被写过吗」。所以它只配当「要不要再对一遍账」
+  // 的提示，不能当拒绝执行的判据：database.read 按设计绕单写队列，检索/启动回填与写并发是常态
+  // （启动期 backfillDocSemanticMeta 就是稳定触发源），据此抛错等于把常态判成故障。
+  // 逐节点的真陈旧判定走 staleVectorIds（按实际嵌入输入逐条比对），与本戳无关。
+  // 同口径的只读戳另见 store/index.ts 的 IftreeStore._dataChangeStamp（投影缓存失效用，与此互不依赖）。
+  function dataChangeStamp(): string {
+    const db = getStore().db;
+    return String(db.pragma('data_version', { simple: true }))
+      + ':' + String(db.prepare('SELECT total_changes() AS count').get<{ count: number }>()?.count);
+  }
+
   // 嵌入前按 token 预算分桶（第 2 步守卫）：超模型窗口的节点跳过（不嵌、不中断整批，避免后端 HTTP 400
   // 整批空转），记进 skipped 供回执醒目列出、引导拆分。countTokens（注入）或 maxInputTokens（按模型配置）
   // 任一缺失 → 守卫关闭、全部可嵌（旧行为）。item.text 即嵌入串（embedInputOf 产出）。
@@ -403,6 +416,31 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
   // 检索就绪 = 完整性（projectneed 14-2）：缺失/陈旧/残留任一存在都不开放语义检索——
   // 带着陈旧向量返回相似度结果是错误输出，不是降级输出。
   async function requireDocVectorIndex(docId: unknown): Promise<true> {
+    // 快路径（O(1) 就绪判定）：live 根 subtree_hash === lance 根行 subtreeHash 且行数够即 ready。
+    // 等价性论证：① merkle 根 hash 覆盖全部后代——树任何增/删/改/移都改变根值，故根相等 ⇒
+    // SQL 树自索引以来逐字节未变 ⇒ 无陈旧、无残留（残留只可能来自树变）；② 树未变时
+    // vectorCount >= 文本节点数 ⇒ 每文本节点都有向量行（无缺失）。
+    // ② 的隐含前提：向量行按 nodeId 唯一（写入侧 VectorUpsertPayload 是 upsert 语义）——
+    // 否则计数会掩盖「A 重复 + B 缺失」。前提若被改动，行数快筛失效，须回退全量对账。
+    // 子节点编辑只清空本行 hash，根 hash 可能仍是旧值；只有文档 hash 缓存干净时才可走快路径。
+    // 文档为脏、根 hash 为 NULL 或任一条件不落 → 回退 reconcile 全量对账。
+    if (isVectorModuleEnabled()) {
+      const id = normalizeStableId(docId);
+      if (id) {
+        const store = getStore();
+        const root = store.db!.prepare(
+          'SELECT n.id, n.subtree_hash FROM nodes n JOIN docs d ON d.id = n.doc_id WHERE n.doc_id = ? AND n.parent_id IS NULL AND d.nodes_hash_dirty = 0'
+        ).get<Pick<NodeRow, 'id' | 'subtree_hash'>>(id);
+        if (root?.subtree_hash) {
+          const vectors = await getVectorStore();
+          const lanceRoot = (await vectors.hashesByNodeIds([String(root.id)])).get(String(root.id));
+          if (lanceRoot?.subtreeHash && lanceRoot.subtreeHash === root.subtree_hash) {
+            const status = await docVectorStatus([id]);
+            if (status[id]?.available) return true;
+          }
+        }
+      }
+    }
     const result = await reconcile(docId, { dryRun: true });
     if (result.skipped) throw new Error(options.vectorDisabledMessage || '向量模块已由用户禁用');
     if (result.ok === false) throw new Error(`向量索引未就绪（${result.reason || 'doc_not_found'}）`);
@@ -443,6 +481,8 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
 
   // 持久化语义状态到 docs.meta.semantic（写入维护、读取读列，免每次查 lance 的计算税）。
   // 建/补向量的收口、push/import 落库、启动回填都调它刷新这一列。
+  // 刷的是「调用这一刻的实际状态」：并发写不会让它拒绝执行——本列是可再生的状态缓存，
+  // 刷完立刻被别人写陈旧也只是慢一拍，下次写收尾 / 补建 / 启动回填会再刷，不是正确性面。
   async function refreshDocSemanticMeta(docId: unknown): Promise<void> {
     const id = normalizeStableId(docId);
     if (!id) return;
@@ -532,7 +572,7 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
   // 完整性检验 + 补齐（projectneed 15-8-1 / 14-2）：检验与补齐一体——残留删除、
   // 缺失补嵌、正文已变更删旧重嵌；已一致节点不动不重算。中断后重跑天然续传：
   // 已补部分在下一轮变 existingCurrent。保存路径不调用本入口（8-3-2-2/4-6-1）。
-  async function ensureDocVectors(docId: unknown, ensureOptions: EnsureDocVectorsOptions = {}): Promise<Record<string, unknown>> {
+  async function ensureDocVectorsOnce(docId: unknown, ensureOptions: EnsureDocVectorsOptions = {}): Promise<Record<string, unknown>> {
     const onProgress = typeof ensureOptions.onProgress === 'function' ? ensureOptions.onProgress : null;
     if (!isVectorModuleEnabled()) {
       return { ok: true, skipped: true, reason: 'vector_disabled' };
@@ -600,7 +640,7 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
         // 写入恒按 id upsert（vector-store 内 mergeInsert）：changed 覆盖旧行、missing 插入新行，
         // 不再分「先删/直接 add」两路，一次写入即可（也不会再产生重复行）。
         if (changedRows.length || missingRows.length) {
-          await vectors.upsertNodeVectors([...changedRows, ...missingRows]);
+          await upsertCurrentNodeVectors(vectors, docId, [...changedRows, ...missingRows]);
           changedDeleted += changedRows.length;
           missingInserted += missingRows.length;
         }
@@ -652,7 +692,6 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
       changedDeleted,
       staleDeleted
     });
-    await refreshDocSemanticMeta(docId);
     return {
       ok: true,
       docId,
@@ -668,12 +707,51 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
     };
   }
 
-  // pull 自对账（4-6-1/14-2/15-8-1）：主进程写完 SQL 只发本信号、不传变更集，向量库自查 SQL 对账。
+  // 两轮统计合并：补建量取两轮之和（第二轮补的是第一轮之后才变的那部分），vectorCountBefore 取
+  // 第一轮入场值（第二轮的入场值已含第一轮成果），其余「现状」字段取最后一轮。超长跳过按 id 去重：
+  // 超长节点会一直是待补，两轮都会报它一次。
+  function mergeEnsurePasses(first: Record<string, unknown>, second: Record<string, unknown>): Record<string, unknown> {
+    const add = (a: unknown, b: unknown): number => (Number(a) || 0) + (Number(b) || 0);
+    const skippedNodes = [...new Map([
+      ...(first.skippedNodes as SkippedItem[] | undefined) || [],
+      ...(second.skippedNodes as SkippedItem[] | undefined) || []
+    ].map((item) => [String(item.id), item] as const)).values()];
+    return {
+      ...second,
+      vectorCountBefore: first.vectorCountBefore,
+      missingInserted: add(first.missingInserted, second.missingInserted),
+      changedDeleted: add(first.changedDeleted, second.changedDeleted),
+      staleDeleted: add(first.staleDeleted, second.staleDeleted),
+      skippedNodes,
+      skippedCount: skippedNodes.length
+    };
+  }
+
+  // 补建对外入口：内核跑一轮，末尾若发现期间主库被写过（全库戳，见 dataChangeStamp）就再对一轮账。
+  // 不是拒绝、只是补一遍：本轮向量已全部 upsert，重跑一轮把「期间真变了的那几个」补上即可；
+  // 已一致的节点在第二轮是 existingCurrent，不重嵌、只多一次扫描。上限 2 轮——主库持续在写时
+  // 不能无限追，第二轮结束就按当时的实际状态刷 meta 并正常返回（meta 是可再生缓存，慢一拍无害）。
+  async function ensureDocVectors(docId: unknown, ensureOptions: EnsureDocVectorsOptions = {}): Promise<Record<string, unknown>> {
+    if (!isVectorModuleEnabled()) return { ok: true, skipped: true, reason: 'vector_disabled' };
+    const MAX_ROUNDS = 2;
+    let result: Record<string, unknown> = {};
+    for (let round = 1; round <= MAX_ROUNDS; round += 1) {
+      const stamp = dataChangeStamp();
+      const pass = await ensureDocVectorsOnce(docId, ensureOptions);
+      if (pass.ok !== true || pass.skipped === true) return pass;
+      result = round === 1 ? pass : mergeEnsurePasses(result, pass);
+      if (dataChangeStamp() === stamp) break;
+    }
+    await refreshDocSemanticMeta(docId);
+    return result;
+  }
+
+  // 完整对账（4-6-1/14-2/15-8-1）：显式补建及无增量提示的写入，由向量模块自查 SQL 对账。
   // 派生索引只读主数据、自算 Merkle 指纹对账自己的向量，不碰主库 content_hash/subtree_hash 列与脏标记
   // （那是版本系统的事，向量库不触发其回写）。subtree_hash top-down 剪枝：未变子树整体跳过，
   // 流式百万节点也只对账变化子树。fillNow=true 当场 embed 待补；false 只删孤儿、返回待补数，
   // 由 completeness 闸拦检索、留待后面补（保存路径不 embed，4-6-1）。
-  async function reconcile(docId: unknown, reconcileOptions: ReconcileOptions = {}): Promise<ReconcileResult> {
+  async function reconcileOnce(docId: unknown, reconcileOptions: ReconcileOptions = {}): Promise<ReconcileResult> {
     if (!isVectorModuleEnabled()) return { ok: true, skipped: true, reason: 'vector_disabled' };
     const id = normalizeStableId(docId);
     if (!id) return { ok: false, reason: 'invalid_doc_id' };
@@ -741,8 +819,7 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
 
     // 孤儿：lance 有、SQL 正文集已无 → 删（lance 不存父子结构，按全 doc id 差集兜底）。
     // 陈旧：pending 里 lance 已有行但 hash 不符的（正文变了、节点还在）——非 fillNow 也必须删。
-    // 陈旧向量比缺失更糟：跨文档语义检索绕过 completeness 闸直接查 lance，留着旧向量会按旧正文打分、
-    // 却用 node_id 回查显示新正文（错配）；删成「缺失」是安全降级，下次 fillNow 补回。fillNow 走
+    // 陈旧向量不参与检索；写入维护将其删成「缺失」，下次 fillNow 补回。fillNow 走
     // upsert 覆盖陈旧行、不必单独删。dryRun（completeness 检查）只读：不删、不嵌、只数待补/孤儿。
     const lanceIds = await vectors.listDocVectorIds(id);
     const lanceIdSet = new Set(lanceIds.map(String));
@@ -752,39 +829,63 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
     const deleted = toDelete.length ? await vectors.deleteNodeVectors(toDelete) : 0;
 
     // 超长守卫 + fillNow 当场 embed：分桶跳超长（skipped），embed 余下待补并 upsert（带 Merkle 哈希）。
-    // dryRun（completeness 检查）不分桶、只数 pending（超长仍计入待补、自然阻断就绪以引导拆分）。
+    // 分桶只在真要 embed 时做：partitionByBudget 会对每个待补节点跑一次 countTokens，非 fillNow
+    // （保存路径只标待补）与 dryRun（completeness 只数）都不嵌，跑 tokenizer 纯属白烧 CPU——
+    // 超长报告是「这些嵌不了」的说明，没有嵌的动作就没有说明对象，故非 fillNow 时 skipped 恒为空。
     let filled = 0;
     let skipped: SkippedItem[] = [];
-    if (pending.length && !dryRun) {
+    if (pending.length && fillNow && !dryRun) {
       const partition = await partitionByBudget(pending);
       skipped = partition.skipped;
-      if (fillNow) {
-        const batchSize = Math.max(1, Math.min(128, Number(getVectorConfig().batchSize) || 16));
-        const embedChunk = Math.max(batchSize, 256);
-        for (let offset = 0; offset < partition.embeddable.length; offset += embedChunk) {
-          const batch = partition.embeddable.slice(offset, offset + embedChunk);
-          const embeddings = await embedTexts(batch.map((item) => item.text));
-          await vectors.upsertNodeVectors(batch.map((item, index) => ({
-            nodeId: item.id,
-            docId: id,
-            text: item.text,
-            contentHash: item.contentHash,
-            subtreeHash: item.subtreeHash,
-            vector: embeddings[index]
-          })));
-          filled += batch.length;
-        }
+      const batchSize = Math.max(1, Math.min(128, Number(getVectorConfig().batchSize) || 16));
+      const embedChunk = Math.max(batchSize, 256);
+      for (let offset = 0; offset < partition.embeddable.length; offset += embedChunk) {
+        const batch = partition.embeddable.slice(offset, offset + embedChunk);
+        const embeddings = await embedTexts(batch.map((item) => item.text));
+        await upsertCurrentNodeVectors(vectors, id, batch.map((item, index) => ({
+          nodeId: item.id,
+          docId: id,
+          text: item.text,
+          contentHash: item.contentHash,
+          subtreeHash: item.subtreeHash,
+          vector: embeddings[index]
+        })));
+        filled += batch.length;
       }
     }
 
-    if (!dryRun) await refreshDocSemanticMeta(id);
     // ready = 对账后一致：dryRun 看「无待补且无孤儿」；写模式看「可嵌的都嵌了」。超长 skipped 不计入应嵌
     // （它本就不可嵌、报告引导拆分而非硬阻断，plan 落实点3）——否则 filled 永不等于 pending，永远 not ready。
+    // 非 fillNow 时 skipped 恒为空（上面不分桶），embeddableCount 退化成 pending.length；它只被
+    // fillNow 分支用到，ready 那条在非 fillNow 时本就只看 pending.length === 0，语义不变。
     const embeddableCount = pending.length - skipped.length;
     const ready = dryRun
       ? (pending.length === 0 && orphans.length === 0)
       : (pending.length === 0 || (fillNow && filled === embeddableCount));
     return { ok: true, docId: id, fillNow, pendingCount: pending.length, orphanCount: orphans.length, filled, deleted, ready, skippedNodes: skipped, skippedCount: skipped.length };
+  }
+
+  // 对账对外入口：写模式跑完一轮后，若期间主库被写过（全库戳，见 dataChangeStamp）就再对一轮账，
+  // 而不是把这一轮判成失败——戳是全库粒度，改的多半是别的文档，本篇的向量此时已按本轮结果落定。
+  // 重跑代价接近零：reconcile 幂等且增量，第二轮靠 subtree_hash 剪枝只下行真变过的子树。
+  // 上限 2 轮，仍变就按当时实际状态刷 meta 并正常返回（meta 是可再生缓存，慢一拍无害）。
+  // 返回的是最后一轮的结果：ready/pendingCount/orphanCount 本就是「现在的状态」，最后一轮最准；
+  // filled/deleted 这两个计数因此只报最后一轮（现无调用方消费它们做回执，maintainDerivedAfterWrite
+  // 拿到就丢；将来若要拿它渲染回执，得像 mergeEnsurePasses 那样把两轮的计数加起来）。
+  // dryRun 是 requireDocVectorIndex 的只读兜底路径（检索入场闸），不重跑、不刷 meta。
+  async function reconcile(docId: unknown, reconcileOptions: ReconcileOptions = {}): Promise<ReconcileResult> {
+    if (!isVectorModuleEnabled()) return { ok: true, skipped: true, reason: 'vector_disabled' };
+    if (reconcileOptions.dryRun === true) return reconcileOnce(docId, reconcileOptions);
+    const MAX_ROUNDS = 2;
+    let result: ReconcileResult = { ok: false, reason: 'invalid_doc_id' };
+    for (let round = 1; round <= MAX_ROUNDS; round += 1) {
+      const stamp = dataChangeStamp();
+      result = await reconcileOnce(docId, reconcileOptions);
+      if (result.ok !== true || result.skipped === true) return result;
+      if (dataChangeStamp() === stamp) break;
+    }
+    await refreshDocSemanticMeta(result.docId);
+    return result;
   }
 
 
@@ -822,25 +923,102 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
     return { ok: true, docId, pruned };
   }
 
+  // 只读取本批节点；同一个同步 SQL 快照同时供有效性核对和结果展示，避免上层再读到新正文。
+  function currentVectorNodes(nodeIds: unknown[]) {
+    type SearchNode = NodeRow & { child_count: number; doc_title: string; source_type: string | null; original_path: string | null };
+    const ids = positiveIds(nodeIds);
+    const db = getStore().db;
+    return db.transaction(() => {
+      const byId = new Map<string, SearchNode>();
+      for (let offset = 0; offset < ids.length; offset += 500) {
+        const batch = ids.slice(offset, offset + 500);
+        const rows = db.prepare(`
+          SELECT n.*, d.title AS doc_title, sd.source_type, sd.original_path,
+            (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = n.id AND child.doc_id = n.doc_id) AS child_count
+          FROM nodes n JOIN docs d ON d.id = n.doc_id
+          LEFT JOIN source_documents sd ON sd.doc_id = n.doc_id
+          WHERE n.id IN (${batch.map(() => '?').join(',')})
+        `).all<SearchNode>(...batch);
+        for (const row of rows) byId.set(String(row.id), row);
+      }
+      return byId;
+    })();
+  }
+
+  function staleVectorIds(docId: unknown, indexedTexts: Map<string, string>): string[] {
+    const current = currentVectorNodes([...indexedTexts.keys()]);
+    return [...indexedTexts].filter(([id, text]) => {
+      const node = current.get(id);
+      return !node || String(node.doc_id) !== String(docId) || !String(node.text || '').trim() || embedInputOf(node) !== text;
+    }).map(([id]) => id);
+  }
+
+  // 保存只提供通用变更范围；是否陈旧由向量模块用实际嵌入输入判定，地址变化可复用原向量。
+  async function pruneChangedNodeVectors(docId: unknown, nodeIds: unknown[]): Promise<void> {
+    if (!isVectorModuleEnabled()) return;
+    const vectors = await getVectorStore();
+    const texts = await vectors.textByNodeIds(positiveIds(nodeIds));
+    const stale = staleVectorIds(docId, texts);
+    if (stale.length) await vectors.deleteNodeVectors(stale);
+  }
+
+  // 仍在共享后端的单写队列内发布；推理或 Lance 写入期间源节点变化，不能把旧批次算作完成。
+  // 这里的前后两次比对是逐节点的（只看本批 id 的实际嵌入输入），与 dataChangeStamp 那种全库戳无关：
+  // 命中说明嵌的正是这几个节点的旧正文，写进去就是错向量，故删回并抛错要求重来——这条守卫保留。
+  async function upsertCurrentNodeVectors(vectors: VectorStore, docId: unknown, rows: VectorUpsertPayload[]): Promise<void> {
+    const texts = new Map(rows.map((row) => [String(row.nodeId), String(row.text || '')]));
+    const changedMessage = '向量索引未就绪：生成期间源节点内容发生变化，请重新运行向量补建';
+    if (staleVectorIds(docId, texts).length) throw new Error(changedMessage);
+    await vectors.upsertNodeVectors(rows);
+    const stale = staleVectorIds(docId, texts);
+    if (stale.length) {
+      await vectors.deleteNodeVectors(stale);
+      throw new Error(changedMessage);
+    }
+  }
+
+  // 语义检索（14-1）。两道把关，都是逐条的、与全库写活动无关：
+  // ① 单篇 scoped 入场查一次 requireDocVectorIndex（完整性闸 14-2）；
+  // ② 每条命中按 embedInputOf(node) === hit.text 核对——向量嵌的就是这段文本，文本对不上即陈旧，
+  //    直接丢弃不返回。检索期间别处在写不构成错误：过滤后返回的每一条都是当下仍有效的向量，
+  //    这正是「带着陈旧向量返回相似度结果是错误输出」要的结果，故 scoped 下也只过滤、不抛错
+  //    （入场闸已把整篇未就绪的情形拦在外面，这里的过滤是余量防御，不是第二道闸）。
   async function vectorSearch({ docId = null, query, limit = 20 }: { docId?: unknown; query?: string; limit?: number } = {}): Promise<unknown> {
     assertVectorModuleEnabled();
     const scopedDocId = normalizeStableId(docId, null);
     if (scopedDocId) await requireDocVectorIndex(scopedDocId);
     const [vector] = await embedTexts([query ?? '']);
     const vectors = await getVectorStore();
-    return vectors.search({
-      docId: scopedDocId,
-      vector,
-      limit: limit || 20
-    });
+    const wanted = Math.max(1, Math.floor(Number(limit) || 20));
+    // 倍增上限：有效率低时（大量陈旧行）不能一路翻到整表规模——那是一次全表扫的代价，
+    // 换不回多少有效命中。触顶就按现有有效命中返回（宁可少给，不拖垮检索）。
+    const maxSearchLimit = Math.min(wanted * 8, 2000);
+    let searchLimit = wanted;
+    let previousCount = -1;
+    for (;;) {
+      const hits = await vectors.search({ docId: scopedDocId, vector, limit: searchLimit });
+      const nodes = currentVectorNodes(hits.map((hit) => hit.node_id));
+      const valid = hits.flatMap((hit) => {
+        const node = nodes.get(String(hit.node_id));
+        return node && String(node.doc_id) === String(hit.doc_id)
+          && String(node.text || '').trim() && embedInputOf(node) === hit.text
+          ? [{ ...hit, node }] : [];
+      });
+      // 只返回已有且有效的向量；陈旧候选不能挤掉排在其后的有效候选，故凑不够就加大 limit 再查。
+      if (valid.length >= wanted || hits.length < searchLimit || hits.length <= previousCount || searchLimit >= maxSearchLimit) {
+        return valid.slice(0, wanted);
+      }
+      previousCount = hits.length;
+      searchLimit = Math.min(searchLimit * 2, maxSearchLimit);
+    }
   }
 
   // 写操作落主库之后的派生索引维护（projectneed 4-6）：调用方=写分发收尾（mutation-api）或导入编排层，
   // 主库只报告"这篇文档怎么变了"（普通内容变更 / 删除 / 全库地址重排 + 要不要当场建向量），
   // 派生索引自己消化怎么维护。
-  // - BM25 关键词：编辑/导入完即整篇重建该文档（分批游标、扛大文档；纯 CPU、不算计增量）。
-  // - 稠密向量：零耦合，默认不建（失活留显式 vectors 动词补）；唯一当场建的情形是导入显式 embed:true
-  //   （这里当场全量 reconcile）。删除连带回收向量行（纯删行、不涉 embedding 成本，不清会命中已删内容）。
+  // - BM25 关键词：有变更范围则增量同步，无提示时整篇重建。
+  // - 稠密向量：有变更范围则只核对本批，清掉失效项；无提示时只刷语义元数据（不做整篇对账，见下方分支注释）。
+  //   默认不生成 embedding，仅显式 embed:true 当场补建。
   async function maintainDerivedAfterWrite(docId: unknown, { deleted = false, allDocs = false, embed = false, touchedNodeIds = null, deletedNodeIds = null }: MaintainAfterWriteOptions = {}): Promise<Record<string, unknown>> {
     if (allDocs) {
       await rebuildKeywordIndexForAllDocs();
@@ -862,9 +1040,13 @@ export function createDerivedIndexReconciler(options: ReconcilerOptions = {}): D
     }
     if (embed) {
       await reconcile(id, { fillNow: true });
+    } else if (incremental) {
+      await pruneChangedNodeVectors(id, [...(touchedNodeIds || []), ...(deletedNodeIds || [])]);
+      await refreshDocSemanticMeta(id);
     } else {
-      // 不建向量，但刷一次向量就绪状态缓存（docs.meta.semantic）：让 index 列表反映当前向量覆盖率
-      //（新导入=missing 0/N）。这是派生索引模块维护自己的缓存、读 lance 计数、轻量、不 embedding。
+      // 无 hint 的写路径只刷语义元数据，不在写收尾做整篇向量对账：对账是 O(N) 的全树扫 + lance 往返，
+      // 挂在每次 doc.create/history.restore 的收尾上会把写返回拖成分钟级；待补由 completeness 闸
+      // （requireDocVectorIndex）在检索入场时拦下、或显式 vectors 动词补齐，语义不丢。
       await refreshDocSemanticMeta(id);
     }
     return { ok: true, docId: id, scope: incremental ? 'keyword(incremental)' : 'keyword', vector: embed };

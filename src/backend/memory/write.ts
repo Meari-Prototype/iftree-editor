@@ -94,6 +94,9 @@ export async function handleMemoryMutation(store: IftreeStore, payload: MemoryPa
     // 一 session 一卷：旧卷全删（解锚 + deleteDoc）后完整重新导入。session 只追加 + 解析确定 → 重导的
     // 前缀与旧卷逐字一致、节点位置恒常不变，所以「全删 + 重导」≡「增量追加」、却甩掉了声明地址 / 幂等键 /
     // 抢锚那一摊（15-10-1）。封卷无需特判：session 文件停止增长后重导结果不再变，天然终态。
+    // 失败语义（刻意接受）：删旧卷与下面的建卷 / 写锚 / push 不在同一个事务里，中途失败（向量模块
+    // 不可用且 embed:true、锚 symlink 写不出等）会在库里留下一个空卷或半卷——旧卷已经没了、新卷没填完。
+    // 这不需要人工修：session 文件是权威，再投一次同一 session 就会把残卷当「旧卷」删掉重导，一次自愈。
     const existing = findSessionVolume(store, { agent, sessionId });
     if (existing) {
       store.db!.prepare('DELETE FROM source_documents WHERE doc_id = ?').run(existing.docId);

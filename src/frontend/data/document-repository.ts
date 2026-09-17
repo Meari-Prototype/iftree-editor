@@ -36,6 +36,8 @@ export const documentRepository = {
   getNode(payload: RepositoryPayload) { return read('node.get', payload); },
   hasDocTreeDepth(payload: RepositoryPayload) { return read('doc.hasTreeDepth', payload); },
   getNodeChildren(payload: RepositoryPayload) { return readDatabase({ action: 'node.listChildren', ...payload }); },
+  // 「根 → 目标节点」整条链（含目标自身）：session 在目标不在镜像时按需把路径拉回来。
+  getNodeAncestors(payload: RepositoryPayload) { return readDatabase({ action: 'node.ancestors', ...payload }); },
   getDocNodesPage(payload: RepositoryPayload) { return read('node.listPage', payload); },
   getSubtreeTextWindow(payload: RepositoryPayload) { return read('subtree.getTextWindow', payload); },
   getSourceWindow(payload: RepositoryPayload) { return readDatabase({ action: 'source.getWindow', ...payload }); },

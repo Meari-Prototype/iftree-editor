@@ -1,9 +1,10 @@
 // 读动作 handler（自 query-api.ts 按域拆出，§6-4：照 mutation-api 的 handlers/write 样板）。
 // 本文件由分派表 query-api.ts 消费；跨域共享的 helper 一律住 shared.ts。
-import { asciiTreeLabel, cleanTreeLabel, contentFormat, contentIncludeSet, contentNodeRowsByIds, crossDocNodeRowsByIds, escapeLike, formatContentNode, libraryRelativeSourcePath, nodeTextChars, normalizeKeywordTerms } from './content.js';
+import { asciiTreeLabel, cleanTreeLabel, contentFormat, contentIncludeSet, escapeLike, formatContentNode, libraryRelativeSourcePath, nodeTextChars, normalizeKeywordTerms } from './content.js';
 import { clipText, normalizeLimit, normalizeNonNegativeInteger, normalizeQueryId, pageRows } from './shared.js';
 import type { ContentNodeRow, CrossDocFormattedResult, CrossDocSearchRow, DocFilterRow, FormattedContentNode, KeywordHit, KeywordNodeRow, KeywordWhere, Payload, QueryContext, RowObject } from './shared.js';
 import { buildAhoCorasickMatcher } from '../../../core/aho-corasick.js';
+import { normalizeTimestampForCompare } from '../../shared.js';
 import { runEntityRead } from '../../entities/read.js';
 import type { IftreeStore } from '../../store/index.js';
 import type { NodeRow, SourceDocumentRow } from '../../db/schema.js';
@@ -72,7 +73,7 @@ export function keywordHaystack(row: Partial<NodeRow> = {}) {
     row.node_title,
     row.text,
     row.node_note
-  ].map((value) => String(value || '').toLocaleLowerCase()).join('\n');
+  ].map((value) => String(value || '').toLowerCase()).join('\n');
 }
 
 export function countLiteralOccurrences(haystack = '', needle = '') {
@@ -89,13 +90,21 @@ export function countLiteralOccurrences(haystack = '', needle = '') {
 }
 
 export function keywordHitCount(row: Partial<NodeRow> = {}, terms: string[] = []) {
-  const haystack = keywordHaystack(row);
-  return terms.reduce((sum, term) => sum + countLiteralOccurrences(haystack, String(term || '').toLocaleLowerCase()), 0);
+  return keywordHitCountInHaystack(keywordHaystack(row), terms);
+}
+
+// 命中计数的 haystack 复用版：scanKeywordHits 缓存的 haystack 直接传入，省一次四字段拼接+lower。
+// 计数口径保持 countLiteralOccurrences 的非重叠语义（与 AC 的重叠出现报告无关），排序/分数不变。
+function keywordHitCountInHaystack(haystack: string, terms: string[] = []) {
+  return terms.reduce((sum, term) => sum + countLiteralOccurrences(haystack, String(term || '').toLowerCase()), 0);
 }
 
 export function keywordHitSummary(row: Partial<NodeRow> = {}, terms: string[] = []) {
-  const haystack = keywordHaystack(row);
-  const termKeys = [...new Set(terms.map((term) => String(term || '').toLocaleLowerCase()).filter(Boolean))];
+  return keywordHitSummaryInHaystack(keywordHaystack(row), terms);
+}
+
+function keywordHitSummaryInHaystack(haystack: string, terms: string[] = []) {
+  const termKeys = [...new Set(terms.map((term) => String(term || '').toLowerCase()).filter(Boolean))];
   let score = 0;
   let rowHits = 0;
   for (const key of termKeys) {
@@ -256,9 +265,10 @@ export function keywordRowInScope(row: KeywordNodeRow, payload: Payload = {}, do
   if (trust && !trust.has(String(row.trust_level || ''))) return false;
   const since = String(payload.since ?? payload.after ?? '').trim();
   const until = String(payload.until ?? payload.before ?? '').trim();
-  const updated = String(row.updated_at || '');
-  if (since && updated && updated < since) return false;
-  if (until && updated && updated > until) return false;
+  // updated_at 两格式混存（CURRENT_TIMESTAMP 空格式 / JS 写入 ISO 式），归一后比较才等价于时间序。
+  const updated = row.updated_at ? normalizeTimestampForCompare(row.updated_at) : '';
+  if (since && updated && updated < normalizeTimestampForCompare(since)) return false;
+  if (until && updated && updated > normalizeTimestampForCompare(until)) return false;
   return true;
 }
 
@@ -326,25 +336,40 @@ export function formatKeywordResultRows(rows: KeywordNodeRow[] = [], terms: stri
 // keyword 召回的候选行（轻量字段，供 Aho-Corasick 扫描与 scope 过滤）。
 // scope（docId / scopeAddress）在 SQL 层缩小；docFilter / trust / 时间窗在 keywordRowInScope 兜底。
 // allDocs 且无 docId 时取全库——keyword 字面召回接受全库扫，AC 扫描是线性的。
-export function keywordScanRows(store: IftreeStore, payload: Payload = {}) {
+// 流式迭代（14-3-3 只规定「扫描」、不规定物化形态）：逐行进 JS，内存 O(命中数) 而非 O(范围全表)，
+// 大库下从「全量 .all() 必然 OOM」变成「慢但跑得完」。扫描行集与每行输入不变，召回逐字节等价。
+export function keywordScanRows(store: IftreeStore, payload: Payload = {}): IterableIterator<KeywordNodeRow> {
   const { sql, params } = keywordWhereSql(payload, [], {});
   return store.db!.prepare(`
     SELECT n.id, n.doc_id, n.address, n.node_title, n.text, n.node_note, n.trust_level, n.updated_at, n.depth
     FROM nodes n
     JOIN docs d ON d.id = n.doc_id
     WHERE ${sql}
-  `).all<KeywordNodeRow>(...params);
+  `).iterate<KeywordNodeRow>(...params);
 }
 
 // 用 Aho-Corasick 一次扫遍候选行，标出每行命中的词键集合。
 // 全量、不漏、不截断——这是 keyword「字面连续命中」的精确召回（projectneed 14-3-3）。
-export function scanKeywordHits(rows: KeywordNodeRow[] = [], termKeys: string[] = []) {
-  const matcher = buildAhoCorasickMatcher(termKeys.map((key) => ({ key })));
+// haystack 随命中行缓存：排序（compareKeywordHits）与 minScore 过滤复用同一份，
+// 不再每次重建——纯记忆化，同输入同输出。
+export function scanKeywordHits(rows: Iterable<KeywordNodeRow> = [], termKeys: string[] = []) {
   const hitRows: KeywordHit[] = [];
+  // 单词快路径：AC 对单模式串的命中判定 ≡ indexOf 命中（AC 算法正确性定理）；
+  // indexOf 走 V8 优化子串查找，比自绘 AC 的 JS 逐字符循环快一个数量级。多词仍一遍 AC。
+  if (termKeys.length === 1) {
+    const needle = termKeys[0]!;
+    for (const row of rows) {
+      const haystack = keywordHaystack(row);
+      if (needle && haystack.includes(needle)) hitRows.push({ row, hits: new Set([needle]), haystack });
+    }
+    return hitRows;
+  }
+  const matcher = buildAhoCorasickMatcher(termKeys.map((key) => ({ key })));
   for (const row of rows) {
+    const haystack = keywordHaystack(row);
     const hits = new Set<string>();
-    matcher.scan(keywordHaystack(row), (pattern) => hits.add(pattern.key));
-    if (hits.size > 0) hitRows.push({ row, hits });
+    matcher.scan(haystack, (pattern) => hits.add(pattern.key));
+    if (hits.size > 0) hitRows.push({ row, hits, haystack });
   }
   return hitRows;
 }
@@ -377,8 +402,8 @@ export function compareKeywordHits(left: KeywordHit, right: KeywordHit, scores: 
     if (leftScore !== rightScore) return rightScore - leftScore;
   }
   if (left.hits.size !== right.hits.size) return right.hits.size - left.hits.size;
-  const leftHits = keywordHitCount(left.row, terms);
-  const rightHits = keywordHitCount(right.row, terms);
+  const leftHits = keywordHitCountInHaystack(left.haystack ?? keywordHaystack(left.row), terms);
+  const rightHits = keywordHitCountInHaystack(right.haystack ?? keywordHaystack(right.row), terms);
   if (leftHits !== rightHits) return rightHits - leftHits;
   return String(left.row.address || '').localeCompare(String(right.row.address || ''));
 }
@@ -386,7 +411,7 @@ export function compareKeywordHits(left: KeywordHit, right: KeywordHit, scores: 
 export async function queryContentKeyword(store: IftreeStore, payload: Payload = {}, ctx: QueryContext = {}) {
   const terms = normalizeKeywordTerms(payload);
   if (terms.length === 0) return { kind: 'content.searchKeyword', terms, rows: [] };
-  const termKeys = [...new Set(terms.map((term) => term.toLocaleLowerCase()).filter(Boolean))];
+  const termKeys = [...new Set(terms.map((term) => term.toLowerCase()).filter(Boolean))];
   // 展示条数：max 放宽到 1000，调用方可显式调大（旧实现卡死在 100）。
   const limit = normalizeLimit(payload.limit, 100, 1000);
   const offset = normalizeNonNegativeInteger(payload.offset ?? payload.start ?? payload.startOffset ?? payload.start_offset, 0);
@@ -401,6 +426,14 @@ export async function queryContentKeyword(store: IftreeStore, payload: Payload =
   // 跨文档（allDocs）默认排除 . 开头隐藏路径文档（15-7-3）；单篇显式定位（含定位到隐藏文档）不受限。
   const hiddenExcluded = docId ? null : resolveHiddenDocExclusion(store, payload, ctx);
   const rowHidden = (row: KeywordNodeRow) => hiddenExcluded != null && hiddenExcluded.has(String(row.doc_id));
+  // 流式过滤生成器：与原先的 .filter().filter() 谓词完全相同、顺序相同，只改物化形态。
+  function* iterateInScopeRows(): Generator<KeywordNodeRow> {
+    for (const row of keywordScanRows(store, payload)) {
+      if (!keywordRowInScope(row, payload, docFilter)) continue;
+      if (rowHidden(row)) continue;
+      yield row;
+    }
+  }
   // 统计用：当前范围可检索的文档数（doc 级过滤 + 隐藏排除后的允许集 / 单篇=1 / 全库总数）。
   // 让 find 返回统计行能把"0 命中"区分成"范围本身就空"还是"范围内没命中"。
   const scopeDocs = docFilter
@@ -410,10 +443,8 @@ export async function queryContentKeyword(store: IftreeStore, payload: Payload =
         : Math.max(0, (Number(store.db!.prepare('SELECT COUNT(*) AS c FROM docs').get()?.c) || 0) - (hiddenExcluded ? hiddenExcluded.size : 0)));
 
   // 召回：Aho-Corasick 全量扫范围节点的字面命中（不漏、不截断）；scope/过滤在 JS 兜底。
-  const candidateRows = keywordScanRows(store, payload)
-    .filter((row) => keywordRowInScope(row, payload, docFilter))
-    .filter((row) => !rowHidden(row));
-  const hitRows = scanKeywordHits(candidateRows, termKeys);
+  // 全程流式：范围行逐行进 JS 过滤、只收集命中行，不物化范围全表。
+  const hitRows = scanKeywordHits(iterateInScopeRows(), termKeys);
   // 排序信号：BM25（仅排序，不影响召回完整性）。
   const scores = await keywordBm25Scores(ctx, terms, docId, rankLimit);
 
@@ -423,7 +454,7 @@ export async function queryContentKeyword(store: IftreeStore, payload: Payload =
     const seen = new Set<string>();
     const flat: RowObject[] = [];
     for (const term of terms) {
-      const key = term.toLocaleLowerCase();
+      const key = term.toLowerCase();
       const groupHits = hitRows
         .filter((entry) => entry.hits.has(key))
         .sort((left, right) => compareKeywordHits(left, right, scores, terms));
@@ -482,7 +513,7 @@ export async function queryContentKeyword(store: IftreeStore, payload: Payload =
   // returned/total 自然是过滤后的真实统计；口径与展示行的 node.score（keywordHitSummary）一致。
   const minScore = payload.minScore != null ? Number(payload.minScore) : null;
   if (minScore != null) {
-    ranked = ranked.filter((entry) => keywordHitSummary(entry.row, terms).score >= minScore);
+    ranked = ranked.filter((entry) => keywordHitSummaryInHaystack(entry.haystack ?? keywordHaystack(entry.row), terms).score >= minScore);
   }
   ranked.sort((left, right) => compareKeywordHits(left, right, scores, terms));
   const page = pageRows(ranked, offset, limit, 1000);
@@ -522,10 +553,8 @@ export async function queryContentSearch(
       return { kind: 'content.search', mode, docId, query, rows: [], error: '向量检索入口未接入' };
     }
     const results = await ctx.vectorSearch({ docId, query, limit });
-    const rows = contentNodeRowsByIds(store, docId, results.map((result) => result.node_id));
-    const byId = new Map(rows.map((row) => [String(row.id), row]));
     let formatted = results.map((result) => {
-      const row = byId.get(String(result.node_id));
+      const row = result.node as ContentNodeRow | undefined;
       return row ? formatContentNode({ ...row, score: Number(result.score) || 0 }, { detail: 'summary', include: includeWithTimestamps(include) }) : null;
     }).filter((row): row is FormattedContentNode => Boolean(row));
     // scopeAddress（地址前缀范围）与 minScore（相似度下限）：召回后过滤，自 db-shell find --semantic 下沉。
@@ -706,10 +735,8 @@ export async function queryContentSearchAll(store: IftreeStore, payload: Payload
     }
     const limit = normalizeLimit(payload.limit, 20, 100);
     const results = await ctx.vectorSearch({ query, limit });
-    const rows = crossDocNodeRowsByIds(store, results.map((result) => result.node_id));
-    const byId = new Map(rows.map((row) => [String(row.id), row]));
     let formatted = results.map((result) => {
-      const row = byId.get(String(result.node_id));
+      const row = result.node as ContentNodeRow | undefined;
       if (!row || (hiddenExcluded && hiddenExcluded.has(String(row.doc_id)))) return null;
       return formatCrossDocSearchRow({ ...row, score: Number(result.score) || 0 }, {
         ...payload,
@@ -789,14 +816,14 @@ export async function queryContentSearchEntityExpand(store: IftreeStore, payload
   const synonymsByTerm = new Map<string, Set<string>>();
   for (const row of related.rows || []) {
     if (row.relation !== 'synonym') continue;
-    const seedLiteral = String(row.seed?.literal || '').trim().toLocaleLowerCase();
+    const seedLiteral = String(row.seed?.literal || '').trim().toLowerCase();
     if (!seedLiteral) continue;
     const group = synonymsByTerm.get(seedLiteral) || new Set<string>();
     group.add(String(row.entity?.literal || '').trim());
     synonymsByTerm.set(seedLiteral, group);
   }
   const expandedTermGroups = terms.map((term) => {
-    const synonyms = synonymsByTerm.get(term.trim().toLocaleLowerCase());
+    const synonyms = synonymsByTerm.get(term.trim().toLowerCase());
     return synonyms ? [term, ...synonyms] : [term];
   });
   const limit = normalizeLimit(payload.limit, 100, 1000);
@@ -818,7 +845,7 @@ export async function queryContentSearchEntityExpand(store: IftreeStore, payload
   // AND 框架过滤：节点必须每个原始词组至少命中一个词。
   const nodeTermHits = new Map<string, Set<string>>();
   for (const group of search.groups || []) {
-    const hitTerm = String(group.term || '').trim().toLocaleLowerCase();
+    const hitTerm = String(group.term || '').trim().toLowerCase();
     for (const row of group.rows || []) {
       const nodeId = rowNodeId(row);
       if (!nodeId) continue;
@@ -830,7 +857,7 @@ export async function queryContentSearchEntityExpand(store: IftreeStore, payload
   const matchingNodeIds = new Set<string>();
   for (const [nodeId, hitTerms] of nodeTermHits) {
     const allGroupsCovered = expandedTermGroups.every((group) =>
-      group.some((term) => hitTerms.has(term.toLocaleLowerCase()))
+      group.some((term) => hitTerms.has(term.toLowerCase()))
     );
     if (allGroupsCovered) matchingNodeIds.add(nodeId);
   }

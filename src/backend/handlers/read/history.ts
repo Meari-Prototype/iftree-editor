@@ -1,6 +1,8 @@
 // 读动作 handler（自 query-api.ts 按域拆出，§6-4：照 mutation-api 的 handlers/write 样板）。
 // 本文件由分派表 query-api.ts 消费；跨域共享的 helper 一律住 shared.ts。
 import { normalizePositiveInteger, normalizeQueryId } from './shared.js';
+import { subtreeBodyText } from './content.js';
+import { keywordHaystack } from './search.js';
 import type { CommitSnapshotRow, Payload, RowObject, SnapshotLike } from './shared.js';
 import { parseJsonObject } from '../../shared.js';
 import { isStableId } from '../../db/ids.js';
@@ -245,11 +247,20 @@ export function queryHistoryFind(store: IftreeStore, payload: Payload = {}) {
   const rows = (Array.isArray(snapshot.nodes) ? snapshot.nodes : []) as SnapshotRow[];
   const scopeAddress = String(payload.scopeAddress ?? '').trim();
   const docTitle = ((snapshot as SnapshotLike).doc as RowObject | undefined)?.title ?? null;
+  // 与 HEAD 侧同口径（search.keywordHaystack）：address+title+text+note 整体小写后按词 AND。
+  // 原先只搜 text、且区分大小写——同一个词在 find 命中、find --at 落空，两侧口径不该分叉。
+  const lowerTerms = terms.map((term) => term.toLowerCase());
   const matched = rows.filter((r) => {
     const addr = String(r.address || '');
     if (scopeAddress && !(addr === scopeAddress || addr.startsWith(`${scopeAddress}-`))) return false;
-    const text = String(r.text || '');
-    return terms.every((term) => text.includes(term));
+    // 快照行 snake/camel 混排（照 snapshotNodeId 的兜底口径）：两个键都认后再交给 keywordHaystack。
+    const haystack = keywordHaystack({
+      address: addr,
+      node_title: String(r.node_title ?? r.nodeTitle ?? ''),
+      text: String(r.text ?? ''),
+      node_note: String(r.node_note ?? r.nodeNote ?? '')
+    });
+    return lowerTerms.every((term) => haystack.includes(term));
   });
   const limit = normalizePositiveInteger(payload.limit, null);
   const limited = limit != null ? matched.slice(0, limit) : matched;
@@ -305,11 +316,9 @@ export function queryHistoryRead(store: IftreeStore, payload: Payload = {}) {
   if (range === 'node') {
     return { kind: 'history.read', commitId: row.id, range, text: String(target.text || '') };
   }
-  const text = snapshotSubtreeRows(target, byParent)
-    .filter((r) => (byParent.get(snapshotNodeId(r)) || []).length === 0)
-    .map((r) => String(r.text || ''))
-    .filter((t) => t.trim())
-    .join('\n');
+  // 与 HEAD 侧同口径（content.subtreeBodyText）：排文档根、保留有正文的容器节点。
+  // 原先只留叶子，同一棵树在 read 与 read --at 读出的正文不一样（容器节点正文在历史侧被吞）。
+  const text = subtreeBodyText(snapshotSubtreeRows(target, byParent));
   return { kind: 'history.read', commitId: row.id, range, text };
 }
 

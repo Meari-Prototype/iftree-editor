@@ -493,3 +493,31 @@ test('isLegalEventVolumeLayout：. / .. / 含分隔符段判非法（堵锚目�
   assert.equal(isLegalEventVolumeLayout('a/b', 'ws'), false);
   assert.equal(isLegalEventVolumeLayout('agent', 'a\\b'), false);
 });
+
+test('封卷后不得改回可写：set_mode 不是封卷的后门（15-10-1）', async () => {
+  await withStore(async (store) => {
+    const { docId } = await runDatabaseWrite(store, deliverPayload(), anchorCtx(store));
+
+    // 未封卷的卷：模式照常可切（闸只认「已封卷」）。
+    store.setDocEditMode(docId, 'full');
+    assert.equal(store.getDocEditMode(docId), 'full');
+    store.setDocEditMode(docId, 'incremental');
+
+    assert.equal(sealDueMemoryVolumes(store, { nowMs: Date.now() + 25 * HOUR_MS }).sealedCount, 1);
+    assert.equal(store.getDocEditMode(docId), 'readonly');
+
+    // 封卷后：任何离开 readonly 的切换都被拒，模式保持 readonly。
+    assert.throws(() => store.setDocEditMode(docId, 'full'), /已封卷/);
+    assert.throws(() => store.setDocEditMode(docId, 'incremental'), /已封卷/);
+    assert.equal(store.getDocEditMode(docId), 'readonly');
+
+    // readonly → readonly 放行：封卷扫描 / 补封卷要能重入。
+    store.setDocEditMode(docId, 'readonly');
+
+    // 普通文档不受影响。
+    const ordinary = store.createDoc({ title: '普通文档' });
+    store.setDocEditMode(ordinary.id, 'readonly');
+    store.setDocEditMode(ordinary.id, 'full');
+    assert.equal(store.getDocEditMode(ordinary.id), 'full');
+  });
+});

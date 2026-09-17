@@ -12,8 +12,17 @@
 // 根节点没有父 tree，其 id 无处安放——对齐 git（根 tree 无名，由 commit 指向）：
 // commit 表存 root_node_id + root_tree_hash 并列，根 id 由 commit 直接指向，restore 时从 commit 取。
 //
-// source_position / created_at / updated_at 不进对象库（第 4 步边界：只追踪子树结构 + 正文）。
-// 句位真相由 source_spans 表承载（用 node_id 直挂），restore 时跟着回，不受影响。
+// created_at / updated_at 不进对象库（第 4 步边界：只追踪子树结构 + 正文）。
+//
+// 句位（span→node 归属 + nodes.source_position）走**第三类对象** spanmap，由 commit 的
+// span_map_hash 单独指向——不进 blob、不进 tree 指纹。早先这里写的是「句位真相由 source_spans 表
+// 承载（用 node_id 直挂），restore 时跟着回，不受影响」，那句话与实际行为相反：restoreSnapshot
+// 只能把「恢复前 live 的链接」里节点仍在快照中的那部分挂回，拆句后回滚到拆句前，span 的 node_id
+// 永久变 NULL。现在归属随 commit 一起内容寻址，restore/revert/undo/redo 到任意带 span_map_hash 的
+// commit 都精确还原该 commit 时代的归属。
+// 刻意不并进 tree 指纹的理由：source_spans 的写入不触发 nodes 的 hash 失效触发器，
+// writeTreeIncremental 会剪掉「归属变、内容不变」的子树而写出错误指纹；且归属并进 contentHash
+// 会让「同正文、不同原文出处」的节点不再共享 blob，废掉重复段落的去重。
 
 import { contentHash, sha256_128 } from '../../core/merkle.js';
 import type { MerkleNode } from '../../core/merkle.js';
@@ -42,11 +51,19 @@ function blobData(node: NodeObjectRow) {
   return data;
 }
 
+// writeBlob 的 INSERT 语句连接级缓存：better-sqlite3 无自动语句缓存，函数内 prepare 会在
+// 每节点循环里各编译一次（保存路径 N 节点 = N 次编译）。WeakMap 按连接持 statement，随连接回收。
+const blobInsertStmts = new WeakMap<DbLike, ReturnType<DbLike['prepare']>>();
+
 // 写单节点内容对象。contentHash 当 blob key，已存在则跳过（INSERT OR IGNORE 天然去重）。
 export function writeBlob(db: DbLike, node: NodeObjectRow) {
   const hash = contentHash(node);
-  db.prepare('INSERT OR IGNORE INTO objects (hash, kind, data) VALUES (?, ?, ?)')
-    .run(hash, 'blob', JSON.stringify(blobData(node)));
+  let stmt = blobInsertStmts.get(db);
+  if (!stmt) {
+    stmt = db.prepare('INSERT OR IGNORE INTO objects (hash, kind, data) VALUES (?, ?, ?)');
+    blobInsertStmts.set(db, stmt);
+  }
+  stmt.run(hash, 'blob', JSON.stringify(blobData(node)));
   return hash;
 }
 
@@ -97,11 +114,98 @@ export function readSource(db: DbLike, hash: unknown) {
   return row ? row.data : '';
 }
 
+// ── spanmap：句位归属对象（A5-1/7）────────────────────────────────────────
+//
+// 承载两件事：① span→node 归属（source_spans 的 sentence_index → node_id）；
+// ② nodes.source_position（tree/blob 都不存它，restore 后原本一律变 NULL——段落容器的
+// 半步偏移 x-0.5 丢了，编辑分支的段落拆句判据就再也命中不到）。两者同源于「导入原文与节点的
+// 对应关系」，共用一个对象、一次 hash、一次写。
+//
+// 归属键是 (doc_id, sentence_index)，不是 source_spans.id：后者是 SQLite 内部 rowid，
+// saveSourceDocument 重导时整批换号，且 A5-9 明文把它排除在身份层外。sentence_index 在每个
+// doc 内密集 1..N（实测全库如此），故 dense 布局直接存有序数组、省掉全部 key。
+//
+// 格式（JSON，v/layout 自描述，留分块等后续扩展位）：
+//   { v:1, layout:'dense',  base:1, ids:[nodeId|null, ...] }
+//   { v:1, layout:'sparse', pairs:[[sentenceIndex, nodeId|null], ...] }   // 密集性退化时
+//   两种布局都可带可选块 nodePositions:[[nodeId, sourcePosition], ...]（只列非 NULL 的）
+export type SpanLink = { sentenceIndex: number; nodeId: string | null };
+export type NodePosition = { nodeId: string; sourcePosition: number };
+export interface SpanMapPayload {
+  links: SpanLink[];
+  nodePositions?: NodePosition[];
+}
+type SpanMapObject = {
+  v?: unknown;
+  layout?: unknown;
+  base?: unknown;
+  ids?: Array<string | null>;
+  pairs?: Array<[number, string | null]>;
+  nodePositions?: Array<[string, number]>;
+};
+
+// 归属为空（既无 span 也无 source_position）不建对象，返回 null——与 writeSource 的空原文约定对称，
+// commit.span_map_hash 置空。注意「NULL = 旧 commit、退回现行行为」与「空对象 = 该版本确实没有
+// 归属」在 restore 侧语义不同，故只有**两者皆空**才返回 null。
+export function writeSpanMap(db: DbLike, payload: SpanMapPayload): string | null {
+  const links = payload.links || [];
+  const nodePositions = payload.nodePositions || [];
+  if (links.length === 0 && nodePositions.length === 0) return null;
+
+  // dense 判定：sentence_index 自 base 起严格连续递增。不连续则退 sparse（键值对全存）。
+  const base = links.length > 0 ? links[0]!.sentenceIndex : 1;
+  const dense = links.every((link, index) => link.sentenceIndex === base + index);
+  const object: SpanMapObject = dense
+    ? { v: 1, layout: 'dense', base, ids: links.map((link) => link.nodeId ?? null) }
+    : { v: 1, layout: 'sparse', pairs: links.map((link) => [link.sentenceIndex, link.nodeId ?? null]) };
+  if (nodePositions.length > 0) {
+    object.nodePositions = nodePositions.map((entry) => [entry.nodeId, entry.sourcePosition]);
+  }
+
+  const data = JSON.stringify(object);
+  const hash = sha256_128(data);
+  db.prepare('INSERT OR IGNORE INTO objects (hash, kind, data) VALUES (?, ?, ?)').run(hash, 'spanmap', data);
+  return hash;
+}
+
+// 读 spanmap 对象；hash 为空、对象缺失或格式不认退回 { links: [] }（调用方据此走「无归属」分支）。
+export function readSpanMap(db: DbLike, hash: unknown): SpanMapPayload {
+  if (!hash) return { links: [] };
+  const row = db.prepare('SELECT data FROM objects WHERE hash = ? AND kind = ?')
+    .get<Pick<ObjectRow, 'data'>>(hash, 'spanmap');
+  if (!row) return { links: [] };
+  let object: SpanMapObject;
+  try { object = JSON.parse(row.data) as SpanMapObject; } catch { return { links: [] }; }
+
+  const links: SpanLink[] = [];
+  if (object.layout === 'dense' && Array.isArray(object.ids)) {
+    const base = Number(object.base ?? 1);
+    object.ids.forEach((nodeId, index) => {
+      links.push({ sentenceIndex: base + index, nodeId: nodeId ?? null });
+    });
+  } else if (object.layout === 'sparse' && Array.isArray(object.pairs)) {
+    for (const pair of object.pairs) {
+      if (!Array.isArray(pair)) continue;
+      links.push({ sentenceIndex: Number(pair[0]), nodeId: pair[1] ?? null });
+    }
+  }
+
+  const nodePositions: NodePosition[] = [];
+  for (const entry of object.nodePositions || []) {
+    if (!Array.isArray(entry)) continue;
+    const position = Number(entry[1]);
+    if (!entry[0] || !Number.isFinite(position)) continue;
+    nodePositions.push({ nodeId: String(entry[0]), sourcePosition: position });
+  }
+  return nodePositions.length > 0 ? { links, nodePositions } : { links };
+}
+
 // gc 的额外可达根：不在 commits 表却仍被引用的对象根——目前是编辑器 undo token（进程内易失，
 // 引用对象库里的树/原文而不建 commit 行）。不纳入的话 gc 会把活 token 指向的对象 sweep 掉。
 export interface ExtraObjectRoots {
   treeHashes?: Array<string | null | undefined>;
   sourceHashes?: Array<string | null | undefined>;
+  spanMapHashes?: Array<string | null | undefined>;
 }
 
 // 从所有 commit 出发收集可达对象 hash（mark 阶段）。每个 commit 的 root_tree_hash 递归下钻
@@ -120,16 +224,22 @@ export function collectReachableHashes(db: DbLike, extraRoots: ExtraObjectRoots 
     if (tree.blob_hash) reachable.add(tree.blob_hash);
     for (const child of tree.children || []) visitTree(child.tree_hash);
   };
-  for (const commit of db.prepare('SELECT root_tree_hash, source_hash FROM commits')
-    .all<Pick<CommitRow, 'root_tree_hash' | 'source_hash'>>()) {
+  for (const commit of db.prepare('SELECT root_tree_hash, source_hash, span_map_hash FROM commits')
+    .all<Pick<CommitRow, 'root_tree_hash' | 'source_hash' | 'span_map_hash'>>()) {
     if (commit.root_tree_hash) visitTree(commit.root_tree_hash);
     if (commit.source_hash) reachable.add(commit.source_hash);
+    // spanmap 当前不分块，是叶子对象、无需下钻；将来若加 layout:'chunked'，这里要改成
+    // 「读顶层对象、把 chunks 里的块 hash 一并加进可达集」。
+    if (commit.span_map_hash) reachable.add(commit.span_map_hash);
   }
   for (const treeHash of extraRoots.treeHashes || []) {
     if (treeHash) visitTree(treeHash);
   }
   for (const sourceHash of extraRoots.sourceHashes || []) {
     if (sourceHash) reachable.add(sourceHash);
+  }
+  for (const spanMapHash of extraRoots.spanMapHashes || []) {
+    if (spanMapHash) reachable.add(spanMapHash);
   }
   return reachable;
 }
