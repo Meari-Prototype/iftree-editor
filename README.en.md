@@ -321,4 +321,4 @@ Released under the [Apache License 2.0](LICENSE), copyright Meari (see [NOTICE](
 - The UI bundles the [Noto Sans CJK](src/frontend/assets/fonts/NOTICE.md) font (SIL Open Font License).
 - Semantic vectors are based on the [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) model.
 - Built with open-source projects including Electron, React, Vite, LanceDB, and Transformers.js.
-- Developed with the help of ChatGPT 5.6 sol, ChatGPT 5.5, Claude Opus 4.8, Claude Opus 4.7, Claude Sonnet 5, Claude Fable 5, GLM 5.2, and DeepSeek V4.
+- Developed with the help of ChatGPT 6 astra, ChatGPT 5.6 sol, ChatGPT 5.5, Claude Opus 5, Claude Fable 5.1, Claude Opus 4.8, Claude Opus 4.7, Claude Sonnet 5, Claude Fable 5, Kimi K3, GLM 5.3, GLM 5.3 Flash, GLM 5.2, and DeepSeek V4.

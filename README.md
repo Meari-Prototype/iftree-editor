@@ -319,4 +319,4 @@ npm run test:verbs    # node --test 运行 db 动词契约套件
 - 界面内置 [Noto Sans CJK](src/frontend/assets/fonts/NOTICE.md) 字体（SIL Open Font License）。
 - 语义向量基于 [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) 模型。
 - 以及 Electron、React、Vite、LanceDB、Transformers.js 等开源项目。
-- 开发过程中借助 ChatGPT 5.6 sol、ChatGPT 5.5、Claude Opus 4.8、Claude Opus 4.7、Claude Sonnet 5、Claude Fable 5、GLM 5.2 与 DeepSeek V4 辅助。
+- 开发过程中借助 ChatGPT 6 astra、ChatGPT 5.6 sol、ChatGPT 5.5、Claude Opus 5、Claude Fable 5.1、Claude Opus 4.8、Claude Opus 4.7、Claude Sonnet 5、Claude Fable 5、Kimi K3、GLM 5.3、GLM 5.3 Flash、GLM 5.2 与 DeepSeek V4 辅助。
